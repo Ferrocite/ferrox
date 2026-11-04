@@ -1080,48 +1080,42 @@ impl GrpcWriter {
         batch.flush_blocking(&self.shared)
     }
 
-    /// The blocking writer's `MultiHunk` path: the same groups as `try_send_multi`, but a message's
-    /// whole window is taken before its first frame and a transport that cannot take the batch is
-    /// drained before the retry.
-    fn send_multi(&self, data: &[u8], payload: usize) -> bool {
-        let cap = self.multi_cap();
-        let wide = usize::try_from(cap).unwrap_or(usize::MAX);
-        let payload = payload.min(wide.saturating_sub(16).max(1));
+    /// The blocking writer's `MultiHunk` path: each group is sized from the room the transport has
+    /// when it is formed, and a transport with no usable room is waited out rather than frozen into
+    /// a one-byte element for the rest of the write.
+    fn send_multi(&self, data: &[u8], element: usize) -> bool {
         let mut batch = Gather::new();
         let mut lengths = [0usize; FRAMES_PER_WRITE];
-        let mut count = 0usize;
-        let mut group_start = 0usize;
-        let mut payload_len = 0usize;
-        let mut prefix_len = 5usize;
-        for piece in data.chunks(payload) {
-            let add = 1 + varint_len(piece.len() as u64);
-            let total = prefix_len + add + payload_len + piece.len();
-            if count > 0 && (count == FRAMES_PER_WRITE || total as u64 > cap) {
-                if !self.send_multi_group(
-                    &data[group_start..group_start + payload_len],
-                    &lengths[..count],
-                    &mut batch,
-                ) {
+        let mut at = 0usize;
+        let mut target = 0usize;
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        while at < data.len() {
+            let cap = self.multi_cap();
+            if cap < 8 {
+                if Instant::now() >= deadline {
                     return false;
                 }
-                group_start += payload_len;
-                payload_len = 0;
-                count = 0;
-                prefix_len = 5;
+                self.wait_for_room(crate::budgets::RELAY_POLL);
+                continue;
             }
-            lengths[count] = piece.len();
-            count += 1;
-            payload_len += piece.len();
-            prefix_len += add;
-        }
-        if count > 0
-            && !self.send_multi_group(
-                &data[group_start..group_start + payload_len],
-                &lengths[..count],
-                &mut batch,
-            )
-        {
-            return false;
+            let fits = multi_payload(cap);
+            if target > 0 && fits < target && data.len() - at > fits {
+                if !batch.flush_blocking(&self.shared) {
+                    return false;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                self.wait_for_room(crate::budgets::RELAY_POLL);
+                continue;
+            }
+            let element = element.min(fits).max(1);
+            target = target.max(element);
+            let (payload_len, count) = multi_group(data, at, element, cap, &mut lengths);
+            if !self.send_multi_group(&data[at..at + payload_len], &lengths[..count], &mut batch) {
+                return false;
+            }
+            at += payload_len;
         }
         batch.flush_blocking(&self.shared)
     }
@@ -1273,58 +1267,37 @@ impl GrpcWriter {
     /// into one gRPC message, and a message is never split across a retry — a group is only added
     /// to a batch that has room for all its frames, and the window for the whole message is taken
     /// before its first frame.
-    fn try_send_multi(&self, data: &[u8], payload: usize) -> crate::proxy::Push {
+    fn try_send_multi(&self, data: &[u8], element: usize) -> crate::proxy::Push {
         let mut batch = Gather::new();
         let mut flushed = 0usize;
         let mut held = 0usize;
         let mut lengths = [0usize; FRAMES_PER_WRITE];
-        let mut count = 0usize;
-        let mut group_start = 0usize;
-        let mut payload_len = 0usize;
-        let mut prefix_len = 5usize;
-        // Cap by the live room, read before the window locks: a refused batch takes them in the other order.
-        let room = self.send_room();
-        let cap = {
-            let init = self
-                .shared
-                .init
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let send = self
-                .shared
-                .send
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            (*init).min(send.conn).min(send.stream).min(room)
-        };
-        let wide = usize::try_from(cap).unwrap_or(usize::MAX);
-        let payload = payload.min(wide.saturating_sub(16).max(1));
-        for piece in data.chunks(payload) {
-            let add = 1 + varint_len(piece.len() as u64);
-            let total = prefix_len + add + payload_len + piece.len();
-            if count > 0 && (count == FRAMES_PER_WRITE || total as u64 > cap) {
-                if let Some(stop) = self.try_multi_group(
-                    &data[group_start..group_start + payload_len],
-                    &lengths[..count],
-                    &mut batch,
-                    &mut flushed,
-                    &mut held,
-                ) {
+        let mut at = 0usize;
+        let mut target = 0usize;
+        while at < data.len() {
+            let cap = self.multi_cap();
+            if cap < 8 {
+                if let Some(stop) =
+                    Self::flush_held(&self.shared, &mut batch, &mut flushed, &mut held)
+                {
                     return stop;
                 }
-                group_start += payload_len;
-                payload_len = 0;
-                count = 0;
-                prefix_len = 5;
+                return Self::took_or_parked(flushed);
             }
-            lengths[count] = piece.len();
-            count += 1;
-            payload_len += piece.len();
-            prefix_len += add;
-        }
-        if count > 0 {
+            let fits = multi_payload(cap);
+            if target > 0 && fits < target && data.len() - at > fits {
+                if let Some(stop) =
+                    Self::flush_held(&self.shared, &mut batch, &mut flushed, &mut held)
+                {
+                    return stop;
+                }
+                return Self::took_or_parked(flushed);
+            }
+            let element = element.min(fits).max(1);
+            target = target.max(element);
+            let (payload_len, count) = multi_group(data, at, element, cap, &mut lengths);
             if let Some(stop) = self.try_multi_group(
-                &data[group_start..group_start + payload_len],
+                &data[at..at + payload_len],
                 &lengths[..count],
                 &mut batch,
                 &mut flushed,
@@ -1332,6 +1305,7 @@ impl GrpcWriter {
             ) {
                 return stop;
             }
+            at += payload_len;
         }
         match batch.flush(&self.shared) {
             Accepted::All => Self::took_or_parked(flushed + held),
@@ -1340,16 +1314,21 @@ impl GrpcWriter {
         }
     }
 
-    /// The largest `MultiHunk` the peer can pay for in one take: its starting stream window, and
-    /// the connection's own 65_535-byte opening window.
+    /// The largest `MultiHunk` the peer can pay for in one take right now: its starting stream
+    /// window, the connection's own 65_535-byte opening window, and the transport's live room.
     fn multi_cap(&self) -> u64 {
-        let cap = *self
+        let room = self.send_room();
+        let init = *self
             .shared
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // A group sized only by the opening window parks when the transport has less room now.
-        cap.min(65_535).min(self.send_room())
+        let send = self
+            .shared
+            .send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        init.min(65_535).min(send.conn).min(send.stream).min(room)
     }
 
     /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
@@ -1613,6 +1592,55 @@ fn message_payload(max_frame: usize) -> usize {
         }
         payload = next;
     }
+}
+
+/// The largest `MultiHunk` element whose complete envelope — the gRPC prefix, the field tag and
+/// its length — fits `cap` bytes, so one element is never split for a margin it does not owe.
+fn multi_payload(cap: u64) -> usize {
+    let max = usize::try_from(cap).unwrap_or(usize::MAX);
+    if max < 8 {
+        return 1;
+    }
+    let mut payload = max - 6;
+    loop {
+        let total = 6 + varint_len(payload as u64) + payload;
+        if total <= max {
+            return payload;
+        }
+        payload = payload.saturating_sub(total - max);
+        if payload == 0 {
+            return 1;
+        }
+    }
+}
+
+/// One `MultiHunk` group from `data[at..]`: whole `element`-sized pieces until the frame count or
+/// the actual envelope cost would cross `cap`, so only a group that cannot fit is split.
+fn multi_group(
+    data: &[u8],
+    at: usize,
+    element: usize,
+    cap: u64,
+    lengths: &mut [usize; FRAMES_PER_WRITE],
+) -> (usize, usize) {
+    let mut end = at;
+    let mut count = 0usize;
+    let mut payload_len = 0usize;
+    let mut prefix_len = 5usize;
+    while end < data.len() && count < FRAMES_PER_WRITE {
+        let len = element.min(data.len() - end);
+        let add = 1 + varint_len(len as u64);
+        let total = prefix_len + add + payload_len + len;
+        if count > 0 && total as u64 > cap {
+            break;
+        }
+        lengths[count] = len;
+        count += 1;
+        payload_len += len;
+        prefix_len += add;
+        end += len;
+    }
+    (payload_len, count)
 }
 
 /// The number of bytes a protobuf varint takes for `value`: seven bits per byte, never fewer than one.
@@ -3787,60 +3815,87 @@ mod tests {
         ));
     }
 
+    /// A muxed sink whose `room()` is the body capacity and whose offers are checked against it;
+    /// `grant` lets a blocking test hand the first `wait_room` a fresh window.
+    struct Roomed {
+        limit: std::sync::atomic::AtomicU64,
+        grant: std::sync::atomic::AtomicU64,
+        got: Arc<Mutex<Vec<u8>>>,
+        offered: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl std::io::Write for Roomed {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.got.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Roomed {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            matches!(self.offer_slices(parts), Accepted::All)
+        }
+        fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+            let frames = parts.len().div_ceil(2);
+            let total: usize = parts.iter().map(|part| part.len()).sum();
+            let body = total - frames * 9;
+            self.offered.lock().unwrap().push(body);
+            use std::sync::atomic::Ordering::Relaxed;
+            if body as u64 > self.limit.load(Relaxed) {
+                return Accepted::Full;
+            }
+            for part in parts {
+                self.got.lock().unwrap().extend_from_slice(part);
+            }
+            Accepted::All
+        }
+        fn room(&self) -> u64 {
+            self.limit.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn wait_room(&self, _turn: Duration) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let limit = self.grant.swap(u64::MAX, Relaxed);
+            if limit != u64::MAX {
+                self.limit.store(limit, Relaxed);
+            }
+        }
+    }
+
+    fn mux_writer_over<W: crate::proxy::FrameWrite + 'static>(
+        write: W,
+        max_frame: usize,
+        window: u64,
+    ) -> GrpcWriter {
+        GrpcWriter {
+            shared: mux_shared(Box::new(write), max_frame, window),
+            stream: 1,
+            multi: true,
+        }
+    }
+
+    fn roomed(limit: u64, grant: Option<u64>) -> (Roomed, Arc<Mutex<Vec<usize>>>) {
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        (
+            Roomed {
+                limit: std::sync::atomic::AtomicU64::new(limit),
+                grant: std::sync::atomic::AtomicU64::new(grant.unwrap_or(u64::MAX)),
+                got: Arc::new(Mutex::new(Vec::new())),
+                offered: Arc::clone(&offered),
+            },
+            offered,
+        )
+    }
+
     /// The multiplexed transport owns the live window, so a group is cut to its `room()` before
     /// it is offered: a group sized only by the opening window parks forever when the peer has
     /// already spent the credit on the response it is reading.
     #[test]
     fn a_multi_mode_muxed_writer_cuts_each_group_to_the_live_room() {
-        struct Roomed {
-            limit: u64,
-            got: Arc<Mutex<Vec<u8>>>,
-            offered: Arc<Mutex<Vec<usize>>>,
-        }
-        impl std::io::Write for Roomed {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.got.lock().unwrap().extend_from_slice(data);
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl crate::proxy::FrameWrite for Roomed {
-            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-                matches!(self.offer_slices(parts), Accepted::All)
-            }
-            fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
-                let total: usize = parts.iter().map(|part| part.len()).sum();
-                self.offered.lock().unwrap().push(total);
-                if total as u64 > self.limit {
-                    return Accepted::Full;
-                }
-                for part in parts {
-                    self.got.lock().unwrap().extend_from_slice(part);
-                }
-                Accepted::All
-            }
-            fn room(&self) -> u64 {
-                self.limit
-            }
-        }
-        let got = Arc::new(Mutex::new(Vec::new()));
-        let offered = Arc::new(Mutex::new(Vec::new()));
-        let shared = mux_shared(
-            Box::new(Roomed {
-                limit: 40_000,
-                got: Arc::clone(&got),
-                offered: Arc::clone(&offered),
-            }),
-            HUNK,
-            65_535,
-        );
-        let writer = GrpcWriter {
-            shared,
-            stream: 1,
-            multi: true,
-        };
+        let (sink, offered) = roomed(40_000, None);
+        let writer = mux_writer_over(sink, HUNK, 65_535);
         let data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         assert!(matches!(
             writer.try_send(&data),
@@ -3850,6 +3905,58 @@ mod tests {
             offered.lock().unwrap().iter().all(|&total| total <= 40_000),
             "every offered group fits the live room"
         );
+    }
+
+    /// A whole element whose complete envelope fits the live room stays one message; only a margin
+    /// inferred from the frame width would split it.
+    #[test]
+    fn a_multi_mode_muxed_writer_keeps_a_message_that_fits_the_room() {
+        let (sink, offered) = roomed(16_370, None);
+        let writer = mux_writer_over(sink, HUNK, 65_535);
+        let data: Vec<u8> = (0..16_360).map(|i| (i % 251) as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n == data.len()
+        ));
+        assert_eq!(
+            offered.lock().unwrap().len(),
+            1,
+            "one message for one element"
+        );
+    }
+
+    /// A blocking write starts with no room: it waits for the transport instead of freezing the
+    /// first group's one-byte element into the chunk size for the rest of the write.
+    #[test]
+    fn a_multi_mode_muxed_writer_waits_for_room_before_sizing_the_write() {
+        let (sink, offered) = roomed(0, Some(40_000));
+        let writer = mux_writer_over(sink, HUNK, 65_535);
+        let data: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
+        assert!(writer.send(&data));
+        assert_eq!(
+            offered.lock().unwrap().len(),
+            1,
+            "one message once room arrives"
+        );
+    }
+
+    /// Every element leaves in the largest envelope the room pays for, and one byte more does not
+    /// fit; a fixed frame-width margin would leave room unused.
+    #[test]
+    fn a_multi_element_uses_the_envelope_the_peer_pays_for() {
+        for cap in [8u64, 9, 127, 128, 16_383, 16_384, 40_000, 65_535] {
+            let payload = multi_payload(cap);
+            let fits = 6 + varint_len(payload as u64) + payload;
+            assert!(
+                fits as u64 <= cap,
+                "cap {cap} leaves payload {payload} at {fits}"
+            );
+            if payload > 1 {
+                let next = payload + 1;
+                let over = 6 + varint_len(next as u64) + next;
+                assert!(over as u64 > cap, "cap {cap} still fits payload {next}");
+            }
+        }
     }
 
     /// A peer whose starting window is smaller than one frame: the writer cuts its elements to
