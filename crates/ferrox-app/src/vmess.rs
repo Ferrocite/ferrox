@@ -2113,13 +2113,16 @@ pub(crate) fn serve_xhttp_split<R, W>(
 /// The session above an xHTTP carrier an accept already split: an h2 stream and an H1 request both
 /// leave the same pair, so the request decode and relay are shared.
 pub(crate) fn serve_xhttp_accepted(
-    mut reader: Box<dyn crate::proxy::WindowRead + Send>,
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
     writer: crate::xhttp::XhttpWriter,
     users: &Users,
     freedom: bool,
     close: &Close,
 ) {
-    let decoded = accept_request_bounded(&mut reader, users);
+    // The h2 reader sleeps through poll timeouts, so the handshake claims the poll and a silent stream ends at its budget.
+    let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
+    let decoded = accept_request(&mut reader, users);
+    reader.disarm();
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -2412,6 +2415,7 @@ pub(crate) fn pump_relay(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Arc;
 
     #[test]
     fn a_frame_coalesced_behind_its_header_still_arrives() {
@@ -5021,5 +5025,66 @@ mod tests {
 
         client.shutdown(Shutdown::Write).expect("ends the upload");
         relay.join().expect("joins");
+    }
+
+    /// A silent h2 stream authenticates under the handshake clock: its reader polls, and the handler
+    /// ends at the budget instead of waiting the relay stall for a body that never comes.
+    #[test]
+    fn a_silent_h2_request_ends_at_the_handshake_budget() {
+        struct Silent(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    crate::proxy::relay_step_owns_poll(),
+                    "an h2 authentication read ran outside the poll"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl crate::proxy::WindowRead for Silent {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                unreachable!("authentication reads through Read")
+            }
+        }
+
+        struct Sink;
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for Sink {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                true
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close: Close = Arc::new({
+            let closed = Arc::clone(&closed);
+            move || closed.store(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
+        let began = std::time::Instant::now();
+        serve_xhttp_accepted(
+            Box::new(Silent(Arc::clone(&polled))),
+            crate::xhttp::XhttpWriter::new(Sink),
+            &Users::single([0x55u8; 16]),
+            true,
+            &close,
+        );
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 }

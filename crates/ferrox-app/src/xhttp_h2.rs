@@ -2400,7 +2400,10 @@ pub(crate) fn serve_h2_service<
     service: &S,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
-    serve_h2_service_until(read, write, service, decryption, None);
+    // A peer that offers the preface and no request ends at the handshake clock; the first HEADERS puts it away.
+    let until = std::time::Instant::now() + crate::budgets::handshake();
+    let opened = Arc::new(AtomicBool::new(false));
+    serve_h2_service_until(read, write, service, decryption, Some((until, opened)));
 }
 
 /// What one call of `Frames::step` settled on: another frame is ready, the socket is quiet until the
@@ -2522,13 +2525,13 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     if !block {
                         return Filled::Idle;
                     }
-                    if let Some(until) = *until {
-                        std::thread::sleep(
-                            until
-                                .saturating_duration_since(std::time::Instant::now())
-                                .min(crate::budgets::RELAY_POLL),
-                        );
-                    }
+                    // No deadline means an established connection: poll in a quantum instead of spinning a worker.
+                    let wait = until.map_or(crate::budgets::RELAY_POLL, |until| {
+                        until
+                            .saturating_duration_since(std::time::Instant::now())
+                            .min(crate::budgets::RELAY_POLL)
+                    });
+                    std::thread::sleep(wait);
                 }
                 Err(_) => return Filled::End,
             }
@@ -2648,6 +2651,11 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 let body = std::mem::take(&mut self.body);
                 if !pump_frame(conn, service, kind, flags, sid, body, &mut self.frag) {
                     return self.end();
+                }
+                if kind == T_HEADERS {
+                    if let Some(opened) = &self.opened {
+                        opened.store(true, Ordering::Relaxed);
+                    }
                 }
                 self.head_have = 0;
                 self.phase = Phase::Head;
@@ -4642,6 +4650,45 @@ mod tests {
         );
         drop(client);
         let _ = handle;
+    }
+
+    /// A peer that offers the h2 preface and no request is ended at the handshake clock: the demux
+    /// does not hold its worker for a connection that never opened a stream.
+    #[test]
+    fn a_preface_without_a_request_ends_at_the_handshake_budget() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let opened = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&opened);
+        let server = thread::spawn(crate::budgets::carrying(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
+                .expect("arms the poll");
+            let service = XhttpSessionService::new(
+                test_settings("stream-up"),
+                Arc::new(move |_, _, _| {
+                    seen.store(true, Ordering::SeqCst);
+                }),
+            );
+            let began = std::time::Instant::now();
+            serve_h2_service(read, stream, &service, None);
+            began.elapsed()
+        }));
+        let mut client = Connection::connect(addr).expect("connects");
+        client.write_all(MAGIC).expect("writes the preface");
+        let took = server.join().expect("joins");
+        crate::budgets::clear();
+        assert!(!opened.load(Ordering::SeqCst), "no stream opened");
+        assert!(
+            took < Duration::from_secs(2),
+            "the demux did not end at its clock: {took:?}"
+        );
+        drop(client);
     }
 
     /// The writer a credit is read by: it answers with the bytes it was handed, so the number of writes it took is exact — over a loopback socket the same shape moves with the scheduler.
