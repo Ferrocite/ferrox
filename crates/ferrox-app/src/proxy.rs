@@ -11922,6 +11922,10 @@ fn serve_vmess_inbound_users(
             true
         }
         carrier if sec == "reality" => {
+            if !carrier.tcp_stream() {
+                eprintln!("vmess reality on {address}: not carried on that transport");
+                return false;
+            }
             let Some(server) = inbound_reality_config(inbound) else {
                 eprintln!("unreadable vmess reality settings on {address}: serves nothing");
                 return false;
@@ -41802,6 +41806,18 @@ mod tests {
         assert!(out.reality.is_some());
         assert!(out.tls.is_none());
         assert!(matches!(out.carrier, Carrier::Raw(_)));
+    }
+
+    /// A REALITY inbound on a carrier the serve path cannot arm is refused before the role starts,
+    /// instead of binding a listener that drops every session.
+    #[test]
+    fn vmess_reality_inbound_refuses_an_unsupported_carrier() {
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vmess","port":0,"settings":{{"clients":[{{"id":"{REALITY_TEST_ID}"}}]}},"streamSettings":{{"network":"quic","security":"reality"}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:0", &inbound, true, None);
+        assert!(!served);
     }
 
     /// The bulk download through the same relay: the session's own buffer is finite, and a
