@@ -39,9 +39,9 @@ use crate::conn::Connection;
 use crate::proxy::{serve_device_flow, serve_udp_lane, Destination, Outbound};
 use crate::wireguard::{DeviceConfig, PeerConfig};
 
-/// The receive side of one flow: `smoltcp` has no window auto-tuning, so this
-/// window must cover a fast link's round trip without one.
-const TCP_RECV_BUFFER: usize = 2 * 1024 * 1024;
+/// The receive side of one flow: a peer may have this much in flight before a
+/// window update, which is the reference's order of magnitude.
+const TCP_RECV_BUFFER: usize = 512 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
 const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
