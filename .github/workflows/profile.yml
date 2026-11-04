@@ -74,8 +74,8 @@ jobs:
           PROFILE_SERVER: ${{ inputs.engine }}
         run: |
           PROFILE_DIR="$PWD/profile" timeout --kill-after=30s 900 ./scripts/run-benchmark-matrix.sh \
-            --tier full --only "$CELL" --engines xray-core,ferrox \
-            --repeats 3 --no-build --out profile/out || true
+            --tier full --only "$CELL" --engines ferrox \
+            --repeats 1 --no-build --out profile/out || true
           ls -la profile profile/out/cells 2>/dev/null || true
           sampled=0
           for data in profile/*.perf.data; do
