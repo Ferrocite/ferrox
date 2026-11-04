@@ -272,7 +272,8 @@ carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
 carrier-xhttp framing-read-syscalls-per-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp read-syscalls-per-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
-carrier-xhttp read-syscalls-for-16-peer-chunks 5 ferrox-app-xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing
+carrier-xhttp read-syscalls-for-16-peer-chunks 3 ferrox-app-xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing
+carrier-xhttp read-syscalls-for-16-maximum-size-lines 17 ferrox-app-xhttp::tests::a_maximum_size_line_keeps_the_closing_crlf_in_the_framing_read
 carrier-xhttp write-slices-per-window 1 ferrox-app-xhttp::tests::one_window_is_one_chunked_frame
 carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
 carrier-xhttp read-window-copies 0 ferrox-app-xhttp::tests::a_body_window_is_the_readers_own_buffer
