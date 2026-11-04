@@ -2005,6 +2005,42 @@ mod tests {
         assert_eq!(got, packets);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sendmsg_fallback_keeps_every_transport_packet_in_order() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let to = receiver.local_addr().expect("address");
+        let (storage, name_len) = crate::proxy::sockaddr_of(to);
+        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        // SAFETY: a zeroed `mmsghdr` is the empty header `send_messages` fills.
+        let mut headers: [libc::mmsghdr; SEND_BATCH] =
+            std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+        send_messages(
+            &sender,
+            &storage,
+            name_len,
+            to,
+            &packets,
+            &mut iovecs,
+            &mut headers,
+        );
+        let mut got = Vec::new();
+        for _ in 0..packets.len() {
+            let mut buf = [0u8; 64];
+            let (n, _) = receiver.recv_from(&mut buf).expect("datagram");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, packets);
+    }
+
     #[test]
     fn a_short_datagram_is_refused_before_any_slice() {
         let Ok(socket) = UdpSocket::bind("127.0.0.1:0") else {
