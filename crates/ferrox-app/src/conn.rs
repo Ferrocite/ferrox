@@ -357,37 +357,33 @@ fn sendmsg_ready<S: std::os::fd::AsRawFd>(stream: &S, parts: &[&[u8]]) -> io::Re
     }
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "linux")]
-    {
-        let sent = unsafe {
-            libc::sendmsg(
-                fd,
-                std::ptr::from_ref(&message),
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
-        return if sent < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(sent as usize)
-        };
-    }
+    let sent = unsafe {
+        libc::sendmsg(
+            fd,
+            std::ptr::from_ref(&message),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let error = (sent < 0).then(io::Error::last_os_error);
+    // Darwin ignores `MSG_DONTWAIT` on a full send buffer, so the descriptor flag is restored before the borrow ends.
     #[cfg(not(target_os = "linux"))]
-    {
-        // Darwin ignores `MSG_DONTWAIT` on a full send buffer, so the descriptor flag is restored before the borrow ends.
+    let (sent, error) = {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
+        let armed =
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0;
+        if armed {
+            let sent = unsafe { libc::sendmsg(fd, std::ptr::from_ref(&message), 0) };
+            let error = (sent < 0).then(io::Error::last_os_error);
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+            (sent, error)
+        } else {
+            (-1, Some(io::Error::last_os_error()))
         }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let sent = unsafe { libc::sendmsg(fd, std::ptr::from_ref(&message), 0) };
-        let error = (sent < 0).then(io::Error::last_os_error);
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-        match error {
-            Some(error) => Err(error),
-            None => Ok(sent as usize),
-        }
+    };
+    match error {
+        Some(error) => Err(error),
+        None => Ok(sent as usize),
     }
 }
 

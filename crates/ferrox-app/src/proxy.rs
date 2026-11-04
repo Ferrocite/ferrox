@@ -9555,6 +9555,7 @@ pub(crate) fn note_wait_fd(fd: WaitFd) {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn note_wait_fd_write(fd: WaitFd) {
     if relay_step_owns_poll() {
         WAIT_FD.with(|slot| slot.set(Some(fd)));
@@ -26715,6 +26716,7 @@ pub(crate) mod lane_pool {
         }
 
         /// A lane parked on a full carrier is woken by the socket taking bytes again, not by the clock.
+        #[cfg(unix)]
         #[test]
         fn a_write_slot_waits_for_the_socket_to_drain() {
             use std::io::{Read as _, Write as _};
