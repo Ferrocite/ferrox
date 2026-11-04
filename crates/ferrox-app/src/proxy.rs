@@ -25707,12 +25707,13 @@ pub(crate) mod lane_pool {
                 .iter()
                 .map(|event| {
                     let bits = event.events;
-                    let error = bits & (libc::EPOLLERR | libc::EPOLLHUP) != 0;
+                    let error = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0;
                     (
                         libc::c_int::try_from(event.u64).unwrap_or(libc::c_int::MAX),
                         Ready {
-                            read: error || bits & (libc::EPOLLIN | libc::EPOLLPRI) != 0,
-                            write: error || bits & libc::EPOLLOUT != 0,
+                            read: error
+                                || bits & (libc::EPOLLIN as u32 | libc::EPOLLPRI as u32) != 0,
+                            write: error || bits & libc::EPOLLOUT as u32 != 0,
                         },
                     )
                 })
