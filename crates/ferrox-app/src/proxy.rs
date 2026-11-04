@@ -6659,6 +6659,9 @@ fn serve_mux_wire(
         return;
     };
     // A client that stops reading must park a write, not the session: the deadline turns it into an error the loop unwinds on.
+    #[cfg(target_os = "linux")]
+    wire.set_write_timeout(budgets::RELAY_RESPONSE_IDLE);
+    #[cfg(not(target_os = "linux"))]
     wire.set_write_timeout(budgets::relay_stall());
     let table: MuxTable = Arc::new(Mutex::new(MuxState {
         flows: HashMap::new(),
