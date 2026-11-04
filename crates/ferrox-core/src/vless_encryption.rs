@@ -14,7 +14,6 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const HEADER_LEN: usize = 5;
 const TAG_LEN: usize = 16;
 const MAX_RECORD_PLAINTEXT: usize = 8192;
-const MAX_BATCH_PLAINTEXT: usize = 8 * MAX_RECORD_PLAINTEXT;
 const MIN_RECORD: usize = 1 + TAG_LEN;
 const MAX_RECORD: usize = 16640;
 const X25519_LEN: usize = 32;
@@ -1363,35 +1362,30 @@ impl WriteSide {
         if buf.is_empty() {
             return Ok(0);
         }
-        let take = buf.len().min(MAX_BATCH_PLAINTEXT);
-        self.out.clear();
         if self.direct {
-            self.out.extend_from_slice(&buf[..take]);
+            self.out.clear();
+            self.out.extend_from_slice(buf);
             self.out_mask.apply(&mut self.out, true);
             inner.write_all(&self.out)?;
-            return Ok(take);
+            return Ok(buf.len());
         }
+        let n = buf.len().min(MAX_RECORD_PLAINTEXT);
+        self.out.clear();
         self.out.append(&mut self.pre_write);
-        let mut at = 0;
-        while at < take {
-            let n = (take - at).min(MAX_RECORD_PLAINTEXT);
-            let header_at = self.out.len();
-            let len = n + TAG_LEN;
-            let header = [23, 3, 3, (len >> 8) as u8, len as u8];
-            self.out.extend_from_slice(&header);
-            let rekey = self.aead.nonce == MAX_NONCE;
-            self.aead
-                .seal_into(None, &buf[at..at + n], &header, &mut self.out);
-            if rekey {
-                self.aead = self
-                    .aead
-                    .derive(&self.out[header_at..], self.united_key.as_slice());
-            }
-            at += n;
+        let header_at = self.out.len();
+        let len = n + TAG_LEN;
+        let header = [23, 3, 3, (len >> 8) as u8, len as u8];
+        self.out.extend_from_slice(&header);
+        let rekey = self.aead.nonce == MAX_NONCE;
+        self.aead.seal_into(None, &buf[..n], &header, &mut self.out);
+        if rekey {
+            self.aead = self
+                .aead
+                .derive(&self.out[header_at..], self.united_key.as_slice());
         }
         self.out_mask.apply(&mut self.out, true);
         inner.write_all(&self.out)?;
-        Ok(take)
+        Ok(n)
     }
 }
 
@@ -2055,68 +2049,6 @@ mod tests {
             got.clear();
         }
         writer.join().unwrap();
-    }
-
-    /// A batch of records is sealed into the same staging buffer and handed to the socket once,
-    /// so the peer's reads are not woken per 8 KiB record; the bytes are the ones the same
-    /// records make one at a time.
-    #[test]
-    fn a_batched_record_write_is_one_call_and_the_same_bytes() {
-        use std::io::Write as _;
-
-        struct Sink {
-            calls: usize,
-            wire: Vec<u8>,
-        }
-
-        impl Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.calls += 1;
-                self.wire.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        fn stream() -> EncryptedStream<Sink> {
-            let key = vec![7u8; 32];
-            EncryptedStream::new(
-                Sink {
-                    calls: 0,
-                    wire: Vec::new(),
-                },
-                key.clone(),
-                Aead::new(b"record batch", &key),
-                None,
-                ReadStage::Records,
-            )
-        }
-
-        let payload: Vec<u8> = (0..MAX_BATCH_PLAINTEXT)
-            .map(|at| (at as u8).wrapping_mul(31).wrapping_add(5))
-            .collect();
-        let mut batched = stream();
-        batched.write_all(&payload).unwrap();
-        assert_eq!(batched.get_ref().calls, 1, "one write for the whole batch");
-        assert_eq!(
-            batched.get_ref().wire.len(),
-            8 * (HEADER_LEN + MAX_RECORD_PLAINTEXT + TAG_LEN),
-            "the batch is eight records"
-        );
-
-        let mut singles = stream();
-        for chunk in payload.chunks(MAX_RECORD_PLAINTEXT) {
-            singles.write_all(chunk).unwrap();
-        }
-        assert_eq!(singles.get_ref().calls, 8);
-        assert_eq!(
-            batched.get_ref().wire,
-            singles.get_ref().wire,
-            "batching adds no byte and no rekey step"
-        );
     }
 
     #[test]
