@@ -1559,6 +1559,13 @@ enum Role {
         server: Arc<ferrox_core::tls::TlsServerConfig>,
         account: InboundAccount,
     },
+    VmessReality {
+        users: crate::vmess::UsersRef,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::RealityServerConfig>,
+        account: InboundAccount,
+    },
     Shadowsocks {
         accounts: Arc<crate::shadowsocks::SsAccounts>,
         carrier: Carrier,
@@ -1600,6 +1607,7 @@ impl Role {
             | Role::TrojanReality { carrier, .. }
             | Role::Vmess { carrier, .. }
             | Role::VmessTls { carrier, .. }
+            | Role::VmessReality { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
             // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
             Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
@@ -1620,6 +1628,7 @@ impl Role {
             | Role::TrojanReality { carrier, .. }
             | Role::Vmess { carrier, .. }
             | Role::VmessTls { carrier, .. }
+            | Role::VmessReality { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_stream(),
             Role::Proxied(inner) => inner.tcp_stream(),
             Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
@@ -1635,7 +1644,8 @@ impl Role {
             | Role::TrojanTls { account, .. }
             | Role::TrojanReality { account, .. }
             | Role::Vmess { account, .. }
-            | Role::VmessTls { account, .. } => Some(account),
+            | Role::VmessTls { account, .. }
+            | Role::VmessReality { account, .. } => Some(account),
             Role::Vless { .. }
             | Role::VlessTls { .. }
             | Role::VlessReality { .. }
@@ -3469,6 +3479,7 @@ pub(crate) struct VmessOut {
     headers: Vec<(String, String)>,
     heartbeat: u32,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+    reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -11869,6 +11880,10 @@ fn serve_vmess_inbound_users(
     let sec = stream_security(inbound);
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
+            if sec == "reality" {
+                eprintln!("vmess reality on {address}: not carried on kcp");
+                return false;
+            }
             let email = account.email.clone();
             let level = account.level;
             let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
@@ -11903,6 +11918,32 @@ fn serve_vmess_inbound_users(
                 serve_vmess_xdrive(session.with_meter(meter.clone()), &xdrive_users, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
+            true
+        }
+        carrier if sec == "reality" => {
+            let Some(server) = inbound_reality_config(inbound) else {
+                eprintln!("unreadable vmess reality settings on {address}: serves nothing");
+                return false;
+            };
+            if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+            spawn_role_stopped(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::VmessReality {
+                        users: std::sync::Arc::clone(users),
+                        carrier,
+                        freedom,
+                        server: Arc::new(server),
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop,
+            );
             true
         }
         carrier if sec == "tls" => {
@@ -11987,6 +12028,119 @@ fn serve_vmess_tls(
         }
         Carrier::Grpc(settings) => {
             crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+/// The session a `VMess` listener that declares `security: reality` answers, over raw and every carried carrier.
+fn serve_vmess_reality(
+    stream: Connection,
+    users: &crate::vmess::Users,
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let edges = reality_edges(server, &stream);
+            let accepted =
+                ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
+            match accepted {
+                Ok(ferrox_core::tls::RealityAccept::Session(mut session)) => {
+                    if !shake_tls(&mut session) {
+                        return;
+                    }
+                    let Ok(out) = raw.try_clone() else { return };
+                    let (reader, writer) = session_halves(session, out);
+                    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        let _ = raw.shutdown(Shutdown::Both);
+                    });
+                    crate::vmess::serve_raw_split(reader, writer, users, freedom, &close);
+                }
+                Ok(ferrox_core::tls::RealityAccept::Proxied(proxied)) => relay_fallback(proxied),
+                Err(why) => {
+                    if server.show {
+                        eprintln!("REALITY: {why}");
+                    }
+                }
+            }
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
+            });
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+            });
+        }
+        Carrier::HttpHeader { path } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
+            });
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_httpupgrade_split(
+                    reader, writer, path, host, users, freedom, &close,
+                );
+            });
+        }
+        Carrier::Grpc(settings) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
+            });
         }
         refused_carriers!() => {}
     }
@@ -14379,6 +14533,10 @@ fn dial_vmess(
     target: &Destination,
     ladder: &Ladder,
 ) {
+    if vmess.reality.is_some() {
+        dial_vmess_reality(client, server, vmess, target);
+        return;
+    }
     if vmess.tls.is_some() {
         dial_vmess_tls(client, server, vmess, target);
         return;
@@ -14942,6 +15100,8 @@ trait Dialed:
     fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)>
     where
         Self: Sized;
+
+    fn raw_clone(&self) -> Option<Connection>;
 }
 
 impl Dialed for ferrox_core::tls::ClientSession<Connection> {
@@ -14949,6 +15109,10 @@ impl Dialed for ferrox_core::tls::ClientSession<Connection> {
         let raw = Arc::new(self.get_ref().try_clone().ok()?);
         let (reader, writer) = session_halves(self, raw.try_clone().ok()?);
         Some((reader, writer, raw))
+    }
+
+    fn raw_clone(&self) -> Option<Connection> {
+        self.get_ref().try_clone().ok()
     }
 }
 
@@ -14959,6 +15123,10 @@ impl Dialed
         let raw = Arc::new(self.get_ref().get_ref().try_clone().ok()?);
         let (reader, writer) = session_halves(self, raw.try_clone().ok()?);
         Some((reader, writer, raw))
+    }
+
+    fn raw_clone(&self) -> Option<Connection> {
+        self.get_ref().get_ref().try_clone().ok()
     }
 }
 
@@ -16847,10 +17015,10 @@ fn dial_trojan_session<S, D>(
     }
 }
 
-fn vmess_tls_raw(
+fn vmess_tls_raw<S: Dialed>(
     client: &Connection,
     server: &SocketAddr,
-    mut session: ferrox_core::tls::ClientSession<Connection>,
+    mut session: S,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -16867,14 +17035,14 @@ fn vmess_tls_raw(
     if session.write_all(&request).is_err() {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
-    let Ok(raw) = session.get_ref().try_clone() else {
+    let Some(raw) = session.raw_clone() else {
         return;
     };
     // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
-    let Ok(cipher) = session.get_ref().try_clone() else {
+    let Some(cipher) = session.raw_clone() else {
         return;
     };
-    let Ok(out) = session.get_ref().try_clone() else {
+    let Some(out) = session.raw_clone() else {
         return;
     };
     if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
@@ -16916,12 +17084,13 @@ fn vmess_tls_raw(
 }
 
 #[allow(clippy::too_many_lines)]
-fn vmess_tls_carried(
+fn vmess_tls_carried<S: Dialed, D: Dialed>(
     client: &Connection,
     server: &SocketAddr,
-    session: ferrox_core::tls::ClientSession<Connection>,
+    session: S,
     vmess: &VmessOut,
     target: &Destination,
+    second: impl FnOnce() -> Option<D>,
 ) {
     let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
         &vmess.id,
@@ -16997,14 +17166,9 @@ fn vmess_tls_carried(
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = tls_xhttp(
-                server,
-                session,
-                || dial_tls_session(server, vmess.tls.as_deref()?, vmess.carrier.tcp_mask()),
-                &vmess.host,
-                settings,
-                false,
-            ) else {
+            let Some((reader, writer)) =
+                tls_xhttp(server, session, second, &vmess.host, settings, false)
+            else {
                 return;
             };
             if !writer.send(&request) {
@@ -17069,7 +17233,29 @@ fn dial_vmess_tls(
     };
     match &vmess.carrier {
         Carrier::Raw(_) => vmess_tls_raw(client, server, session, vmess, target),
-        _ => vmess_tls_carried(client, server, session, vmess, target),
+        _ => vmess_tls_carried(client, server, session, vmess, target, || {
+            dial_tls_session(server, cfg, vmess.carrier.tcp_mask())
+        }),
+    }
+}
+
+fn dial_vmess_reality(
+    client: &Connection,
+    server: &SocketAddr,
+    vmess: &VmessOut,
+    target: &Destination,
+) {
+    let Some(cfg) = vmess.reality.as_deref() else {
+        return;
+    };
+    let Some(session) = dial_reality_session(server, cfg, vmess.carrier.tcp_mask()) else {
+        return;
+    };
+    match &vmess.carrier {
+        Carrier::Raw(_) => vmess_tls_raw(client, server, session, vmess, target),
+        _ => vmess_tls_carried(client, server, session, vmess, target, || {
+            dial_reality_session(server, cfg, vmess.carrier.tcp_mask())
+        }),
     }
 }
 
@@ -30673,6 +30859,7 @@ fn loopback_dial(
                 carrier,
                 host,
                 tls: None,
+                reality: None,
                 headers,
                 heartbeat,
             }))
@@ -32301,6 +32488,39 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
         let cipher = vmess_cipher(user);
         let auth_len = authenticated_length(user);
         let no_termination = no_termination(user);
+        if stream_security(outbound) == "reality" {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(
+                carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+            ) {
+                return None;
+            }
+            let reality = outbound_reality(outbound, &address)?;
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                eprintln!("vmess: {error}; outbound refused");
+                return None;
+            }
+            return Some(VmessOut {
+                address,
+                port,
+                id,
+                cipher,
+                auth_len,
+                no_termination,
+                carrier,
+                host,
+                tls: None,
+                reality: Some(reality),
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            });
+        }
         if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
             return Some(VmessOut {
                 address,
@@ -32312,6 +32532,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 carrier,
                 host,
                 tls: Some(tls),
+                reality: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
@@ -32332,6 +32553,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             carrier,
             host,
             tls: None,
+            reality: None,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
@@ -41549,6 +41771,23 @@ mod tests {
         assert!(find_vmess_outbound(&vnext_tls_root("vmess", &stream("reality"))).is_none());
     }
 
+    /// VMess carries the same REALITY identity VLESS and Trojan do: the outbound keeps the sealed
+    /// handshake and adds no TLS layer above it.
+    #[test]
+    fn vmess_reality_outbound_parses_its_identity() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"vmess","settings":{{"vnext":[{{"address":"127.0.0.1","port":443,"users":[{{"id":"{REALITY_TEST_ID}"}}]}}]}},"streamSettings":{{"network":"tcp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#,
+            b64url(&public),
+        ))
+        .expect("parses");
+        let out = find_vmess_outbound(&root).expect("dials raw REALITY");
+        assert!(out.reality.is_some());
+        assert!(out.tls.is_none());
+        assert!(matches!(out.carrier, Carrier::Raw(_)));
+    }
+
     /// The bulk download through the same relay: the session's own buffer is finite, and a
     /// relay that kept feeding it after the caller's window was full filled it.
     #[test]
@@ -42968,6 +43207,7 @@ mod tests {
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
                 tls: Some(Arc::clone(&client)),
+                reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
             };
@@ -44190,6 +44430,7 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: Some(client),
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -44549,6 +44790,7 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: tls.map(|(_, client)| Arc::new(client.clone())),
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         }
@@ -45183,6 +45425,7 @@ mod tests {
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
+                reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
             };
@@ -45401,6 +45644,7 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: Some(Arc::new(tls)),
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         })
@@ -46180,6 +46424,7 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -47815,6 +48060,7 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -50477,6 +50723,7 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -50548,6 +50795,7 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -50618,6 +50866,7 @@ mod tests {
             )),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -50693,6 +50942,7 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -59383,6 +59633,7 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         }));
@@ -64155,7 +64406,10 @@ fn with_account(stream: Connection, account: Option<&InboundAccount>, vmess: boo
 
 #[allow(clippy::too_many_lines)]
 fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
-    let vmess = matches!(role, Role::Vmess { .. } | Role::VmessTls { .. });
+    let vmess = matches!(
+        role,
+        Role::Vmess { .. } | Role::VmessTls { .. } | Role::VmessReality { .. }
+    );
     let stream = with_account(stream, account, vmess);
     match role {
         Role::Vless {
@@ -64271,6 +64525,13 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             server,
             account: _,
         } => serve_vmess_tls(stream, &users, &carrier, freedom, &server),
+        Role::VmessReality {
+            users,
+            carrier,
+            freedom,
+            server,
+            account: _,
+        } => serve_vmess_reality(stream, &users, &carrier, freedom, &server),
         Role::Shadowsocks {
             accounts,
             carrier,
