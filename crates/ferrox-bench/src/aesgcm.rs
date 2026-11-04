@@ -54,7 +54,9 @@ pub(crate) fn gate_aesgcm() -> (Vec<Row>, Vec<Window>) {
             .collect();
         rows.push(check_and_time(len, &plain, &mut windows));
         rows.push(check_and_time_256(len, &plain, &mut windows));
-        rows.push(check_and_time_256_from(len, &plain));
+        if len >= 4096 {
+            rows.push(check_and_time_256_from(len, &plain));
+        }
     }
     (rows, windows)
 }

@@ -15,6 +15,7 @@ const HEADER_LEN: usize = 5;
 const TAG_LEN: usize = 16;
 const MAX_RECORD_PLAINTEXT: usize = 8192;
 const MAX_BATCH_PLAINTEXT: usize = 8 * MAX_RECORD_PLAINTEXT;
+const SOURCE_SEAL_MIN: usize = 4096;
 const MIN_RECORD: usize = 1 + TAG_LEN;
 const MAX_RECORD: usize = 16640;
 const X25519_LEN: usize = 32;
@@ -127,9 +128,14 @@ impl Aead {
         match &self.cipher {
             Cipher::Aes(cipher) => {
                 let start = out.len();
-                out.reserve(plaintext.len());
-                unsafe { out.set_len(start + plaintext.len()) };
-                let tag = cipher.seal_from(&nonce, aad, plaintext, &mut out[start..]);
+                let tag = if plaintext.len() >= SOURCE_SEAL_MIN {
+                    out.reserve(plaintext.len());
+                    unsafe { out.set_len(start + plaintext.len()) };
+                    cipher.seal_from(&nonce, aad, plaintext, &mut out[start..])
+                } else {
+                    out.extend_from_slice(plaintext);
+                    cipher.seal_in_place(&nonce, aad, &mut out[start..])
+                };
                 out.extend_from_slice(&tag);
             }
             Cipher::ChaCha(cipher) => {
