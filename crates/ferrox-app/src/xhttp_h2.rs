@@ -186,6 +186,12 @@ impl H2StreamOut {
         }
         self.conn.end_session_of(self.stream);
     }
+
+    /// The request is refused with its body unread: an `RST_STREAM` frees the stream and the credit
+    /// it would otherwise keep granting a body nobody drains.
+    pub(crate) fn reset(&self) {
+        self.conn.reset(self.stream);
+    }
 }
 
 pub(crate) struct H2Stream {
@@ -2068,7 +2074,8 @@ fn block_from_head(head: &str, host: &str, scheme: &str) -> Vec<u8> {
 /// What a connection does with a request stream: xHTTP synthesises its H1 head and reuses the H1
 /// dispatch, gRPC opens the message reader and writer over the same demux.
 pub(crate) trait H2Service: Send + Sync {
-    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool);
+    /// True when the frame opened a request; a rejected head resets its stream and answers false.
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool;
 }
 
 impl H2Conn {
@@ -2180,7 +2187,7 @@ struct XhttpService {
 }
 
 impl H2Service for XhttpService {
-    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool {
         open_stream(
             conn,
             &self.settings,
@@ -2188,7 +2195,7 @@ impl H2Service for XhttpService {
             sid,
             block,
             end_stream,
-        );
+        )
     }
 }
 
@@ -2206,7 +2213,7 @@ impl XhttpSessionService {
 }
 
 impl H2Service for XhttpSessionService {
-    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool {
         open_stream(
             conn,
             &self.settings,
@@ -2214,7 +2221,7 @@ impl H2Service for XhttpSessionService {
             sid,
             block,
             end_stream,
-        );
+        )
     }
 }
 
@@ -2271,7 +2278,7 @@ fn open_stream(
     sid: u32,
     block: &[u8],
     end_stream: bool,
-) {
+) -> bool {
     let (method, target, lines) = {
         let mut decoder = conn.decoder.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut method, mut target, mut lines) = (Vec::new(), Vec::new(), Vec::new());
@@ -2297,17 +2304,17 @@ fn open_stream(
         drop(decoder);
         if !ok || !have_method || !have_target {
             conn.reset_stream(sid);
-            return;
+            return false;
         }
         (method, target, lines)
     };
     if conn.goaway.load(Ordering::SeqCst) {
         conn.reset_stream(sid);
-        return;
+        return false;
     }
     let Some(state) = conn.attach_stream(sid, end_stream) else {
         conn.reset_stream(sid);
-        return;
+        return false;
     };
     let head = synth_head(&method, &target, &lines, end_stream);
     let reader = H2StreamReader {
@@ -2347,6 +2354,7 @@ fn open_stream(
             _ => h2out.end(),
         }
     });
+    true
 }
 
 pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + Send + 'static>(
@@ -2885,9 +2893,10 @@ fn pump_frame(
                 {
                     return true;
                 }
-                service.open(conn, sid, &block, end_stream);
-                if let Some(opened) = opened {
-                    opened.store(true, Ordering::Relaxed);
+                if service.open(conn, sid, &block, end_stream) {
+                    if let Some(opened) = opened {
+                        opened.store(true, Ordering::Relaxed);
+                    }
                 }
             } else {
                 *frag = Some((sid, block, end_stream));
@@ -2907,9 +2916,10 @@ fn pump_frame(
                 }
                 gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
-                    service.open(conn, sid, &gathered, end_stream);
-                    if let Some(opened) = opened {
-                        opened.store(true, Ordering::Relaxed);
+                    if service.open(conn, sid, &gathered, end_stream) {
+                        if let Some(opened) = opened {
+                            opened.store(true, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     *frag = Some((sid, gathered, end_stream));
@@ -4715,6 +4725,57 @@ mod tests {
         drop(client);
     }
 
+    /// A refused request must not clear the clock: the reply is the last thing the peer sends, then
+    /// it goes silent, and the stream never opened.
+    #[test]
+    fn a_refused_head_does_not_open_the_connection() {
+        struct Reject;
+        impl H2Service for Reject {
+            fn open(&self, _: &Arc<H2Conn>, _: u32, _: &[u8], _: bool) -> bool {
+                false
+            }
+        }
+        let (conn, _, _) = bare_conn();
+        let opened = Arc::new(AtomicBool::new(false));
+        let mut frag = None;
+        assert!(super::pump_frame(
+            &conn,
+            &Reject,
+            T_HEADERS,
+            F_END_HEADERS,
+            3,
+            vec![0x82],
+            &mut frag,
+            Some(&opened),
+        ));
+        assert!(!opened.load(Ordering::SeqCst), "a refused head opened");
+    }
+
+    /// A refused session frees its request stream with an `RST_STREAM`: leaving it open would credit
+    /// a body nobody reads for the connection's life.
+    #[test]
+    fn an_aborted_writer_resets_its_stream() {
+        let (conn, written, _) = bare_conn();
+        let Some((_reader, _writer, out)) = conn.open(3, false) else {
+            panic!("the stream opens");
+        };
+        let writer = crate::xhttp::XhttpWriter::new(Vec::<u8>::new());
+        writer.set_h2(out);
+        writer.abort();
+        let bytes = written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(
+            bytes
+                .as_chunks::<9>()
+                .0
+                .iter()
+                .any(|f| { f[3] == T_RST && u32::from_be_bytes([f[5], f[6], f[7], f[8]]) == 3 }),
+            "no RST_STREAM went out"
+        );
+    }
+
     /// A HEADERS on stream 0 is not a request: it must not clear the clock, or a silent peer keeps
     /// the demux worker without ever opening a stream.
     #[test]
@@ -4836,7 +4897,15 @@ mod tests {
     fn a_settings_length_outside_sixes_is_refused_as_a_frame_size_error() {
         struct Silent;
         impl H2Service for Silent {
-            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
         }
         let (conn, written, _slices) = bare_conn();
         let mut frag = None;
@@ -4909,11 +4978,12 @@ mod tests {
     fn an_end_stream_header_block_keeps_its_flag_across_a_continuation() {
         struct Record(Arc<Mutex<Vec<(u32, bool)>>>);
         impl H2Service for Record {
-            fn open(&self, _conn: &Arc<H2Conn>, sid: u32, _block: &[u8], end_stream: bool) {
+            fn open(&self, _conn: &Arc<H2Conn>, sid: u32, _block: &[u8], end_stream: bool) -> bool {
                 self.0
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push((sid, end_stream));
+                true
             }
         }
         let (conn, _, _) = bare_conn();
@@ -5374,7 +5444,15 @@ mod tests {
     fn a_failed_control_send_ends_the_read_loop() {
         struct Silent;
         impl H2Service for Silent {
-            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
         }
         let conn = conn_with(Box::new(NullWrite), true);
         conn.dead.store(true, Ordering::SeqCst);

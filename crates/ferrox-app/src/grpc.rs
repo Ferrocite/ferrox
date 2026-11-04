@@ -2092,7 +2092,13 @@ impl GrpcService {
 }
 
 impl crate::xhttp_h2::H2Service for GrpcService {
-    fn open(&self, conn: &Arc<crate::xhttp_h2::H2Conn>, sid: u32, block: &[u8], end_stream: bool) {
+    fn open(
+        &self,
+        conn: &Arc<crate::xhttp_h2::H2Conn>,
+        sid: u32,
+        block: &[u8],
+        end_stream: bool,
+    ) -> bool {
         let mut gate = Gate::default();
         if !conn.decode_block(block, |name, value| {
             gate.take(name, value, &self.path, &self.multi_path);
@@ -2101,7 +2107,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
             || gate.typed != Some(true)
         {
             conn.reset(sid);
-            return;
+            return false;
         }
         let method = if gate.multi == Some(true) {
             Method::MultiHunk
@@ -2109,7 +2115,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
             Method::Hunk
         };
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
-            return;
+            return false;
         };
         if !conn.respond(
             sid,
@@ -2120,7 +2126,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
             ],
         ) {
             conn.reset(sid);
-            return;
+            return false;
         }
         let (reader, writer) = mux_stream(conn, body, out, sid, method);
         let users = Arc::clone(&self.users);
@@ -2129,6 +2135,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
         crate::proxy::lane_pool::submit_stream_setup(move || {
             crate::proxy::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
         });
+        true
     }
 }
 
@@ -4925,15 +4932,15 @@ mod tests {
             sid: u32,
             _block: &[u8],
             end_stream: bool,
-        ) {
+        ) -> bool {
             let Some((body, _head, out)) = conn.open(sid, end_stream) else {
-                return;
+                return false;
             };
             if !conn.respond(
                 sid,
                 &[(":status", "200"), ("content-type", "application/grpc")],
             ) {
-                return;
+                return false;
             }
             let (mut reader, writer) = mux_stream(conn, body, out, sid, Method::Hunk);
             crate::budgets::spawn(move || {
@@ -4950,6 +4957,7 @@ mod tests {
                 }
                 writer.close();
             });
+            true
         }
     }
 

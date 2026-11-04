@@ -2123,6 +2123,11 @@ pub(crate) fn serve_xhttp_accepted(
     let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let decoded = accept_request(&mut reader, users);
     reader.disarm();
+    if decoded.is_none() {
+        writer.abort();
+        close();
+        return;
+    }
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {

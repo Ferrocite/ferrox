@@ -19179,7 +19179,7 @@ fn serve_trojan_xhttp_accepted(
     let creader = bounded.into_inner();
     let Some((cmd, target)) = decoded else {
         echo_trace("session xhttp trojan decode refused");
-        cwriter.finish();
+        cwriter.abort();
         return;
     };
     crate::accesslog::record_current(&target);
@@ -66600,10 +66600,11 @@ mod h2_carrier_tests {
             }
         }
 
-        struct Sink;
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
 
         impl std::io::Write for Sink {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
                 Ok(buf.len())
             }
 
@@ -66613,21 +66614,29 @@ mod h2_carrier_tests {
         }
 
         impl FrameWrite for Sink {
-            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                for part in parts {
+                    self.write_all(part).expect("sink");
+                }
                 true
             }
         }
 
         let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
         let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
         let began = Instant::now();
         serve_trojan_xhttp_accepted(
             Box::new(Silent(Arc::clone(&polled))),
-            crate::xhttp::XhttpWriter::new(Sink),
+            crate::xhttp::XhttpWriter::new(Sink(Arc::clone(&out))),
             &[[0x11u8; 56]],
             true,
         );
         assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
         assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(
+            out.lock().expect("lock").ends_with(b"0\r\n\r\n"),
+            "the refusal did not end the carrier"
+        );
     }
 }
