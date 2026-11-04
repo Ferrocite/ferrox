@@ -113,6 +113,7 @@ vless sealed-record-read-buffers 1 ferrox-core-vless::tests::a_record_is_opened_
 vless sealed-record-buffer-moves 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
 vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
 vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
+vless sealed-record-writes-per-batch 1 ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes
 
 # --- Trojan -----------------------------------------------------------------
 trojan ops-retired-instructions 1170 scripts/count-ops.sh
