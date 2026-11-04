@@ -2135,7 +2135,8 @@ impl crate::xhttp_h2::H2Service for GrpcService {
         crate::proxy::lane_pool::submit_stream_setup(move || {
             crate::proxy::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
         });
-        true
+        // The head is not a request until the VLESS body decodes: `serve_grpc_muxed` puts the clock away then.
+        false
     }
 }
 

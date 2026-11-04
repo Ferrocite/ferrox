@@ -4725,6 +4725,34 @@ mod tests {
         drop(client);
     }
 
+    /// A gRPC head is not a request either: the VLESS body decodes later, so the connection clock
+    /// stays until then and a head-only peer cannot hold the demux.
+    #[test]
+    fn a_grpc_head_does_not_clear_the_connection_clock() {
+        let (conn, _, _) = bare_conn();
+        let settings = crate::config::GrpcSettings::path("/p");
+        let service =
+            crate::grpc::GrpcService::new(&settings, &[], true, Arc::new(AtomicBool::new(false)));
+        let block = block_encode(&[
+            (":path", "/p"),
+            (":method", "POST"),
+            ("content-type", "application/grpc"),
+        ]);
+        let opened = Arc::new(AtomicBool::new(false));
+        let mut frag = None;
+        assert!(super::pump_frame(
+            &conn,
+            &service,
+            T_HEADERS,
+            F_END_HEADERS,
+            3,
+            block,
+            &mut frag,
+            Some(&opened),
+        ));
+        assert!(!opened.load(Ordering::SeqCst), "a gRPC head opened");
+    }
+
     /// A refused request must not clear the clock: the reply is the last thing the peer sends, then
     /// it goes silent, and the stream never opened.
     #[test]
