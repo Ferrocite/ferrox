@@ -1809,8 +1809,8 @@ mod tests {
         let mut batch = ReceiveBatch::new();
         let got = batch.recv(&receiver, true).expect("batch");
         assert_eq!(got, packets.len(), "the batch reads all four");
-        for at in 0..got {
-            assert_eq!(batch.packet(at), packets[at].as_slice());
+        for (at, packet) in packets.iter().enumerate().take(got) {
+            assert_eq!(batch.packet(at), packet.as_slice());
             assert_eq!(batch.source(at), Some(sender.local_addr().unwrap()));
         }
     }
