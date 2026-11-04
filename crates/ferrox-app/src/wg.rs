@@ -1201,6 +1201,7 @@ fn io(
     }
 }
 
+/// Read one datagram's message kind without slicing past a short packet.
 #[allow(clippy::too_many_arguments)]
 fn receive_datagram(
     peers: &mut [Peer],
@@ -1215,8 +1216,14 @@ fn receive_datagram(
     ipv6_socket: bool,
     sends: &mut Vec<Vec<u8>>,
 ) {
-    let kind = u32::from(packet[0]);
-    if kind == TYPE_INITIATION && packet.len() == INITIATION_SIZE {
+    let Some(&first) = packet.first() else {
+        return;
+    };
+    let kind = u32::from(first);
+    if kind == TYPE_INITIATION {
+        if packet.len() != INITIATION_SIZE {
+            return;
+        }
         let under_load = cookies.observe(now);
         clear_reserved(packet);
         handle_initiation(
@@ -1225,7 +1232,13 @@ fn receive_datagram(
         return;
     }
     let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
-    let receiver = u32::from_le_bytes(packet[at..at + 4].try_into().unwrap_or([0; 4]));
+    let Some(receiver) = packet
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return;
+    };
     let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
         return;
     };
@@ -1472,7 +1485,7 @@ fn flush(
     flush_sends(socket, ipv6_socket, endpoint, sends);
 }
 
-/// The most transport packets one `sendmmsg` carries. A batch that cannot be
+/// The most transport packets one socket batch carries. A batch that cannot be
 /// taken whole falls back to the socket for the rest, so a full queue still
 /// names every packet.
 const SEND_BATCH: usize = 64;
@@ -1497,6 +1510,11 @@ fn flush_sends(
 }
 
 #[cfg(target_os = "linux")]
+static GSO_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
+/// Send one endpoint's transport records, coalescing equal-sized runs where the
+/// kernel accepts `UDP_SEGMENT` and batching the rest with `sendmmsg`.
+#[cfg(target_os = "linux")]
 fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
     debug_assert!(packets.len() <= SEND_BATCH);
     let to = send_endpoint(endpoint, ipv6);
@@ -1506,6 +1524,9 @@ fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[V
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
     });
+    // SAFETY: a zeroed `mmsghdr` is the empty header the loop fills below.
+    let mut headers: [libc::mmsghdr; SEND_BATCH] =
+        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
     let mut start = 0;
     while start < packets.len() {
         let gso = packets[start].len();
@@ -1521,32 +1542,99 @@ fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[V
             end += 1;
             shorter = len < gso;
         }
-        if end - start > 1 && gso <= 65_535 {
+        if end - start > 1 && gso <= 65_535 && GSO_SUPPORTED.load(Ordering::Relaxed) {
             for (at, packet) in packets[start..end].iter().enumerate() {
                 iovecs[at] = libc::iovec {
                     iov_base: packet.as_ptr().cast_mut().cast(),
                     iov_len: packet.len(),
                 };
             }
-            if let Some(sent) = send_segments(
+            match send_segments(
                 socket,
                 &storage,
                 name_len,
                 &mut iovecs[..end - start],
                 gso as u16,
             ) {
-                if sent >= total {
+                Ok(sent) if sent >= total => {
                     start = end;
                     continue;
                 }
-                if sent >= gso {
+                Ok(sent) if sent >= gso => {
                     start += sent / gso;
                     continue;
                 }
+                Ok(_) => {}
+                Err(error) => {
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL | libc::EIO | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+                    ) {
+                        GSO_SUPPORTED.store(false, Ordering::Relaxed);
+                    }
+                }
             }
         }
-        let _ = socket.send_to(&packets[start], to);
-        start += 1;
+        send_messages(
+            socket,
+            &storage,
+            name_len,
+            to,
+            &packets[start..end],
+            &mut iovecs,
+            &mut headers,
+        );
+        start = end;
+    }
+}
+
+/// Hand every record to one endpoint with `sendmmsg`, then `send_to` for what
+/// the call could not take.
+#[cfg(target_os = "linux")]
+fn send_messages(
+    socket: &UdpSocket,
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+    to: SocketAddr,
+    packets: &[Vec<u8>],
+    iovecs: &mut [libc::iovec; SEND_BATCH],
+    headers: &mut [libc::mmsghdr; SEND_BATCH],
+) {
+    use std::os::fd::AsRawFd as _;
+
+    for (at, packet) in packets.iter().enumerate() {
+        iovecs[at] = libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        };
+        headers[at].msg_hdr = libc::msghdr {
+            msg_name: (&raw const *storage).cast_mut().cast(),
+            msg_namelen: name_len,
+            msg_iov: (&raw mut iovecs[at]).cast(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+    }
+    let mut done = 0;
+    while done < packets.len() {
+        // SAFETY: each header names its own iovec and packet, and `storage` outlives the call.
+        let sent = unsafe {
+            libc::sendmmsg(
+                socket.as_raw_fd(),
+                headers[done..].as_mut_ptr(),
+                (packets.len() - done) as libc::c_uint,
+                0,
+            )
+        };
+        if sent <= 0 {
+            break;
+        }
+        done += usize::try_from(sent).unwrap_or(0);
+    }
+    for packet in &packets[done..] {
+        let _ = socket.send_to(packet, to);
     }
 }
 
@@ -1559,7 +1647,7 @@ fn send_segments(
     name_len: libc::socklen_t,
     iovecs: &mut [libc::iovec],
     gso: u16,
-) -> Option<usize> {
+) -> std::io::Result<usize> {
     use std::os::fd::AsRawFd as _;
 
     const UDP_SEGMENT: libc::c_int = 103;
@@ -1568,7 +1656,7 @@ fn send_segments(
     let space = unsafe { libc::CMSG_SPACE(2) } as usize;
     let mut control = Control([0u8; 32]);
     if space > control.0.len() {
-        return None;
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
     // SAFETY: `control` is aligned and large enough for one two-byte control message, which the calls below fill before the header names it.
     unsafe {
@@ -1589,7 +1677,10 @@ fn send_segments(
     };
     // SAFETY: the name, iovecs and control all outlive the call, and the kernel only reads them.
     let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, 0) };
-    (sent >= 0).then_some(sent as usize)
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(sent as usize)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1912,6 +2003,44 @@ mod tests {
             got.push(buf[..n].to_vec());
         }
         assert_eq!(got, packets);
+    }
+
+    #[test]
+    fn a_short_datagram_is_refused_before_any_slice() {
+        let Ok(socket) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let (to_stack, _stack) = mpsc::channel();
+        let mut peers = Vec::new();
+        let mut cookies = CookieGuard::default();
+        let mut incoming = Vec::new();
+        let mut sends = Vec::new();
+        let source = socket.local_addr().expect("address");
+        for (kind, len) in [
+            (TYPE_RESPONSE, 4),
+            (TYPE_RESPONSE, 7),
+            (TYPE_RESPONSE, 11),
+            (TYPE_INITIATION, 4),
+            (TYPE_INITIATION, INITIATION_SIZE - 1),
+        ] {
+            let mut packet = vec![0u8; len];
+            let bytes = kind.to_le_bytes();
+            let copied = len.min(bytes.len());
+            packet[..copied].copy_from_slice(&bytes[..copied]);
+            receive_datagram(
+                &mut peers,
+                &mut cookies,
+                0,
+                source,
+                &mut packet,
+                &socket,
+                &to_stack,
+                &mut incoming,
+                None,
+                false,
+                &mut sends,
+            );
+        }
     }
 
     #[test]
