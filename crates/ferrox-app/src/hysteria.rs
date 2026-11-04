@@ -3036,11 +3036,27 @@ mod tests {
         assert_eq!(router.by_client_cid.get(peer_cid.as_slice()), Some(&key));
         assert_eq!(
             router.initial_route(&[0x99u8; 8], &peer_cid),
-            Some(key),
+            Some(key.clone()),
             "a source CID alone names its lane"
         );
+        let received = |router: &Router<'_>| {
+            router
+                .routes
+                .get(key.as_slice())
+                .expect("the route")
+                .conn
+                .lock()
+                .expect("locks")
+                .stats()
+                .recv
+        };
+        let before = received(&router);
         let mut wire = initial;
         route_packet(&mut router, &mut template, &mut wire, client_addr);
+        assert!(
+            received(&router) > before,
+            "the retransmit reached the existing connection"
+        );
         assert_eq!(router.routes.len(), 1, "a retransmit adds no route");
         assert_eq!(router.by_initial_dcid.len(), 1);
         assert_eq!(router.by_client_cid.len(), 1);
