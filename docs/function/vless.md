@@ -46,7 +46,7 @@ Both directions ride the relay lanes, and one direction ending does not end the 
 | request-parse-name-copies | 0 | ferrox-core-vless::tests::the_request_parse_allocates_nothing_and_borrows_the_name |
 | request-flow-decisions | 1 | ferrox-core-vless::tests::the_flow_is_named_without_building_a_string |
 | handshake-pump-buffer-reallocations | 0 | ferrox-app-proxy::tests::the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady |
-| sealed-relay-min-window-bytes | 8192 | ferrox-app-proxy::tests::a_sealed_relay_reads_at_least_one_record |
+| sealed-relay-min-window-bytes | 16384 | ferrox-app-proxy::tests::a_sealed_relay_reads_at_least_one_record |
 | sealed-record-read-buffers | 1 | ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in |
 | sealed-record-buffer-moves | 0 | ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in |
 | sealed-record-buffer-growth | 0 | ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in |

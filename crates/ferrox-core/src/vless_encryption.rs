@@ -13,7 +13,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 const HEADER_LEN: usize = 5;
 const TAG_LEN: usize = 16;
-pub const MAX_RECORD_PLAINTEXT: usize = 8192;
+const MAX_RECORD_PLAINTEXT: usize = 8192;
 const MAX_BATCH_PLAINTEXT: usize = 8 * MAX_RECORD_PLAINTEXT;
 const MIN_RECORD: usize = 1 + TAG_LEN;
 const MAX_RECORD: usize = 16640;
