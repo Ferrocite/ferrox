@@ -4499,6 +4499,8 @@ fn serve_vless_raw_with<D, R>(
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
 {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
+    #[cfg(target_os = "linux")]
+    stream.set_notsent_lowat(16 * 1024);
     let handshake = stream
         .policy()
         .and_then(|flow| flow.handshake())
