@@ -9569,6 +9569,10 @@ pub(crate) struct RelayStep(bool);
 
 impl RelayStep {
     pub(crate) fn enter() -> Self {
+        // A step starts with no wait hint: the socket, flow and budget the pool parks on belong to this step's own read.
+        forget_wait_fd();
+        forget_wait_finish();
+        forget_wait_idle();
         Self(RELAY_STEP.with(|flag| flag.replace(true)))
     }
 }
@@ -27215,17 +27219,34 @@ impl<R> Copied<R> {
             parks,
         }
     }
+
+    /// A queued carrier's timeout is the queue's, not the socket its inner read was last woken by.
+    fn drop_fd_hint(&self) {
+        if self.parks {
+            crate::proxy::forget_wait_fd();
+        }
+    }
 }
 
 impl<R: Read> Read for Copied<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
+        let got = self.inner.read(buf);
+        if got.is_err() {
+            self.drop_fd_hint();
+        }
+        got
     }
 }
 
 impl<R: Read> WindowRead for Copied<R> {
     fn read_window(&mut self) -> std::io::Result<Window<'_>> {
-        let n = self.inner.read(self.buffer.as_mut())?;
+        let n = match self.inner.read(self.buffer.as_mut()) {
+            Ok(n) => n,
+            Err(err) => {
+                self.drop_fd_hint();
+                return Err(err);
+            }
+        };
         Ok(Window::one(self.buffer.filled(n)))
     }
 
@@ -36226,6 +36247,112 @@ mod tests {
         assert!(
             began.elapsed() >= crate::budgets::RELAY_POLL,
             "the backoff turn slept its quantum"
+        );
+    }
+
+    /// A carrier whose body waits in a queue parks its relay lane on a poll timeout, because the demux
+    /// that owes it the bytes wakes the slot; a socket carrier keeps taking turns for the sibling's grant.
+    #[test]
+    fn a_queued_carrier_timeout_parks_its_lane() {
+        #[derive(Clone)]
+        struct Queue {
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+            ended: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Read for Queue {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if self.ended.load(Ordering::Relaxed) {
+                    return Ok(0);
+                }
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Take;
+
+        impl CarrierSink for Take {
+            fn send(&self, _: &[u8]) -> bool {
+                true
+            }
+            fn close(&self) {}
+        }
+
+        fn turns(queued: bool) -> usize {
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = listener.local_addr().expect("addr");
+            let client = Connection::connect(address).expect("connects");
+            let (peer, _) = listener.accept().expect("accepts");
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let queue = Queue {
+                reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ended: Arc::clone(&ended),
+            };
+            let reads = Arc::clone(&queue.reads);
+            let sink = Take;
+            let flow = if queued {
+                relay_sink_drained_queued(queue, &sink, &peer, |_| {}, |_| false)
+            } else {
+                relay_sink_drained_with(queue, &sink, &peer, |_| {}, |_| false)
+            }
+            .expect("the relay starts");
+            let progress = if queued { 1 } else { 1000 };
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while reads.load(Ordering::Relaxed) < progress && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(Duration::from_millis(300));
+            let turns = reads.load(Ordering::Relaxed);
+            ended.store(true, Ordering::Relaxed);
+            let _ = client.shutdown(Shutdown::Both);
+            wait_for_flow(&flow, Duration::from_secs(5), "the carrier relay");
+            turns
+        }
+
+        let queued = turns(true);
+        let socket = turns(false);
+        assert!(queued >= 1, "the queued reader never started");
+        assert!(
+            queued <= 64,
+            "a queued timeout parked, yet its reader took {queued} turns"
+        );
+        assert!(
+            socket >= 1000,
+            "a socket carrier kept its turns, yet its reader took {socket}"
+        );
+    }
+
+    /// The queue's timeout belongs to the queue, not to the socket its inner read left a hint for: a
+    /// lane that parked on that hint woke on every readable event the demux already owns.
+    #[test]
+    fn a_parked_queue_read_drops_the_socket_hint() {
+        struct Noted;
+
+        impl Read for Noted {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let fd: WaitFd = 7;
+                note_wait_fd(fd);
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let _step = RelayStep::enter();
+        let mut queued = Copied::with_park(Noted, true);
+        assert!(
+            queued.read_window().is_err(),
+            "the queue answers WouldBlock"
+        );
+        assert_eq!(take_wait_fd(), None, "a queued park owns no socket");
+
+        let mut socket = Copied::with_park(Noted, false);
+        assert!(socket.read_window().is_err());
+        let fd: WaitFd = 7;
+        assert_eq!(
+            take_wait_fd(),
+            Some(fd),
+            "a socket carrier parks on its descriptor"
         );
     }
 
