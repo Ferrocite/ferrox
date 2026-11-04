@@ -1265,6 +1265,12 @@ fn measure_once(
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
+    // The server's window ends with the run's flows, before the settle, so a drain the next run
+    // would otherwise be charged is not counted here either.
+    let server = match server {
+        Some(server) => Some(server.finish()?),
+        None => None,
+    };
 
     std::thread::sleep(SAMPLE_INTERVAL + Duration::from_millis(20));
     stop.store(true, Ordering::Relaxed);
@@ -1272,10 +1278,6 @@ fn measure_once(
     let mut samples = startup_samples;
     samples.extend(rx.try_iter());
     samples.extend(sample_for(pid, Phase::Settle, SETTLE)?);
-    let server = match server {
-        Some(server) => Some(server.finish()?),
-        None => None,
-    };
 
     engine.reap();
     let sink_reasons = sink_thread.reasons();
@@ -1372,6 +1374,24 @@ fn straggler_tail(windows: &[Duration]) -> Option<Duration> {
     Some(tail)
 }
 
+/// A server still draining the previous run is not this run's cost: the window opens once two
+/// reads a sample apart agree on the cpu count, bounded so a server that never rests is measured.
+fn quiesced(
+    deadline: Instant,
+    mut read: impl FnMut() -> Result<ps::Sample, Error>,
+) -> Result<ps::Sample, Error> {
+    let mut previous = read()?;
+    while Instant::now() < deadline {
+        std::thread::sleep(SAMPLE_INTERVAL);
+        let next = read()?;
+        if next.cpu_millis == previous.cpu_millis {
+            return Ok(next);
+        }
+        previous = next;
+    }
+    Ok(previous)
+}
+
 /// The server process beside the client: sampled from the same clock, stopped from `Drop` so a
 /// disturbed attempt cannot leave a sampler forking `ps` into the next one.
 struct ServerSampler {
@@ -1384,7 +1404,8 @@ struct ServerSampler {
 
 impl ServerSampler {
     fn start(pid: u32) -> Result<Self, Error> {
-        let first = sample_at(Host::current(), pid, 0)?;
+        let host = Host::current();
+        let first = quiesced(Instant::now() + SETTLE, || sample_at(host, pid, 0))?;
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let thread = spawn_sampler(pid, Arc::clone(&stop), tx);
@@ -3268,6 +3289,35 @@ mod tests {
             threads,
             io: None,
         }
+    }
+
+    /// The server's window opens on a settled process: the previous run's drain is not charged
+    /// here, and a server that never rests is still measured at the deadline.
+    #[test]
+    fn a_server_window_opens_once_the_cpu_stops_moving() {
+        let mut scripted = [
+            sampled(100, Some(2)),
+            sampled(180, Some(9)),
+            sampled(180, Some(3)),
+            sampled(900, Some(9)),
+        ]
+        .into_iter();
+        let first = quiesced(Instant::now() + Duration::from_secs(5), || {
+            scripted
+                .next()
+                .ok_or_else(|| Error::Invalid("scripted samples exhausted".to_owned()))
+        })
+        .expect("reads");
+        assert_eq!(first.cpu_millis, 180);
+        assert_eq!(first.threads, Some(3));
+
+        let mut busy = [sampled(10, None), sampled(20, None)].into_iter();
+        let first = quiesced(Instant::now(), || {
+            busy.next()
+                .ok_or_else(|| Error::Invalid("scripted samples exhausted".to_owned()))
+        })
+        .expect("reads");
+        assert_eq!(first.cpu_millis, 10);
     }
 
     #[test]
