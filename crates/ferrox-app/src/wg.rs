@@ -1510,7 +1510,10 @@ fn flush_sends(
 }
 
 #[cfg(target_os = "linux")]
-static GSO_SUPPORTED: AtomicBool = AtomicBool::new(true);
+/// `UDP_SEGMENT` coalescing, off on aarch64: the arm pool's reference client
+/// collapses to 72 MiB/s on the coalesced super-packet (0.40 leg, 41894636989)
+/// where the `sendmmsg` path holds 189 (1.10, 41899990310).
+static GSO_SUPPORTED: AtomicBool = AtomicBool::new(!cfg!(target_arch = "aarch64"));
 
 /// Send one endpoint's transport records, coalescing equal-sized runs where the
 /// kernel accepts `UDP_SEGMENT` and batching the rest with `sendmmsg`.
