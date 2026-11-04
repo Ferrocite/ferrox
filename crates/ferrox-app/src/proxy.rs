@@ -25163,8 +25163,8 @@ pub(crate) mod lane_pool {
                 .collect()
         }
 
-        /// Registers a fresh slot, or hands it back when its descriptor cannot be watched. The first
-        /// slot on a descriptor adds it; the last one removes it.
+        /// Registers a fresh slot, or arms its turn a quantum out when its descriptor cannot be
+        /// watched. The first slot on a descriptor adds it; the last one removes it.
         fn park(&mut self, slot: std::sync::Arc<ReadySlot>) -> Option<std::sync::Arc<ReadySlot>> {
             if slot.is_empty() {
                 return None;
@@ -25175,7 +25175,13 @@ pub(crate) mod lane_pool {
             let fd = slot.fd;
             // A stale id can outlive its closed descriptor, so a reused number is added again.
             if !self.add(fd) {
-                return Some(slot);
+                // A descriptor the reactor cannot watch keeps the poll's pace instead of spinning the worker.
+                self.due.push(std::cmp::Reverse((
+                    std::time::Instant::now() + crate::budgets::RELAY_POLL,
+                    slot.id,
+                )));
+                self.slots.insert(slot.id, slot);
+                return None;
             }
             self.fds.entry(fd).or_default().push(slot.id);
             self.slots.insert(slot.id, slot);
@@ -25944,6 +25950,51 @@ pub(crate) mod lane_pool {
             unsafe {
                 libc::close(fd);
             }
+        }
+
+        /// A regular file cannot join epoll: the slot waits a poll quantum on the clock instead of
+        /// coming straight back to the worker, which would spin a read that always answers `WouldBlock`.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn an_unwatchable_descriptor_waits_a_poll_quantum() {
+            use std::os::fd::AsRawFd;
+
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let path = std::env::temp_dir()
+                .join(format!("ferrox-unwatchable-{}-{stamp}", std::process::id()));
+            std::fs::write(&path, b"x").expect("writes the fixture");
+            let file = std::fs::File::open(&path).expect("opens the fixture");
+            let fd = file.as_raw_fd();
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd,
+                finish: None,
+                lane: Mutex::new(None),
+                pool: std::sync::Arc::downgrade(&pool),
+            });
+            slot.put_lane(Lane {
+                step: Box::new(|| Next::Done),
+                complete: Some(Box::new(|| {})),
+                idle: 0,
+                relay: true,
+            });
+            let park = std::time::Instant::now();
+            assert!(
+                reactor.park(slot).is_none(),
+                "an unwatchable descriptor was handed back at once"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake_due(park + crate::budgets::RELAY_POLL / 4, &mut lanes);
+            assert!(lanes.is_empty(), "the clock fired before its quantum");
+            reactor.wake_due(park + crate::budgets::RELAY_POLL * 4, &mut lanes);
+            assert_eq!(lanes.len(), 1, "the unwatchable descriptor never came back");
+            let _ = std::fs::remove_file(&path);
         }
 
         /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
@@ -27439,7 +27490,7 @@ where
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
-                peer_read.read(buffer.as_mut())
+                peer_read.read_ready(buffer.as_mut())
             };
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
                 forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
@@ -27507,7 +27558,7 @@ where
                 }
                 // A record still arriving is not an idle peer: the reader stays open and the lane requeues.
                 Err(error) if is_driven_yield(&error) => (Next::Retry, false),
-                // A socket carrier read that times out takes another turn at once, because the frame granting the sibling's window arrives on it; a queued body parks instead, since its demux reads that frame.
+                // A carrier that waits on its own source parks there; one whose window credit arrives on another read keeps the turn.
                 Err(error) if is_timeout(&error) => (
                     if reader.parks_on_timeout() {
                         Next::Idle
@@ -27527,6 +27578,8 @@ where
                     && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
                 {
                     Next::Done
+                } else if reader.parks_on_timeout() {
+                    Next::Idle
                 } else {
                     Next::More
                 }
@@ -27537,6 +27590,9 @@ where
             if ended_request && !upload.half_closed {
                 let _ = peer_write.shutdown(Shutdown::Write);
                 upload.half_closed = true;
+            }
+            if next == Next::Idle {
+                note_wait_finish(&upload_flow);
             }
             if next != Next::Done {
                 return next;
