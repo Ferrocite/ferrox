@@ -64,6 +64,7 @@ The size rows are the constants the record and handshake write, asserted against
 
 ```bash
 ./scripts/count-ops.sh report wireguard::device::tests::a_replayed_transport_counter_is_refused 'wireguard::device::Tunnel::send'
+./scripts/count-ops.sh report wg_stack::tests::a_server_stack_datagram_reuses_its_frame_head 'wg_stack::ServerStack::datagram'
 ```
 
 `UNBLESSED`. `scripts/count-ops.sh` needs valgrind, which does not exist on macOS/aarch64, so this count is CI-only (`ops.yml`) and nothing quotes it until the artefact has been read.
@@ -74,7 +75,7 @@ The size rows are the constants the record and handshake write, asserted against
 
 ## Memory copies
 
-Zero extra copies on the stack send path. Every producer reserves the 16-byte transport header (`QueueDevice`, `QueueTx`, the client and server datagram lanes, the DNS exchange and the IO loop), and `Tunnel::send_prefixed` seals the record where the packet already lies. `prefixed-record-allocations` and `prefixed-record-zeroed-bytes` are both zero: `a_prefixed_record_reuses_the_stack_headroom` asserts the returned packet's base is the caller's, the caller's pointer does not move and its capacity does not grow, and the peer decrypts it. A caller without headroom still takes the old path: `send_owned` seals in place from offset zero, while `send(&[u8])` allocates one sized buffer and copies the payload once. On receive, both paths copy the decrypted record into the stack's own packet buffer. Neither the `send(&[u8])` copy nor the receive copy is claimed removed.
+Zero extra copies on the stack send path. Every producer reserves the 16-byte transport header (`QueueDevice`, `QueueTx`, the client and server datagram lanes, the DNS exchange and the IO loop), and `Tunnel::send_prefixed` seals the record where the packet already lies. `prefixed-record-allocations` and `prefixed-record-zeroed-bytes` are both zero: `a_prefixed_record_reuses_the_stack_headroom` asserts the returned packet's base is the caller's, the caller's pointer does not move and its capacity does not grow, and the peer decrypts it. A caller without headroom still takes the old path: `send_owned` seals in place from offset zero, while `send(&[u8])` allocates one sized buffer and copies the payload once. The server datagram lane hands its payload to the loopback relay by pointer: `socks_udp_parts` returns the lane's reused SOCKS head and the caller's payload, and `send_two` puts both in one `sendmsg` (`WSASend` on Windows) rather than gathering them into a per-datagram frame. `ferrox-app-proxy::tests::a_udp_reply_hands_the_payload_over_by_pointer` is the pointer witness for those parts; the per-datagram `Vec` that held head and payload is gone. The client lane still frames its reply into its reused buffer before `send_to`. On receive, both paths copy the decrypted record into the stack's own packet buffer; that copy is not claimed removed.
 
 ## Time
 
@@ -83,6 +84,8 @@ Zero extra copies on the stack send path. Every producer reserves the 16-byte tr
 ## What we removed
 
 The iptables control plane. The upstream kernel-mode work installs mangle rules, toggles `src_valid_mark`, and vendors an iptables runner; this tree writes route and generic netlink only, uses a private table with `SO_MARK` on the inner sockets, and adds an `iif` rule so the reverse-path lookup stays on the link. No firewall chain, global sysctl or `SO_BINDTODEVICE` is touched, and the link, table and rules are removed on drop. The host resolver for a client name is also gone: the query rides the tunnel against `remoteDNS`, so the name and the answer are not visible to the host's resolver. The reserved bytes are handled in one place — after the MACs are computed, before any parse, and put back when a record is refused — so the WARP form and the vanilla form are the same code path rather than two.
+
+The per-datagram frame on the server datagram lane. Its head is now the lane's reused buffer and its payload is the second iovec of one `sendmsg`, so the relay gets the SOCKS frame without a new `Vec` and without copying the inner payload into it; on Windows the connected lane's `WSASend` does the same. The client lane still builds its reply frame in the buffer it already reused.
 
 The gVisor dependency. The reference's netstack pulls gVisor's `tcpip`; this tree's `smoltcp` is one small crate, and its only new transitive licence is `0BSD` (`managed`), now in `deny.toml`. It is a dependency change, not a measured speed claim.
 
