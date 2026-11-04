@@ -5220,6 +5220,7 @@ fn relay_split<R, W>(
                     if sealed_write.write_all(buf.filled(n)).is_err() {
                         break;
                     }
+                    thread::yield_now();
                 }
                 Err(error) if is_timeout(&error) => {
                     if forward_ended.load(Ordering::Relaxed) {
