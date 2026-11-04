@@ -1265,8 +1265,7 @@ fn measure_once(
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
-    // The server's window ends with the run's flows, before the settle, so a drain the next run
-    // would otherwise be charged is not counted here either.
+    // The server's window ends with the run's flows, before the settle, so the next run's drain is not charged here either.
     let server = match server {
         Some(server) => Some(server.finish()?),
         None => None,
