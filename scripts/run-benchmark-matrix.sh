@@ -602,7 +602,7 @@ while read -r id traffic connections iterations payload duration_ms; do
     ss_pid=""
     if [[ -n "${PROFILE_SS:-}" ]]; then
       mkdir -p "$PROFILE_DIR"
-      ( while :; do printf '\n### %s\n' "$(date +%s.%N)"; ss -tinm "sport = :$srvport or dport = :$srvport" 2>/dev/null; sleep 0.1; done ) >"$PROFILE_DIR/$cell.ss.log" &
+      ( while :; do printf '\n### %s pid=%s\n' "$(date +%s.%N)" "$(matrix_native_pid "$server_pid")"; ss -tinmp 2>/dev/null; sleep 0.1; done ) >"$PROFILE_DIR/$cell.ss.log" &
       ss_pid=$!
     fi
     perf_pid=""
