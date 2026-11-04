@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::conn::Connection;
@@ -221,6 +221,10 @@ struct Shared {
     closed: AtomicBool,
     /// Whether this side masks what it writes: a client must, a server must not, and the reply to a control frame follows the side that sends it.
     masked: bool,
+    /// Payload still owed to a frame whose head is on the wire: a partial take leaves the announced length short of what followed, so the rest goes out bare before the next head.
+    open: AtomicUsize,
+    /// Head bytes a full socket cut: `open` is the payload length they announce, so the rest is rebuilt and sent first.
+    cut: AtomicUsize,
 }
 
 impl std::fmt::Debug for Shared {
@@ -626,21 +630,50 @@ impl WsWriter {
                 crate::proxy::Push::Lost
             };
         }
-        match write_frame_ready(&mut **stream, OP_DATA, data) {
-            None => {
-                if write_frame(&mut **stream, self.masked, OP_DATA, data) {
-                    crate::proxy::Push::Took(data.len())
-                } else {
-                    crate::proxy::Push::Lost
+        let mut owed = self.shared.open.load(Ordering::Relaxed);
+        let mut cut = self.shared.cut.load(Ordering::Relaxed);
+        let mut taken = 0;
+        // A bare second offer starts the payload when the first only landed the head, so a full socket parks here.
+        loop {
+            let offer = if cut > 0 {
+                write_cut_ready(&mut **stream, cut, owed, data)
+            } else if owed == 0 {
+                write_frame_ready(&mut **stream, OP_DATA, data)
+            } else {
+                stream
+                    .write_ready(&[&data[..owed.min(data.len())]])
+                    .map(|result| result.map(|n| (n, owed - n, 0)))
+            };
+            match offer {
+                None => {
+                    return if write_frame(&mut **stream, self.masked, OP_DATA, data) {
+                        crate::proxy::Push::Took(data.len())
+                    } else {
+                        crate::proxy::Push::Lost
+                    };
+                }
+                Some(Ok((n, left_owed, left_cut))) => {
+                    taken += n;
+                    owed = left_owed;
+                    cut = left_cut;
+                }
+                Some(Err(error)) => {
+                    self.shared.open.store(owed, Ordering::Relaxed);
+                    self.shared.cut.store(cut, Ordering::Relaxed);
+                    return if crate::proxy::is_descriptor_wait(&error) {
+                        crate::proxy::Push::Parked
+                    } else {
+                        crate::proxy::Push::Lost
+                    };
                 }
             }
-            Some(Ok(0)) => crate::proxy::Push::Parked,
-            Some(Ok(taken)) => crate::proxy::Push::Took(taken),
-            Some(Err(error)) if crate::proxy::is_descriptor_wait(&error) => {
-                crate::proxy::Push::Parked
+            if taken > 0 || (owed == 0 && cut == 0) {
+                break;
             }
-            Some(Err(_)) => crate::proxy::Push::Lost,
         }
+        self.shared.open.store(owed, Ordering::Relaxed);
+        self.shared.cut.store(cut, Ordering::Relaxed);
+        crate::proxy::Push::Took(taken)
     }
 
     pub(crate) fn close(&self) {
@@ -650,6 +683,10 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
+        if self.shared.open.load(Ordering::Relaxed) > 0 {
+            // The head on the wire still owes payload: a close frame would land inside it.
+            return;
+        }
         let _ = write_frame(&mut **stream, self.masked, OP_CLOSE, &CLOSE_BODY);
     }
 }
@@ -691,33 +728,38 @@ fn frame_head(opcode: u8, len: usize, masked: bool) -> ([u8; 10], usize) {
     (head, hlen)
 }
 
-/// One unmasked data frame offered without waiting; `None` when the transport cannot report a
-/// partial take, so the caller sends the blocking frame instead.
+/// One unmasked data frame offered without waiting: the payload prefix it took, the payload its head still owes, and how much of a head a full socket cut.
 fn write_frame_ready(
     stream: &mut dyn crate::proxy::FrameWrite,
     opcode: u8,
     data: &[u8],
-) -> Option<std::io::Result<usize>> {
+) -> Option<std::io::Result<(usize, usize, usize)>> {
     let (head, hlen) = frame_head(opcode, data.len(), false);
-    let mut taken = match stream.write_ready(&[&head[..hlen], data])? {
-        Ok(n) if n >= hlen => n - hlen,
-        Ok(n) => {
-            // A header cut on the wire is finished before the lane parks; it is ten bytes at most.
-            if let Err(error) = stream.write_all(&head[n..hlen]) {
-                return Some(Err(error));
-            }
-            0
-        }
-        Err(error) => return Some(Err(error)),
-    };
-    if taken == 0 && !data.is_empty() {
-        // The socket took the head and none of the payload, so the next offer is the bare payload.
-        taken = match stream.write_ready(&[data])? {
-            Ok(n) => n,
-            Err(error) => return Some(Err(error)),
-        };
+    match stream.write_ready(&[&head[..hlen], data])? {
+        Ok(n) if n >= hlen => Some(Ok((n - hlen, data.len() - (n - hlen), 0))),
+        Ok(n) if n > 0 => Some(Ok((0, data.len(), n))),
+        Ok(_) => Some(Ok((0, 0, 0))),
+        Err(error) => Some(Err(error)),
     }
-    Some(Ok(taken))
+}
+
+/// Finishes a head a full socket cut, then the payload, from the length the frame already announced.
+fn write_cut_ready(
+    stream: &mut dyn crate::proxy::FrameWrite,
+    cut: usize,
+    len: usize,
+    data: &[u8],
+) -> Option<std::io::Result<(usize, usize, usize)>> {
+    let (head, hlen) = frame_head(OP_DATA, len, false);
+    let left = hlen - cut;
+    match stream.write_ready(&[&head[cut..hlen], &data[..len.min(data.len())]])? {
+        Ok(n) if n >= left => {
+            let took = n - left;
+            Some(Ok((took, len - took, 0)))
+        }
+        Ok(n) => Some(Ok((0, len, cut + n))),
+        Err(error) => Some(Err(error)),
+    }
 }
 
 fn write_frame(
@@ -951,6 +993,10 @@ fn start_heartbeat(writer: &WsWriter, period: u32) {
         let Ok(mut stream) = shared.stream.lock() else {
             return;
         };
+        if shared.open.load(Ordering::Relaxed) > 0 {
+            // A data frame is half on the wire: a control frame here would land inside it.
+            continue;
+        }
         if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
             return;
         }
@@ -982,6 +1028,8 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let shared = Arc::new(Shared {
         stream: Mutex::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>),
         closed: AtomicBool::new(false),
+        open: AtomicUsize::new(0),
+        cut: AtomicUsize::new(0),
         masked,
     });
     let reader = WsReader {
@@ -1217,6 +1265,8 @@ mod tests {
                         as Box<dyn crate::proxy::FrameWrite + Send>),
                     closed: AtomicBool::new(false),
                     masked: false,
+                    open: AtomicUsize::new(0),
+                    cut: AtomicUsize::new(0),
                 });
                 let mut reader = WsReader {
                     read: stream,
@@ -1246,6 +1296,116 @@ mod tests {
         }
     }
 
+    /// A socket that takes a bounded slice per call must not cut a frame short: the head announced the
+    /// whole payload, so the remainder goes out bare before the next head or the reader eats it as payload.
+    #[test]
+    fn a_partial_take_finishes_the_frame_before_the_next_head() {
+        struct Trickle {
+            kept: Arc<Mutex<Vec<u8>>>,
+            room: usize,
+        }
+
+        impl Write for Trickle {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let n = data.len().min(self.room);
+                self.kept
+                    .lock()
+                    .expect("kept")
+                    .extend_from_slice(&data[..n]);
+                Ok(n)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for Trickle {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                parts.iter().all(|part| self.write_all(part).is_ok())
+            }
+
+            fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+                let want: usize = parts.iter().map(|part| part.len()).sum();
+                let mut left = want.min(self.room);
+                for part in parts {
+                    let take = left.min(part.len());
+                    self.kept
+                        .lock()
+                        .expect("kept")
+                        .extend_from_slice(&part[..take]);
+                    left -= take;
+                }
+                Some(Ok(want.min(self.room)))
+            }
+        }
+
+        let check = |len: usize, room: usize| {
+            let kept = Arc::new(Mutex::new(Vec::new()));
+            let shared = Arc::new(Shared {
+                stream: Mutex::new(Box::new(Trickle {
+                    kept: Arc::clone(&kept),
+                    room,
+                })
+                    as Box<dyn crate::proxy::FrameWrite + Send>),
+                closed: AtomicBool::new(false),
+                masked: false,
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
+            });
+            let writer = WsWriter {
+                shared: Arc::clone(&shared),
+                masked: false,
+            };
+            let data = vec![0x5au8; len];
+            let mut sent = 0;
+            let mut calls = 0;
+            while sent < len {
+                match writer.push_ready(&data[sent..]) {
+                    crate::proxy::Push::Took(n) => sent += n,
+                    _ => panic!("a writable sink must not park: len {len} room {room}"),
+                }
+                calls += 1;
+                assert!(
+                    calls <= 4 * len + 64,
+                    "len {len} room {room} made no progress"
+                );
+            }
+            assert_eq!(shared.open.load(Ordering::Relaxed), 0);
+            assert_eq!(shared.cut.load(Ordering::Relaxed), 0);
+            let wire = kept.lock().expect("kept").clone();
+            let mut at = 0;
+            let mut payload = Vec::new();
+            while at < wire.len() {
+                assert_eq!(wire[at] & 0x0f, OP_DATA, "only data frames, at {at}");
+                let (frame, hlen) = match wire[at + 1] & 0x7f {
+                    short @ 0..=125 => (usize::from(short), 2),
+                    126 => (
+                        usize::from(u16::from_be_bytes([wire[at + 2], wire[at + 3]])),
+                        4,
+                    ),
+                    _ => {
+                        let huge =
+                            u64::from_be_bytes(wire[at + 2..at + 10].try_into().expect("eight"));
+                        (usize::try_from(huge).expect("fits"), 10)
+                    }
+                };
+                assert!(
+                    at + hlen + frame <= wire.len(),
+                    "the frame at {at} declares {frame} but {} bytes follow",
+                    wire.len() - at - hlen
+                );
+                payload.extend_from_slice(&wire[at + hlen..at + hlen + frame]);
+                at += hlen + frame;
+            }
+            assert_eq!(payload, data, "len {len} room {room}");
+        };
+        check(64, 1);
+        check(64, 7);
+        check(200, 3);
+        check(70_000, 9);
+    }
+
     /// RFC 6455 has two data opcodes, and the tunnel reads both: a text frame answers like a binary one, a text message reassembles over a continuation, and a binary one reaches the reader unchanged.
     #[test]
     fn two_buffered_frames_leave_in_one_read() {
@@ -1264,6 +1424,8 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Sink::default())),
                 closed: AtomicBool::new(false),
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1298,6 +1460,8 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Sink::default())),
                 closed: AtomicBool::new(false),
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1365,6 +1529,8 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Recorder(Arc::clone(&kept)))),
                 closed: AtomicBool::new(false),
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1424,6 +1590,8 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Sink::default())),
                 closed: AtomicBool::new(false),
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1524,6 +1692,8 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Sink::default())),
                 closed: AtomicBool::new(false),
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1568,6 +1738,8 @@ mod tests {
             stream: Mutex::new(Box::new(stream.try_clone().expect("clones"))
                 as Box<dyn crate::proxy::FrameWrite + Send>),
             closed: AtomicBool::new(false),
+            open: AtomicUsize::new(0),
+            cut: AtomicUsize::new(0),
             masked: false,
         });
         let mut reader = WsReader {
@@ -1610,6 +1782,8 @@ mod tests {
                 Box::new(server.join().expect("joins")) as Box<dyn crate::proxy::FrameWrite + Send>
             ),
             closed: AtomicBool::new(false),
+            open: AtomicUsize::new(0),
+            cut: AtomicUsize::new(0),
             masked: false,
         });
         let frames = 64usize;
@@ -1759,6 +1933,8 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Sink::default())),
                 closed: AtomicBool::new(false),
+                open: AtomicUsize::new(0),
+                cut: AtomicUsize::new(0),
                 masked: false,
             }),
             have,
