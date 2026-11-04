@@ -792,8 +792,22 @@ struct Listener {
 
 struct UdpLane {
     uplink: UdpSocket,
+    head: Vec<u8>,
     stop: Arc<AtomicBool>,
     last_used: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_SERVER_DATAGRAM: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn remember_server_datagram(head: &[u8], payload: &[u8]) {
+    LAST_SERVER_DATAGRAM.with(|sent| {
+        sent.set(Some((head.as_ptr() as usize, payload.as_ptr() as usize)));
+    });
 }
 
 fn elapsed_ms(started: StdInstant) -> u64 {
@@ -900,6 +914,7 @@ impl ServerStack {
                 key,
                 UdpLane {
                     uplink,
+                    head: Vec::new(),
                     stop,
                     last_used,
                 },
@@ -910,9 +925,11 @@ impl ServerStack {
             lane
         };
         lane.last_used.store(now, Ordering::Relaxed);
-        let mut frame = Vec::with_capacity(32 + datagram.payload.len());
-        let out = crate::proxy::socks_udp_frame(&mut frame, None, &target, datagram.payload);
-        let _ = lane.uplink.send(out);
+        let (head, payload) =
+            crate::proxy::socks_udp_parts(&mut lane.head, &target, datagram.payload);
+        #[cfg(test)]
+        remember_server_datagram(head, payload);
+        let _ = crate::proxy::send_two(&lane.uplink, head, payload);
     }
 
     fn poll(&mut self, buf: &mut [u8]) -> bool {
@@ -2282,6 +2299,90 @@ mod tests {
     }
 
     #[test]
+    fn a_server_stack_datagram_reuses_its_frame_head() {
+        crate::budgets::clear();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let target = echo.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&config, to_tunnel.clone(), out, 0);
+        let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let send = |stack: &mut ServerStack, payload: &[u8]| {
+            let mut inner = Vec::new();
+            assert!(udp_datagram(
+                &UdpDatagram {
+                    source: &[10, 0, 0, 2],
+                    destination: &[127, 0, 0, 1],
+                    source_port: source.port(),
+                    destination_port: target.port(),
+                    payload,
+                },
+                &mut inner,
+            ));
+            let parsed = udp_from_packet(&inner).expect("inner datagram");
+            let base = inner.as_ptr() as usize;
+            let end = base + inner.len();
+            let parsed_payload = parsed.payload.as_ptr() as usize;
+            assert!((base..end).contains(&parsed_payload));
+            LAST_SERVER_DATAGRAM.with(|sent| sent.set(None));
+            stack.receive(Packet {
+                peer: [0x11; 32],
+                bytes: inner,
+            });
+            let (head, sent) = LAST_SERVER_DATAGRAM
+                .with(std::cell::Cell::get)
+                .expect("the server datagram sent");
+            let lane = stack.udp.values().next().expect("lane");
+            assert_eq!(
+                head,
+                lane.head.as_ptr() as usize,
+                "the head is the lane buffer"
+            );
+            assert_eq!(
+                sent, parsed_payload,
+                "the second iovec is the parsed payload, not a frame copy"
+            );
+            let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+            let datagram = udp_from_packet(&packet).expect("inner datagram");
+            assert_eq!(datagram.payload, payload);
+        };
+        send(&mut stack, b"hi");
+        let lane = stack.udp.values().next().expect("lane");
+        let first_head = lane.head.as_ptr();
+        let first = lane.head.capacity();
+        assert!(first > 0, "the head is built once");
+        send(&mut stack, b"again");
+        let lane = stack.udp.values().next().expect("lane");
+        assert_eq!(
+            lane.head.as_ptr(),
+            first_head,
+            "the head allocation does not move"
+        );
+        assert_eq!(
+            lane.head.capacity(),
+            first,
+            "the head buffer does not grow per datagram"
+        );
+        crate::budgets::clear();
+    }
+
+    #[test]
     fn a_server_datagram_lane_is_reclaimed_when_idle() {
         crate::budgets::apply(&crate::config::Budgets {
             udp_idle: Some(Duration::from_millis(100)),
@@ -2314,6 +2415,7 @@ mod tests {
             key,
             UdpLane {
                 uplink,
+                head: Vec::new(),
                 stop: Arc::clone(&stop),
                 last_used,
             },
