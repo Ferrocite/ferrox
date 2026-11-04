@@ -999,7 +999,10 @@ fn io(
     let mut peers = peers(&config, epoch);
     let mut cookies = CookieGuard::default();
     let started = Instant::now();
+    #[cfg(not(target_os = "linux"))]
     let mut buf = vec![0u8; 65_535];
+    #[cfg(target_os = "linux")]
+    let mut batch = RxBatch::new();
     let mut incoming = Vec::new();
     let mut events = Vec::new();
     let mut sends = Vec::new();
@@ -1087,61 +1090,288 @@ fn io(
             );
         }
 
-        let mut received = 0;
-        let mut nonblocking = false;
-        loop {
-            match socket.recv_from(&mut buf) {
-                Ok((n, source)) if n >= 4 => {
-                    let source = recv_endpoint(source, ipv6_socket);
-                    receive_datagram(
-                        &mut peers,
-                        &mut cookies,
-                        now,
-                        source,
-                        &mut buf[..n],
-                        &socket,
-                        &to_stack,
-                        &mut incoming,
-                        routes.as_ref(),
-                        ipv6_socket,
-                        &mut sends,
-                    );
-                    received += 1;
-                    if received >= RX_BURST {
-                        break;
-                    }
-                    if !nonblocking {
-                        if socket.set_nonblocking(true).is_err() {
-                            break;
-                        }
-                        nonblocking = true;
-                    }
-                }
-                Ok(_) => break,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    break;
-                }
-                Err(_) => {
-                    if nonblocking {
-                        let _ = socket.set_nonblocking(false);
-                    }
-                    return;
-                }
-            }
-        }
-        if nonblocking {
-            let _ = socket.set_nonblocking(false);
+        #[cfg(target_os = "linux")]
+        let failed = receive_batch(
+            &socket,
+            &mut batch,
+            &mut peers,
+            &mut cookies,
+            now,
+            &to_stack,
+            &mut incoming,
+            routes.as_ref(),
+            ipv6_socket,
+            &mut sends,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let failed = receive_single(
+            &socket,
+            &mut buf,
+            &mut peers,
+            &mut cookies,
+            now,
+            &to_stack,
+            &mut incoming,
+            routes.as_ref(),
+            ipv6_socket,
+            &mut sends,
+        );
+        if failed {
+            return;
         }
     }
+}
+
+/// One datagram a call: the reader's path on a platform without `recvmmsg`.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn receive_single(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    peers: &mut [Peer],
+    cookies: &mut CookieGuard,
+    now: u64,
+    to_stack: &Sender<Packet>,
+    incoming: &mut Vec<Event>,
+    routes: Option<&UdpRoutes>,
+    ipv6_socket: bool,
+    sends: &mut Vec<Vec<u8>>,
+) -> bool {
+    let mut received = 0;
+    let mut nonblocking = false;
+    loop {
+        match socket.recv_from(buf) {
+            Ok((n, source)) if n >= 4 => {
+                let source = recv_endpoint(source, ipv6_socket);
+                receive_datagram(
+                    peers,
+                    cookies,
+                    now,
+                    source,
+                    &mut buf[..n],
+                    socket,
+                    to_stack,
+                    incoming,
+                    routes,
+                    ipv6_socket,
+                    sends,
+                );
+                received += 1;
+                if received >= RX_BURST {
+                    break;
+                }
+                if !nonblocking {
+                    if socket.set_nonblocking(true).is_err() {
+                        break;
+                    }
+                    nonblocking = true;
+                }
+            }
+            Ok(_) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                break;
+            }
+            Err(_) => {
+                if nonblocking {
+                    let _ = socket.set_nonblocking(false);
+                }
+                return true;
+            }
+        }
+    }
+    if nonblocking {
+        let _ = socket.set_nonblocking(false);
+    }
+    false
+}
+
+/// How many datagrams one receive call takes, so a queued burst costs one
+/// syscall instead of one per datagram; the same 65,535-byte slot the single
+/// read used, so an oversized datagram is still truncated rather than refused.
+#[cfg(target_os = "linux")]
+const RX_BATCH: usize = 32;
+#[cfg(target_os = "linux")]
+const RX_DATAGRAM: usize = 65_535;
+
+/// A fixed set of receive slots for one `recvmmsg` call. Every pointer names a
+/// buffer this struct owns and never reallocates, so the kernel writes into the
+/// same memory each turn.
+#[cfg(target_os = "linux")]
+struct RxBatch {
+    msgs: Vec<libc::mmsghdr>,
+    names: Vec<libc::sockaddr_storage>,
+    iovs: Vec<libc::iovec>,
+    bufs: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl RxBatch {
+    fn new() -> Self {
+        let mut msgs = Vec::with_capacity(RX_BATCH);
+        let mut names = Vec::with_capacity(RX_BATCH);
+        let mut iovs = Vec::with_capacity(RX_BATCH);
+        for _ in 0..RX_BATCH {
+            msgs.push(unsafe { std::mem::zeroed::<libc::mmsghdr>() });
+            names.push(unsafe { std::mem::zeroed::<libc::sockaddr_storage>() });
+            iovs.push(libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            });
+        }
+        Self {
+            msgs,
+            names,
+            iovs,
+            bufs: vec![0u8; RX_BATCH * RX_DATAGRAM],
+        }
+    }
+
+    /// One receive call: the first may wait for the socket, the rest take only
+    /// what is already queued.
+    fn recv(&mut self, socket: &UdpSocket, block: bool) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let base = self.bufs.as_mut_ptr();
+        for index in 0..RX_BATCH {
+            self.iovs[index].iov_base =
+                unsafe { base.add(index * RX_DATAGRAM) }.cast::<libc::c_void>();
+            self.iovs[index].iov_len = RX_DATAGRAM;
+            let header = &mut self.msgs[index].msg_hdr;
+            header.msg_name = std::ptr::addr_of_mut!(self.names[index]).cast::<libc::c_void>();
+            header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            header.msg_iov = std::ptr::addr_of_mut!(self.iovs[index]);
+            header.msg_iovlen = 1;
+            header.msg_control = std::ptr::null_mut();
+            header.msg_controllen = 0;
+            header.msg_flags = 0;
+        }
+        let flags = if block {
+            libc::MSG_WAITFORONE
+        } else {
+            libc::MSG_DONTWAIT
+        };
+        let ready = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                self.msgs.as_mut_ptr(),
+                RX_BATCH as libc::c_uint,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ready as usize)
+    }
+
+    fn len(&self, index: usize) -> usize {
+        self.msgs[index].msg_len as usize
+    }
+
+    fn source(&self, index: usize) -> Option<SocketAddr> {
+        let name = &self.names[index];
+        match name.ss_family as libc::c_int {
+            libc::AF_INET => {
+                let address = unsafe { &*std::ptr::from_ref(name).cast::<libc::sockaddr_in>() };
+                Some(SocketAddr::V4(std::net::SocketAddrV4::new(
+                    Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)),
+                    u16::from_be(address.sin_port),
+                )))
+            }
+            libc::AF_INET6 => {
+                let address = unsafe { &*std::ptr::from_ref(name).cast::<libc::sockaddr_in6>() };
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                    Ipv6Addr::from(address.sin6_addr.s6_addr),
+                    u16::from_be(address.sin6_port),
+                    u32::from_be(address.sin6_flowinfo),
+                    address.sin6_scope_id,
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    fn packet(&mut self, index: usize) -> &mut [u8] {
+        let at = index * RX_DATAGRAM;
+        let len = self.msgs[index].msg_len as usize;
+        &mut self.bufs[at..at + len]
+    }
+}
+
+/// Hand a turn's queued datagrams to the stack, one syscall per batch. Returns
+/// true when the socket failed in a way the reader cannot recover from.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn receive_batch(
+    socket: &UdpSocket,
+    batch: &mut RxBatch,
+    peers: &mut [Peer],
+    cookies: &mut CookieGuard,
+    now: u64,
+    to_stack: &Sender<Packet>,
+    incoming: &mut Vec<Event>,
+    routes: Option<&UdpRoutes>,
+    ipv6_socket: bool,
+    sends: &mut Vec<Vec<u8>>,
+) -> bool {
+    let mut dequeued = 0;
+    while dequeued < RX_BURST {
+        let ready = match batch.recv(socket, dequeued == 0) {
+            Ok(ready) => ready,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                break;
+            }
+            Err(_) => return true,
+        };
+        if ready == 0 {
+            break;
+        }
+        for index in 0..ready {
+            dequeued += 1;
+            let len = batch.len(index);
+            let Some(source) = batch.source(index) else {
+                continue;
+            };
+            if len < 4 {
+                continue;
+            }
+            receive_datagram(
+                peers,
+                cookies,
+                now,
+                recv_endpoint(source, ipv6_socket),
+                batch.packet(index),
+                socket,
+                to_stack,
+                incoming,
+                routes,
+                ipv6_socket,
+                sends,
+            );
+            if dequeued >= RX_BURST {
+                break;
+            }
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2196,6 +2426,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(answer, vec!["127.0.0.1:7".parse().expect("address")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_receive_batch_takes_every_queued_datagram_in_order() {
+        let reader = UdpSocket::bind("127.0.0.1:0").expect("reader");
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let writer = UdpSocket::bind("127.0.0.1:0").expect("writer");
+        let target = reader.local_addr().expect("address");
+        let sent: Vec<Vec<u8>> = (0..3).map(|index| vec![index as u8; 32 + index]).collect();
+        for packet in &sent {
+            writer.send_to(packet, target).expect("send");
+        }
+        let source = writer.local_addr().expect("source");
+        let mut batch = RxBatch::new();
+        assert_eq!(batch.recv(&reader, true).expect("receive"), sent.len());
+        for (index, packet) in sent.iter().enumerate() {
+            assert_eq!(batch.len(index), packet.len());
+            let bytes = batch.packet(index);
+            assert_eq!(&*bytes, packet.as_slice());
+            assert_eq!(batch.source(index), Some(source));
+        }
+        assert!(matches!(
+            batch.recv(&reader, false),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
