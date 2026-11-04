@@ -1735,7 +1735,7 @@ impl Role {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
                     let reader = crate::xhttp::ChainReader::new(prefix, reader);
-                    serve_session_trojan_xhttp(reader, writer, &settings, keys.as_ref(), freedom);
+                    serve_trojan_xhttp_carrier(reader, writer, &settings, keys.as_ref(), freedom);
                 });
             }
             Carrier::HttpUpgrade { path, host, .. } => {
@@ -12259,10 +12259,40 @@ fn serve_vmess_hysteria(flow: crate::hysteria::Flow, users: &crate::vmess::Users
     crate::vmess::serve_decoded_with_finish(reader, flow, &close, decoded, freedom, Some(finish));
 }
 
+/// A TLS xHTTP carrier for vmess: h2 shares the demux with the vless lane, H1 keeps the session
+/// the carrier has always served.
+fn serve_vmess_xhttp_carrier<
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+    close: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return crate::vmess::serve_xhttp_split(chained, write, settings, users, freedom, close);
+    }
+    let users = Arc::clone(users);
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            crate::vmess::serve_xhttp_accepted(reader, writer, &users, freedom, &close);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
 /// The session a `VMess` listener that declares `security: tls` answers, over raw and every carried carrier.
 fn serve_vmess_tls(
     stream: Connection,
-    users: &crate::vmess::Users,
+    users: &crate::vmess::UsersRef,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -12287,7 +12317,7 @@ fn serve_vmess_tls(
             crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+            serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
         }
         Carrier::HttpHeader { path } => {
             crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
@@ -12311,7 +12341,7 @@ fn serve_vmess_tls(
 )]
 fn serve_vmess_reality(
     stream: Connection,
-    users: &crate::vmess::Users,
+    users: &crate::vmess::UsersRef,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
@@ -12370,7 +12400,7 @@ fn serve_vmess_reality(
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                     let _ = raw.shutdown(Shutdown::Both);
                 });
-                crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+                serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
             });
         }
         Carrier::HttpHeader { path } => {
@@ -19099,12 +19129,45 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    let Some((mut creader, cwriter)) =
-        crate::xhttp::accept_split_with_settings(read, write, settings)
+    let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
     else {
         echo_trace("session xhttp trojan accept refused");
         return;
     };
+    serve_trojan_xhttp_accepted(creader, cwriter, key, freedom);
+}
+
+/// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
+/// session every TLS xhttp client has always reached.
+fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
+    }
+    let keys: Vec<[u8; 56]> = key.to_vec();
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
+fn serve_trojan_xhttp_accepted(
+    mut creader: Box<dyn crate::proxy::WindowRead + Send>,
+    cwriter: crate::xhttp::XhttpWriter,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
     let Some((cmd, target)) = decode_trojan_request(&mut creader, key) else {
         echo_trace("session xhttp trojan decode refused");
@@ -19147,7 +19210,7 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
         return;
     };
     echo_trace("session xhttp relaying");
-    relay_sink_drained(creader, &cwriter, &uplink);
+    relay_sink_xhttp_drained(creader, &cwriter, &uplink);
 }
 
 fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(

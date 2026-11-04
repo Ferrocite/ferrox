@@ -2166,10 +2166,17 @@ impl H2Conn {
     }
 }
 
+/// What a served h2 stream hands the protocol above the carrier once `accept_core` split it.
+pub(crate) type SessionServe = dyn Fn(
+        Box<dyn crate::proxy::WindowRead + Send>,
+        crate::xhttp::XhttpWriter,
+        Option<Arc<ferrox_core::vless_encryption::Server>>,
+    ) + Send
+    + Sync;
+
 struct XhttpService {
     settings: XhttpSettings,
-    users: VlessUsers,
-    freedom: bool,
+    serve: Arc<SessionServe>,
 }
 
 impl H2Service for XhttpService {
@@ -2177,8 +2184,33 @@ impl H2Service for XhttpService {
         open_stream(
             conn,
             &self.settings,
-            &self.users,
-            self.freedom,
+            Arc::clone(&self.serve),
+            sid,
+            block,
+            end_stream,
+        );
+    }
+}
+
+/// The same demux for a carrier whose protocol above xHTTP is not VLESS: the accept still splits the
+/// stream into the carrier reader and writer, and the caller's closure runs the protocol handler.
+pub(crate) struct XhttpSessionService {
+    settings: XhttpSettings,
+    serve: Arc<SessionServe>,
+}
+
+impl XhttpSessionService {
+    pub(crate) fn new(settings: XhttpSettings, serve: Arc<SessionServe>) -> Self {
+        Self { settings, serve }
+    }
+}
+
+impl H2Service for XhttpSessionService {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) {
+        open_stream(
+            conn,
+            &self.settings,
+            Arc::clone(&self.serve),
             sid,
             block,
             end_stream,
@@ -2235,8 +2267,7 @@ fn serve_stream(
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
-    users: &VlessUsers,
-    freedom: bool,
+    serve: Arc<SessionServe>,
     sid: u32,
     block: &[u8],
     end_stream: bool,
@@ -2300,7 +2331,6 @@ fn open_stream(
         headed: false,
     };
     let settings = settings.clone();
-    let users = Arc::clone(users);
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
@@ -2312,7 +2342,7 @@ fn open_stream(
             Some(h2out.clone()),
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
-                serve_stream(ureader, xwriter, &users, freedom, decryption);
+                serve(ureader, xwriter, decryption);
             }
             _ => h2out.end(),
         }
@@ -2327,10 +2357,12 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     freedom: bool,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
+    let users: VlessUsers = Arc::from(users);
     let service = XhttpService {
         settings: settings.clone(),
-        users: Arc::from(users),
-        freedom,
+        serve: Arc::new(move |reader, writer, decryption| {
+            serve_stream(reader, writer, &users, freedom, decryption);
+        }),
     };
     serve_h2_service(read, write, &service, decryption);
 }
@@ -2348,10 +2380,12 @@ pub(crate) fn h2_xhttp_lane<
     freedom: bool,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) -> impl FnMut() -> crate::proxy::lane_pool::Next + Send + 'static {
+    let users: VlessUsers = Arc::from(users);
     let service = XhttpService {
         settings: settings.clone(),
-        users: Arc::from(users),
-        freedom,
+        serve: Arc::new(move |reader, writer, decryption| {
+            serve_stream(reader, writer, &users, freedom, decryption);
+        }),
     };
     h2_lane(read, write, service, decryption, None)
 }
@@ -2931,10 +2965,12 @@ mod tests {
     use std::time::Duration;
 
     fn test_service(settings: &XhttpSettings) -> XhttpService {
+        let users = crate::proxy::one_user([0u8; 16]);
         XhttpService {
             settings: settings.clone(),
-            users: crate::proxy::one_user([0u8; 16]),
-            freedom: true,
+            serve: Arc::new(move |reader, writer, decryption| {
+                serve_stream(reader, writer, &users, true, decryption);
+            }),
         }
     }
 
@@ -3601,6 +3637,61 @@ mod tests {
         assert_eq!(client.response_data(down, payload.len()), payload);
         drop(client);
         echo.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// A carrier whose protocol above xHTTP is not VLESS hands the demux a closure instead of the engine session: the split request reaches it with the upload body as its first bytes and its reply lands on the downlink stream.
+    #[test]
+    fn a_carried_session_runs_above_the_demux() {
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let ran = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ran);
+        let server = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            let service = XhttpSessionService::new(
+                test_settings("stream-up"),
+                Arc::new(move |mut reader, mut writer, _decryption| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let mut body = Vec::new();
+                    let mut chunk = [0u8; 8];
+                    while body.len() < 8 {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = writer.write_all(&body);
+                    writer.finish();
+                }),
+            );
+            serve_h2_service(read, stream, &service, None);
+        });
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers("GET", "/up/carried-1", &[("referer", pad.as_str())], true);
+        assert_eq!(client.response_head(down), 200);
+        let up = client.headers(
+            "POST",
+            "/up/carried-1",
+            &[
+                ("referer", pad.as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        client.data(up, b"carried!", true);
+        assert_eq!(client.response_head(up), 200);
+        assert_eq!(client.response_data(down, 8), b"carried!");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the carried session ran once"
+        );
+        drop(client);
         server.join().expect("joins");
     }
 

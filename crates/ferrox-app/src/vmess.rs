@@ -2103,11 +2103,22 @@ pub(crate) fn serve_xhttp_split<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((mut reader, writer)) =
-        crate::xhttp::accept_split_with_settings(reader, writer, settings)
+    let Some((reader, writer)) = crate::xhttp::accept_split_with_settings(reader, writer, settings)
     else {
         return;
     };
+    serve_xhttp_accepted(reader, writer, users, freedom, close);
+}
+
+/// The session above an xHTTP carrier an accept already split: an h2 stream and an H1 request both
+/// leave the same pair, so the request decode and relay are shared.
+pub(crate) fn serve_xhttp_accepted(
+    mut reader: Box<dyn crate::proxy::WindowRead + Send>,
+    writer: crate::xhttp::XhttpWriter,
+    users: &Users,
+    freedom: bool,
+    close: &Close,
+) {
     let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
