@@ -12,6 +12,8 @@ use ferrox_core::transport::url_decode_parts;
 const HEAD_LIMIT: usize = 64 * 1024;
 /// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
+/// A whole body plus the longest size line that can precede it, so the framing read that opens a body brings the body with it instead of paying a second syscall.
+const FRAMING_READ: usize = CHUNK + 130;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 fn path_covers(configured: &str, requested: &str) -> bool {
@@ -109,9 +111,8 @@ fn read_line_into(
             reader.prefix.drain(..reader.at);
             reader.at = 0;
         }
-        let mut tmp = [0u8; 128];
-        match reader.take(&mut tmp) {
-            Ok(n) if n > 0 => reader.prefix.extend_from_slice(&tmp[..n]),
+        match reader.fill(FRAMING_READ) {
+            Ok(n) if n > 0 => {}
             Err(error) if crate::proxy::is_timeout(&error) => return Err(error),
             _ => return Ok(None),
         }
@@ -3405,11 +3406,11 @@ mod tests {
                 got.extend_from_slice(&buf[..n]);
             }
             assert_eq!(got, payload, "{count} chunks: the bytes must be unchanged");
-            // Two reads per chunk amortised -- one framing window, one body -- plus the terminating size line. The old shape read the size line and the two-byte CRLF separately, so it cost three per chunk.
+            // A size line now rides in the same window as the body it opens, so only the body's tail is a second read; the terminal line shares the last window. The old shape read the line and the two-byte CRLF on their own, so it cost three per chunk.
             assert_eq!(
                 reader.reads(),
-                count * 2 + 1,
-                "{count} chunks: framing reads must amortise to one per chunk"
+                count * 2 - 1,
+                "{count} chunks: the framing read must not ask for a line alone"
             );
         }
     }
@@ -3443,7 +3444,7 @@ mod tests {
         assert_eq!(got, payload, "the bytes must be unchanged");
         assert_eq!(
             reader.reads(),
-            5,
+            3,
             "{count} peer chunks must not cost a read each"
         );
     }
