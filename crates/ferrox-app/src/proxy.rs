@@ -14191,7 +14191,7 @@ fn dial_mux_stream(client: &Connection, mut mux: MuxUplink, target: &Destination
         target: Some(dest),
         global_id: None,
     };
-    let mut frame = vec![0u8; new.frame_len(0)];
+    let mut frame = unfilled(new.frame_len(0));
     let written = new.encode_into(None, &mut frame);
     if mux.write.write_all(&frame[..written]).is_err() {
         (mux.close)();
@@ -49429,6 +49429,33 @@ mod tests {
         let mut joined = head.to_vec();
         joined.extend_from_slice(body);
         assert_eq!(joined, whole[..n], "two parts, one frame");
+    }
+
+    /// The stream frame is written whole before it is read, so its buffer is claimed, not zeroed: the
+    /// bytes match the zero-filled encoding and no byte is zeroed.
+    #[test]
+    fn a_mux_frame_is_encoded_without_a_zero_pass() {
+        let target = mux_target_of("198.51.100.7:5353".parse().expect("addr"));
+        let frame = ferrox_core::mux::Outgoing {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(target),
+            global_id: None,
+        };
+        let (claimed, counts) = ferrox_core::alloc_count::measure(|| {
+            let mut out = unfilled(frame.frame_len(0));
+            let written = frame.encode_into(None, &mut out);
+            out.truncate(written);
+            out
+        });
+        let mut zeroed = vec![0u8; frame.frame_len(0)];
+        let written = frame.encode_into(None, &mut zeroed);
+        assert_eq!(claimed, zeroed[..written], "the claimed bytes are the frame");
+        assert_eq!(
+            counts.zeroed, 0,
+            "the encoder fills the prefix it returns: {counts:?}"
+        );
     }
 
     /// The framer keeps the mux uplink's rule: a payload longer than the two-byte length field is refused, not wrapped.
