@@ -1485,10 +1485,10 @@ fn flush(
     flush_sends(socket, ipv6_socket, endpoint, sends);
 }
 
-/// The most transport packets one socket batch carries. A batch that cannot be
-/// taken whole falls back to the socket for the rest, so a full queue still
-/// names every packet.
-const SEND_BATCH: usize = 64;
+/// The most transport packets one socket batch carries: four keeps the
+/// microburst inside a reference client's clamped receive buffer where 64
+/// collapsed four of five arm repeats. No progress falls back to `send_to`.
+const SEND_BATCH: usize = 4;
 
 fn flush_sends(
     socket: &UdpSocket,
@@ -1940,7 +1940,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
-        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let packets: Vec<Vec<u8>> = (0..SEND_BATCH).map(|i| vec![i as u8; 32]).collect();
         let address = receiver.local_addr().expect("address");
         for packet in &packets {
             sender.send_to(packet, address).expect("datagram");
@@ -1962,7 +1962,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
-        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let packets: Vec<Vec<u8>> = (0..SEND_BATCH).map(|i| vec![i as u8; 32]).collect();
         send_batch(
             &sender,
             false,
@@ -2015,7 +2015,7 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
         let to = receiver.local_addr().expect("address");
         let (storage, name_len) = crate::proxy::sockaddr_of(to);
-        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let packets: Vec<Vec<u8>> = (0..SEND_BATCH).map(|i| vec![i as u8; 32]).collect();
         let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
