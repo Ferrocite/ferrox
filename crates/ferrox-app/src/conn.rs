@@ -344,15 +344,27 @@ fn sendmsg_ready<S: std::os::fd::AsRawFd>(stream: &S, parts: &[&[u8]]) -> io::Re
         };
         count += 1;
     }
-    // SAFETY: a zeroed `msghdr` names no address, no control and no segment; the fields below are the
-    // caller's slices, which outlive the call.
+    // SAFETY: a zeroed `msghdr` names no address, control or segment, and the caller's slices outlive the call.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = made.as_mut_ptr();
-    message.msg_iovlen = count as _;
+    #[cfg(target_os = "linux")]
+    {
+        message.msg_iovlen = count;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        message.msg_iovlen = i32::try_from(count).unwrap_or(i32::MAX);
+    }
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "linux")]
     {
-        let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        let sent = unsafe {
+            libc::sendmsg(
+                fd,
+                std::ptr::from_ref(&message),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
         return if sent < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -361,8 +373,7 @@ fn sendmsg_ready<S: std::os::fd::AsRawFd>(stream: &S, parts: &[&[u8]]) -> io::Re
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Darwin ignores `MSG_DONTWAIT` on a full send buffer, so the descriptor's own flag is the
-        // portable form; it is restored before the borrow ends, so no other writer sees it.
+        // Darwin ignores `MSG_DONTWAIT` on a full send buffer, so the descriptor flag is restored before the borrow ends.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
             return Err(io::Error::last_os_error());
@@ -370,7 +381,7 @@ fn sendmsg_ready<S: std::os::fd::AsRawFd>(stream: &S, parts: &[&[u8]]) -> io::Re
         if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let sent = unsafe { libc::sendmsg(fd, &message, 0) };
+        let sent = unsafe { libc::sendmsg(fd, std::ptr::from_ref(&message), 0) };
         let error = (sent < 0).then(io::Error::last_os_error);
         unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
         match error {

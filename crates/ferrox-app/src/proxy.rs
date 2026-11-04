@@ -25615,23 +25615,6 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "linux")]
-        fn change_interest(&mut self, fd: WaitFd, write: bool) -> bool {
-            let mut row = libc::epoll_event {
-                events: u32::try_from(libc::EPOLLIN | if write { libc::EPOLLOUT } else { 0 })
-                    .unwrap_or(u32::MAX),
-                u64: u64::try_from(fd).unwrap_or(u64::MAX),
-            };
-            (unsafe {
-                libc::epoll_ctl(
-                    self.ep,
-                    libc::EPOLL_CTL_MOD,
-                    fd,
-                    std::ptr::from_mut(&mut row),
-                )
-            }) == 0
-        }
-
-        #[cfg(target_os = "linux")]
         fn del(&mut self, fd: WaitFd) {
             unsafe {
                 libc::epoll_ctl(self.ep, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
@@ -25668,15 +25651,8 @@ pub(crate) mod lane_pool {
         #[cfg(target_os = "macos")]
         fn add(&mut self, fd: WaitFd, write: bool) -> bool {
             self.change(fd, libc::EV_ADD | libc::EV_ENABLE)
-                && (!write || self.change_interest(fd, true))
-        }
-
-        #[cfg(target_os = "macos")]
-        fn change_interest(&mut self, fd: WaitFd, write: bool) -> bool {
-            if write {
-                return self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ENABLE);
-            }
-            true
+                && (!write
+                    || self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ENABLE))
         }
 
         #[cfg(target_os = "macos")]
@@ -25687,11 +25663,6 @@ pub(crate) mod lane_pool {
 
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         fn add(&mut self, _: WaitFd, _: bool) -> bool {
-            true
-        }
-
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        fn change_interest(&mut self, _: WaitFd, _: bool) -> bool {
             true
         }
 
@@ -25802,11 +25773,6 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(windows)]
-        fn change_interest(&mut self, _: WaitFd, _: bool) -> bool {
-            true
-        }
-
-        #[cfg(windows)]
         fn del(&mut self, _: WaitFd) {}
 
         #[cfg(windows)]
@@ -25882,19 +25848,12 @@ pub(crate) mod lane_pool {
         /// Joins the descriptor's interest set, upgrading it to writability when a full carrier parks
         /// on the same socket a reader already waits on.
         fn watch(&mut self, fd: WaitFd, write: bool) -> bool {
-            if !self.fds.contains_key(&fd) {
-                if !self.add(fd, write) {
-                    return false;
-                }
-                if write {
-                    self.write.insert(fd);
-                }
-                return true;
+            // Every park re-adds, so a reused number is registered again, and the write interest is upgraded once.
+            let upgrade = write && !self.write.contains(&fd);
+            if !self.add(fd, upgrade) {
+                return false;
             }
-            if write && !self.write.contains(&fd) {
-                if !self.change_interest(fd, true) {
-                    return false;
-                }
+            if write {
                 self.write.insert(fd);
             }
             true
@@ -26800,7 +26759,7 @@ pub(crate) mod lane_pool {
                 reactor.wait(Duration::from_millis(50)).is_empty(),
                 "a full socket reported itself writable"
             );
-            let mut sink = [0u8; 64 * 1024];
+            let mut sink = [0u8; 4096];
             while peer.read(&mut sink).is_ok() {}
             assert_eq!(
                 reactor.wait(Duration::from_secs(2)),
@@ -28232,8 +28191,7 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
                 at.sent += n;
                 at.spins = 0;
             }
-            // A full socket hands the lane to the reactor; a full window is another lane's frame away
-            // and rejoins the queue at once, because a quantum spent here is a window the peer cannot grant.
+            // A full socket hands the lane to the reactor, while a full window rejoins the queue at once.
             Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
                 return Some(Next::Idle);
             }

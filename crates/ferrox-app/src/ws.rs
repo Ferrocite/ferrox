@@ -711,8 +711,7 @@ fn write_frame_ready(
         Err(error) => return Some(Err(error)),
     };
     if taken == 0 && !data.is_empty() {
-        // The socket took the head and none of the payload; the next offer is the bare payload,
-        // which is where a full socket reports itself and the lane learns its descriptor.
+        // The socket took the head and none of the payload, so the next offer is the bare payload.
         taken = match stream.write_ready(&[data])? {
             Ok(n) => n,
             Err(error) => return Some(Err(error)),
