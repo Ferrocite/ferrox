@@ -32,5 +32,7 @@ vless-ws-down-8|server-threads|1.36|696
 vless-xhttp-duplex-8|server-threads|1.29|696
 vless-xhttp-down-8|server-threads|1.27|696
 vmess-tls-ws-down-8|server-threads|1.54|696
-vless-grpc-duplex-8|server-threads|1.21|1276
+# 1.21 was taken before the server window ended at the sink's last byte; the corrected window reads
+# 19 threads against the reference's 14, the same structural gap its grpc siblings file at 1.54-1.67.
+vless-grpc-duplex-8|server-threads|1.36|1276
 vless-grpc-duplex-8|server-cpu|5.77|1276
