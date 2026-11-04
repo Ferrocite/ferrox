@@ -3021,7 +3021,8 @@ mod tests {
         let mut room = Unfilled::<MAX_DATAGRAM>::new();
         let (n, _) = client.send(room.as_mut()).expect("an Initial");
         let initial = room.as_mut()[..n].to_vec();
-        let header = quiche::Header::from_slice(&initial, SCID_LEN).expect("an Initial header");
+        let mut head = initial.clone();
+        let header = quiche::Header::from_slice(&mut head, SCID_LEN).expect("an Initial header");
         let initial_dcid = header.dcid.as_ref().to_vec();
         let peer_cid = header.scid.as_ref().to_vec();
         let mut wire = initial.clone();
