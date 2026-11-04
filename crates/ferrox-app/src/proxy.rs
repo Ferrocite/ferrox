@@ -11869,6 +11869,7 @@ fn serve_vmess_inbound(
 }
 
 /// One address of a `VMess` handler, sharing the account table every port of that handler reads.
+#[allow(clippy::too_many_lines)]
 fn serve_vmess_inbound_users(
     address: &str,
     inbound: &Json,
@@ -12034,6 +12035,10 @@ fn serve_vmess_tls(
 }
 
 /// The session a `VMess` listener that declares `security: reality` answers, over raw and every carried carrier.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per carrier; splitting would scatter the dispatch"
+)]
 fn serve_vmess_reality(
     stream: Connection,
     users: &crate::vmess::Users,
@@ -41771,7 +41776,7 @@ mod tests {
         assert!(find_vmess_outbound(&vnext_tls_root("vmess", &stream("reality"))).is_none());
     }
 
-    /// VMess carries the same REALITY identity VLESS and Trojan do: the outbound keeps the sealed
+    /// `VMess` carries the same REALITY identity VLESS and Trojan do: the outbound keeps the sealed
     /// handshake and adds no TLS layer above it.
     #[test]
     fn vmess_reality_outbound_parses_its_identity() {
