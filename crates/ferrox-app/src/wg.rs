@@ -1528,15 +1528,21 @@ fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[V
                     iov_len: packet.len(),
                 };
             }
-            if send_segments(
+            if let Some(sent) = send_segments(
                 socket,
                 &storage,
                 name_len,
                 &mut iovecs[..end - start],
                 gso as u16,
             ) {
-                start = end;
-                continue;
+                if sent >= total {
+                    start = end;
+                    continue;
+                }
+                if sent >= gso {
+                    start += sent / gso;
+                    continue;
+                }
             }
         }
         let _ = socket.send_to(&packets[start], to);
@@ -1553,18 +1559,20 @@ fn send_segments(
     name_len: libc::socklen_t,
     iovecs: &mut [libc::iovec],
     gso: u16,
-) -> bool {
+) -> Option<usize> {
     use std::os::fd::AsRawFd as _;
 
     const UDP_SEGMENT: libc::c_int = 103;
+    #[repr(align(8))]
+    struct Control([u8; 32]);
     let space = unsafe { libc::CMSG_SPACE(2) } as usize;
-    let mut control = [0u8; 32];
-    if space > control.len() {
-        return false;
+    let mut control = Control([0u8; 32]);
+    if space > control.0.len() {
+        return None;
     }
     // SAFETY: `control` is aligned and large enough for one two-byte control message, which the calls below fill before the header names it.
     unsafe {
-        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
         (*header).cmsg_level = libc::IPPROTO_UDP;
         (*header).cmsg_type = UDP_SEGMENT;
         (*header).cmsg_len = libc::CMSG_LEN(2) as _;
@@ -1575,12 +1583,13 @@ fn send_segments(
         msg_namelen: name_len,
         msg_iov: iovecs.as_mut_ptr(),
         msg_iovlen: iovecs.len(),
-        msg_control: control.as_mut_ptr().cast(),
+        msg_control: control.0.as_mut_ptr().cast(),
         msg_controllen: space as _,
         msg_flags: 0,
     };
     // SAFETY: the name, iovecs and control all outlive the call, and the kernel only reads them.
-    unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, 0) >= 0 }
+    let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, 0) };
+    (sent >= 0).then_some(sent as usize)
 }
 
 #[cfg(not(target_os = "linux"))]
