@@ -1557,7 +1557,7 @@ fn send_segments(
     use std::os::fd::AsRawFd as _;
 
     const UDP_SEGMENT: libc::c_int = 103;
-    let space = libc::CMSG_SPACE(2) as usize;
+    let space = unsafe { libc::CMSG_SPACE(2) } as usize;
     let mut control = [0u8; 32];
     if space > control.len() {
         return false;
@@ -1570,7 +1570,7 @@ fn send_segments(
         (*header).cmsg_len = libc::CMSG_LEN(2) as _;
         std::ptr::copy_nonoverlapping(gso.to_ne_bytes().as_ptr(), libc::CMSG_DATA(header), 2);
     }
-    let mut message = libc::msghdr {
+    let message = libc::msghdr {
         msg_name: (&raw const *storage).cast_mut().cast(),
         msg_namelen: name_len,
         msg_iov: iovecs.as_mut_ptr(),
