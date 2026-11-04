@@ -2055,6 +2055,9 @@ struct Router<'a> {
     /// Whether an accepted connection advertises the token a peer resets it with; the reference's default, off only when `disableStatelessReset` names it.
     stateless_reset: bool,
     routes: HashMap<Vec<u8>, Inbound>,
+    /// The route each client CID and initial DCID names, so an Initial's retransmit finds its lane in one probe instead of walking every route.
+    by_client_cid: HashMap<Vec<u8>, Vec<u8>>,
+    by_initial_dcid: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
@@ -2145,22 +2148,55 @@ impl Router<'_> {
             return;
         }
         crate::quic::flush_egress(&mut conn, &self.sock);
-        self.routes.insert(
-            scid.to_vec(),
-            Inbound {
-                conn: Arc::new(Mutex::new(conn)),
-                client_cid: client_cid.to_vec(),
-                initial_dcid: initial_dcid.to_vec(),
-                authed: false,
-                settings_sent: false,
-                settings_done: false,
-                auth_buf: Vec::new(),
-                served: HashSet::new(),
-                wakes: Driver::new(),
-                udp: HashMap::new(),
-                cc_rx: self.cc_rx,
-            },
+        let key = scid.to_vec();
+        let inbound = Inbound {
+            conn: Arc::new(Mutex::new(conn)),
+            client_cid: client_cid.to_vec(),
+            initial_dcid: initial_dcid.to_vec(),
+            authed: false,
+            settings_sent: false,
+            settings_done: false,
+            auth_buf: Vec::new(),
+            served: HashSet::new(),
+            wakes: Driver::new(),
+            udp: HashMap::new(),
+            cc_rx: self.cc_rx,
+        };
+        if let Some(old) = self.routes.insert(key.clone(), inbound) {
+            self.forget(&key, &old);
+        }
+        if !client_cid.is_empty() {
+            self.by_client_cid.insert(client_cid.to_vec(), key.clone());
+        }
+        if !initial_dcid.is_empty() {
+            self.by_initial_dcid.insert(initial_dcid.to_vec(), key);
+        }
+    }
+
+    /// Drop the reverse names a replaced route held, so a later Initial cannot be sent to a lane the table no longer carries.
+    fn forget(&mut self, key: &[u8], inbound: &Inbound) {
+        forget_route(
+            &mut self.by_client_cid,
+            &mut self.by_initial_dcid,
+            key,
+            &inbound.client_cid,
+            &inbound.initial_dcid,
         );
+    }
+
+    /// The lane an Initial names, if one already carries it: its DCID is the key a retransmit arrives under, and a client CID matches the first flight's source id.
+    fn initial_route(&self, dcid: &[u8], peer_cid: &[u8]) -> Option<Vec<u8>> {
+        let live = |key: &Vec<u8>| self.routes.contains_key(key.as_slice());
+        if let Some(key) = self.by_initial_dcid.get(dcid).filter(|key| live(key)) {
+            return Some(key.clone());
+        }
+        if peer_cid.is_empty() {
+            return None;
+        }
+        self.by_client_cid
+            .get(peer_cid)
+            .filter(|key| live(key))
+            .cloned()
     }
 
     /// Hand one received packet to the route it names, then let every route that took it send once.
@@ -2281,17 +2317,26 @@ impl Router<'_> {
     fn idle(&mut self) {
         let Self {
             routes,
+            by_client_cid,
+            by_initial_dcid,
             sock,
             udp_idle,
             ..
         } = self;
         let now = Instant::now();
         // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
-        routes.retain(|_, inbound| {
+        routes.retain(|key, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
                 return true;
             };
             if conn.is_closed() {
+                forget_route(
+                    by_client_cid,
+                    by_initial_dcid,
+                    key,
+                    &inbound.client_cid,
+                    &inbound.initial_dcid,
+                );
                 for flow in inbound.udp.values() {
                     flow.stop.store(true, Ordering::Relaxed);
                 }
@@ -2310,6 +2355,30 @@ impl Router<'_> {
             });
             true
         });
+    }
+}
+
+/// Drop a route's reverse names when they still point at it, so a replaced or reaped lane leaves no stale lookup.
+fn forget_route(
+    by_client_cid: &mut HashMap<Vec<u8>, Vec<u8>>,
+    by_initial_dcid: &mut HashMap<Vec<u8>, Vec<u8>>,
+    key: &[u8],
+    client_cid: &[u8],
+    initial_dcid: &[u8],
+) {
+    if !client_cid.is_empty()
+        && by_client_cid
+            .get(client_cid)
+            .is_some_and(|held| held.as_slice() == key)
+    {
+        by_client_cid.remove(client_cid);
+    }
+    if !initial_dcid.is_empty()
+        && by_initial_dcid
+            .get(initial_dcid)
+            .is_some_and(|held| held.as_slice() == key)
+    {
+        by_initial_dcid.remove(initial_dcid);
     }
 }
 
@@ -2340,13 +2409,11 @@ fn route_packet(
     if initial {
         // A client that sends a zero-length source CID, as the pinned client does, has no peer CID to look up: matching the empty slice against every route sends a new connection's Initial to whichever stale route came first, and the handshake never completes. Its initial DCID is the key a retransmit carries; a new connection's random DCID matches nothing and is accepted.
         let known = router.routes.contains_key(dcid);
-        let retransmit = router.routes.iter().find_map(|(key, inbound)| {
-            ((!inbound.initial_dcid.is_empty() && inbound.initial_dcid.as_slice() == dcid)
-                || (!peer_cid.is_empty()
-                    && !inbound.client_cid.is_empty()
-                    && inbound.client_cid.as_slice() == peer_cid))
-                .then(|| key.clone())
-        });
+        let retransmit = if known {
+            None
+        } else {
+            router.initial_route(dcid, peer_cid)
+        };
         if known {
             router.drive(dcid, packet, from);
         } else if let Some(key) = retransmit {
@@ -2395,6 +2462,8 @@ pub(crate) fn serve_loop(
         cc_rx: quic.map_or(0, |params| params.brutal_down),
         stateless_reset: quic.is_none_or(|params| !params.disable_stateless_reset),
         routes: HashMap::new(),
+        by_client_cid: HashMap::new(),
+        by_initial_dcid: HashMap::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
@@ -2901,6 +2970,8 @@ mod tests {
                 cc_rx: 0,
                 stateless_reset: false,
                 routes: by_scid,
+                by_client_cid: HashMap::new(),
+                by_initial_dcid: HashMap::new(),
             };
             router.idle();
             stop.load(Ordering::Relaxed)
@@ -2910,6 +2981,171 @@ mod tests {
             "five seconds reaps a six-second-old association"
         );
         assert!(!reaps(Duration::from_secs(60)), "sixty seconds keeps it");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_retransmitted_initial_reuses_its_lane_without_a_second_route() {
+        // A retransmit names the first flight's DCID and source CID; route_packet must drive it on the lane accept already made rather than add a second route. The client's next flight is the observable that `drive` reaches that lane.
+        let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let local = server_sock.local_addr().expect("addr");
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client_sock.connect(local).expect("connects");
+        client_sock
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("arms");
+        let client_addr = client_sock.local_addr().expect("addr");
+        let auths: Vec<String> = Vec::new();
+        let handler: Serve = Arc::new(|_| {});
+        let mut router = Router {
+            sock: Arc::new(crate::quic::Datagram::plain(server_sock)),
+            local,
+            auths: &auths,
+            serve: &handler,
+            masq: Arc::new(Masquerade::NotFound),
+            udp_idle: Duration::from_secs(60),
+            cc_rx: 0,
+            stateless_reset: false,
+            routes: HashMap::new(),
+            by_client_cid: HashMap::new(),
+            by_initial_dcid: HashMap::new(),
+        };
+        let mut template = server_template(&hysteria::Config::default());
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        client_config.verify_peer(false);
+        client_config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let client_cid = [0x42u8; SCID_LEN];
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            local,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut room = Unfilled::<MAX_DATAGRAM>::new();
+        let (n, _) = client.send(room.as_mut()).expect("an Initial");
+        let initial = room.as_mut()[..n].to_vec();
+        let mut head = initial.clone();
+        let header = quiche::Header::from_slice(&mut head, SCID_LEN).expect("an Initial header");
+        let initial_dcid = header.dcid.as_ref().to_vec();
+        let peer_cid = header.scid.as_ref().to_vec();
+        let mut wire = initial.clone();
+        route_packet(&mut router, &mut template, &mut wire, client_addr);
+        assert_eq!(router.routes.len(), 1, "the first Initial makes one route");
+        let key = router.routes.keys().next().expect("a route").clone();
+        assert_eq!(
+            router.by_initial_dcid.get(initial_dcid.as_slice()),
+            Some(&key)
+        );
+        assert_eq!(router.by_client_cid.get(peer_cid.as_slice()), Some(&key));
+        assert_eq!(
+            router.initial_route(&[0x99u8; 8], &peer_cid),
+            Some(key.clone()),
+            "a source CID alone names its lane"
+        );
+        let received = |router: &Router<'_>| {
+            router
+                .routes
+                .get(key.as_slice())
+                .expect("the route")
+                .conn
+                .lock()
+                .expect("locks")
+                .stats()
+                .recv
+        };
+        let mut down = [0u8; 2048];
+        loop {
+            match client_sock.recv_from(&mut down) {
+                Ok((n, from)) => {
+                    client
+                        .recv(
+                            &mut down[..n],
+                            quiche::RecvInfo {
+                                from,
+                                to: client_addr,
+                            },
+                        )
+                        .expect("the client reads the server");
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("the server's answer: {error}"),
+            }
+        }
+        let (n, _) = client
+            .send(room.as_mut())
+            .expect("the client's next flight");
+        let next = room.as_mut()[..n].to_vec();
+        let before = received(&router);
+        let mut wire = next;
+        route_packet(&mut router, &mut template, &mut wire, client_addr);
+        assert!(
+            received(&router) > before,
+            "the next flight reached the existing connection"
+        );
+        assert_eq!(router.routes.len(), 1, "the next flight adds no route");
+        // The replayed Initial is a duplicate quiche drops before its counters, so it is checked for the route table alone.
+        let mut wire = initial;
+        route_packet(&mut router, &mut template, &mut wire, client_addr);
+        assert_eq!(router.routes.len(), 1, "a retransmit adds no route");
+        assert_eq!(router.by_initial_dcid.len(), 1);
+        assert_eq!(router.by_client_cid.len(), 1);
+    }
+
+    #[test]
+    fn an_idle_reap_drops_a_closed_routes_reverse_names() {
+        let session = idle_session();
+        {
+            let mut conn = session.shared.lock().expect("locks");
+            let _ = conn.close(false, 0, b"done");
+        }
+        let client = vec![2u8; 8];
+        let initial = vec![3u8; 8];
+        let key = vec![1u8; SCID_LEN];
+        let auths: Vec<String> = Vec::new();
+        let handler: Serve = Arc::new(|_| {});
+        let mut router = Router {
+            sock: Arc::clone(&session.sock),
+            local: session.local,
+            auths: &auths,
+            serve: &handler,
+            masq: Arc::new(Masquerade::NotFound),
+            udp_idle: Duration::from_secs(60),
+            cc_rx: 0,
+            stateless_reset: false,
+            routes: HashMap::from([(
+                key.clone(),
+                Inbound {
+                    conn: Arc::clone(&session.shared),
+                    client_cid: client.clone(),
+                    initial_dcid: initial.clone(),
+                    authed: false,
+                    settings_sent: false,
+                    settings_done: false,
+                    auth_buf: Vec::new(),
+                    served: HashSet::new(),
+                    wakes: Driver::new(),
+                    udp: HashMap::new(),
+                    cc_rx: 0,
+                },
+            )]),
+            by_client_cid: HashMap::from([(client, key.clone())]),
+            by_initial_dcid: HashMap::from([(initial, key)]),
+        };
+        router.idle();
+        assert!(router.routes.is_empty());
+        assert!(router.by_client_cid.is_empty());
+        assert!(router.by_initial_dcid.is_empty());
     }
 
     fn idle_session() -> Session {
