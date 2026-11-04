@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, IoSlice, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
@@ -24,7 +24,7 @@ pub(crate) const KEY_LENGTH: usize = 16;
 pub(crate) const MIN_PADDING: usize = 32;
 pub(crate) const MAX_PADDING: usize = 8192;
 const MAX_PACKET: usize = 256 * 1024;
-const CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
 const CHANNEL_PACKET: u32 = 32 * 1024;
 /// Channel ids are 0-based, so 0 is a server's first channel; this is the only value
 /// that never names one.
@@ -39,7 +39,7 @@ const CLIENT_CAPABILITIES: &str = "server-requests";
 const PACKET_CHUNK: usize = CHANNEL_PACKET as usize + 1024;
 /// The pool holds a whole channel window plus the packets a flow is writing,
 /// so a saturated download recycles buffers instead of allocating one per packet.
-const PACKET_POOL: usize = (CHANNEL_WINDOW / CHANNEL_PACKET) as usize + 8;
+const PACKET_POOL: usize = (DEFAULT_CHANNEL_WINDOW / CHANNEL_PACKET) as usize + 8;
 const ENTROPY: usize = 4096;
 
 const MSG_DISCONNECT: u8 = 1;
@@ -71,7 +71,9 @@ const MSG_CHANNEL_FAILURE: u8 = 100;
 /// One transport below SSH: a TCP socket or an in-proxy WebRTC data channel.
 pub(crate) enum Stream {
     Tcp(TcpStream),
+    Quic(crate::psiphon_quic::QuicStream),
     Shadowsocks(crate::psiphon_shadowsocks::Stream<TcpStream>),
+    WebRtcShadowsocks(crate::psiphon_shadowsocks::Stream<WebRtcStream>),
     WebRtc(WebRtcStream),
 }
 
@@ -87,7 +89,9 @@ impl Stream {
     fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Tcp(socket) => socket.try_clone().map(Self::Tcp),
+            Self::Quic(stream) => Ok(Self::Quic(stream.clone())),
             Self::Shadowsocks(stream) => stream.try_clone().map(Self::Shadowsocks),
+            Self::WebRtcShadowsocks(stream) => Ok(Self::WebRtcShadowsocks(stream.try_clone())),
             Self::WebRtc(stream) => Ok(Self::WebRtc(stream.clone())),
         }
     }
@@ -97,7 +101,15 @@ impl Stream {
             Self::Tcp(socket) => socket
                 .set_read_timeout(timeout)
                 .and_then(|()| socket.set_write_timeout(timeout)),
+            Self::Quic(stream) => {
+                stream.set_timeout(timeout);
+                Ok(())
+            }
             Self::Shadowsocks(stream) => stream.set_timeout(timeout),
+            Self::WebRtcShadowsocks(stream) => {
+                stream.set_timeout(timeout);
+                Ok(())
+            }
             Self::WebRtc(stream) => {
                 stream.set_timeout(timeout);
                 Ok(())
@@ -109,7 +121,15 @@ impl Stream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.set_read_timeout(timeout),
+            Self::Quic(stream) => {
+                stream.set_read_timeout(timeout);
+                Ok(())
+            }
             Self::Shadowsocks(stream) => stream.set_read_timeout(timeout),
+            Self::WebRtcShadowsocks(stream) => {
+                stream.set_read_timeout(timeout);
+                Ok(())
+            }
             Self::WebRtc(stream) => {
                 stream.set_read_timeout(timeout);
                 Ok(())
@@ -120,7 +140,15 @@ impl Stream {
     fn shutdown(&self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
+            Self::Quic(stream) => {
+                stream.shutdown();
+                Ok(())
+            }
             Self::Shadowsocks(stream) => stream.shutdown(),
+            Self::WebRtcShadowsocks(stream) => {
+                stream.shutdown();
+                Ok(())
+            }
             Self::WebRtc(stream) => {
                 stream.shutdown();
                 Ok(())
@@ -133,7 +161,9 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.read(buf),
+            Self::Quic(stream) => stream.read(buf),
             Self::Shadowsocks(stream) => stream.read(buf),
+            Self::WebRtcShadowsocks(stream) => stream.read(buf),
             Self::WebRtc(stream) => stream.read(buf),
         }
     }
@@ -143,7 +173,9 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.write(buf),
+            Self::Quic(stream) => stream.write(buf),
             Self::Shadowsocks(stream) => stream.write(buf),
+            Self::WebRtcShadowsocks(stream) => stream.write(buf),
             Self::WebRtc(stream) => stream.write(buf),
         }
     }
@@ -151,7 +183,9 @@ impl Write for Stream {
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.write_vectored(bufs),
+            Self::Quic(stream) => stream.write_vectored(bufs),
             Self::Shadowsocks(stream) => stream.write_vectored(bufs),
+            Self::WebRtcShadowsocks(stream) => stream.write_vectored(bufs),
             Self::WebRtc(stream) => {
                 let parts: Vec<&[u8]> = bufs.iter().map(|buf| &buf[..]).collect();
                 stream.write_parts(&parts)
@@ -162,7 +196,9 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.flush(),
+            Self::Quic(stream) => stream.flush(),
             Self::Shadowsocks(stream) => stream.flush(),
+            Self::WebRtcShadowsocks(stream) => stream.flush(),
             Self::WebRtc(stream) => stream.flush(),
         }
     }
@@ -178,10 +214,15 @@ pub(crate) struct Shadowsocks {
 
 /// The parts of a signed server entry this transport dials.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Server {
     pub(crate) host: String,
     pub(crate) address: IpAddr,
     pub(crate) port: u16,
+    pub(crate) quic: bool,
+    pub(crate) quic_port: Option<u16>,
+    pub(crate) quic_versions: Vec<String>,
+    pub(crate) quic_noise: Option<String>,
     pub(crate) user: String,
     pub(crate) password: String,
     pub(crate) host_key: Vec<u8>,
@@ -199,6 +240,8 @@ pub(crate) struct Server {
     pub(crate) tactics: Option<crate::psiphon_tactics::Keys>,
     pub(crate) inproxy: Option<crate::psiphon_broker::Destination>,
     pub(crate) tls_inproxy: Option<crate::psiphon_broker::Destination>,
+    pub(crate) inproxy_shadowsocks_key: Option<String>,
+    pub(crate) channel_window: u32,
 }
 
 impl Server {
@@ -211,12 +254,14 @@ impl Server {
     /// The `SHADOWSOCKS-OSSH` sibling of an entry that also names another direct port.
     #[must_use]
     pub(crate) fn shadowsocks_variant(&self) -> Option<Self> {
-        if self.ss {
+        if self.ss || self.quic {
             return None;
         }
         let ss = self.shadowsocks.as_ref()?;
         let mut variant = self.clone();
         variant.ss = true;
+        variant.quic = false;
+        variant.quic_port = None;
         variant.direct = true;
         variant.port = ss.port;
         variant.obfuscation_key = ss
@@ -226,6 +271,50 @@ impl Server {
             .or_else(|| self.obfuscation_key.clone());
         variant.tls = false;
         variant.tls_port = None;
+        variant.meek = None;
+        variant.unfronted_meek = None;
+        variant.tactics = None;
+        variant.inproxy = None;
+        variant.tls_inproxy = None;
+        Some(variant)
+    }
+
+    /// The `QUIC-OSSH` sibling of any direct entry that names a QUIC port.
+    #[must_use]
+    pub(crate) fn quic_variant(&self) -> Option<Self> {
+        if self.quic {
+            return None;
+        }
+        let port = self.quic_port?;
+        let supported: Vec<&str> = if self.quic_versions.is_empty() {
+            crate::psiphon_quic::SUPPORTED_QUIC_VERSIONS.to_vec()
+        } else {
+            self.quic_versions
+                .iter()
+                .map(String::as_str)
+                .filter(|version| crate::psiphon_quic::SUPPORTED_QUIC_VERSIONS.contains(version))
+                .collect()
+        };
+        if supported.is_empty() {
+            return None;
+        }
+        let index = usize::from(random::<1>()[0]) % supported.len();
+        let version = (*supported.get(index)?).to_owned();
+        let mut variant = self.clone();
+        variant.quic = true;
+        variant.quic_versions = vec![version];
+        variant.direct = true;
+        variant.port = port;
+        if variant.obfuscation_key.is_none() {
+            variant.obfuscation_key = variant
+                .tls_obfuscation_key
+                .clone()
+                .or_else(|| variant.meek_obfuscated_key.clone());
+        }
+        variant.tls = false;
+        variant.tls_port = None;
+        variant.ss = false;
+        variant.shadowsocks = None;
         variant.meek = None;
         variant.unfronted_meek = None;
         variant.tactics = None;
@@ -243,11 +332,12 @@ pub(crate) struct Proxy {
     port: u16,
     user: String,
     pass: String,
+    dns: Vec<SocketAddr>,
 }
 
 impl Proxy {
     /// `http://`, `socks5://` or `socks5h://`, with optional `user:pass@` credentials.
-    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str, dns: &[SocketAddr]) -> Result<Self, String> {
         let text = text.trim();
         let (http, rest) = text
             .strip_prefix("http://")
@@ -284,6 +374,7 @@ impl Proxy {
             port,
             user,
             pass,
+            dns: dns.to_vec(),
         })
     }
 
@@ -304,8 +395,7 @@ impl Proxy {
         timeout: Duration,
     ) -> Result<TcpStream, String> {
         let mut last = String::new();
-        for address in (self.host.as_str(), self.port)
-            .to_socket_addrs()
+        for address in crate::psiphon_dns::resolve(&self.host, self.port, &self.dns)
             .map_err(|error| format!("psiphon: upstream proxy resolve {}: {error}", self.host))?
         {
             match TcpStream::connect_timeout(&address, timeout) {
@@ -502,6 +592,7 @@ struct Inner {
     writer: Mutex<PacketWriter>,
     channels: Mutex<HashMap<u32, Arc<ChannelState>>>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    channel_window: u32,
     next_channel: AtomicU32,
     closed: AtomicBool,
     socket: Stream,
@@ -591,15 +682,29 @@ impl Session {
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
                 let (stream, relay) = conduit.open(server.address, destination, identity)?;
                 let base = destination.base_protocol();
-                let stream = if base == "TLS-OSSH" {
-                    tls_tunnel(
+                let stream = match base {
+                    "TLS-OSSH" => tls_tunnel(
                         Stream::WebRtc(stream),
                         &server.host,
                         tls_passthrough_key(server),
                         timeout,
-                    )?
-                } else {
-                    Stream::WebRtc(stream)
+                    )?,
+                    "SHADOWSOCKS-OSSH" => {
+                        let key = server
+                            .shadowsocks
+                            .as_ref()
+                            .map(|shadowsocks| shadowsocks.key.as_str())
+                            .or(server.inproxy_shadowsocks_key.as_deref())
+                            .or(server.obfuscation_key.as_deref())
+                            .filter(|key| !key.is_empty())
+                            .ok_or_else(|| {
+                                "psiphon ssh: in-proxy Shadowsocks entry has no key".to_owned()
+                            })?;
+                        Stream::WebRtcShadowsocks(
+                            crate::psiphon_shadowsocks::Stream::connect_webrtc(stream, key),
+                        )
+                    }
+                    _ => Stream::WebRtc(stream),
                 };
                 (stream, Some(relay), destination.protocol, base)
             } else {
@@ -611,7 +716,7 @@ impl Session {
             .try_clone()
             .map_err(|error| format!("psiphon ssh socket clone: {error}"))?;
         let pool = Arc::new(Mutex::new(Vec::new()));
-        let (mut output, mut input) = split(stream, server, Arc::clone(&pool))?;
+        let (mut output, mut input) = split(stream, server, relay.is_some(), Arc::clone(&pool))?;
         // An OSSH server reads the seed before it writes anything, so the client line goes first.
         let our_version = b"SSH-2.0-OpenSSH_9.6";
         write_all(&mut output, b"SSH-2.0-OpenSSH_9.6\r\n")?;
@@ -651,6 +756,7 @@ impl Session {
             writer: Mutex::new(output),
             channels: Mutex::new(HashMap::new()),
             pool,
+            channel_window: server.channel_window,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             socket: control,
@@ -693,7 +799,7 @@ impl Session {
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(CHANNEL_WINDOW),
+                local_window: u64::from(self.inner.channel_window),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -707,7 +813,7 @@ impl Session {
         let mut payload = vec![MSG_CHANNEL_OPEN];
         put_str(&mut payload, b"direct-tcpip");
         put_u32(&mut payload, local);
-        put_u32(&mut payload, CHANNEL_WINDOW);
+        put_u32(&mut payload, self.inner.channel_window);
         put_u32(&mut payload, CHANNEL_PACKET);
         put_str(&mut payload, host.as_bytes());
         put_u32(&mut payload, u32::from(port));
@@ -1234,7 +1340,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn tls_passthrough_key(server: &Server) -> &str {
+pub(crate) fn tls_passthrough_key(server: &Server) -> &str {
     server
         .meek_obfuscated_key
         .as_deref()
@@ -1246,7 +1352,7 @@ fn tls_passthrough_key(server: &Server) -> &str {
 /// the server checks before it will speak `TLS-OSSH`; an invalid field is relayed to a decoy web
 /// site. The key is HKDF-derived from the 20-minute time period, and the message's second half
 /// is an HMAC over its nonce.
-fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
+pub(crate) fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
     let period = 20 * 60u64;
     let rounded = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1277,6 +1383,10 @@ fn direct_stream(
     timeout: Duration,
     proxy: Option<&Proxy>,
 ) -> Result<(Stream, &'static str), String> {
+    if server.quic {
+        let stream = crate::psiphon_quic::QuicStream::connect(server, timeout, proxy)?;
+        return Ok((Stream::Quic(stream), "QUIC-OSSH"));
+    }
     let address = SocketAddr::new(server.address, server.port);
     let tls = server.tls && server.meek.is_none() && !server.ss;
     let socket = match &server.meek {
@@ -1448,14 +1558,22 @@ fn idle(error: &io::Error) -> bool {
 fn split(
     socket: Stream,
     server: &Server,
+    relayed: bool,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 ) -> Result<(PacketWriter, PacketReader), String> {
     let write = socket
         .try_clone()
         .map_err(|error| format!("psiphon ssh socket clone: {error}"))?;
-    let obfuscated = match server.inproxy.as_ref() {
-        Some(destination) => destination.base_protocol().contains("OSSH"),
-        None => server.obfuscated(),
+    let obfuscated = if server.ss {
+        false
+    } else {
+        match server.inproxy.as_ref().filter(|_| relayed) {
+            Some(destination) => {
+                let base = destination.base_protocol();
+                base.contains("OSSH") && base != "SHADOWSOCKS-OSSH"
+            }
+            None => server.obfuscated(),
+        }
     };
     if obfuscated {
         let key = match server
@@ -2777,6 +2895,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         )),
         channels: Mutex::new(HashMap::new()),
         pool: Arc::clone(&pool),
+        channel_window: DEFAULT_CHANNEL_WINDOW,
         next_channel: AtomicU32::new(1),
         closed: AtomicBool::new(false),
         socket: Stream::Tcp(peer),
@@ -2795,7 +2914,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
             eof: false,
             closed: false,
             pending_adjust: 0,
-            local_window: u64::from(CHANNEL_WINDOW),
+            local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
         }),
         cond: Condvar::new(),
         window_cond: Condvar::new(),
@@ -3041,6 +3160,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::clone(&pool),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             socket: Stream::Tcp(peer),
@@ -3059,7 +3179,7 @@ mod tests {
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(CHANNEL_WINDOW),
+                local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -3112,6 +3232,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::clone(&pool),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             socket: Stream::Tcp(peer),
@@ -3130,7 +3251,7 @@ mod tests {
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(CHANNEL_WINDOW),
+                local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -3174,6 +3295,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::clone(&pool),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
             socket: Stream::Tcp(peer),
@@ -3193,7 +3315,7 @@ mod tests {
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(CHANNEL_WINDOW),
+                local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -3205,7 +3327,7 @@ mod tests {
         let mut confirm = vec![MSG_CHANNEL_OPEN_CONFIRMATION];
         put_u32(&mut confirm, 1);
         put_u32(&mut confirm, 2);
-        put_u32(&mut confirm, CHANNEL_WINDOW);
+        put_u32(&mut confirm, DEFAULT_CHANNEL_WINDOW);
         put_u32(&mut confirm, CHANNEL_PACKET);
         let end = confirm.len();
         assert!(matches!(
@@ -3261,6 +3383,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::clone(&pool),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
             socket: Stream::Tcp(peer),
@@ -3279,7 +3402,7 @@ mod tests {
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(CHANNEL_WINDOW),
+                local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -3343,6 +3466,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::new(Mutex::new(Vec::new())),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             socket: Stream::Tcp(peer),
@@ -3381,6 +3505,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::clone(&pool),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
             socket: Stream::Tcp(peer),
@@ -3392,14 +3517,14 @@ mod tests {
         let state = Arc::new(ChannelState {
             local: 1,
             remote: AtomicU32::new(2),
-            remote_window: Mutex::new(u64::from(CHANNEL_WINDOW)),
+            remote_window: Mutex::new(u64::from(DEFAULT_CHANNEL_WINDOW)),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
-                local_window: u64::from(CHANNEL_WINDOW),
+                local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -3494,12 +3619,12 @@ mod tests {
 
     #[test]
     fn an_upstream_proxy_url_names_its_scheme_and_credentials() {
-        let proxy = Proxy::parse("http://user:p%40ss@127.0.0.1:8080").expect("proxy");
+        let proxy = Proxy::parse("http://user:p%40ss@127.0.0.1:8080", &[]).expect("proxy");
         assert!(proxy.http);
         assert_eq!(proxy.host, "127.0.0.1");
         assert_eq!(proxy.port, 8080);
         assert_eq!(proxy.user, "user");
         assert_eq!(proxy.pass, "p@ss");
-        assert!(Proxy::parse("socks4://127.0.0.1:1").is_err());
+        assert!(Proxy::parse("socks4://127.0.0.1:1", &[]).is_err());
     }
 }

@@ -902,6 +902,7 @@ dependencies = [
  "aes-gcm 0.11.1",
  "aho-corasick",
  "base64",
+ "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",
  "crypto_box",
  "ctr 0.10.1",
@@ -911,12 +912,14 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "libc",
+ "maxminddb",
  "md5",
  "mlua",
  "quiche",
  "rcgen",
  "regex",
  "ring",
+ "rustls",
  "rustls-native-certs",
  "sha1",
  "sha2 0.11.1",
@@ -1211,6 +1214,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4275b20e6057cd7733fd8df8a5a31701e4fe44497dad0f3fa0e1c4fb971506be"
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "is"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,6 +1344,18 @@ name = "managed"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
+
+[[package]]
+name = "maxminddb"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b43d2458d977b610b04a3858e6504f06133663d303a1a0606601b530bfc9bc6"
+dependencies = [
+ "ipnetwork",
+ "memchr",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "md5"

@@ -3,13 +3,13 @@ name: Psiphon lane (live tunnel check)
 # Proves the `psiphon` lane against the real Psiphon network and measures it
 # beside the pinned Go console client on the same runner: `ferrox-app` starts
 # with a socks and a mixed front, waits for a front to carry a trace through the
-# lane's first tunnel, then carries an exact 1 MB file through each front and
+# lane's first tunnel, then carries an exact 10 MB file through each front and
 # through the lane's own HTTP edge, and a DNS query through the lane's SOCKS5 UDP
 # association. The reference then runs on the same ports, pinned to the server and
 # SSH/OSSH protocol the native lane selected, so a ratio is not a difference between
 # two carriers.
 # The runner's own egress is the control, so a refused tunnel, a broken UDP path
-# and a runner that cannot move a megabyte are different lines in the summary.
+# and a runner that cannot move ten megabytes are different lines in the summary.
 # Speed, RSS and CPU are read as native/reference on one runner, never as local
 # absolutes: the runners move week to week.
 #
@@ -57,7 +57,7 @@ env:
 
 jobs:
   psiphon-live:
-    name: Psiphon lane live (tunnel + 1 MB, native vs console client)
+    name: Psiphon lane live (tunnel + 10 MB, native vs console client)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -109,28 +109,28 @@ jobs:
             *"panic:"*) echo "::error::the pinned console client panicked at init"; exit 1 ;;
           esac
       # A leg below cannot tell a refused tunnel from a runner that cannot carry
-      # a megabyte. This control names which one it is; a short read here is a
+      # ten megabytes. This control names which one it is; a short read here is a
       # warning about the runner, never a red lane.
-      - name: Egress control - 1 MB with no lane
+      - name: Egress control - 10 MB with no lane
         run: |
           : > psiphon-legs.tsv
           : > control.bin
           code=0
           timing=$(curl -sS --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download}' \
-            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
+            'https://speed.cloudflare.com/__down?bytes=10000000' -o control.bin) || code=$?
           echo "control, no lane ${timing:-0 0 0}" >> psiphon-legs.tsv
           got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
-          echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
-          if test "$code" = 0 && test "${got:-0}" = 1000000; then
-            echo "egress control carried the whole megabyte"
+          echo "egress control: curl exit $code, ${got:-0} bytes of 10000000"
+          if test "$code" = 0 && test "${got:-0}" = 10000000; then
+            echo "egress control carried the whole ten megabytes"
           else
-            echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
+            echo "::warning::this runner cannot itself download 10 MB (curl exit $code, ${got:-0} bytes)"
           fi
       # Both implementations run on the same ports, back to back, after the other
       # has exited: a port, a front and a download are the same in both lanes, so a
       # ratio is the implementation and not a different front.
-      - name: Carry a megabyte through both implementations
+      - name: Carry ten megabytes through both implementations
         env:
           PSIPHON_REGION: ${{ inputs.region }}
           PSIPHON_POOL: ${{ inputs.pool }}
@@ -217,15 +217,15 @@ jobs:
             local front="$1" port="$2" file="$3" label="$4" code=0 timing got
             timing=$(via "$front" "$port" --max-time 300 \
               -w '%{size_download} %{time_total} %{speed_download}' \
-              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
+              'https://speed.cloudflare.com/__down?bytes=10000000' -o "$file") || code=$?
             echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
             got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
-            if test "$code" = 0 && test "$got" = 1000000; then
-              echo "$label: 1000000 B"
+            if test "$code" = 0 && test "$got" = 10000000; then
+              echo "$label: 10000000 B"
               return 0
             fi
-            echo "$label FAILED: curl exit $code after $got of 1000000 B" >&2
+            echo "$label FAILED: curl exit $code after $got of 10000000 B" >&2
             return 1
           }
           # The two signature values are read out of the lane's own source, so the
@@ -362,7 +362,7 @@ jobs:
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
           fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
           fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
-          # The CPU window matches the reference's three megabytes; the mixed leg
+          # The CPU window matches the reference's three ten-megabyte legs; the mixed leg
           # still gates, but it is extra work and stays outside the ratio.
           sample_process "native done" "$LANE_PID"
           trace_front mixed 10809 "native mixed" || FAILED="$FAILED native(mixed trace)"
@@ -387,7 +387,7 @@ jobs:
             PAR_PIDS=""
             for index in 1 2 3 4 5 6 7 8; do
               via socks 10808 --fail --max-time 300 -sS -o "$PAR_DIR/$index" \
-                'https://speed.cloudflare.com/__down?bytes=1000000' &
+                'https://speed.cloudflare.com/__down?bytes=10000000' &
               PAR_PIDS="$PAR_PIDS $!"
             done
             PAR_CODE=0
@@ -400,8 +400,8 @@ jobs:
             echo "native pool parallel $PAR_BYTES $PAR_SECONDS $PAR_SPEED" >> psiphon-legs.tsv
             FLOW_SERVERS=$(tail -n +"$((FLOW_BASE + 1))" psiphon-live.log 2>/dev/null | sed -n 's/.*flow via session \([0-9]*\).*/\1/p' | sort -u | wc -l | tr -d ' ' || true)
             FLOW_SERVERS="${FLOW_SERVERS:-0}"
-            if [ "$PAR_CODE" != 0 ] || [ "$PAR_BYTES" != 8000000 ]; then
-              echo "native pool parallel FAILED: curl exit $PAR_CODE after $PAR_BYTES of 8000000 B" >&2
+            if [ "$PAR_CODE" != 0 ] || [ "$PAR_BYTES" != 80000000 ]; then
+              echo "native pool parallel FAILED: curl exit $PAR_CODE after $PAR_BYTES of 80000000 B" >&2
               FAILED="$FAILED native(pool parallel)"
             fi
             if [ "$FLOW_SERVERS" -lt 2 ]; then
@@ -588,7 +588,7 @@ jobs:
           print("### Psiphon lane, live")
           print()
           print("The native lane and the pinned Go console client run back to back on")
-          print("the same runner and the same ports; each carries 1 MB through its")
+          print("the same runner and the same ports; each carries 10 MB through its")
           print("socks front, its HTTP front and a warm repeat. The native lane also")
           print("carries the mixed front, which gates but sits outside the CPU window.")
           print("The console client is pinned to the server and SSH/OSSH protocol the")
@@ -638,9 +638,9 @@ jobs:
           else:
               print("| RSS KiB after the legs | n/a | n/a | n/a |")
           if cpu_native is not None and cpu_reference is not None and cpu_native > 0:
-              print(f"| CPU s for 3 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
+              print(f"| CPU s for 30 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
           else:
-              print("| CPU s for 3 MB | n/a | n/a | n/a |")
+              print("| CPU s for 30 MB | n/a | n/a | n/a |")
           PY
           echo "Raw legs (label bytes seconds bytes/s):"
           cat psiphon-legs.tsv 2>/dev/null || true

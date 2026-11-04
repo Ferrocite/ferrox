@@ -6,7 +6,7 @@ use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use ferrox_core::tls::{ClientSession, RecordAlignment as _, TlsConfig, TlsProvider as _};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
@@ -20,6 +20,7 @@ const USER_AGENT: &str =
 
 /// One server entry's meek front.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Meek {
     pub(crate) dial: String,
     pub(crate) port: u16,
@@ -32,8 +33,11 @@ pub(crate) struct Meek {
     pub(crate) fronts: Vec<(String, u16)>,
     pub(crate) hosts: Vec<String>,
     pub(crate) https: bool,
+    pub(crate) quic: bool,
     pub(crate) fronted: bool,
     pub(crate) protocol: &'static str,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) dns: Vec<SocketAddr>,
 }
 
 /// Start the loopback relay and return the socket the SSH handshake rides.
@@ -131,6 +135,7 @@ fn relay(
 enum MeekStream {
     Plain(TcpStream),
     Tls(ClientSession<TcpStream>),
+    H3(Box<crate::psiphon_h3::H3>),
 }
 
 impl Read for MeekStream {
@@ -139,6 +144,7 @@ impl Read for MeekStream {
         match self {
             Self::Plain(stream) => stream.read(buf),
             Self::Tls(stream) => stream.read(buf),
+            Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
         }
     }
 }
@@ -149,6 +155,7 @@ impl Write for MeekStream {
         match self {
             Self::Plain(stream) => stream.write(buf),
             Self::Tls(stream) => stream.write(buf),
+            Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
         }
     }
 
@@ -157,6 +164,7 @@ impl Write for MeekStream {
         match self {
             Self::Plain(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
+            Self::H3(_) => Ok(()),
         }
     }
 }
@@ -168,6 +176,7 @@ impl MeekStream {
         match self {
             Self::Plain(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
             Self::Tls(stream) => stream.write_all_slices(parts),
+            Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
         }
     }
 
@@ -177,6 +186,7 @@ impl MeekStream {
             Self::Plain(stream) => stream,
             Self::Tls(stream) if stream.closed() => return true,
             Self::Tls(stream) => stream.get_ref(),
+            Self::H3(h3) => return h3.is_closed(),
         };
         if stream.set_nonblocking(true).is_err() {
             return false;
@@ -262,9 +272,25 @@ impl MeekHttp {
     /// Dial the next front and start a TLS session when required.
     fn open(&mut self) -> Result<(), String> {
         self.rotate_front();
-        let address = (self.meek.dial.as_str(), self.meek.port)
-            .to_socket_addrs()
+        if self.meek.quic && self.proxy.is_none() {
+            let sni = if self.meek.disable_sni {
+                String::new()
+            } else {
+                self.meek.sni.clone()
+            };
+            let h3 = crate::psiphon_h3::H3::connect(
+                &self.meek.dial,
+                self.meek.port,
+                &sni,
+                self.timeout,
+                &self.meek.dns,
+            )?;
+            self.stream = Some(MeekStream::H3(Box::new(h3)));
+            return Ok(());
+        }
+        let address = crate::psiphon_dns::resolve(&self.meek.dial, self.meek.port, &self.meek.dns)
             .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
+            .into_iter()
             .next()
             .ok_or_else(|| format!("psiphon meek resolve {}: no address", self.meek.dial))?;
         let stream = match &self.proxy {
@@ -343,22 +369,59 @@ impl MeekHttp {
             .cookie
             .as_ref()
             .map(|(name, value)| format!("{name}={value}"));
-        let mut headers = vec![
+        let mut host = self.meek.host.as_str();
+        let mut headers: Vec<(&str, &str)> = self
+            .meek
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                if name.eq_ignore_ascii_case("host") {
+                    host = value;
+                    None
+                } else {
+                    Some((name.as_str(), value.as_str()))
+                }
+            })
+            .collect();
+        for (name, value) in [
             ("Content-Type", "application/octet-stream"),
             ("User-Agent", USER_AGENT),
             ("Accept", "*/*"),
             ("Connection", "keep-alive"),
-        ];
-        if let Some(cookie) = cookie.as_deref() {
-            headers.push(("Cookie", cookie));
+        ] {
+            if !headers
+                .iter()
+                .any(|(have, _)| have.eq_ignore_ascii_case(name))
+            {
+                headers.push((name, value));
+            }
         }
-        let head = crate::foxy_account::request_head(
-            "POST",
-            &self.meek.host,
-            self.path,
-            &headers,
-            body.len(),
-        );
+        let combined_cookie;
+        if let Some(cookie) = cookie.as_deref() {
+            if let Some(index) = headers
+                .iter()
+                .position(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            {
+                combined_cookie = format!("{}; {cookie}", headers[index].1);
+                headers[index].1 = &combined_cookie;
+            } else {
+                headers.push(("Cookie", cookie));
+            }
+        }
+        if let Some(MeekStream::H3(h3)) = self.stream.as_mut() {
+            let headers: Vec<(&str, &str)> = headers
+                .iter()
+                .copied()
+                .filter(|(name, _)| !is_hop_by_hop(name))
+                .collect();
+            let reply = h3.round_trip(host, self.path, &headers, body, self.timeout)?;
+            if reply.status != 200 {
+                return Err(format!("psiphon meek status {}", reply.status));
+            }
+            self.absorb_cookie(&reply.headers);
+            return Ok(reply.body);
+        }
+        let head = crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
         let stream = self
             .stream
             .as_mut()
@@ -372,19 +435,7 @@ impl MeekHttp {
         if reply.status != 200 {
             return Err(format!("psiphon meek status {}", reply.status));
         }
-        if let Some((cookie_name, cookie_value)) = self.cookie.as_mut() {
-            for (name, value) in &reply.headers {
-                if !name.eq_ignore_ascii_case("set-cookie") {
-                    continue;
-                }
-                let pair = value.split(';').next().unwrap_or(value);
-                if let Some((name, value)) = pair.split_once('=') {
-                    if name.trim() == cookie_name {
-                        value.trim().clone_into(cookie_value);
-                    }
-                }
-            }
-        }
+        self.absorb_cookie(&reply.headers);
         if reply
             .header("connection")
             .is_some_and(|value| value.eq_ignore_ascii_case("close"))
@@ -393,6 +444,32 @@ impl MeekHttp {
         }
         Ok(reply.body)
     }
+
+    /// Take a renewed meek cookie from a response.
+    fn absorb_cookie(&mut self, headers: &[(String, String)]) {
+        let Some((cookie_name, cookie_value)) = self.cookie.as_mut() else {
+            return;
+        };
+        for (name, value) in headers {
+            if !name.eq_ignore_ascii_case("set-cookie") {
+                continue;
+            }
+            let pair = value.split(';').next().unwrap_or(value);
+            if let Some((name, value)) = pair.split_once('=') {
+                if name.trim() == cookie_name {
+                    value.trim().clone_into(cookie_value);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a header is connection-specific and must not cross HTTP/3.
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" | "host"
+    )
 }
 
 /// The protocol name the meek cookie reports, with the CDN marker removed.
@@ -464,8 +541,11 @@ mod tests {
             fronts: vec![("front.example".to_owned(), 443)],
             hosts: vec!["cdn.example".to_owned()],
             https: true,
+            quic: false,
             fronted: true,
             protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
         }
     }
 

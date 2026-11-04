@@ -5,7 +5,7 @@ use crate::psiphon_ssh::random;
 use crate::psiphon_ssh::Identity;
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -36,6 +36,7 @@ pub(crate) struct WebRtc {
     open: bool,
     buffer: Vec<u8>,
     events: VecDeque<Event>,
+    peer: Option<IpAddr>,
 }
 
 impl WebRtc {
@@ -44,6 +45,7 @@ impl WebRtc {
         destination: IpAddr,
         stun_servers: &[String],
         timeout: Duration,
+        servers: &[SocketAddr],
     ) -> Result<(Self, String), String> {
         let socket = bind_socket(destination)?;
         let local = socket
@@ -55,7 +57,7 @@ impl WebRtc {
         let _ = rtc.add_local_candidate(host);
         let stun_timeout = timeout.min(Duration::from_secs(3));
         for server in stun_servers.iter().take(2) {
-            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout) {
+            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, servers) {
                 if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
                     let _ = rtc.add_local_candidate(candidate);
                 }
@@ -79,6 +81,7 @@ impl WebRtc {
                 open: false,
                 buffer: vec![0u8; MAX_DATAGRAM],
                 events: VecDeque::new(),
+                peer: None,
             },
             offer.to_sdp_string(),
         ))
@@ -165,6 +168,11 @@ impl WebRtc {
         }
     }
 
+    /// The address the last peer datagram came from.
+    pub(crate) fn peer_ip(&self) -> Option<IpAddr> {
+        self.peer
+    }
+
     /// Move the engine onto a driver thread and expose it as an `io` stream.
     pub(crate) fn into_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
         WebRtcStream::spawn(self, timeout)
@@ -210,6 +218,7 @@ impl WebRtc {
             .map_err(|error| format!("psiphon webrtc timeout: {error}"))?;
         match self.socket.recv_from(&mut self.buffer) {
             Ok((length, source)) => {
+                self.peer = Some(source.ip());
                 let destination = self.local;
                 let input =
                     Receive::new(Protocol::Udp, source, destination, &self.buffer[..length])
@@ -274,25 +283,27 @@ fn stun_binding(
     local: SocketAddr,
     server: &str,
     timeout: Duration,
+    servers: &[SocketAddr],
 ) -> Result<Option<SocketAddr>, String> {
     let ipv6 = local.is_ipv6();
     let same_family = |address: &SocketAddr| address.is_ipv6() == ipv6;
-    let resolved = if let Ok(address) = server.parse::<SocketAddr>() {
-        Some(address).filter(same_family)
-    } else if let Some(address) = server
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.find(same_family))
-    {
-        Some(address)
+    let (host, port) = if let Ok(address) = server.parse::<SocketAddr>() {
+        (address.ip().to_string(), address.port())
+    } else if let Ok(address) = server.parse::<IpAddr>() {
+        (address.to_string(), 3478)
+    } else if let Some((host, port)) = server.rsplit_once(':') {
+        match port.parse::<u16>() {
+            Ok(port) => (host.trim_matches(['[', ']']).to_owned(), port),
+            Err(_) => (server.to_owned(), 3478),
+        }
     } else {
-        let host = server.trim_start_matches('[').trim_end_matches(']');
-        (host, 3478u16)
-            .to_socket_addrs()
-            .map_err(|error| format!("psiphon webrtc STUN {server}: {error}"))?
-            .find(same_family)
+        (server.to_owned(), 3478)
     };
-    let target = resolved.ok_or_else(|| format!("psiphon webrtc STUN {server}: no address"))?;
+    let target = crate::psiphon_dns::resolve(&host, port, servers)
+        .map_err(|error| format!("psiphon webrtc STUN {server}: {error}"))?
+        .into_iter()
+        .find(same_family)
+        .ok_or_else(|| format!("psiphon webrtc STUN {server}: no address"))?;
     let transaction = random::<12>();
     let mut request = Vec::with_capacity(20);
     request.extend_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
@@ -698,6 +709,49 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[derive(Clone, Copy)]
+struct Cidr {
+    base: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    fn parse(text: &str) -> Option<Self> {
+        let (address, prefix) = text.split_once('/')?;
+        let base = address.trim().parse::<IpAddr>().ok()?;
+        let prefix = prefix.trim().parse::<u8>().ok()?;
+        let width = if base.is_ipv4() { 32 } else { 128 };
+        (prefix <= width).then_some(Self { base, prefix })
+    }
+
+    fn contains(&self, address: IpAddr) -> bool {
+        match (self.base, address) {
+            (IpAddr::V4(base), IpAddr::V4(address)) => {
+                mask(u128::from(u32::from(base)), self.prefix, 32)
+                    == mask(u128::from(u32::from(address)), self.prefix, 32)
+            }
+            (IpAddr::V6(base), IpAddr::V6(address)) => {
+                mask(u128::from(base), self.prefix, 128)
+                    == mask(u128::from(address), self.prefix, 128)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn mask(value: u128, prefix: u8, width: u32) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        let bits = if width == 32 {
+            u128::from(u32::MAX)
+        } else {
+            u128::MAX
+        };
+        value & (bits << (width - u32::from(prefix)))
+    }
+}
+
 /// Everything one in-proxy dial needs: a broker, its fronts, and the compartments.
 pub(crate) struct Conduit {
     broker: Broker,
@@ -707,10 +761,15 @@ pub(crate) struct Conduit {
     stun_servers: Vec<String>,
     protocols: Vec<String>,
     timeout: Duration,
+    headers: Vec<(String, String)>,
+    dns: Vec<SocketAddr>,
+    reject: Vec<Cidr>,
+    geoip: Option<crate::psiphon_geoip::GeoIp>,
 }
 
 impl Conduit {
     /// Build a conduit from a tactics payload and the selected compartments.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         broker: Broker,
         fronts: Vec<Front>,
@@ -719,7 +778,21 @@ impl Conduit {
         stun_servers: Vec<String>,
         protocols: Vec<String>,
         timeout: Duration,
+        headers: Vec<(String, String)>,
+        dns: Vec<SocketAddr>,
+        reject_cidrs: &[String],
+        geoip: Option<crate::psiphon_geoip::GeoIp>,
     ) -> Self {
+        let reject = reject_cidrs
+            .iter()
+            .filter_map(|text| {
+                let cidr = Cidr::parse(text);
+                if cidr.is_none() {
+                    eprintln!("psiphon conduit: ignoring invalid CIDR {text:?}");
+                }
+                cidr
+            })
+            .collect();
         Self {
             broker,
             fronts,
@@ -728,6 +801,10 @@ impl Conduit {
             stun_servers,
             protocols,
             timeout,
+            headers,
+            dns,
+            reject,
+            geoip,
         }
     }
 
@@ -741,7 +818,10 @@ impl Conduit {
         if self.fronts.is_empty() {
             return Err("psiphon conduit: no broker front".to_owned());
         }
-        if !matches!(destination.base_protocol(), "OSSH" | "SSH" | "TLS-OSSH") {
+        if !matches!(
+            destination.base_protocol(),
+            "OSSH" | "SSH" | "TLS-OSSH" | "SHADOWSOCKS-OSSH"
+        ) {
             return Err(format!(
                 "psiphon conduit: {} is not carried by this lane",
                 destination.protocol
@@ -761,14 +841,22 @@ impl Conduit {
         let metrics = Metrics::from_identity(identity);
         let mut why = String::new();
         for front in &self.fronts {
-            let (mut webrtc, sdp) = match WebRtc::offer(address, &self.stun_servers, self.timeout) {
-                Ok(offer) => offer,
-                Err(error) => {
-                    why = error;
-                    continue;
-                }
-            };
-            let mut client = match Client::connect(self.broker.clone(), front, self.timeout, None) {
+            let (mut webrtc, sdp) =
+                match WebRtc::offer(address, &self.stun_servers, self.timeout, &self.dns) {
+                    Ok(offer) => offer,
+                    Err(error) => {
+                        why = error;
+                        continue;
+                    }
+                };
+            let mut client = match Client::connect(
+                self.broker.clone(),
+                front,
+                self.timeout,
+                None,
+                &self.headers,
+                &self.dns,
+            ) {
                 Ok(client) => client,
                 Err(error) => {
                     why = error;
@@ -802,6 +890,18 @@ impl Conduit {
             if let Err(error) = webrtc.await_channel(self.timeout) {
                 why = error;
                 continue;
+            }
+            if !self.reject.is_empty() || self.geoip.is_some() {
+                let Some(peer) = webrtc.peer_ip() else {
+                    why = String::from("psiphon conduit: peer address was not observed");
+                    continue;
+                };
+                if self.reject.iter().any(|cidr| cidr.contains(peer))
+                    || self.geoip.as_ref().is_some_and(|geoip| geoip.rejects(peer))
+                {
+                    why = format!("psiphon conduit: rejected in-proxy {peer}");
+                    continue;
+                }
             }
             let stream = webrtc.into_stream(self.timeout)?;
             return Ok((
@@ -844,6 +944,18 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cidr_matches_only_its_own_family_and_prefix() {
+        let cidr = Cidr::parse("192.0.2.0/24").expect("CIDR");
+        assert!(cidr.contains("192.0.2.55".parse().expect("IP")));
+        assert!(!cidr.contains("198.51.100.1".parse().expect("IP")));
+        assert!(!cidr.contains("2001:db8::1".parse().expect("IP")));
+        let cidr = Cidr::parse("2001:db8::/32").expect("CIDR");
+        assert!(cidr.contains("2001:db8:1::1".parse().expect("IP")));
+        assert!(!cidr.contains("2001:db9::1".parse().expect("IP")));
+        assert!(Cidr::parse("192.0.2.0/33").is_none());
+    }
 
     #[test]
     fn an_xor_mapped_address_is_unmasked() {
@@ -901,9 +1013,13 @@ mod tests {
 
     #[test]
     fn a_loopback_peer_opens_the_data_channel() {
-        let (mut client, offer) =
-            WebRtc::offer(IpAddr::V4(Ipv4Addr::LOCALHOST), &[], Duration::from_secs(1))
-                .expect("offer");
+        let (mut client, offer) = WebRtc::offer(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[],
+            Duration::from_secs(1),
+            &[],
+        )
+        .expect("offer");
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .expect("remote socket");
         let local = socket.local_addr().expect("remote local");
@@ -983,9 +1099,13 @@ mod tests {
 
     #[test]
     fn a_private_offer_names_a_data_channel() {
-        let (webrtc, sdp) =
-            WebRtc::offer(IpAddr::V4(Ipv4Addr::LOCALHOST), &[], Duration::from_secs(1))
-                .expect("offer");
+        let (webrtc, sdp) = WebRtc::offer(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[],
+            Duration::from_secs(1),
+            &[],
+        )
+        .expect("offer");
         assert!(sdp.contains("m=application"));
         assert!(webrtc.socket.local_addr().is_ok());
     }
