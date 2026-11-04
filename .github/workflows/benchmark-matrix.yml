@@ -267,7 +267,7 @@ jobs:
               --readme docs/benchmarks/matrix.md \
               --runner "$slug" \
               "${previous[@]}"
-            cp "$bundle/manifest.txt" "$bundle/README.md" "$results/"
+            cp "$bundle/manifest.txt" "$results/"
             cp "$results/matrix-results.json" "$dest/"
             cp "$bundle/table.md" "$bundle/table.csv" "$bundle/distribution.csv" "$results/"
             cp "$bundle/table.md" "$bundle/table.csv" "$bundle/distribution.csv" "$dest/"
