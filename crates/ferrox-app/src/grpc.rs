@@ -4973,9 +4973,9 @@ mod tests {
         assert!(lanes >= 1, "the sealed demux never reached the lane pool");
         let grown = crate::conn::live_threads().saturating_sub(before);
         assert!(
-            grown <= crate::proxy::lane_pool::DEMUX_LANES + 1,
+            grown <= crate::proxy::lane_pool::demux_lanes() + 1,
             "sixteen sealed demuxes grew the process by {grown} threads past the demux pool's {} lanes and its reaper",
-            crate::proxy::lane_pool::DEMUX_LANES
+            crate::proxy::lane_pool::demux_lanes()
         );
     }
 }
