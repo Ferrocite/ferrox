@@ -1648,23 +1648,26 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
     match kind {
         T_HEADERS => {
             let mut block = body;
-            let mut skip = 0;
+            let mut start = 0;
+            let mut end = block.len();
             if flags & F_PADDED != 0 {
                 let Some(&pad) = block.first() else {
                     return true;
                 };
-                skip = 1 + pad as usize;
-                if skip > block.len() {
-                    return true;
-                }
+                start = 1;
+                end = match block.len().checked_sub(pad as usize) {
+                    Some(end) if end >= start => end,
+                    _ => return true,
+                };
             }
             if flags & F_PRIORITY != 0 {
-                skip += 5;
-                if skip > block.len() {
+                start += 5;
+                if start > end {
                     return true;
                 }
             }
-            block.drain(..skip);
+            block.truncate(end);
+            block.drain(..start);
             let end_stream = flags & F_END != 0;
             if flags & F_END_HEADERS != 0 {
                 *conn
@@ -4306,6 +4309,43 @@ mod tests {
         let (conn, state, _) = reading_conn(Box::new(Silent));
         assert!(client_frame(&conn, T_HEADERS, 0, 1, Vec::new()));
         assert!(client_frame(&conn, T_CONT, F_END_HEADERS, 1, vec![0x8d]));
+        assert_eq!(
+            state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .status,
+            Some(404)
+        );
+    }
+
+    /// Padding sits at the end of a `HEADERS` frame, behind the priority fields: only the pad length
+    /// octet and the priority are skipped from the front, and the padding is cut from the tail.
+    #[test]
+    fn a_padded_response_head_keeps_its_status() {
+        let (conn, state, _) = reading_conn(Box::new(Silent));
+        assert!(client_frame(
+            &conn,
+            T_HEADERS,
+            F_END_HEADERS | F_PADDED,
+            1,
+            vec![3, 0x88, 0, 0, 0]
+        ));
+        assert_eq!(
+            state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .status,
+            Some(200)
+        );
+        assert!(client_frame(
+            &conn,
+            T_HEADERS,
+            F_END_HEADERS | F_PADDED | F_PRIORITY,
+            1,
+            vec![2, 0, 0, 0, 0, 0x10, 0x8d, 0, 0]
+        ));
         assert_eq!(
             state
                 .state
