@@ -1095,6 +1095,9 @@ impl GrpcWriter {
                 if Instant::now() >= deadline {
                     return false;
                 }
+                if !batch.flush_blocking(&self.shared) {
+                    return false;
+                }
                 self.wait_for_room(crate::budgets::RELAY_POLL);
                 continue;
             }
@@ -1607,7 +1610,7 @@ fn multi_payload(cap: u64) -> usize {
         if total <= max {
             return payload;
         }
-        payload = payload.saturating_sub(total - max);
+        payload = payload.saturating_sub(1);
         if payload == 0 {
             return 1;
         }
@@ -3942,7 +3945,9 @@ mod tests {
     /// fit; a fixed frame-width margin would leave room unused.
     #[test]
     fn a_multi_element_uses_the_envelope_the_peer_pays_for() {
-        for cap in [8u64, 9, 127, 128, 16_383, 16_384, 40_000, 65_535] {
+        for cap in [
+            8u64, 9, 127, 128, 134, 16_383, 16_384, 16_390, 40_000, 65_535,
+        ] {
             let payload = multi_payload(cap);
             let fits = 6 + varint_len(payload as u64) + payload;
             assert!(
