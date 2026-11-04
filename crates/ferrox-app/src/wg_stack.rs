@@ -86,9 +86,6 @@ const RX_BURST: usize = 256;
 const TX_BURST: usize = 128;
 /// The most server datagram lanes one inbound may hold.
 const UDP_FLOWS: usize = 4096;
-/// The most stacks one server inbound may drive at once: each shard is a whole
-/// `smoltcp` interface, so this bounds the memory and threads a tunnel owns.
-const SERVER_SHARDS: usize = 4;
 
 /// One decrypted inner packet and the peer that authenticated it.
 pub(crate) struct Packet {
@@ -542,46 +539,6 @@ pub(crate) fn server(
     out: Outbound,
     headroom: usize,
 ) {
-    let shards = std::thread::available_parallelism()
-        .map(|cpus| cpus.get())
-        .unwrap_or(1)
-        .clamp(1, SERVER_SHARDS);
-    if shards == 1 {
-        run_server(config, to_tunnel.into(), packets, out, headroom);
-        return;
-    }
-    let to_tunnel: ToTunnel = to_tunnel.into();
-    let mut senders = Vec::with_capacity(shards);
-    let mut workers = Vec::with_capacity(shards);
-    for _ in 0..shards {
-        let (sender, packets) = mpsc::channel();
-        senders.push(sender);
-        let config = config.clone();
-        let to_tunnel = to_tunnel.clone();
-        let out = out.clone();
-        workers.push(std::thread::spawn(move || {
-            run_server(config, to_tunnel, packets, out, headroom);
-        }));
-    }
-    while let Ok(packet) = packets.recv() {
-        let shard = usize::try_from(flow_hash(&packet.bytes) % shards as u64).unwrap_or(0);
-        if senders[shard].send(packet).is_err() {
-            break;
-        }
-    }
-    drop(senders);
-    for worker in workers {
-        let _ = worker.join();
-    }
-}
-
-fn run_server(
-    config: DeviceConfig,
-    to_tunnel: ToTunnel,
-    packets: Packets,
-    out: Outbound,
-    headroom: usize,
-) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -589,44 +546,6 @@ fn run_server(
             return;
         }
     }
-}
-
-/// Mix one inner packet's addresses, ports and protocol so two flows that differ
-/// only by a port land on different server stacks.
-fn flow_hash(packet: &[u8]) -> u64 {
-    let (addressed, protocol, transport) = match packet.first().map(|byte| byte >> 4) {
-        Some(4) => {
-            let header = usize::from(packet.first().copied().unwrap_or(0) & 0x0f) * 4;
-            if header < IPV4_HEADER || packet.len() < header {
-                return 0;
-            }
-            (&packet[12..20], packet[9], header)
-        }
-        Some(6) => {
-            if packet.len() < IPV6_HEADER {
-                return 0;
-            }
-            (&packet[8..40], packet[6], IPV6_HEADER)
-        }
-        _ => return 0,
-    };
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in addressed {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash ^= u64::from(protocol);
-    if matches!(protocol, PROTOCOL_TCP | PROTOCOL_UDP) {
-        if let Some(ports) = packet.get(transport..transport + 4) {
-            for &byte in ports {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-    }
-    hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    hash ^ (hash >> 33)
 }
 
 /// One server turn, or true once the inbound is closed.
@@ -1878,17 +1797,6 @@ fn icmp_mtu(packet: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_flow_hash_moves_with_its_transport_ports() {
-        let source = [10, 0, 0, 2];
-        let destination = [10, 0, 0, 1];
-        let first = tcp_segment(source, 40_000, destination, 443, 1, 0, 0x02);
-        let second = tcp_segment(source, 40_001, destination, 443, 1, 0, 0x02);
-        assert_eq!(flow_hash(&first), flow_hash(&first));
-        assert_ne!(flow_hash(&first), flow_hash(&second));
-        assert_eq!(flow_hash(&[]), 0);
-    }
 
     #[test]
     fn listeners_share_one_total_budget_and_expire() {
