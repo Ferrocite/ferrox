@@ -56,6 +56,9 @@ pub(crate) struct Tail<V> {
     len: usize,
 }
 
+/// The fixed cost of the split pass is higher than a short memcpy, so shorter inputs keep the copy the fused loop used to stage.
+const SOURCE_SEAL_MIN: usize = 4096;
+
 impl<V: Lanes> Tail<V> {
     #[inline(always)]
     pub(crate) fn new() -> Self {
@@ -576,10 +579,14 @@ impl Aes128Gcm {
         }
     }
 
-    /// Seal `src` into `dst` without a staging copy: the CTR pass reads plaintext and writes ciphertext where the caller wants it, and GHASH authenticates the bytes it just wrote. `src` and `dst` must be equal-length and must not overlap.
+    /// Seal `src` into `dst` without a staging copy: the CTR pass reads plaintext and writes ciphertext where the caller wants it, and GHASH authenticates the bytes it just wrote. Short messages stage the copy the fused path's fixed cost makes cheaper. `src` and `dst` must be equal-length and must not overlap.
     #[must_use]
     pub fn seal_from(&self, nonce: &[u8; 12], aad: &[u8], src: &[u8], dst: &mut [u8]) -> [u8; 16] {
         assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        if src.len() < SOURCE_SEAL_MIN {
+            dst.copy_from_slice(src);
+            return self.seal_in_place(nonce, aad, dst);
+        }
         assert!(
             (dst.len() as u64) <= (u64::from(u32::MAX) - 1) * 16,
             "GCM plaintext is at most 2^32 - 2 blocks"
@@ -1020,10 +1027,14 @@ impl Aes256Gcm {
         }
     }
 
-    /// Seal `src` into `dst` without a staging copy: the CTR pass reads plaintext and writes ciphertext where the caller wants it, and GHASH authenticates the bytes it just wrote. `src` and `dst` must be equal-length and must not overlap.
+    /// Seal `src` into `dst` without a staging copy: the CTR pass reads plaintext and writes ciphertext where the caller wants it, and GHASH authenticates the bytes it just wrote. Short messages stage the copy the fused path's fixed cost makes cheaper. `src` and `dst` must be equal-length and must not overlap.
     #[must_use]
     pub fn seal_from(&self, nonce: &[u8; 12], aad: &[u8], src: &[u8], dst: &mut [u8]) -> [u8; 16] {
         assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        if src.len() < SOURCE_SEAL_MIN {
+            dst.copy_from_slice(src);
+            return self.seal_in_place(nonce, aad, dst);
+        }
         assert!(
             (dst.len() as u64) <= (u64::from(u32::MAX) - 1) * 16,
             "GCM plaintext is at most 2^32 - 2 blocks"
