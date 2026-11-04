@@ -33,8 +33,9 @@ vless-xhttp-duplex-8|server-threads|1.29|696
 vless-xhttp-down-8|server-threads|1.27|696
 vmess-tls-ws-down-8|server-threads|1.54|696
 # 1.21 predates the window that ends at the sink's last byte. The corrected window reads 19-23
-# threads against the reference's 14 (1.36-1.53 over three runs), the same structural gap its grpc
-# siblings file at 1.54-1.67; filed at the top of the observed range because the peak's spread is
-# wider than the 0.10 tolerance.
-vless-grpc-duplex-8|server-threads|1.53|1276
+# threads against the reference's 13-15, so the medians land at 1.27, 1.36, 1.50 and 1.53 across
+# four runs; the worst pairing of the observed medians is 23/14, filed here because the peak's
+# spread is wider than the 0.10 tolerance. The gap itself is the one its grpc siblings file at
+# 1.54-1.67.
+vless-grpc-duplex-8|server-threads|1.64|1276
 vless-grpc-duplex-8|server-cpu|5.77|1276
