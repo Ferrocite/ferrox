@@ -1002,6 +1002,7 @@ fn io(
     let mut buf = vec![0u8; 65_535];
     let mut incoming = Vec::new();
     let mut events = Vec::new();
+    let mut sends = Vec::new();
     loop {
         if stop
             .as_ref()
@@ -1010,11 +1011,26 @@ fn io(
             return;
         }
         let now = started.elapsed().as_millis() as u64;
+        let mut pending = None;
         for _ in 0..TX_DRAIN {
             let packet = match from_tunnel.try_recv() {
                 Ok(packet) => packet,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(index) = pending {
+                        flush(
+                            &mut events,
+                            &socket,
+                            &to_stack,
+                            routes.as_ref(),
+                            &peers,
+                            Some(index),
+                            ipv6_socket,
+                            &mut sends,
+                        );
+                    }
+                    return;
+                }
             };
             if packet.len() < WG_HEADER_SIZE {
                 continue;
@@ -1026,9 +1042,26 @@ fn io(
             let Some(index) = peer_for(&peers, destination) else {
                 continue;
             };
+            if pending != Some(index) {
+                if let Some(previous) = pending {
+                    flush(
+                        &mut events,
+                        &socket,
+                        &to_stack,
+                        routes.as_ref(),
+                        &peers,
+                        Some(previous),
+                        ipv6_socket,
+                        &mut sends,
+                    );
+                }
+                pending = Some(index);
+            }
             peers[index]
                 .tunnel
                 .send_prefixed(now, packet, WG_HEADER_SIZE, &mut events);
+        }
+        if let Some(index) = pending {
             flush(
                 &mut events,
                 &socket,
@@ -1037,6 +1070,7 @@ fn io(
                 &peers,
                 Some(index),
                 ipv6_socket,
+                &mut sends,
             );
         }
         for index in 0..peers.len() {
@@ -1049,6 +1083,7 @@ fn io(
                 &peers,
                 Some(index),
                 ipv6_socket,
+                &mut sends,
             );
         }
 
@@ -1069,6 +1104,7 @@ fn io(
                         &mut incoming,
                         routes.as_ref(),
                         ipv6_socket,
+                        &mut sends,
                     );
                     received += 1;
                     if received >= RX_BURST {
@@ -1120,13 +1156,14 @@ fn receive_datagram(
     incoming: &mut Vec<Event>,
     routes: Option<&UdpRoutes>,
     ipv6_socket: bool,
+    sends: &mut Vec<Vec<u8>>,
 ) {
     let kind = u32::from(packet[0]);
     if kind == TYPE_INITIATION && packet.len() == INITIATION_SIZE {
         let under_load = cookies.observe(now);
         clear_reserved(packet);
         handle_initiation(
-            peers, now, source, &*packet, socket, to_stack, cookies, under_load,
+            peers, now, source, &*packet, socket, to_stack, cookies, under_load, sends,
         );
         return;
     }
@@ -1144,6 +1181,7 @@ fn receive_datagram(
         peers,
         Some(index),
         ipv6_socket,
+        sends,
     );
 }
 
@@ -1163,6 +1201,7 @@ fn handle_initiation(
     to_stack: &Sender<Packet>,
     cookies: &mut CookieGuard,
     under_load: bool,
+    sends: &mut Vec<Vec<u8>>,
 ) {
     let Some(peer) = peers.first() else {
         return;
@@ -1207,12 +1246,14 @@ fn handle_initiation(
         peers,
         Some(index),
         ipv6,
+        sends,
     );
 }
 
 /// Send every event, and for each decrypted payload require the authenticating
 /// peer to own the source by longest allowed prefix before the upper layer sees
 /// it.
+#[allow(clippy::too_many_arguments)]
 fn flush(
     events: &mut Vec<Event>,
     socket: &UdpSocket,
@@ -1221,19 +1262,34 @@ fn flush(
     peers: &[Peer],
     peer: Option<usize>,
     ipv6_socket: bool,
+    sends: &mut Vec<Vec<u8>>,
 ) {
+    let candidates = peer.map(|index| peers[index].config.endpoints.as_slice());
+    let mut endpoint = None;
     for event in events.drain(..) {
         match event {
-            Event::Send { endpoint, packet } => {
-                send_packet(
-                    socket,
-                    ipv6_socket,
-                    endpoint,
-                    &packet,
-                    peer.map(|index| peers[index].config.endpoints.as_slice()),
-                );
+            Event::Send {
+                endpoint: to,
+                packet,
+            } => {
+                if is_initiation(&packet) {
+                    flush_sends(socket, ipv6_socket, endpoint, sends);
+                    endpoint = None;
+                    send_packet(socket, ipv6_socket, to, &packet, candidates);
+                } else if ipv6_socket || to.is_ipv4() {
+                    if endpoint != Some(to) {
+                        flush_sends(socket, ipv6_socket, endpoint, sends);
+                        endpoint = Some(to);
+                    }
+                    sends.push(packet);
+                    if sends.len() == SEND_BATCH {
+                        flush_sends(socket, ipv6_socket, endpoint, sends);
+                    }
+                }
             }
             Event::Data(inner) => {
+                flush_sends(socket, ipv6_socket, endpoint, sends);
+                endpoint = None;
                 let Some(index) = peer else {
                     continue;
                 };
@@ -1259,6 +1315,88 @@ fn flush(
                 });
             }
         }
+    }
+    flush_sends(socket, ipv6_socket, endpoint, sends);
+}
+
+/// The most transport packets one `sendmmsg` carries. A batch that cannot be
+/// taken whole falls back to the socket for the rest, so a full queue still
+/// names every packet.
+const SEND_BATCH: usize = 64;
+
+fn flush_sends(
+    socket: &UdpSocket,
+    ipv6: bool,
+    endpoint: Option<SocketAddr>,
+    sends: &mut Vec<Vec<u8>>,
+) {
+    if sends.is_empty() {
+        return;
+    }
+    let Some(endpoint) = endpoint else {
+        sends.clear();
+        return;
+    };
+    if ipv6 || endpoint.is_ipv4() {
+        send_batch(socket, ipv6, endpoint, sends);
+    }
+    sends.clear();
+}
+
+#[cfg(target_os = "linux")]
+fn send_batch(socket: &UdpSocket, _ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
+    use std::os::fd::AsRawFd as _;
+
+    debug_assert!(packets.len() <= SEND_BATCH);
+    let to = send_endpoint(endpoint, _ipv6);
+    let (storage, name_len) = crate::proxy::sockaddr_of(to);
+    let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    });
+    // SAFETY: a zeroed `mmsghdr` is the empty header the loop fills below.
+    let mut headers: [libc::mmsghdr; SEND_BATCH] =
+        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    for (at, packet) in packets.iter().enumerate() {
+        iovecs[at].iov_base = packet.as_ptr().cast_mut().cast();
+        iovecs[at].iov_len = packet.len();
+        headers[at].msg_hdr = libc::msghdr {
+            msg_name: (&raw const storage).cast_mut().cast(),
+            msg_namelen: name_len,
+            msg_iov: (&raw mut iovecs[at]).cast(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+    }
+    let mut done = 0;
+    while done < packets.len() {
+        // SAFETY: every header names the one iovec and packet at the same index,
+        // `storage` outlives the call, and only the entries from `done` are named.
+        let sent = unsafe {
+            libc::sendmmsg(
+                socket.as_raw_fd(),
+                headers[done..].as_mut_ptr(),
+                (packets.len() - done) as libc::c_uint,
+                0,
+            )
+        };
+        if sent <= 0 {
+            break;
+        }
+        done += usize::try_from(sent).unwrap_or(0);
+    }
+    for packet in &packets[done..] {
+        let _ = socket.send_to(packet, to);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
+    let to = send_endpoint(endpoint, ipv6);
+    for packet in packets {
+        let _ = socket.send_to(packet, to);
     }
 }
 
@@ -1374,6 +1512,11 @@ fn widen(socket: &UdpSocket) {
 /// Send a handshake to every configured endpoint candidate, so a name that
 /// resolves to two families or two hosts is raced; data follows the endpoint
 /// the responder pinned.
+fn is_initiation(packet: &[u8]) -> bool {
+    packet.len() == INITIATION_SIZE
+        && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_INITIATION
+}
+
 fn send_packet(
     socket: &UdpSocket,
     ipv6: bool,
@@ -1381,9 +1524,7 @@ fn send_packet(
     packet: &[u8],
     candidates: Option<&[SocketAddr]>,
 ) {
-    let initiation = packet.len() == INITIATION_SIZE
-        && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_INITIATION;
-    if initiation {
+    if is_initiation(packet) {
         if ipv6 || endpoint.is_ipv4() {
             let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
         }
@@ -1480,6 +1621,7 @@ mod tests {
             &peers,
             Some(1),
             false,
+            &mut Vec::new(),
         );
         assert!(packets.try_recv().is_err(), "the owner is peer zero");
         let mut packet = vec![0u8; 20];
@@ -1494,8 +1636,33 @@ mod tests {
             &peers,
             Some(1),
             false,
+            &mut Vec::new(),
         );
         assert!(packets.try_recv().is_ok(), "the peer owns its own source");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_sends_every_transport_packet_in_order() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        send_batch(
+            &sender,
+            false,
+            receiver.local_addr().expect("address"),
+            &packets,
+        );
+        let mut got = Vec::new();
+        for _ in 0..packets.len() {
+            let mut buf = [0u8; 64];
+            let (n, _) = receiver.recv_from(&mut buf).expect("datagram");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, packets);
     }
 
     #[test]
@@ -2207,6 +2374,7 @@ mod tests {
             &to_stack,
             &mut guard,
             true,
+            &mut Vec::new(),
         );
 
         let mut cookie = [0u8; 64];
@@ -2233,6 +2401,7 @@ mod tests {
             &to_stack,
             &mut guard,
             true,
+            &mut Vec::new(),
         );
 
         let mut answer = [0u8; 128];
