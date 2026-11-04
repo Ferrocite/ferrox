@@ -28,6 +28,7 @@ use rustls::{DigitallySignedStruct, Side, SignatureScheme};
 use sha2::Sha256;
 
 use crate::psiphon_ssh::{tls_passthrough, tls_passthrough_key, Proxy, Server};
+use crate::psiphon_webrtc::WebRtcStream;
 
 const READ_WAIT: Duration = Duration::from_millis(2);
 const KEEPALIVE: Duration = Duration::from_secs(15);
@@ -181,8 +182,64 @@ impl Clone for QuicStream {
     }
 }
 
+/// The obfuscation mode, proof key and packet key an entry selects.
+fn quic_parameters(server: &Server) -> Result<(bool, bool, &str, [u8; 32]), String> {
+    let version = if server.quic_versions.is_empty() {
+        SUPPORTED_QUIC_VERSIONS
+            [bounded_random(SUPPORTED_QUIC_VERSIONS.len()).map_err(|error| error.to_string())?]
+    } else {
+        server
+            .quic_versions
+            .iter()
+            .map(String::as_str)
+            .find(|version| SUPPORTED_QUIC_VERSIONS.contains(version))
+            .ok_or_else(|| {
+                "psiphon quic: the entry does not allow a supported QUIC mode".to_owned()
+            })?
+    };
+    let obfuscated = matches!(version, "OBFUSCATED-QUICv1" | "DECOY-QUICv1");
+    let decoy = version == "DECOY-QUICv1";
+    let proof_key = tls_passthrough_key(server);
+    if proof_key.is_empty() {
+        return Err("psiphon quic: entry has no passthrough key".to_owned());
+    }
+    let packet_key = if obfuscated {
+        let key = server
+            .obfuscation_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| "psiphon quic: entry has no obfuscation key".to_owned())?;
+        packet_key(key)?
+    } else {
+        [0u8; 32]
+    };
+    Ok((obfuscated, decoy, proof_key, packet_key))
+}
+
+/// Wrap a packet source in the entry's QUIC obfuscation layer.
+fn packet_io(
+    io: PacketIo,
+    obfuscated: bool,
+    decoy: bool,
+    packet_key: [u8; 32],
+) -> Result<Udp, String> {
+    if !obfuscated {
+        return Ok(Udp::Plain(io));
+    }
+    Ok(Udp::Obfuscated(ObfuscatedUdp {
+        io,
+        key: packet_key,
+        nonce: [0u8; 12],
+        decoy: if decoy {
+            Some(u8::try_from(bounded_random(10).map_err(|error| error.to_string())?).unwrap_or(0))
+        } else {
+            None
+        },
+    }))
+}
+
 impl QuicStream {
-    #[allow(clippy::too_many_lines)]
+    /// Dial a direct QUIC-OSSH server over a UDP socket.
     pub(crate) fn connect(
         server: &Server,
         timeout: Duration,
@@ -191,35 +248,7 @@ impl QuicStream {
         if proxy.is_some() {
             return Err("psiphon quic: an upstream proxy cannot carry UDP QUIC".to_owned());
         }
-        let version = if server.quic_versions.is_empty() {
-            SUPPORTED_QUIC_VERSIONS[bounded_random(SUPPORTED_QUIC_VERSIONS.len())
-                .map_err(|error| error.to_string())?]
-        } else {
-            server
-                .quic_versions
-                .iter()
-                .map(String::as_str)
-                .find(|version| SUPPORTED_QUIC_VERSIONS.contains(version))
-                .ok_or_else(|| {
-                    "psiphon quic: the entry does not allow a supported QUIC mode".to_owned()
-                })?
-        };
-        let obfuscated = matches!(version, "OBFUSCATED-QUICv1" | "DECOY-QUICv1");
-        let decoy = version == "DECOY-QUICv1";
-        let proof_key = tls_passthrough_key(server);
-        if proof_key.is_empty() {
-            return Err("psiphon quic: entry has no passthrough key".to_owned());
-        }
-        let packet_key = if obfuscated {
-            let key = server
-                .obfuscation_key
-                .as_deref()
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| "psiphon quic: entry has no obfuscation key".to_owned())?;
-            packet_key(key)?
-        } else {
-            [0u8; 32]
-        };
+        let (obfuscated, decoy, proof_key, packet_key) = quic_parameters(server)?;
         let remote = SocketAddr::new(server.address, server.port);
         let bind = if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -240,25 +269,30 @@ impl QuicStream {
                     .map_err(|error| format!("psiphon quic noise {remote}: {error}"))?;
             }
         }
+        let udp = packet_io(PacketIo::Socket(socket), obfuscated, decoy, packet_key)?;
+        Self::connect_over(udp, remote, timeout, proof_key)
+    }
 
-        let mut udp = if obfuscated {
-            Udp::Obfuscated(ObfuscatedUdp {
-                socket,
-                key: packet_key,
-                nonce: [0u8; 12],
-                decoy: if decoy {
-                    Some(
-                        u8::try_from(bounded_random(10).map_err(|error| error.to_string())?)
-                            .unwrap_or(0),
-                    )
-                } else {
-                    None
-                },
-            })
-        } else {
-            Udp::Plain(socket)
-        };
+    /// Dial QUIC-OSSH through an in-proxy WebRTC data channel.
+    pub(crate) fn connect_inproxy(
+        server: &Server,
+        timeout: Duration,
+        stream: WebRtcStream,
+    ) -> Result<Self, String> {
+        let (obfuscated, decoy, proof_key, packet_key) = quic_parameters(server)?;
+        let remote = SocketAddr::new(server.address, server.port);
+        stream.set_timeout(Some(timeout));
+        let udp = packet_io(PacketIo::WebRtc(stream), obfuscated, decoy, packet_key)?;
+        Self::connect_over(udp, remote, timeout, proof_key)
+    }
 
+    /// Complete the QUIC handshake over a packet source and start its driver.
+    fn connect_over(
+        mut udp: Udp,
+        remote: SocketAddr,
+        timeout: Duration,
+        proof_key: &str,
+    ) -> Result<Self, String> {
         let mut engine = Engine::new(proof_key)?;
         let deadline = Instant::now() + timeout;
         let mut datagram = vec![0u8; 65535];
@@ -513,37 +547,66 @@ fn wait_writable<'a>(
     (next, result.timed_out())
 }
 
+enum PacketIo {
+    Socket(UdpSocket),
+    WebRtc(WebRtcStream),
+}
+
+impl PacketIo {
+    fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.send(plain),
+            Self::WebRtc(stream) => stream.write(plain),
+        }
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.recv(buf),
+            Self::WebRtc(stream) => stream.read(buf),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) {
+        match self {
+            Self::Socket(socket) => {
+                let _ = socket.set_read_timeout(timeout);
+            }
+            Self::WebRtc(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+}
+
 enum Udp {
     Obfuscated(ObfuscatedUdp),
-    Plain(UdpSocket),
+    Plain(PacketIo),
 }
 
 impl Udp {
     fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
         match self {
             Self::Obfuscated(udp) => udp.send(plain),
-            Self::Plain(socket) => socket.send(plain),
+            Self::Plain(io) => io.send(plain),
         }
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Obfuscated(udp) => udp.recv(buf),
-            Self::Plain(socket) => socket.recv(buf),
+            Self::Plain(io) => io.recv(buf),
         }
     }
 
     fn set_read_timeout(&self, timeout: Option<Duration>) {
-        let socket = match self {
-            Self::Obfuscated(udp) => &udp.socket,
-            Self::Plain(socket) => socket,
-        };
-        let _ = socket.set_read_timeout(timeout);
+        match self {
+            Self::Obfuscated(udp) => udp.io.set_read_timeout(timeout),
+            Self::Plain(io) => io.set_read_timeout(timeout),
+        }
     }
 }
 
 struct ObfuscatedUdp {
-    socket: UdpSocket,
+    io: PacketIo,
     key: [u8; 32],
     nonce: [u8; 12],
     decoy: Option<u8>,
@@ -572,7 +635,7 @@ impl ObfuscatedUdp {
             let mut cipher = ChaCha20::new(&self.key.into(), &self.nonce.into());
             cipher.apply_keystream(&mut framed[12..end]);
             if !looks_like_quic_initial(&framed[..end]) {
-                self.socket.send(&framed[..end])?;
+                self.io.send(&framed[..end])?;
                 return Ok(plain.len());
             }
         }
@@ -580,7 +643,7 @@ impl ObfuscatedUdp {
 
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let count = self.socket.recv(buf)?;
+            let count = self.io.recv(buf)?;
             if let Some(left) = self.decoy.as_mut() {
                 if *left > 0 && bounded_random(2)? == 1 {
                     *left -= 1;
@@ -588,7 +651,7 @@ impl ObfuscatedUdp {
                     let mut decoy = [0u8; PADDING_LIMIT];
                     getrandom::fill(&mut decoy[..length])
                         .map_err(|_| io::Error::other("psiphon quic decoy"))?;
-                    let _ = self.socket.send(&decoy[..length]);
+                    let _ = self.io.send(&decoy[..length]);
                 }
             }
             if count < OBFUSCATION_OVERHEAD {
@@ -1959,7 +2022,7 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 
 #[cfg(test)]
 mod tests {
-    use super::{ObfuscatedUdp, QuicNoise, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD};
+    use super::{ObfuscatedUdp, PacketIo, QuicNoise, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD};
     use std::net::UdpSocket;
     use std::time::Duration;
 
@@ -2010,13 +2073,13 @@ mod tests {
             .expect("right timeout");
         let key = [0x5au8; 32];
         let mut sender = ObfuscatedUdp {
-            socket: right,
+            io: PacketIo::Socket(right),
             key,
             nonce: [0u8; 12],
             decoy: None,
         };
         let mut receiver = ObfuscatedUdp {
-            socket: left,
+            io: PacketIo::Socket(left),
             key,
             nonce: [0u8; 12],
             decoy: None,

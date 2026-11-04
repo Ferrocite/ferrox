@@ -164,16 +164,18 @@ impl Reader {
 struct Writer {
     master: MasterKey,
     cipher: Option<Cipher>,
+    prefix: Vec<u8>,
     wire: Vec<u8>,
     plain: Vec<u8>,
     failed: bool,
 }
 
 impl Writer {
-    fn new(key: &str) -> Self {
+    fn new(key: &str, prefix: &[u8]) -> Self {
         Self {
             master: MasterKey::new(key, METHOD.key_len()),
             cipher: None,
+            prefix: prefix.to_vec(),
             wire: Vec::new(),
             plain: Vec::new(),
             failed: false,
@@ -185,7 +187,10 @@ impl Writer {
             return Ok(());
         }
         let mut salt = [0u8; SALT_LEN];
-        getrandom::fill(&mut salt).map_err(|error| io::Error::other(error.to_string()))?;
+        let prefix = self.prefix.len().min(SALT_LEN);
+        salt[..prefix].copy_from_slice(&self.prefix[..prefix]);
+        getrandom::fill(&mut salt[prefix..])
+            .map_err(|error| io::Error::other(error.to_string()))?;
         io.write_all(&salt)?;
         self.cipher = Some(
             Cipher::from_master_key(METHOD, &self.master, &salt)
@@ -245,18 +250,18 @@ pub(crate) struct Stream<T> {
 }
 
 impl<T: Read + Write> Stream<T> {
-    fn new(io: T, key: &str) -> Self {
+    fn new(io: T, key: &str, prefix: &[u8]) -> Self {
         Self {
             io,
             reader: Arc::new(Mutex::new(Reader::new(key))),
-            writer: Arc::new(Mutex::new(Writer::new(key))),
+            writer: Arc::new(Mutex::new(Writer::new(key, prefix))),
         }
     }
 }
 
 impl Stream<TcpStream> {
-    pub(crate) fn connect(io: TcpStream, key: &str) -> Self {
-        Self::new(io, key)
+    pub(crate) fn connect(io: TcpStream, key: &str, prefix: Option<&[u8]>) -> Self {
+        Self::new(io, key, prefix.unwrap_or_default())
     }
 
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
@@ -283,8 +288,12 @@ impl Stream<TcpStream> {
 }
 
 impl Stream<crate::psiphon_webrtc::WebRtcStream> {
-    pub(crate) fn connect_webrtc(io: crate::psiphon_webrtc::WebRtcStream, key: &str) -> Self {
-        Self::new(io, key)
+    pub(crate) fn connect_webrtc(
+        io: crate::psiphon_webrtc::WebRtcStream,
+        key: &str,
+        prefix: Option<&[u8]>,
+    ) -> Self {
+        Self::new(io, key, prefix.unwrap_or_default())
     }
 
     pub(crate) fn try_clone(&self) -> Self {
@@ -382,6 +391,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         let payload: Vec<u8> = (0..=255u8).cycle().take(MAX_CHUNK * 2 + 17).collect();
         writer.write_all(&payload).expect("writes");
@@ -394,10 +404,27 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         let mut got = vec![0u8; payload.len()];
         reader.read_exact(&mut got).expect("reads");
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn a_configured_prefix_leads_the_salt() {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut writer = Stream::new(
+            Wire {
+                input: Vec::new(),
+                at: 0,
+                output: Vec::new(),
+            },
+            key,
+            b"\x16\x03\x01",
+        );
+        writer.write_all(b"hello").expect("writes");
+        assert!(writer.io.output.starts_with(b"\x16\x03\x01"));
     }
 
     #[test]
@@ -410,6 +437,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         let mut got = [0u8; 4];
         assert_eq!(
@@ -428,6 +456,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         let slices = [
             IoSlice::new(b"abc"),
@@ -444,6 +473,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         let mut got = [0u8; 6];
         reader.read_exact(&mut got).expect("reads");
@@ -486,6 +516,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         assert!(writer.write_all(b"hello").is_err());
         let written = writer.io.output.len();
@@ -503,6 +534,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         writer.write_all(b"hello").expect("writes");
         let mut wire = writer.io.output;
@@ -516,6 +548,7 @@ mod tests {
                 output: Vec::new(),
             },
             key,
+            &[],
         );
         let mut got = [0u8; 5];
         assert_eq!(

@@ -253,6 +253,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
             master_key_log: None,
             client_cert: None,
             client_random: None,
+            padding: None,
         })
     })
 }

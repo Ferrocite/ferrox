@@ -81,6 +81,7 @@ pub(crate) fn tls(
         master_key_log: None,
         client_cert: None,
         client_random: None,
+        padding: None,
     });
     let mut stream = ferrox_core::tls::RustlsProvider::connect(&config, stream)
         .map_err(|error| format!("dns tls: {error}"))?;
@@ -131,6 +132,7 @@ pub(crate) fn doh(
         master_key_log: None,
         client_cert: None,
         client_random: None,
+        padding: None,
     });
     let mut tls = ferrox_core::tls::RustlsProvider::connect(&config, stream)
         .map_err(|error| format!("dns doh tls: {error}"))?;

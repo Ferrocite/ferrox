@@ -1,7 +1,9 @@
 //! HTTP/3 over QUIC for the CDN-fronted meek entries that carry QUIC.
 
+use crate::psiphon_webrtc::WebRtcStream;
 use quiche::h3::NameValue as _;
 use std::io;
+use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -15,9 +17,51 @@ pub(crate) struct Response {
     pub(crate) body: Vec<u8>,
 }
 
+/// A datagram path for QUIC: a UDP socket or an in-proxy WebRTC channel.
+enum Link {
+    Udp(UdpSocket),
+    WebRtc(WebRtcStream),
+}
+
+impl Link {
+    fn send(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send(buffer),
+            Self::WebRtc(stream) => stream.write(buffer),
+        }
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.recv(buffer),
+            Self::WebRtc(stream) => stream.read(buffer),
+        }
+    }
+
+    fn set_read_timeout(&mut self, wait: Duration) -> io::Result<()> {
+        match self {
+            Self::Udp(socket) => socket.set_read_timeout(Some(wait)),
+            Self::WebRtc(stream) => {
+                stream.set_read_timeout(Some(wait));
+                Ok(())
+            }
+        }
+    }
+
+    fn addresses(&self) -> io::Result<(SocketAddr, SocketAddr)> {
+        match self {
+            Self::Udp(socket) => Ok((socket.local_addr()?, socket.peer_addr()?)),
+            Self::WebRtc(_) => Ok((
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+            )),
+        }
+    }
+}
+
 /// A persistent HTTP/3 connection to one front.
 pub(crate) struct H3 {
-    socket: UdpSocket,
+    link: Link,
     peer: SocketAddr,
     local: SocketAddr,
     conn: quiche::Connection,
@@ -29,7 +73,6 @@ pub(crate) struct H3 {
 
 impl H3 {
     /// Open a QUIC connection carrying HTTP/3 to one front.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn connect(
         dial: &str,
         port: u16,
@@ -55,8 +98,29 @@ impl H3 {
             .set_read_timeout(Some(timeout))
             .and_then(|()| socket.set_write_timeout(Some(timeout)))
             .map_err(|error| format!("psiphon h3 socket: {error}"))?;
-        let local = socket
-            .local_addr()
+        Self::connect_link(Link::Udp(socket), dial, sni, timeout)
+    }
+
+    /// Open HTTP/3 over an in-proxy WebRTC datagram channel.
+    pub(crate) fn connect_over(
+        stream: WebRtcStream,
+        dial: &str,
+        sni: &str,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        Self::connect_link(Link::WebRtc(stream), dial, sni, timeout)
+    }
+
+    /// Open HTTP/3 over one datagram path.
+    #[allow(clippy::too_many_lines)]
+    fn connect_link(
+        mut link: Link,
+        dial: &str,
+        sni: &str,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let (local, peer) = link
+            .addresses()
             .map_err(|error| format!("psiphon h3 local address: {error}"))?;
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|error| format!("psiphon h3 config: {error}"))?;
@@ -87,8 +151,7 @@ impl H3 {
             loop {
                 match conn.send(&mut out) {
                     Ok((write, _)) => {
-                        socket
-                            .send(&out[..write])
+                        link.send(&out[..write])
                             .map_err(|error| format!("psiphon h3 send: {error}"))?;
                     }
                     Err(quiche::Error::Done) => break,
@@ -103,10 +166,9 @@ impl H3 {
                 .saturating_duration_since(now)
                 .min(conn.timeout().unwrap_or(Duration::ZERO))
                 .max(Duration::from_millis(1));
-            socket
-                .set_read_timeout(Some(wait))
+            link.set_read_timeout(wait)
                 .map_err(|error| format!("psiphon h3 socket: {error}"))?;
-            match socket.recv(&mut buffer) {
+            match link.receive(&mut buffer) {
                 Ok(read) => {
                     let info = quiche::RecvInfo {
                         from: peer,
@@ -131,7 +193,7 @@ impl H3 {
         let http3 = quiche::h3::Connection::with_transport(&mut conn, &http3_config)
             .map_err(|error| format!("psiphon h3 transport: {error}"))?;
         Ok(Self {
-            socket,
+            link,
             peer,
             local,
             conn,
@@ -228,10 +290,10 @@ impl H3 {
             .saturating_duration_since(now)
             .min(self.conn.timeout().unwrap_or(Duration::ZERO))
             .max(Duration::from_millis(1));
-        self.socket
-            .set_read_timeout(Some(wait))
+        self.link
+            .set_read_timeout(wait)
             .map_err(|error| format!("psiphon h3 socket: {error}"))?;
-        match self.socket.recv(buffer) {
+        match self.link.receive(buffer) {
             Ok(read) => {
                 let info = quiche::RecvInfo {
                     from: self.peer,
@@ -259,7 +321,7 @@ impl H3 {
         loop {
             match self.conn.send(out) {
                 Ok((write, _)) => {
-                    self.socket
+                    self.link
                         .send(&out[..write])
                         .map_err(|error| format!("psiphon h3 send: {error}"))?;
                 }

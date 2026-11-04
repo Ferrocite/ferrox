@@ -34,6 +34,10 @@ on:
         description: tunnels each implementation keeps; blank is one
         required: false
         default: ""
+      window:
+        description: native SSH channel window in bytes; blank keeps the lane's 2 MiB
+        required: false
+        default: ""
       protocol:
         description: direct SSH/OSSH or CDN fronted meek
         required: false
@@ -134,6 +138,7 @@ jobs:
         env:
           PSIPHON_REGION: ${{ inputs.region }}
           PSIPHON_POOL: ${{ inputs.pool }}
+          PSIPHON_WINDOW: ${{ inputs.window }}
           PSIPHON_PROTOCOL: ${{ inputs.protocol }}
         run: |
           BIN=target/release/ferrox-app
@@ -230,11 +235,19 @@ jobs:
           }
           # The two signature values are read out of the lane's own source, so the
           # reference verifies the same list with the same key this tree pins.
-          if [ -n "${PSIPHON_POOL:-}" ] && ! [[ "$PSIPHON_POOL" =~ ^[0-9]+$ && "$PSIPHON_POOL" -ge 1 && "$PSIPHON_POOL" -le 32 ]]; then
-            echo "::error::pool must be an integer from 1 to 32, got '$PSIPHON_POOL'"
-            exit 1
+          if [ -n "${PSIPHON_POOL:-}" ]; then
+            if ! PSIPHON_POOL=$(python3 -c 'import sys; v=sys.argv[1]; n=int(v) if v.isdigit() else 0; print(n) if 1 <= n <= 32 else sys.exit(1)' "$PSIPHON_POOL"); then
+              echo "::error::pool must be an integer from 1 to 32, got '$PSIPHON_POOL'"
+              exit 1
+            fi
           fi
-          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_PROTOCOL="$PSIPHON_PROTOCOL" STATE="$RUNNER_TEMP/psiphon-state" python3 - <<'PY'
+          if [ -n "${PSIPHON_WINDOW:-}" ]; then
+            if ! PSIPHON_WINDOW=$(python3 -c 'import sys; v=sys.argv[1]; n=int(v) if v.isdigit() else 0; print(n) if 65536 <= n <= 67108864 else sys.exit(1)' "$PSIPHON_WINDOW"); then
+              echo "::error::window must be an integer from 65536 to 67108864, got '$PSIPHON_WINDOW'"
+              exit 1
+            fi
+          fi
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_PROTOCOL="$PSIPHON_PROTOCOL" PSIPHON_WINDOW="$PSIPHON_WINDOW" STATE="$RUNNER_TEMP/psiphon-state" python3 - <<'PY'
           import json, os
           settings = {
               "listen": "127.0.0.1:1821",
@@ -246,6 +259,8 @@ jobs:
               settings["region"] = os.environ["PSIPHON_REGION"]
           if os.environ.get("PSIPHON_POOL"):
               settings["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
+          if os.environ.get("PSIPHON_WINDOW"):
+              settings["SSHChannelWindowSize"] = int(os.environ["PSIPHON_WINDOW"])
           if os.environ.get("PSIPHON_PROTOCOL") == "cdn":
               settings["protocolSelection"] = "cdn_fronting"
           else:
@@ -541,8 +556,11 @@ jobs:
           retention-days: 7
       - name: Summarise
         if: always()
+        env:
+          PSIPHON_WINDOW: ${{ inputs.window }}
         run: |
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
           legs = []
           try:
               lines = open("psiphon-legs.tsv").read().splitlines()
@@ -595,9 +613,13 @@ jobs:
           print("native lane chose, so the ratio is the implementation and not a")
           print("different carrier. When the dispatch asks for a pool above one, the")
           print("reference is still pinned to one server, so the pool rows are")
-          print("native-only. Both")
+          print("native-only. A dispatch window sets the native channel window only;")
+          print("the reference keeps its own default, so the ratio includes it. Both")
           print("verify the same signed list with the key this tree pins. The runner's")
           print("own egress is the control; byte counts are the gate.")
+          window = os.environ.get("PSIPHON_WINDOW")
+          selected = f"{int(window)} bytes" if window and window.isdigit() else "default 2 MiB"
+          print(f"Native channel window: {selected}.")
           print()
           print("| leg | bytes | seconds | MiB/s |")
           print("| --- | --- | --- | --- |")

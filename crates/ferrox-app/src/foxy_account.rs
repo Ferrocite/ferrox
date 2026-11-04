@@ -536,6 +536,7 @@ impl Endpoint {
             master_key_log: None,
             client_cert: None,
             client_random: None,
+            padding: None,
         }
     }
 

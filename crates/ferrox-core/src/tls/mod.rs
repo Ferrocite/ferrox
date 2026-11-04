@@ -64,6 +64,9 @@ pub struct TlsConfig {
     /// itself in that field (Psiphon TLS-OSSH). Only the shaped session can carry it; the stock
     /// rustls builder draws its own and cannot be overridden.
     pub client_random: Option<[u8; 32]>,
+    /// An exact RFC 7685 padding extension body length, moved to the front of a shaped hello as
+    /// Psiphon's `TLSPadding` does. `None` keeps each preset's own padding rule.
+    pub padding: Option<u16>,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key

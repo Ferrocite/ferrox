@@ -157,6 +157,9 @@ impl<S: Stream> Session<S> {
             &cfg.curves,
             cfg.client_random,
         )?;
+        if let Some(padding) = cfg.padding {
+            hello.set_padding(usize::from(padding));
+        }
         if let Some(list) = &cfg.ech_config_list {
             hello.enable_ech(list)?;
         }
