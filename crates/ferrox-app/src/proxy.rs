@@ -9539,6 +9539,30 @@ pub(crate) fn forget_wait_finish() {
     WAIT_FINISH.with(|slot| slot.borrow_mut().take());
 }
 
+#[cfg(unix)]
+thread_local! {
+    /// The idle budget of the flow a timed-out step belongs to: its parked leg wakes on that budget,
+    /// not on the shorter default the readiness scheduler used before the policy was read.
+    static WAIT_IDLE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+pub(crate) fn note_wait_idle(idle: Duration) {
+    if relay_step_owns_poll() {
+        WAIT_IDLE.with(|slot| slot.set(Some(idle)));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn take_wait_idle() -> Option<Duration> {
+    WAIT_IDLE.with(std::cell::Cell::take)
+}
+
+#[cfg(unix)]
+pub(crate) fn forget_wait_idle() {
+    WAIT_IDLE.with(|slot| slot.set(None));
+}
+
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
 pub(crate) struct RelayStep(bool);
 
@@ -23255,6 +23279,7 @@ impl TcpCopy {
                 {
                     use std::os::fd::AsRawFd as _;
                     note_wait_fd(self.src.as_raw_fd());
+                    note_wait_idle(self.reply_idle);
                     note_wait_finish(flow);
                 }
                 if flow.ended() && flow.ended_and_idle(self.reply_idle) {
@@ -24737,14 +24762,17 @@ pub(crate) mod lane_pool {
     #[cfg(unix)]
     fn park_ready(pool: &std::sync::Arc<Pool>, lane: Lane) -> Result<(), Lane> {
         if !lane.relay {
+            crate::proxy::forget_wait_idle();
             return Err(lane);
         }
         let Some(fd) = crate::proxy::take_wait_fd() else {
+            crate::proxy::forget_wait_idle();
             return Err(lane);
         };
         if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
             return Err(lane);
         }
+        let idle = crate::proxy::take_wait_idle().unwrap_or(crate::budgets::RELAY_RESPONSE_IDLE);
         let slot = std::sync::Arc::new(ReadySlot {
             id: pool
                 .next_slot
@@ -24760,9 +24788,9 @@ pub(crate) mod lane_pool {
         let ended = slot.finish.as_ref().map(|flow| flow.watch_park(&slot));
         // A flow with a living sibling arms no clock; no sibling, or one already ended, keeps the check.
         let due = match ended {
-            None => Some(std::time::Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE),
+            None => Some(std::time::Instant::now() + idle),
             Some(None) => None,
-            Some(Some(at)) => Some(at + crate::budgets::RELAY_RESPONSE_IDLE),
+            Some(Some(at)) => Some(at + idle),
         };
         let _ = slot.due.set(due);
         #[cfg(all(test, unix))]
