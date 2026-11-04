@@ -3094,6 +3094,7 @@ mod tests {
             "the next flight reached the existing connection"
         );
         assert_eq!(router.routes.len(), 1, "the next flight adds no route");
+        // The replayed Initial is a duplicate quiche drops before its counters, so it is checked for the route table alone.
         let mut wire = initial;
         route_packet(&mut router, &mut template, &mut wire, client_addr);
         assert_eq!(router.routes.len(), 1, "a retransmit adds no route");
