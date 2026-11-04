@@ -255,7 +255,7 @@ fn exchange(
     let mut status = None;
     loop {
         let (len, kind, flags, id) = read_head(&mut stream).ok_or("dns doh closed")?;
-        let mut payload = vec![0u8; len];
+        let mut payload = crate::proxy::unfilled(len);
         stream
             .read_exact(&mut payload)
             .map_err(|error| format!("dns doh read: {error}"))?;
@@ -316,8 +316,11 @@ fn frame(stream: &mut impl Write, kind: u8, flags: u8, id: u32, body: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::read_frame;
-    use std::io::Cursor;
+    use super::{exchange, read_frame};
+    use crate::h2::{
+        block_encode, frame_head, F_END, F_END_HEADERS, T_DATA, T_HEADERS, T_SETTINGS,
+    };
+    use std::io::{Cursor, Read, Write};
 
     /// The framed answer is read into room no zero pass filled first: the read writes every
     /// byte the frame reports before the caller sees one. The `zeroed` counter is the witness.
@@ -335,5 +338,62 @@ mod tests {
             "the bytes are the frame"
         );
         assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+    }
+
+    struct Wire {
+        read: Cursor<Vec<u8>>,
+    }
+
+    impl Read for Wire {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read.read(buf)
+        }
+    }
+
+    impl Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Each `DoH` frame body is read into room no zero pass filled first: the read writes every
+    /// byte the frame reports before the caller sees one. The `zeroed` counter is the witness.
+    #[test]
+    fn a_doh_frame_read_does_not_zero_its_read_target() {
+        let settings = [0u8, 3, 0, 0, 0, 100];
+        let status = block_encode(&[(":status", "200")]);
+        let body = b"answer-bytes";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&frame_head(settings.len(), T_SETTINGS, 0, 0));
+        wire.extend_from_slice(&settings);
+        wire.extend_from_slice(&frame_head(status.len(), T_HEADERS, F_END_HEADERS, 1));
+        wire.extend_from_slice(&status);
+        wire.extend_from_slice(&frame_head(body.len(), T_DATA, F_END, 1));
+        wire.extend_from_slice(body);
+        let old_zeroed = settings.len() + status.len() + body.len();
+        let (answer, counts) = ferrox_core::alloc_count::measure(|| {
+            exchange(
+                Wire {
+                    read: Cursor::new(wire),
+                },
+                "dns.example",
+                "https",
+                "/dns-query",
+                b"query",
+            )
+        });
+        assert_eq!(
+            answer.expect("the answer").as_slice(),
+            body,
+            "the body is the answer"
+        );
+        assert_eq!(
+            counts.zeroed, 0,
+            "no frame body is zeroed first ({old_zeroed} bytes before this change): {counts:?}"
+        );
     }
 }
