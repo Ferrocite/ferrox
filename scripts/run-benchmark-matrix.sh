@@ -594,7 +594,7 @@ while read -r id traffic connections iterations payload duration_ms; do
     if [[ -n "${PROFILE_DIR:-}" && "$server" == "${PROFILE_SERVER:-ferrox}" ]]; then
       mkdir -p "$PROFILE_DIR"
       perf record -F 997 -g --call-graph dwarf -p "$server_pid" \
-        -o "$PROFILE_DIR/$cell.perf.data" -- sleep 600 &
+        -o "$PROFILE_DIR/$cell.perf.data" -- sleep 120 >/dev/null 2>&1 &
       perf_pid=$!
       sleep 1
     fi
