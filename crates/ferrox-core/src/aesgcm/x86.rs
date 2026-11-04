@@ -48,6 +48,11 @@ impl Lanes for __m128i {
     }
 
     #[inline(always)]
+    unsafe fn store_ptr(self, dst: *mut u8) {
+        unsafe { _mm_storeu_si128(dst.cast(), self) }
+    }
+
+    #[inline(always)]
     fn xor(self, o: Self) -> Self {
         unsafe { _mm_xor_si128(self, o) }
     }
@@ -318,6 +323,18 @@ impl Engine256 {
         dst: &mut [u8],
     ) -> [u8; 16] {
         super::seal_impl_from_256(&self.rk, &self.h, nonce, aad, src, dst)
+    }
+
+    /// Seal `src` into uninitialized `dst` and return the tag.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: *mut u8,
+    ) -> [u8; 16] {
+        unsafe { super::seal_impl_from_256_uninit(&self.rk, &self.h, nonce, aad, src, dst) }
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]

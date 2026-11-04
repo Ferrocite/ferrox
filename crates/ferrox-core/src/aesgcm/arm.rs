@@ -191,6 +191,11 @@ impl Lanes for uint8x16_t {
     }
 
     #[inline(always)]
+    unsafe fn store_ptr(self, dst: *mut u8) {
+        unsafe { vst1q_u8(dst, self) }
+    }
+
+    #[inline(always)]
     fn xor(self, o: Self) -> Self {
         unsafe { veorq_u8(self, o) }
     }
@@ -862,6 +867,18 @@ impl Engine256 {
             dst.len() as u64,
             mask,
         )
+    }
+
+    /// Seal `src` into uninitialized `dst` and return the tag.
+    #[target_feature(enable = "aes,neon")]
+    pub(crate) unsafe fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: *mut u8,
+    ) -> [u8; 16] {
+        unsafe { super::seal_impl_from_256_uninit(&self.rk, &self.h, nonce, aad, src, dst) }
     }
 
     #[target_feature(enable = "aes,neon")]

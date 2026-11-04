@@ -114,6 +114,10 @@ impl Aead {
     }
 
     /// Seal one record into `out` and append its tag.
+    #[allow(
+        clippy::uninit_vec,
+        reason = "seal_from_uninit initializes the spare capacity before set_len"
+    )]
     fn seal_into(
         &mut self,
         nonce: Option<[u8; 12]>,
@@ -126,8 +130,16 @@ impl Aead {
             Cipher::Aes(cipher) => {
                 let start = out.len();
                 let tag = if plaintext.len() >= SOURCE_SEAL_MIN {
-                    out.resize(start + plaintext.len(), 0);
-                    cipher.seal_from(&nonce, aad, plaintext, &mut out[start..])
+                    out.reserve(plaintext.len());
+                    let tag = cipher.seal_from_uninit(
+                        &nonce,
+                        aad,
+                        plaintext,
+                        &mut out.spare_capacity_mut()[..plaintext.len()],
+                    );
+                    // SAFETY: seal_from_uninit wrote every byte of the spare range.
+                    unsafe { out.set_len(start + plaintext.len()) };
+                    tag
                 } else {
                     out.extend_from_slice(plaintext);
                     cipher.seal_in_place(&nonce, aad, &mut out[start..])
