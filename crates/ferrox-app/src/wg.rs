@@ -1498,50 +1498,89 @@ fn flush_sends(
 
 #[cfg(target_os = "linux")]
 fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
-    use std::os::fd::AsRawFd as _;
-
     debug_assert!(packets.len() <= SEND_BATCH);
     let to = send_endpoint(endpoint, ipv6);
     let (storage, name_len) = crate::proxy::sockaddr_of(to);
+    let max_payload = if ipv6 { 65_527 } else { 65_507 };
     let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
     });
-    // SAFETY: a zeroed `mmsghdr` is the empty header the loop fills below.
-    let mut headers: [libc::mmsghdr; SEND_BATCH] =
-        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
-    for (at, packet) in packets.iter().enumerate() {
-        iovecs[at].iov_base = packet.as_ptr().cast_mut().cast();
-        iovecs[at].iov_len = packet.len();
-        headers[at].msg_hdr = libc::msghdr {
-            msg_name: (&raw const storage).cast_mut().cast(),
-            msg_namelen: name_len,
-            msg_iov: (&raw mut iovecs[at]).cast(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
-    }
-    let mut done = 0;
-    while done < packets.len() {
-        // SAFETY: each header names its own iovec and packet, and `storage` outlives the call.
-        let sent = unsafe {
-            libc::sendmmsg(
-                socket.as_raw_fd(),
-                headers[done..].as_mut_ptr(),
-                (packets.len() - done) as libc::c_uint,
-                0,
-            )
-        };
-        if sent <= 0 {
-            break;
+    let mut start = 0;
+    while start < packets.len() {
+        let gso = packets[start].len();
+        let mut end = start + 1;
+        let mut total = gso;
+        let mut shorter = false;
+        while end < packets.len() && !shorter {
+            let len = packets[end].len();
+            if len > gso || total + len > max_payload {
+                break;
+            }
+            total += len;
+            end += 1;
+            shorter = len < gso;
         }
-        done += usize::try_from(sent).unwrap_or(0);
+        if end - start > 1 && gso <= 65_535 {
+            for (at, packet) in packets[start..end].iter().enumerate() {
+                iovecs[at] = libc::iovec {
+                    iov_base: packet.as_ptr().cast_mut().cast(),
+                    iov_len: packet.len(),
+                };
+            }
+            if send_segments(
+                socket,
+                &storage,
+                name_len,
+                &mut iovecs[..end - start],
+                gso as u16,
+            ) {
+                start = end;
+                continue;
+            }
+        }
+        let _ = socket.send_to(&packets[start], to);
+        start += 1;
     }
-    for packet in &packets[done..] {
-        let _ = socket.send_to(packet, to);
+}
+
+/// Send concatenated records as one `UDP_SEGMENT` payload, so the kernel splits
+/// them into the datagrams the peer expects.
+#[cfg(target_os = "linux")]
+fn send_segments(
+    socket: &UdpSocket,
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+    iovecs: &mut [libc::iovec],
+    gso: u16,
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    const UDP_SEGMENT: libc::c_int = 103;
+    let space = libc::CMSG_SPACE(2) as usize;
+    let mut control = [0u8; 32];
+    if space > control.len() {
+        return false;
     }
+    // SAFETY: `control` is aligned and large enough for one two-byte control message, which the calls below fill before the header names it.
+    unsafe {
+        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        (*header).cmsg_level = libc::IPPROTO_UDP;
+        (*header).cmsg_type = UDP_SEGMENT;
+        (*header).cmsg_len = libc::CMSG_LEN(2) as _;
+        std::ptr::copy_nonoverlapping(gso.to_ne_bytes().as_ptr(), libc::CMSG_DATA(header), 2);
+    }
+    let mut message = libc::msghdr {
+        msg_name: (&raw const *storage).cast_mut().cast(),
+        msg_namelen: name_len,
+        msg_iov: iovecs.as_mut_ptr(),
+        msg_iovlen: iovecs.len(),
+        msg_control: control.as_mut_ptr().cast(),
+        msg_controllen: space as _,
+        msg_flags: 0,
+    };
+    // SAFETY: the name, iovecs and control all outlive the call, and the kernel only reads them.
+    unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, 0) >= 0 }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1833,6 +1872,33 @@ mod tests {
         let mut got = Vec::new();
         for _ in 0..packets.len() {
             let mut buf = [0u8; 64];
+            let (n, _) = receiver.recv_from(&mut buf).expect("datagram");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, packets);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_keeps_each_packet_size_after_segmentation() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let packets: Vec<Vec<u8>> = [128usize, 128, 64, 256, 256, 32]
+            .into_iter()
+            .map(|len| vec![len as u8; len])
+            .collect();
+        send_batch(
+            &sender,
+            false,
+            receiver.local_addr().expect("address"),
+            &packets,
+        );
+        let mut got = Vec::new();
+        for _ in 0..packets.len() {
+            let mut buf = [0u8; 256];
             let (n, _) = receiver.recv_from(&mut buf).expect("datagram");
             got.push(buf[..n].to_vec());
         }
