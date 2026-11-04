@@ -299,6 +299,9 @@ carrier-xhttp carry-tail-allocations 0 ferrox-app-xhttp::tests::the_tail_a_body_
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp partly-read-frame-tail-copies 0 ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved
+carrier-xhttp body-readers-per-waker 1 ferrox-app-xhttp_h2::tests::a_body_landing_wakes_only_its_parked_reader
+carrier-xhttp body-waker-posts-per-unwaited-body 0 ferrox-app-xhttp_h2::tests::a_body_landing_wakes_only_its_parked_reader
+carrier-xhttp owner-wakers-per-queued-park 1 ferrox-app-proxy::tests::a_queued_timeout_keeps_the_owner_waker
 carrier-xhttp zero-filled-bytes-per-received-frame 0 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled
 carrier-xhttp response-head-field-allocations 0 ferrox-app-xhttp_h2::tests::a_response_head_is_split_without_allocating
 carrier-xhttp answer-head-allocations 1 ferrox-app-xhttp::tests::a_padded_answer_is_written_from_one_buffer

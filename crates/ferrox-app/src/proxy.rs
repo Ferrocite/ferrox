@@ -9531,6 +9531,22 @@ pub(crate) fn forget_wait_fd() {
 }
 
 thread_local! {
+    /// A queue owner's waker the lane may park on: unlike a socket hint, this one is posted by the
+    /// thread that fills the queue, so a drain of the socket must not discard it.
+    static WAIT_WAKE: std::cell::Cell<Option<WaitFd>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn note_wait_wake(fd: WaitFd) {
+    if relay_step_owns_poll() {
+        WAIT_WAKE.with(|slot| slot.set(Some(fd)));
+    }
+}
+
+pub(crate) fn take_wait_wake() -> Option<WaitFd> {
+    WAIT_WAKE.with(std::cell::Cell::take)
+}
+
+thread_local! {
     /// The flow a timed-out relay step belongs to: its sibling's end wakes the lane instead of a clock.
     static WAIT_FINISH: std::cell::RefCell<Option<std::sync::Arc<RelayFinish>>> =
         const { std::cell::RefCell::new(None) };
@@ -9578,6 +9594,7 @@ impl RelayStep {
     pub(crate) fn enter() -> Self {
         // A step starts with no wait hint: the socket, flow and budget the pool parks on belong to this step's own read.
         forget_wait_fd();
+        WAIT_WAKE.with(|slot| slot.set(None));
         forget_wait_finish();
         forget_wait_idle();
         Self(RELAY_STEP.with(|flag| flag.replace(true)))
@@ -24395,14 +24412,14 @@ pub(crate) mod lane_pool {
 
     /// The descriptor a parker writes to wake the reaper for a lane the reaper has not seen yet.
     #[cfg(unix)]
-    struct WakePipe {
+    pub(crate) struct WakePipe {
         read: std::os::fd::RawFd,
         write: std::os::fd::RawFd,
     }
 
     #[cfg(unix)]
     impl WakePipe {
-        fn new() -> Option<Self> {
+        pub(crate) fn new() -> Option<Self> {
             let mut fds = [-1; 2];
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                 return None;
@@ -24422,14 +24439,14 @@ pub(crate) mod lane_pool {
             })
         }
 
-        fn post(&self) {
+        pub(crate) fn post(&self) {
             let byte = 1u8;
             unsafe {
                 libc::write(self.write, std::ptr::from_ref(&byte).cast(), 1);
             }
         }
 
-        fn drain(&self) {
+        pub(crate) fn drain(&self) {
             let mut byte = 0u8;
             loop {
                 let read =
@@ -24440,7 +24457,7 @@ pub(crate) mod lane_pool {
             }
         }
 
-        fn key(&self) -> WaitFd {
+        pub(crate) fn key(&self) -> WaitFd {
             self.read
         }
     }
@@ -24458,14 +24475,14 @@ pub(crate) mod lane_pool {
     /// The same wake on Windows: `WSAPoll` watches sockets, so a loopback datagram pair stands in
     /// for the pipe. A full receive buffer drops the extra posts, and one already queued wakes.
     #[cfg(windows)]
-    struct WakePipe {
+    pub(crate) struct WakePipe {
         read: std::net::UdpSocket,
         write: std::net::UdpSocket,
     }
 
     #[cfg(windows)]
     impl WakePipe {
-        fn new() -> Option<Self> {
+        pub(crate) fn new() -> Option<Self> {
             let read = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
             let write = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
             write.connect(read.local_addr().ok()?).ok()?;
@@ -24474,16 +24491,16 @@ pub(crate) mod lane_pool {
             Some(Self { read, write })
         }
 
-        fn post(&self) {
+        pub(crate) fn post(&self) {
             let _ = self.write.send(&[1]);
         }
 
-        fn drain(&self) {
+        pub(crate) fn drain(&self) {
             let mut byte = [0u8; 64];
             while matches!(self.read.recv(&mut byte), Ok(n) if n > 0) {}
         }
 
-        fn key(&self) -> WaitFd {
+        pub(crate) fn key(&self) -> WaitFd {
             use std::os::windows::io::AsRawSocket as _;
             self.read.as_raw_socket()
         }
@@ -24803,7 +24820,10 @@ pub(crate) mod lane_pool {
             crate::proxy::forget_wait_idle();
             return Err(lane);
         }
-        let Some(fd) = crate::proxy::take_wait_fd() else {
+        // The owner's waker wins, and either way the socket hint is consumed so a later step cannot park on a stale one.
+        let wake = crate::proxy::take_wait_wake();
+        let socket = crate::proxy::take_wait_fd();
+        let Some(fd) = wake.or(socket) else {
             crate::proxy::forget_wait_idle();
             return Err(lane);
         };
@@ -36360,6 +36380,38 @@ mod tests {
             take_wait_fd(),
             Some(fd),
             "a socket carrier parks on its descriptor"
+        );
+    }
+
+    /// A queued carrier's timeout drops the socket its inner read left behind, but keeps the waker its
+    /// queue owner posts: that one names the park the lane actually waits on.
+    #[test]
+    fn a_queued_timeout_keeps_the_owner_waker() {
+        struct Noted;
+
+        impl Read for Noted {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let socket: WaitFd = 7;
+                let waker: WaitFd = 9;
+                note_wait_fd(socket);
+                note_wait_wake(waker);
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let _step = RelayStep::enter();
+        let mut queued = Copied::with_park(Noted, true);
+        assert!(queued.read_window().is_err());
+        assert_eq!(
+            take_wait_fd(),
+            None,
+            "the queue owns the socket, not the lane"
+        );
+        let waker: WaitFd = 9;
+        assert_eq!(
+            take_wait_wake(),
+            Some(waker),
+            "the owner's waker is the park the lane keeps"
         );
     }
 

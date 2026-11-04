@@ -195,6 +195,13 @@ pub(crate) struct H2Stream {
     responded: AtomicBool,
 }
 
+/// The waker a stream's body reader parks on, created the first time that reader finds nothing.
+#[derive(Default)]
+struct BodyWait {
+    wakers: HashMap<u32, Arc<crate::proxy::lane_pool::WakePipe>>,
+    parked: HashSet<u32>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct StreamState {
     body: VecDeque<Vec<u8>>,
@@ -402,6 +409,11 @@ pub(crate) struct H2Conn {
     upload_of: Mutex<HashMap<u32, String>>,
     send_conn: Mutex<u64>,
     wake: Condvar,
+    /// Each stream's body reader waits on its own waker, so a body that lands wakes that reader
+    /// instead of the reader polling a quantum and a sibling's body waking a stranger.
+    body_wait: Mutex<BodyWait>,
+    /// Whether any reader is parked, so a body nobody waits for costs no lock and no post.
+    body_parked_any: AtomicBool,
     decoder: Mutex<Decoder>,
     max_frame: Mutex<usize>,
     peer_initial: Mutex<u64>,
@@ -463,6 +475,7 @@ impl Read for H2StreamReader {
         if buf.is_empty() {
             return Ok(0);
         }
+        self.conn.leave_body(self.id);
         loop {
             if self.at < self.cur.len() {
                 let n = (self.cur.len() - self.at).min(buf.len());
@@ -522,7 +535,7 @@ impl Read for H2StreamReader {
                 }
                 continue;
             }
-            // A lane step owns its thread for one poll; a body idle for the whole stall still ends.
+            // A lane step owns its poll: an idle body parks on its waker, and one idle for the whole stall still ends.
             if crate::proxy::relay_step_owns_poll() {
                 let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= crate::budgets::relay_stall() {
@@ -530,15 +543,11 @@ impl Read for H2StreamReader {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
-                let (_guard, wait) = self
-                    .stream
-                    .cv
-                    .wait_timeout(st, crate::budgets::RELAY_POLL)
-                    .unwrap_or_else(PoisonError::into_inner);
-                if wait.timed_out() {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                if let Some(fd) = self.conn.park_body(self.id) {
+                    crate::proxy::note_wait_wake(fd);
                 }
-                continue;
+                drop(st);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             let (next, wait) = self
                 .stream
@@ -557,6 +566,7 @@ impl Read for H2StreamReader {
 
 impl crate::proxy::WindowRead for H2StreamReader {
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        self.conn.leave_body(self.id);
         loop {
             if self.at < self.cur.len() {
                 let start = self.at;
@@ -618,15 +628,11 @@ impl crate::proxy::WindowRead for H2StreamReader {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
-                let (_guard, wait) = self
-                    .stream
-                    .cv
-                    .wait_timeout(st, crate::budgets::RELAY_POLL)
-                    .unwrap_or_else(PoisonError::into_inner);
-                if wait.timed_out() {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                if let Some(fd) = self.conn.park_body(self.id) {
+                    crate::proxy::note_wait_wake(fd);
                 }
-                continue;
+                drop(st);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             let (next, wait) = self
                 .stream
@@ -640,6 +646,20 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 return Err(std::io::Error::other("h2 body stalled"));
             }
         }
+    }
+
+    /// The demuxed body is a lane the pool parks on its waker; the client pump keeps its turn,
+    /// because the window it owes the peer arrives on the connection it reads.
+    fn parks_on_timeout(&self) -> bool {
+        self.conn.client_read.is_none()
+    }
+}
+
+/// The waker lives exactly as long as this reader: no reactor can still name its descriptor once
+/// the reader is dropped, so freeing it here cannot close a descriptor a parked lane is watching.
+impl Drop for H2StreamReader {
+    fn drop(&mut self) {
+        self.conn.drop_body_waker(self.id);
     }
 }
 
@@ -1223,6 +1243,7 @@ impl H2Conn {
             st.dead = true;
             state.cv.notify_all();
         }
+        self.wake_body(stream);
         self.wake.notify_all();
     }
 
@@ -1239,6 +1260,7 @@ impl H2Conn {
             state.cv.notify_all();
             (state.responded.load(Ordering::SeqCst), st.ended)
         };
+        self.wake_body(stream);
         if responded {
             let _ = self.frame(T_DATA, F_END, stream, &[]);
             if ended {
@@ -1274,6 +1296,7 @@ impl H2Conn {
                 state.cv.notify_all();
             }
         }
+        self.wake_body(stream);
         self.wake.notify_all();
         self.end_session_of(stream);
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
@@ -1295,6 +1318,17 @@ impl H2Conn {
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.dead = true;
             state.cv.notify_all();
+        }
+        let waiting: Vec<u32> = self
+            .body_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parked
+            .iter()
+            .copied()
+            .collect();
+        for sid in waiting {
+            self.wake_body(sid);
         }
         let sessions: Vec<String> = self
             .sessions
@@ -1338,6 +1372,71 @@ impl H2Conn {
             .remove(&stream);
     }
 
+    /// The descriptor a stream's body reader parks on, made the first time that reader finds
+    /// nothing. The caller holds the stream's state lock, so a body pushed meanwhile is seen.
+    fn park_body(&self, sid: u32) -> Option<crate::proxy::WaitFd> {
+        let mut wait = self
+            .body_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let wake = if let Some(wake) = wait.wakers.get(&sid) {
+            Arc::clone(wake)
+        } else {
+            let wake = Arc::new(crate::proxy::lane_pool::WakePipe::new()?);
+            wait.wakers.insert(sid, Arc::clone(&wake));
+            wake
+        };
+        wake.drain();
+        wait.parked.insert(sid);
+        self.body_parked_any.store(true, Ordering::Relaxed);
+        Some(wake.key())
+    }
+
+    /// Releases a stream the reader has run again for: its waker stays for the next park.
+    fn leave_body(&self, sid: u32) {
+        if !self.body_parked_any.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut wait = self
+            .body_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        wait.parked.remove(&sid);
+        if wait.parked.is_empty() {
+            self.body_parked_any.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Wakes a stream's parked reader once its body gained a chunk or ended.
+    fn wake_body(&self, sid: u32) {
+        if !self.body_parked_any.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut wait = self
+            .body_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !wait.parked.remove(&sid) {
+            return;
+        }
+        if wait.parked.is_empty() {
+            self.body_parked_any.store(false, Ordering::Relaxed);
+        }
+        if let Some(wake) = wait.wakers.get(&sid) {
+            wake.post();
+        }
+    }
+
+    /// Only the reader's own drop frees its waker: retiring a stream earlier could close a
+    /// descriptor the reactor is still polling for that reader's lane.
+    fn drop_body_waker(&self, sid: u32) {
+        self.body_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .wakers
+            .remove(&sid);
+    }
+
     /// The session is over, so the uploads that shared it are too: mark each one ended and wake its parked reader before the connection's death is the only way out.
     fn end_uploads(&self, sid: &str) {
         let streams: Vec<u32> = {
@@ -1367,6 +1466,7 @@ impl H2Conn {
                 st.dead = true;
                 state.cv.notify_all();
             }
+            self.wake_body(stream);
         }
     }
 
@@ -1618,6 +1718,7 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
                     state.cv.notify_all();
                     st.both_ended()
                 };
+                conn.wake_body(sid);
                 if done {
                     conn.retire(sid);
                 }
@@ -1681,6 +1782,8 @@ impl H2Client {
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
             wake: Condvar::new(),
+            body_wait: Mutex::new(BodyWait::default()),
+            body_parked_any: AtomicBool::new(false),
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
             peer_initial: Mutex::new(65_535),
@@ -2305,6 +2408,8 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     upload_of: Mutex::new(HashMap::new()),
                     send_conn: Mutex::new(65_535),
                     wake: Condvar::new(),
+                    body_wait: Mutex::new(BodyWait::default()),
+                    body_parked_any: AtomicBool::new(false),
                     decoder: Mutex::new(Decoder::default()),
                     max_frame: Mutex::new(16_384),
                     peer_initial: Mutex::new(65_535),
@@ -2520,6 +2625,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         state.cv.notify_all();
         st.both_ended()
     };
+    conn.wake_body(sid);
     conn.replenish(sid, wire_len);
     if done {
         conn.retire(sid);
@@ -2635,6 +2741,7 @@ fn pump_frame(
                 state.cv.notify_all();
                 (finished, abandoned)
             };
+            conn.wake_body(sid);
             if abandoned {
                 if !conn.replenish_connection(wire_len) {
                     return false;
@@ -3933,6 +4040,8 @@ mod tests {
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
             wake: Condvar::new(),
+            body_wait: Mutex::new(BodyWait::default()),
+            body_parked_any: AtomicBool::new(false),
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
             peer_initial: Mutex::new(65_535),
@@ -4204,6 +4313,8 @@ mod tests {
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
             wake: Condvar::new(),
+            body_wait: Mutex::new(BodyWait::default()),
+            body_parked_any: AtomicBool::new(false),
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
             peer_initial: Mutex::new(65_535),
@@ -4228,6 +4339,91 @@ mod tests {
             false,
         );
         (conn, written, slices)
+    }
+
+    #[cfg(unix)]
+    fn readable(fd: crate::proxy::WaitFd) -> bool {
+        let mut row = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        (unsafe { libc::poll(std::ptr::from_mut(&mut row), 1, 0) }) == 1
+    }
+
+    #[cfg(windows)]
+    fn readable(fd: crate::proxy::WaitFd) -> bool {
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAPoll, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+        };
+        let mut row = WSAPOLLFD {
+            fd: fd as SOCKET,
+            events: POLLIN | POLLRDNORM,
+            revents: 0,
+        };
+        (unsafe { WSAPoll(std::ptr::from_mut(&mut row), 1, 0) }) == 1
+    }
+
+    fn window_reader(conn: &Arc<H2Conn>, stream: Arc<H2Stream>, id: u32) -> H2StreamReader {
+        H2StreamReader {
+            conn: Arc::clone(conn),
+            stream,
+            id,
+            cur: Vec::new(),
+            at: 0,
+            idle_since: None,
+        }
+    }
+
+    /// The idle body of one stream waits on its own waker: a chunk for a sibling wakes nobody else,
+    /// and a chunk nobody waits for posts nothing at all.
+    #[test]
+    fn a_body_landing_wakes_only_its_parked_reader() {
+        let (conn, _, _) = bare_conn();
+        let first = conn.attach_stream(1, false).expect("a stream");
+        let second = conn.attach_stream(3, false).expect("a stream");
+        // No reader has parked: the demux makes no waker and posts no wake.
+        assert!(queue_data(&conn, 0, 1, b"early".to_vec()));
+        assert!(
+            conn.body_wait
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .wakers
+                .is_empty(),
+            "a body nobody waits for costs no descriptor"
+        );
+        first
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .body
+            .clear();
+        let mut one = window_reader(&conn, Arc::clone(&first), 1);
+        let mut three = window_reader(&conn, second, 3);
+        let step = crate::proxy::RelayStep::enter();
+        assert!(crate::proxy::WindowRead::read_window(&mut one).is_err());
+        let one_fd = crate::proxy::take_wait_wake().expect("the idle body parks on its waker");
+        assert!(crate::proxy::WindowRead::read_window(&mut three).is_err());
+        let three_fd = crate::proxy::take_wait_wake().expect("the idle body parks on its waker");
+        assert_ne!(one_fd, three_fd, "each stream waits on its own waker");
+        assert!(queue_data(&conn, 0, 1, b"answer".to_vec()));
+        assert!(readable(one_fd), "the fed stream's reader wakes");
+        assert!(!readable(three_fd), "an unfed sibling stays asleep");
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut one).expect("the body lands");
+            assert_eq!(window.bytes(), b"answer");
+        }
+        assert!(crate::proxy::WindowRead::read_window(&mut one).is_err());
+        assert_eq!(
+            crate::proxy::take_wait_wake(),
+            Some(one_fd),
+            "the waker outlives the wake it served"
+        );
+        assert!(
+            !readable(one_fd),
+            "a park drains the wake its previous turn had already served"
+        );
+        drop(step);
     }
 
     /// A SETTINGS payload whose length is not a multiple of six is a connection error
@@ -4975,8 +5171,9 @@ mod tests {
     /// A lane's polls hand the thread back, but an idle body still ends at the stall.
     #[test]
     fn a_lane_read_still_ends_at_the_stall() {
+        let stall = Duration::from_millis(40);
         crate::budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(Duration::from_millis(40)),
+            relay_stall: Some(stall),
             ..Default::default()
         });
         let (conn, _written, _slices) = streaming_conn(0);
@@ -4996,19 +5193,14 @@ mod tests {
             idle_since: None,
         };
         let mut buf = [0u8; 8];
-        let error = {
+        let (first, error) = {
             let _step = crate::proxy::RelayStep::enter();
-            let mut polls = 0u32;
-            loop {
-                polls += 1;
-                assert!(polls < 500, "a lane read never ended at the stall");
-                match reader.read(&mut buf) {
-                    Err(error) if crate::proxy::is_timeout(&error) => {}
-                    other => break other.expect_err("no body arrived"),
-                }
-            }
+            let first = reader.read(&mut buf).expect_err("no body arrived");
+            std::thread::sleep(stall);
+            (first, reader.read(&mut buf).expect_err("no body arrived"))
         };
         crate::budgets::clear();
+        assert!(crate::proxy::is_timeout(&first), "{first:?}");
         assert!(!crate::proxy::is_timeout(&error), "{error:?}");
     }
 
