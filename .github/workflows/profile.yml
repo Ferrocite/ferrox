@@ -31,7 +31,7 @@ env:
 jobs:
   profile:
     name: profile ${{ inputs.cell }} on ${{ inputs.engine }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +67,14 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: "false"
           CARGO_PROFILE_RELEASE_DEBUG: "1"
         run: cargo build --locked --release -p ferrox-bench -p ferrox-app
+      - name: capture the wire for the profiled cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p profile
+          sudo tcpdump -i lo -s 0 -U -w profile/loopback.pcap >/tmp/tcpdump.log 2>&1 &
+          echo $! >/tmp/tcpdump.pid
+          sleep 1
       - name: measure one cell under perf
         shell: bash
         env:
@@ -75,7 +83,7 @@ jobs:
         run: |
           PROFILE_DIR="$PWD/profile" timeout --kill-after=30s 900 ./scripts/run-benchmark-matrix.sh \
             --tier full --only "$CELL" --engines xray-core,ferrox \
-            --repeats 3 --no-build --out profile/out || true
+            --repeats 1 --no-build --out profile/out || true
           ls -la profile profile/out/cells 2>/dev/null || true
           sampled=0
           for data in profile/*.perf.data; do
@@ -88,6 +96,24 @@ jobs:
             tail -40 profile/out/summary.txt 2>/dev/null || true
             exit 1
           fi
+      - name: stop the wire capture
+        if: always()
+        shell: bash
+        run: |
+          sudo pkill -INT -x tcpdump || true
+          if [[ -f /tmp/tcpdump.pid ]]; then
+            kill "$(cat /tmp/tcpdump.pid)" 2>/dev/null || true
+          fi
+          sleep 1
+          sudo chown "$(id -u):$(id -g)" profile/loopback.pcap 2>/dev/null || true
+          cat /tmp/tcpdump.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wire-${{ github.run_id }}
+          path: profile/loopback.pcap
+          if-no-files-found: warn
+          retention-days: 7
       - name: collapse the profiles
         shell: bash
         run: |
