@@ -24438,9 +24438,9 @@ pub(crate) mod lane_pool {
     pub(crate) const RELAY_LANES: usize = 8;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
-    /// relay worker with it. One keeps the setup peak under the reference's server threads.
+    /// relay worker with it. Two keep a blocked stream setup from holding the only one.
     #[cfg(target_os = "linux")]
-    pub(crate) const SETUP_LANES: usize = 1;
+    pub(crate) const SETUP_LANES: usize = 2;
     #[cfg(not(target_os = "linux"))]
     pub(crate) const SETUP_LANES: usize = 2;
 
@@ -24449,7 +24449,7 @@ pub(crate) mod lane_pool {
     const SETUP_PENDING: usize = 8;
 
     /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
-    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave five relay
+    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave four relay
     /// workers for the flows behind them.
     const SETUP_BORROW_LANES: usize = 2;
 
