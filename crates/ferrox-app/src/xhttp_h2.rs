@@ -543,8 +543,8 @@ impl Read for H2StreamReader {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
-                if let Some(fd) = self.conn.park_body(self.id) {
-                    crate::proxy::note_wait_wake(fd);
+                if let Some(wake) = self.conn.park_body(self.id) {
+                    crate::proxy::note_wait_wake(wake);
                 }
                 drop(st);
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -628,8 +628,8 @@ impl crate::proxy::WindowRead for H2StreamReader {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
-                if let Some(fd) = self.conn.park_body(self.id) {
-                    crate::proxy::note_wait_wake(fd);
+                if let Some(wake) = self.conn.park_body(self.id) {
+                    crate::proxy::note_wait_wake(wake);
                 }
                 drop(st);
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -1374,7 +1374,7 @@ impl H2Conn {
 
     /// The descriptor a stream's body reader parks on, made the first time that reader finds
     /// nothing. The caller holds the stream's state lock, so a body pushed meanwhile is seen.
-    fn park_body(&self, sid: u32) -> Option<crate::proxy::WaitFd> {
+    fn park_body(&self, sid: u32) -> Option<Arc<crate::proxy::lane_pool::WakePipe>> {
         let mut wait = self
             .body_wait
             .lock()
@@ -1389,7 +1389,7 @@ impl H2Conn {
         wake.drain();
         wait.parked.insert(sid);
         self.body_parked_any.store(true, Ordering::Relaxed);
-        Some(wake.key())
+        Some(wake)
     }
 
     /// Releases a stream the reader has run again for: its waker stays for the next park.
@@ -4402,25 +4402,28 @@ mod tests {
         let mut three = window_reader(&conn, second, 3);
         let step = crate::proxy::RelayStep::enter();
         assert!(crate::proxy::WindowRead::read_window(&mut one).is_err());
-        let one_fd = crate::proxy::take_wait_wake().expect("the idle body parks on its waker");
+        let one_wake = crate::proxy::take_wait_wake().expect("the idle body parks on its waker");
         assert!(crate::proxy::WindowRead::read_window(&mut three).is_err());
-        let three_fd = crate::proxy::take_wait_wake().expect("the idle body parks on its waker");
-        assert_ne!(one_fd, three_fd, "each stream waits on its own waker");
+        let three_wake = crate::proxy::take_wait_wake().expect("the idle body parks on its waker");
+        assert!(
+            !Arc::ptr_eq(&one_wake, &three_wake),
+            "each stream waits on its own waker"
+        );
         assert!(queue_data(&conn, 0, 1, b"answer".to_vec()));
-        assert!(readable(one_fd), "the fed stream's reader wakes");
-        assert!(!readable(three_fd), "an unfed sibling stays asleep");
+        assert!(readable(one_wake.key()), "the fed stream's reader wakes");
+        assert!(!readable(three_wake.key()), "an unfed sibling stays asleep");
         {
             let window = crate::proxy::WindowRead::read_window(&mut one).expect("the body lands");
             assert_eq!(window.bytes(), b"answer");
         }
         assert!(crate::proxy::WindowRead::read_window(&mut one).is_err());
-        assert_eq!(
-            crate::proxy::take_wait_wake(),
-            Some(one_fd),
-            "the waker outlives the wake it served"
+        let again = crate::proxy::take_wait_wake().expect("the waker outlives the wake it served");
+        assert!(
+            Arc::ptr_eq(&again, &one_wake),
+            "the same stream parks on the same waker"
         );
         assert!(
-            !readable(one_fd),
+            !readable(again.key()),
             "a park drains the wake its previous turn had already served"
         );
         drop(step);

@@ -9532,18 +9532,20 @@ pub(crate) fn forget_wait_fd() {
 
 thread_local! {
     /// A queue owner's waker the lane may park on: unlike a socket hint, this one is posted by the
-    /// thread that fills the queue, so a drain of the socket must not discard it.
-    static WAIT_WAKE: std::cell::Cell<Option<WaitFd>> = const { std::cell::Cell::new(None) };
+    /// thread that fills the queue, so a drain of the socket must not discard it. The handle is an
+    /// owner, not a number: the parked slot keeps the descriptor open until the reactor drops it.
+    static WAIT_WAKE: std::cell::RefCell<Option<std::sync::Arc<lane_pool::WakePipe>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) fn note_wait_wake(fd: WaitFd) {
+pub(crate) fn note_wait_wake(wake: std::sync::Arc<lane_pool::WakePipe>) {
     if relay_step_owns_poll() {
-        WAIT_WAKE.with(|slot| slot.set(Some(fd)));
+        WAIT_WAKE.with(|slot| *slot.borrow_mut() = Some(wake));
     }
 }
 
-pub(crate) fn take_wait_wake() -> Option<WaitFd> {
-    WAIT_WAKE.with(std::cell::Cell::take)
+pub(crate) fn take_wait_wake() -> Option<std::sync::Arc<lane_pool::WakePipe>> {
+    WAIT_WAKE.with(|slot| slot.borrow_mut().take())
 }
 
 thread_local! {
@@ -9594,7 +9596,7 @@ impl RelayStep {
     pub(crate) fn enter() -> Self {
         // A step starts with no wait hint: the socket, flow and budget the pool parks on belong to this step's own read.
         forget_wait_fd();
-        WAIT_WAKE.with(|slot| slot.set(None));
+        WAIT_WAKE.with(|slot| *slot.borrow_mut() = None);
         forget_wait_finish();
         forget_wait_idle();
         Self(RELAY_STEP.with(|flag| flag.replace(true)))
@@ -24360,6 +24362,8 @@ pub(crate) mod lane_pool {
         finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
         lane: Mutex<Option<Lane>>,
         pool: std::sync::Weak<Pool>,
+        /// The waker this slot polls, owned here so the descriptor outlives a reader that parks and drops.
+        _wake: Option<std::sync::Arc<WakePipe>>,
     }
 
     impl ReadySlot {
@@ -24823,7 +24827,7 @@ pub(crate) mod lane_pool {
         // The owner's waker wins, and either way the socket hint is consumed so a later step cannot park on a stale one.
         let wake = crate::proxy::take_wait_wake();
         let socket = crate::proxy::take_wait_fd();
-        let Some(fd) = wake.or(socket) else {
+        let Some(fd) = wake.as_ref().map(|wake| wake.key()).or(socket) else {
             crate::proxy::forget_wait_idle();
             return Err(lane);
         };
@@ -24840,6 +24844,7 @@ pub(crate) mod lane_pool {
             finish: crate::proxy::take_wait_finish(),
             lane: Mutex::new(None),
             pool: std::sync::Arc::downgrade(pool),
+            _wake: wake,
         });
         slot.put_lane(lane);
         // Watch before reading the end, so a racing end either wakes this slot or leaves the grace it arms.
@@ -25942,6 +25947,7 @@ pub(crate) mod lane_pool {
                     finish: None,
                     lane: Mutex::new(None),
                     pool: std::sync::Arc::downgrade(&pool),
+                    _wake: None,
                 });
                 slot.put_lane(Lane {
                     step: Box::new(|| Next::Done),
@@ -26008,6 +26014,7 @@ pub(crate) mod lane_pool {
                 finish: None,
                 lane: Mutex::new(None),
                 pool: std::sync::Arc::downgrade(&pool),
+                _wake: None,
             });
             slot.put_lane(Lane {
                 step: Box::new(|| Next::Done),
@@ -26026,6 +26033,33 @@ pub(crate) mod lane_pool {
             reactor.wake_due(park + crate::budgets::RELAY_POLL * 4, &mut lanes);
             assert_eq!(lanes.len(), 1, "the unwatchable descriptor never came back");
             let _ = std::fs::remove_file(&path);
+        }
+
+        /// A reader hands its waker to a parked slot and may drop before the poll runs: the slot
+        /// owns the descriptor, so the poll never holds one the reader already closed.
+        #[test]
+        fn a_parked_slot_owns_the_waker_its_reader_dropped() {
+            let wake = std::sync::Arc::new(WakePipe::new().expect("wake pipe"));
+            let seen = std::sync::Arc::downgrade(&wake);
+            let pool = spawn_pool();
+            let lane = Lane {
+                step: Box::new(|| Next::Done),
+                complete: Some(Box::new(|| {})),
+                idle: 0,
+                relay: true,
+            };
+            let _step = crate::proxy::RelayStep::enter();
+            crate::proxy::note_wait_wake(std::sync::Arc::clone(&wake));
+            assert!(
+                park_ready(&pool, lane).is_ok(),
+                "the waker slot was refused"
+            );
+            // The reader that handed the waker over is gone before the poll sees it.
+            drop(wake);
+            assert!(
+                seen.upgrade().is_some(),
+                "the slot dropped the reader's waker, closing the descriptor under the poll"
+            );
         }
 
         /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
@@ -36387,31 +36421,30 @@ mod tests {
     /// queue owner posts: that one names the park the lane actually waits on.
     #[test]
     fn a_queued_timeout_keeps_the_owner_waker() {
-        struct Noted;
+        struct Noted(std::sync::Arc<lane_pool::WakePipe>);
 
         impl Read for Noted {
             fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
                 let socket: WaitFd = 7;
-                let waker: WaitFd = 9;
                 note_wait_fd(socket);
-                note_wait_wake(waker);
+                note_wait_wake(std::sync::Arc::clone(&self.0));
                 Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
             }
         }
 
         let _step = RelayStep::enter();
-        let mut queued = Copied::with_park(Noted, true);
+        let wake = std::sync::Arc::new(lane_pool::WakePipe::new().expect("wake pipe"));
+        let mut queued = Copied::with_park(Noted(std::sync::Arc::clone(&wake)), true);
         assert!(queued.read_window().is_err());
         assert_eq!(
             take_wait_fd(),
             None,
             "the queue owns the socket, not the lane"
         );
-        let waker: WaitFd = 9;
-        assert_eq!(
-            take_wait_wake(),
-            Some(waker),
-            "the owner's waker is the park the lane keeps"
+        let kept = take_wait_wake().expect("the owner's waker is the park the lane keeps");
+        assert!(
+            std::sync::Arc::ptr_eq(&kept, &wake),
+            "the lane parks on the owner's own waker, not a copied number"
         );
     }
 
