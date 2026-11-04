@@ -12,8 +12,8 @@ use ferrox_core::transport::url_decode_parts;
 const HEAD_LIMIT: usize = 64 * 1024;
 /// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
-/// A whole body plus the longest size line that can precede it, so the framing read that opens a body brings the body with it instead of paying a second syscall.
-const FRAMING_READ: usize = CHUNK + 130;
+/// A whole body plus the longest size line that can precede it and both bytes that close the body, so one framing read opens and finishes it.
+const FRAMING_READ: usize = CHUNK + 131;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 fn path_covers(configured: &str, requested: &str) -> bool {
@@ -3447,6 +3447,48 @@ mod tests {
             3,
             "{count} peer chunks must not cost a read each"
         );
+    }
+
+    /// A peer can spend all 127 bytes before CRLF on an extension; the window must still carry the closing pair, or every such chunk pays a fill.
+    #[test]
+    fn a_maximum_size_line_keeps_the_closing_crlf_in_the_framing_read() {
+        let line = format!("10000;{}\r\n", "a".repeat(121));
+        assert_eq!(line.len(), 129, "127 bytes of line and its CRLF");
+        for count in [1usize, 2, 4, 8, 16] {
+            let payload: Vec<u8> = vec![0x5Au8; CHUNK * count];
+            let mut wire = Vec::new();
+            for _ in 0..count {
+                wire.extend_from_slice(line.as_bytes());
+                wire.extend(std::iter::repeat_n(0x5Au8, CHUNK));
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b"0\r\n\r\n");
+            let mut reader = Reader {
+                read: std::io::Cursor::new(wire),
+                prefix: Vec::new(),
+                at: 0,
+                left: 0,
+                ended: false,
+                reads: 0,
+                pending_head: false,
+                chunk: Chunk::Body,
+            };
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = reader.read(&mut buf).expect("reads");
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, payload, "{count} chunks: the bytes must be unchanged");
+            assert_eq!(
+                reader.reads(),
+                count + 1,
+                "{count} chunks: the closing pair must ride in the framing read"
+            );
+        }
     }
 
     /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
