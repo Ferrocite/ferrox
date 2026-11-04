@@ -205,10 +205,7 @@ fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> R
     )
 }
 
-#[allow(
-    clippy::uninit_vec,
-    reason = "seal_from writes every byte of the claimed room before the tag is appended"
-)]
+/// Time the source seal against the staging copy, asserting the same bytes first.
 fn check_and_time_256_from(len: usize, plain: &[u8]) -> Row {
     let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(5));
     let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(1));
@@ -222,8 +219,7 @@ fn check_and_time_256_from(len: usize, plain: &[u8]) -> Row {
 
     let mut fresh = Vec::with_capacity(len + 16);
     let start = fresh.len();
-    fresh.reserve(len);
-    unsafe { fresh.set_len(start + len) };
+    fresh.resize(start + len, 0);
     let tag = ours.seal_from(&nonce, aad, plain, &mut fresh[start..]);
     fresh.extend_from_slice(&tag);
     assert_eq!(old, fresh, "{len}: the same ciphertext and tag either way");
@@ -243,8 +239,7 @@ fn check_and_time_256_from(len: usize, plain: &[u8]) -> Row {
     let mut ours_run = || {
         fresh_buf.clear();
         let start = fresh_buf.len();
-        fresh_buf.reserve(len);
-        unsafe { fresh_buf.set_len(start + len) };
+        fresh_buf.resize(start + len, 0);
         let tag = ours.seal_from(
             std::hint::black_box(&nonce),
             aad,

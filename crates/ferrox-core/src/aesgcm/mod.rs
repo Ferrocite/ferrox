@@ -838,6 +838,7 @@ pub(crate) fn seal_impl_256<V: Lanes>(
     )
 }
 
+/// Seal `src` into `dst` with the fused CTR/GHASH pass, returning the authentication tag.
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn seal_impl_from_256<V: Lanes>(
@@ -1410,6 +1411,7 @@ mod tests_aes256 {
             .into()
     }
 
+    /// The source seal writes the same bytes as the in-place seal and leaves its input alone.
     #[test]
     fn sealing_256_from_a_source_writes_the_same_bytes_and_leaves_the_source_alone() {
         let keys: [[u8; 32]; 2] = [

@@ -510,6 +510,7 @@ impl Engine256 {
     }
 
     #[inline(always)]
+    /// CTR and GHASH reading `src` and writing `dst`, returning the chained GHASH state.
     fn ctr_ghash8_from_256(
         &self,
         template: __m128i,
@@ -587,6 +588,7 @@ impl Engine256 {
     }
 
     #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
+    /// Seal `src` into `dst` without staging the plaintext, returning the authentication tag.
     pub(crate) unsafe fn seal_from(
         &self,
         nonce: &[u8; 12],

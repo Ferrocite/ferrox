@@ -498,6 +498,7 @@ fn ctr_ghash8_256(
     clippy::too_many_arguments,
     reason = "the cipher state, both directions and the deferred tail are the pass, not a bundle"
 )]
+/// CTR and GHASH reading `src` and writing `dst`, returning the chained GHASH state.
 fn ctr_ghash8_from_256(
     rk: &[uint8x16_t; 15],
     ghash: &impl GhashTables,
@@ -833,6 +834,7 @@ impl Engine256 {
     }
 
     #[target_feature(enable = "aes,neon")]
+    /// Seal `src` into `dst` without staging the plaintext, returning the authentication tag.
     pub(crate) unsafe fn seal_from(
         &self,
         nonce: &[u8; 12],

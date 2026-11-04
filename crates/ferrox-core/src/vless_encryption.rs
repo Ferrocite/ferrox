@@ -113,10 +113,7 @@ impl Aead {
         self.nonce
     }
 
-    #[allow(
-        clippy::uninit_vec,
-        reason = "seal_from writes every byte of the claimed room before the tag is appended"
-    )]
+    /// Seal one record into `out` and append its tag.
     fn seal_into(
         &mut self,
         nonce: Option<[u8; 12]>,
@@ -129,8 +126,7 @@ impl Aead {
             Cipher::Aes(cipher) => {
                 let start = out.len();
                 let tag = if plaintext.len() >= SOURCE_SEAL_MIN {
-                    out.reserve(plaintext.len());
-                    unsafe { out.set_len(start + plaintext.len()) };
+                    out.resize(start + plaintext.len(), 0);
                     cipher.seal_from(&nonce, aad, plaintext, &mut out[start..])
                 } else {
                     out.extend_from_slice(plaintext);

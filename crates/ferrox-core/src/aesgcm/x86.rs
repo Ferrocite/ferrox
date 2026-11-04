@@ -309,6 +309,7 @@ impl Engine256 {
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    /// Seal `src` into `dst` without staging the plaintext, returning the authentication tag.
     pub(crate) unsafe fn seal_from(
         &self,
         nonce: &[u8; 12],
