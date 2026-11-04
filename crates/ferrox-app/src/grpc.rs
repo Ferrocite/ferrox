@@ -2675,6 +2675,10 @@ impl crate::proxy::CarrierSink for GrpcWriter {
         self.wait_for_room(turn);
     }
     #[inline]
+    fn room_wakes(&self) -> bool {
+        true
+    }
+    #[inline]
     fn close(&self) {
         self.close();
     }

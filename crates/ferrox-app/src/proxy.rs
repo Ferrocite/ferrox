@@ -26955,6 +26955,11 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn wait_for_room(&self, turn: std::time::Duration) {
         std::thread::sleep(turn);
     }
+    /// Whether the peer's own wake frees this carrier's room, so a full window waits at once instead
+    /// of spending the sibling lanes' turns on a grant that arrives off the pool.
+    fn room_wakes(&self) -> bool {
+        false
+    }
     fn close(&self);
     /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp, gRPC) answers here.
     fn upload_done(&self) {}
@@ -27381,6 +27386,11 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
             Push::Took(n) if n > 0 => {
                 at.sent += n;
                 at.spins = 0;
+            }
+            // A carrier the peer wakes holds its worker for no turn: the grant is read on the demux, so a lap per sibling buys nothing.
+            Push::Parked if uplink.room_wakes() => {
+                uplink.wait_for_room(crate::budgets::RELAY_POLL);
+                return Some(Next::Retry);
             }
             // A full window is another lane's frame away, so the leg rejoins the queue at once: a quantum spent here is a window the peer cannot grant.
             Push::Took(_) | Push::Parked => {
@@ -36354,6 +36364,59 @@ mod tests {
             Some(fd),
             "a socket carrier parks on its descriptor"
         );
+    }
+
+    /// A carrier whose room arrives on the peer's wake waits on its first full window: the grant is
+    /// read on the demux, so a lap through the sibling lanes buys a small window's frame nothing.
+    #[test]
+    fn a_peer_woken_window_waits_at_once() {
+        #[derive(Clone)]
+        struct Sink {
+            pushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            waits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl CarrierSink for Sink {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push(&self, _: &[u8]) -> Push {
+                self.pushes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Push::Parked
+            }
+            fn wait_for_room(&self, _: std::time::Duration) {
+                self.waits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn room_wakes(&self) -> bool {
+                true
+            }
+            fn close(&self) {}
+        }
+
+        let mut buffer = RelayBuf::new();
+        buffer.as_mut()[..8].copy_from_slice(b"abcdefgh");
+        let _ = buffer.filled(8);
+        let mut at = Forward::new();
+        at.pending = 8;
+        let sink = Sink {
+            pushes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            waits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        assert_eq!(forward_flush(&buffer, &sink, &mut at), Some(Next::Retry));
+        assert_eq!(
+            sink.waits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the woken carrier waited on its first full window"
+        );
+        assert_eq!(
+            sink.pushes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the grant cost no sibling lane's turn"
+        );
+        assert_eq!(at.spins, 0, "a woken carrier keeps no spin streak");
+        assert_eq!(at.sent, 0);
     }
 
     #[test]
