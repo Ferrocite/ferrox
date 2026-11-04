@@ -9475,9 +9475,24 @@ pub(crate) fn is_udp_gone(error: &std::io::Error) -> bool {
 }
 
 /// A timeout that waits on the socket: an interrupted read is retried, not parked on the descriptor.
-#[cfg(unix)]
 pub(crate) fn is_descriptor_wait(error: &std::io::Error) -> bool {
     is_timeout(error) && error.kind() != std::io::ErrorKind::Interrupted
+}
+
+/// The handle a parked lane waits on readiness with: the descriptor on Unix, the socket on Windows.
+#[cfg(unix)]
+pub(crate) type WaitFd = std::os::fd::RawFd;
+#[cfg(windows)]
+pub(crate) type WaitFd = std::os::windows::io::RawSocket;
+
+#[cfg(unix)]
+pub(crate) fn wait_key<T: std::os::fd::AsRawFd>(stream: &T) -> WaitFd {
+    stream.as_raw_fd()
+}
+
+#[cfg(windows)]
+pub(crate) fn wait_key<T: std::os::windows::io::AsRawSocket>(stream: &T) -> WaitFd {
+    stream.as_raw_socket()
 }
 
 thread_local! {
@@ -9489,30 +9504,25 @@ pub(crate) fn relay_step_owns_poll() -> bool {
     RELAY_STEP.with(std::cell::Cell::get)
 }
 
-#[cfg(unix)]
 thread_local! {
     /// The socket a relay step's read timed out on: the lane waits on its readiness instead of the clock.
-    static WAIT_FD: std::cell::Cell<Option<std::os::fd::RawFd>> = const { std::cell::Cell::new(None) };
+    static WAIT_FD: std::cell::Cell<Option<WaitFd>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(unix)]
-pub(crate) fn note_wait_fd(fd: std::os::fd::RawFd) {
+pub(crate) fn note_wait_fd(fd: WaitFd) {
     if relay_step_owns_poll() {
         WAIT_FD.with(|slot| slot.set(Some(fd)));
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn take_wait_fd() -> Option<std::os::fd::RawFd> {
+pub(crate) fn take_wait_fd() -> Option<WaitFd> {
     WAIT_FD.with(std::cell::Cell::take)
 }
 
-#[cfg(unix)]
 pub(crate) fn forget_wait_fd() {
     WAIT_FD.with(|slot| slot.set(None));
 }
 
-#[cfg(unix)]
 thread_local! {
     /// The flow a timed-out relay step belongs to: its sibling's end wakes the lane instead of a clock.
     static WAIT_FINISH: std::cell::RefCell<Option<std::sync::Arc<RelayFinish>>> =
@@ -9521,44 +9531,35 @@ thread_local! {
 
 /// Names the flow a timed-out step will park on, so ending the sibling can wake it directly.
 pub(crate) fn note_wait_finish(finish: &std::sync::Arc<RelayFinish>) {
-    #[cfg(unix)]
     if relay_step_owns_poll() {
         WAIT_FINISH.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(finish)));
     }
-    #[cfg(not(unix))]
-    let _ = finish;
 }
 
-#[cfg(unix)]
 pub(crate) fn take_wait_finish() -> Option<std::sync::Arc<RelayFinish>> {
     WAIT_FINISH.with(|slot| slot.borrow_mut().take())
 }
 
-#[cfg(unix)]
 pub(crate) fn forget_wait_finish() {
     WAIT_FINISH.with(|slot| slot.borrow_mut().take());
 }
 
-#[cfg(unix)]
 thread_local! {
     /// The idle budget of the flow a timed-out step belongs to: its parked leg wakes on that budget,
     /// not on the shorter default the readiness scheduler used before the policy was read.
     static WAIT_IDLE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(unix)]
 pub(crate) fn note_wait_idle(idle: Duration) {
     if relay_step_owns_poll() {
         WAIT_IDLE.with(|slot| slot.set(Some(idle)));
     }
 }
 
-#[cfg(unix)]
 pub(crate) fn take_wait_idle() -> Option<Duration> {
     WAIT_IDLE.with(std::cell::Cell::take)
 }
 
-#[cfg(unix)]
 pub(crate) fn forget_wait_idle() {
     WAIT_IDLE.with(|slot| slot.set(None));
 }
@@ -23275,13 +23276,9 @@ impl TcpCopy {
                 Next::More
             }
             Err(error) if is_timeout(&error) => {
-                #[cfg(unix)]
-                {
-                    use std::os::fd::AsRawFd as _;
-                    note_wait_fd(self.src.as_raw_fd());
-                    note_wait_idle(self.reply_idle);
-                    note_wait_finish(flow);
-                }
+                note_wait_fd(wait_key(&self.src));
+                note_wait_idle(self.reply_idle);
+                note_wait_finish(flow);
                 if flow.ended() && flow.ended_and_idle(self.reply_idle) {
                     self.end();
                     Next::Done
@@ -23727,7 +23724,6 @@ where
         }),
     );
     let reply_finish = Arc::clone(&flow);
-    #[cfg(unix)]
     let parked = Arc::clone(&reply_finish);
     let reply_done = Arc::clone(&reply_finish);
     let down = udp;
@@ -23744,12 +23740,8 @@ where
                 Next::More
             }
             Err(error) if is_timeout(&error) => {
-                #[cfg(unix)]
-                {
-                    use std::os::fd::AsRawFd as _;
-                    note_wait_fd(down.as_raw_fd());
-                    note_wait_finish(&parked);
-                }
+                note_wait_fd(wait_key(&down));
+                note_wait_finish(&parked);
                 if reply_finish.ended()
                     && (awaiting.load(Ordering::Relaxed) == 0
                         || reply_finish.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE))
@@ -24229,6 +24221,7 @@ impl Default for RelayBuf {
 /// every wrapped flow. A step is one read and the write it feeds, bounded by the read clock the
 /// lane's source was armed with; the step says whether the direction is still moving.
 pub(crate) mod lane_pool {
+    use super::WaitFd;
     use std::collections::VecDeque;
     use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
     use std::thread;
@@ -24259,7 +24252,6 @@ pub(crate) mod lane_pool {
 
     impl Lane {
         fn run(&mut self) -> Next {
-            #[cfg(unix)]
             {
                 crate::proxy::forget_wait_fd();
                 crate::proxy::forget_wait_finish();
@@ -24281,7 +24273,7 @@ pub(crate) mod lane_pool {
     }
 
     /// The deadline a readiness park armed, or that it armed none because its sibling still lives.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum ReadyClock {
         None,
@@ -24302,26 +24294,21 @@ pub(crate) mod lane_pool {
         idle_exit: bool,
         /// Lanes whose source is a socket wait here; one reaper polls every descriptor and requeues
         /// the lane that has bytes, whose sibling ends, or whose grace falls due.
-        #[cfg(unix)]
         waiting: Mutex<Vec<std::sync::Arc<ReadySlot>>>,
-        #[cfg(unix)]
         wake: Option<WakePipe>,
-        #[cfg(unix)]
         reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
         /// Slots whose sibling ended, named so the reaper drops them without scanning the parked set.
-        #[cfg(unix)]
         retired: Mutex<Vec<u64>>,
-        #[cfg(unix)]
         next_slot: std::sync::atomic::AtomicU64,
         /// Which park branch a lane took: a readiness park is a descriptor wait, a timer park is the clock.
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         ready_parks: std::sync::atomic::AtomicUsize,
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         timer_parks: std::sync::atomic::AtomicUsize,
         /// The deadline the last readiness park armed; `None` is a lane whose sibling has not ended.
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         last_ready_due: Mutex<Option<ReadyClock>>,
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         ended_wakes: std::sync::atomic::AtomicUsize,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
@@ -24338,17 +24325,15 @@ pub(crate) mod lane_pool {
 
     /// A lane parked on a socket. The descriptor wakes it when the peer writes, its sibling's end
     /// wakes it when it does not, and `due` is the grace a sibling's end leaves for the last reply.
-    #[cfg(unix)]
     pub(crate) struct ReadySlot {
         id: u64,
         due: std::sync::OnceLock<Option<std::time::Instant>>,
-        fd: std::os::fd::RawFd,
+        fd: WaitFd,
         finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
         lane: Mutex<Option<Lane>>,
         pool: std::sync::Weak<Pool>,
     }
 
-    #[cfg(unix)]
     impl ReadySlot {
         fn due(&self) -> Option<std::time::Instant> {
             self.due.get().copied().flatten()
@@ -24380,7 +24365,7 @@ pub(crate) mod lane_pool {
             let Some(pool) = self.pool.upgrade() else {
                 return;
             };
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             pool.ended_wakes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Ok(mut retired) = pool.retired.lock() {
@@ -24443,6 +24428,10 @@ pub(crate) mod lane_pool {
                 }
             }
         }
+
+        fn key(&self) -> WaitFd {
+            self.read
+        }
     }
 
     #[cfg(unix)]
@@ -24452,6 +24441,40 @@ pub(crate) mod lane_pool {
                 libc::close(self.read);
                 libc::close(self.write);
             }
+        }
+    }
+
+    /// The same wake on Windows: `WSAPoll` watches sockets, so a loopback datagram pair stands in
+    /// for the pipe. A full receive buffer drops the extra posts, and one already queued wakes.
+    #[cfg(windows)]
+    struct WakePipe {
+        read: std::net::UdpSocket,
+        write: std::net::UdpSocket,
+    }
+
+    #[cfg(windows)]
+    impl WakePipe {
+        fn new() -> Option<Self> {
+            let read = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+            let write = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+            write.connect(read.local_addr().ok()?).ok()?;
+            read.set_nonblocking(true).ok()?;
+            write.set_nonblocking(true).ok()?;
+            Some(Self { read, write })
+        }
+
+        fn post(&self) {
+            let _ = self.write.send(&[1]);
+        }
+
+        fn drain(&self) {
+            let mut byte = [0u8; 64];
+            while matches!(self.read.recv(&mut byte), Ok(n) if n > 0) {}
+        }
+
+        fn key(&self) -> WaitFd {
+            use std::os::windows::io::AsRawSocket as _;
+            self.read.as_raw_socket()
         }
     }
 
@@ -24526,23 +24549,18 @@ pub(crate) mod lane_pool {
             cap,
             pending,
             idle_exit,
-            #[cfg(unix)]
             waiting: Mutex::new(Vec::new()),
-            #[cfg(unix)]
             wake: WakePipe::new(),
-            #[cfg(unix)]
             reaper: Mutex::new(None),
-            #[cfg(unix)]
             retired: Mutex::new(Vec::new()),
-            #[cfg(unix)]
             next_slot: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             ready_parks: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             timer_parks: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             last_ready_due: Mutex::new(None),
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             ended_wakes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
@@ -24649,7 +24667,6 @@ pub(crate) mod lane_pool {
                     }
                     Ok(Next::Idle) => {
                         lane.idle = lane.idle.saturating_add(1);
-                        #[cfg(unix)]
                         match park_ready(pool, lane) {
                             Ok(()) => break,
                             Err(parked) => lane = parked,
@@ -24692,7 +24709,7 @@ pub(crate) mod lane_pool {
     /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
     /// deadline already parked.
     fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         pool.timer_parks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let due = std::time::Instant::now() + wait_for(lane.idle, quantum);
@@ -24760,7 +24777,6 @@ pub(crate) mod lane_pool {
     /// Parks an idle lane on the descriptor its read timed out on, so the peer's write wakes it
     /// instead of the lane re-reading every poll quantum. The check falls due once per response-idle
     /// budget, which is what notices a sibling that ended while this direction stayed quiet.
-    #[cfg(unix)]
     fn park_ready(pool: &std::sync::Arc<Pool>, lane: Lane) -> Result<(), Lane> {
         if !lane.relay {
             crate::proxy::forget_wait_idle();
@@ -24794,7 +24810,7 @@ pub(crate) mod lane_pool {
             Some(Some(at)) => Some(at + idle),
         };
         let _ = slot.due.set(due);
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         {
             *pool
                 .last_ready_due
@@ -24817,7 +24833,6 @@ pub(crate) mod lane_pool {
 
     /// One reaper per pool, started by the first socket lane that parks. A spawn failure leaves the
     /// lane to the timer path rather than parked on a descriptor nobody polls.
-    #[cfg(unix)]
     fn start_reaper(pool: &std::sync::Arc<Pool>) -> bool {
         let mut slot = pool.reaper.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_some() {
@@ -24829,7 +24844,7 @@ pub(crate) mod lane_pool {
         let Some(wake) = pool.wake.as_ref() else {
             return false;
         };
-        let Some(reactor) = Reactor::new(wake.read) else {
+        let Some(reactor) = Reactor::new(wake.key()) else {
             return false;
         };
         let weak = std::sync::Arc::downgrade(pool);
@@ -24844,28 +24859,31 @@ pub(crate) mod lane_pool {
     }
 
     /// A parked lane's descriptor wait. The epoll/kqueue shape returns only the descriptors that
-    /// are ready, so a wake costs the set's ready lines instead of rebuilding a row per parked lane.
-    #[cfg(unix)]
+    /// are ready, so a wake costs the set's ready lines instead of rebuilding a row per parked lane;
+    /// `WSAPoll` keeps the rows and reports which of them are ready.
     struct Reactor {
         #[cfg(target_os = "linux")]
         ep: libc::c_int,
         #[cfg(target_os = "macos")]
         kq: libc::c_int,
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         wake: libc::c_int,
-        fds: std::collections::HashMap<libc::c_int, Vec<u64>>,
+        #[cfg(windows)]
+        wake: WaitFd,
+        fds: std::collections::HashMap<WaitFd, Vec<u64>>,
         slots: std::collections::HashMap<u64, std::sync::Arc<ReadySlot>>,
         due: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>,
         #[cfg(target_os = "linux")]
         events: Vec<libc::epoll_event>,
         #[cfg(target_os = "macos")]
         events: Vec<libc::kevent>,
+        #[cfg(windows)]
+        rows: Vec<windows_sys::Win32::Networking::WinSock::WSAPOLLFD>,
     }
 
-    #[cfg(unix)]
     impl Reactor {
         #[cfg(target_os = "linux")]
-        fn new(wake: libc::c_int) -> Option<Self> {
+        fn new(wake: WaitFd) -> Option<Self> {
             let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
             if ep < 0 {
                 return None;
@@ -24887,7 +24905,7 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn new(wake: libc::c_int) -> Option<Self> {
+        fn new(wake: WaitFd) -> Option<Self> {
             let kq = unsafe { libc::kqueue() };
             if kq < 0 {
                 return None;
@@ -24916,8 +24934,8 @@ pub(crate) mod lane_pool {
             Some(reactor)
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        fn new(wake: libc::c_int) -> Option<Self> {
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn new(wake: WaitFd) -> Option<Self> {
             Some(Self {
                 wake,
                 fds: std::collections::HashMap::new(),
@@ -24927,7 +24945,7 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "linux")]
-        fn add(&mut self, fd: libc::c_int) -> bool {
+        fn add(&mut self, fd: WaitFd) -> bool {
             let mut row = libc::epoll_event {
                 events: u32::try_from(libc::EPOLLIN).unwrap_or(u32::MAX),
                 u64: u64::try_from(fd).unwrap_or(u64::MAX),
@@ -24947,14 +24965,14 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "linux")]
-        fn del(&mut self, fd: libc::c_int) {
+        fn del(&mut self, fd: WaitFd) {
             unsafe {
                 libc::epoll_ctl(self.ep, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
             }
         }
 
         #[cfg(target_os = "macos")]
-        fn change(&self, fd: libc::c_int, flags: u16) -> bool {
+        fn change(&self, fd: WaitFd, flags: u16) -> bool {
             let change = libc::kevent {
                 ident: usize::try_from(fd).unwrap_or(usize::MAX),
                 filter: libc::EVFILT_READ,
@@ -24976,25 +24994,25 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn add(&mut self, fd: libc::c_int) -> bool {
+        fn add(&mut self, fd: WaitFd) -> bool {
             self.change(fd, libc::EV_ADD | libc::EV_ENABLE)
         }
 
         #[cfg(target_os = "macos")]
-        fn del(&mut self, fd: libc::c_int) {
+        fn del(&mut self, fd: WaitFd) {
             self.change(fd, libc::EV_DELETE);
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        fn add(&mut self, _: libc::c_int) -> bool {
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn add(&mut self, _: WaitFd) -> bool {
             true
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        fn del(&mut self, _: libc::c_int) {}
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn del(&mut self, _: WaitFd) {}
 
         #[cfg(target_os = "linux")]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<libc::c_int> {
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
             let millis =
                 libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
             let count = unsafe {
@@ -25015,7 +25033,7 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<libc::c_int> {
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
             let seconds = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
             let nanos = i64::from(timeout.subsec_nanos());
             let span = libc::timespec {
@@ -25041,8 +25059,8 @@ pub(crate) mod lane_pool {
                 .collect()
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<libc::c_int> {
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
             let millis =
                 libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
             let mut rows = Vec::with_capacity(self.fds.len() + 1);
@@ -25071,6 +25089,67 @@ pub(crate) mod lane_pool {
             rows.iter()
                 .filter(|row| row.revents != 0)
                 .map(|row| row.fd)
+                .collect()
+        }
+
+        #[cfg(windows)]
+        fn new(wake: WaitFd) -> Option<Self> {
+            Some(Self {
+                wake,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+                rows: Vec::new(),
+            })
+        }
+
+        // `WSAPoll` takes the whole set per wait, so a socket joins the rows and leaves with its slot.
+        #[cfg(windows)]
+        fn add(&mut self, _: WaitFd) -> bool {
+            true
+        }
+
+        #[cfg(windows)]
+        fn del(&mut self, _: WaitFd) {}
+
+        #[cfg(windows)]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
+            use windows_sys::Win32::Networking::WinSock::{
+                WSAPoll, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+            };
+            let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+            self.rows.clear();
+            self.rows.push(WSAPOLLFD {
+                fd: self.wake as SOCKET,
+                events: POLLIN | POLLRDNORM,
+                revents: 0,
+            });
+            for fd in self.fds.keys() {
+                self.rows.push(WSAPOLLFD {
+                    fd: *fd as SOCKET,
+                    events: POLLIN | POLLRDNORM,
+                    revents: 0,
+                });
+            }
+            let polled = unsafe {
+                WSAPoll(
+                    self.rows.as_mut_ptr(),
+                    u32::try_from(self.rows.len()).unwrap_or(u32::MAX),
+                    millis,
+                )
+            };
+            if polled < 0 {
+                // A socket closed under the poll fails the call for the whole set; the retire list drops it on the next pass.
+                std::thread::sleep(crate::budgets::RELAY_POLL);
+                return Vec::new();
+            }
+            if polled == 0 {
+                return Vec::new();
+            }
+            self.rows
+                .iter()
+                .filter(|row| row.revents != 0)
+                .map(|row| row.fd as WaitFd)
                 .collect()
         }
 
@@ -25111,7 +25190,7 @@ pub(crate) mod lane_pool {
 
         /// Hands every slot on a ready descriptor back to the queue. Level-triggered, so a lane that
         /// parks again after leaving a partial frame re-arms and fires at once.
-        fn wake(&mut self, fd: libc::c_int, ready: &mut Vec<Lane>) {
+        fn wake(&mut self, fd: WaitFd, ready: &mut Vec<Lane>) {
             let Some(ids) = self.fds.remove(&fd) else {
                 return;
             };
@@ -25186,7 +25265,6 @@ pub(crate) mod lane_pool {
     #[cfg(target_os = "macos")]
     unsafe impl Send for Reactor {}
 
-    #[cfg(unix)]
     fn reaper_loop(pool: &std::sync::Weak<Pool>, mut reactor: Reactor) {
         loop {
             let Some(pool) = pool.upgrade() else {
@@ -25236,7 +25314,7 @@ pub(crate) mod lane_pool {
             };
             let ready_fds = reactor.wait(timeout);
             for fd in ready_fds {
-                if fd == wake.read {
+                if fd == wake.key() {
                     wake.drain();
                 } else {
                     reactor.wake(fd, &mut ready);
@@ -25269,7 +25347,6 @@ pub(crate) mod lane_pool {
         pool.stop.store(true, SeqCst);
         pool.notify.notify_all();
         drop(ready);
-        #[cfg(unix)]
         {
             if let Some(wake) = pool.wake.as_ref() {
                 wake.post();
@@ -25683,7 +25760,6 @@ pub(crate) mod lane_pool {
 
         /// A lane whose source is a socket parks in the reaper's waiting set, on the descriptor its
         /// read timed out on, and one peer byte wakes it. A lane on the timer never enters that set.
-        #[cfg(unix)]
         #[test]
         fn a_socket_lane_waits_on_readiness() {
             use std::io::{Read as _, Write as _};
@@ -25806,7 +25882,6 @@ pub(crate) mod lane_pool {
 
         /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
         /// then does the response-idle grace arm.
-        #[cfg(unix)]
         #[test]
         fn a_parked_lane_waits_for_its_sibling_not_the_clock() {
             use std::io::Read as _;
@@ -26188,7 +26263,6 @@ pub(crate) struct RelayFinish {
     ended: AtomicBool,
     ended_at: Mutex<Option<std::time::Instant>>,
     /// Lanes parked on the peer's read, so ending this flow hands its sibling back at once.
-    #[cfg(unix)]
     parked: Mutex<Vec<std::sync::Weak<lane_pool::ReadySlot>>>,
     closed: AtomicBool,
     close_first: bool,
@@ -26210,7 +26284,6 @@ impl RelayFinish {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
             ended_at: Mutex::new(None),
-            #[cfg(unix)]
             parked: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             close_first,
@@ -26233,7 +26306,6 @@ impl RelayFinish {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         self.ended.store(true, Ordering::Relaxed);
-        #[cfg(unix)]
         {
             let parked = std::mem::take(
                 &mut *self
@@ -26249,7 +26321,6 @@ impl RelayFinish {
 
     /// Registers a parked sibling and returns the end it must outlive, under the same hand as
     /// `mark_ended` so a race lands either on the wake or on the armed grace.
-    #[cfg(unix)]
     pub(crate) fn watch_park(
         &self,
         slot: &std::sync::Arc<lane_pool::ReadySlot>,
@@ -26265,7 +26336,6 @@ impl RelayFinish {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    #[cfg(unix)]
     pub(crate) fn unwatch_park(&self, slot: &std::sync::Arc<lane_pool::ReadySlot>) {
         let weak = std::sync::Arc::downgrade(slot);
         self.parked
