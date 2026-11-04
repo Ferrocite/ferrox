@@ -282,6 +282,32 @@ impl Stream<TcpStream> {
     }
 }
 
+impl Stream<crate::psiphon_webrtc::WebRtcStream> {
+    pub(crate) fn connect_webrtc(io: crate::psiphon_webrtc::WebRtcStream, key: &str) -> Self {
+        Self::new(io, key)
+    }
+
+    pub(crate) fn try_clone(&self) -> Self {
+        Self {
+            io: self.io.clone(),
+            reader: Arc::clone(&self.reader),
+            writer: Arc::clone(&self.writer),
+        }
+    }
+
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
+        self.io.set_timeout(timeout);
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
+        self.io.set_read_timeout(timeout);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.io.shutdown();
+    }
+}
+
 impl<T: Read + Write> Read for Stream<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         lock(&self.reader).read(&mut self.io, buf)

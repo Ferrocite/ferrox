@@ -10,6 +10,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_VERSION: u8 = 1;
@@ -113,7 +114,12 @@ impl Destination {
 }
 
 /// The in-proxy destination a signed server entry names for the requested TLS shape.
-pub(crate) fn destination(entry: &Json, host: &str, tls: bool) -> Option<Destination> {
+pub(crate) fn destination(
+    entry: &Json,
+    host: &str,
+    tls: bool,
+    protocols: &[String],
+) -> Option<Destination> {
     let capabilities = entry.get("capabilities").and_then(Json::as_arr)?;
     let has = |name: &str| {
         capabilities
@@ -121,36 +127,56 @@ pub(crate) fn destination(entry: &Json, host: &str, tls: bool) -> Option<Destina
             .filter_map(Json::as_str)
             .any(|capability| capability == name)
     };
-    let (port, network_protocol, protocol) = if !tls && has("INPROXY-WEBRTC-OSSH") {
-        (
-            entry.get("inproxyOSSHPort").and_then(Json::as_port),
-            NetworkProtocol::Tcp,
-            "INPROXY-WEBRTC-OSSH",
-        )
-    } else if !tls && has("INPROXY-WEBRTC-SSH") {
-        (
-            entry.get("inproxySSHPort").and_then(Json::as_port),
-            NetworkProtocol::Tcp,
-            "INPROXY-WEBRTC-SSH",
-        )
-    } else if tls && has("INPROXY-WEBRTC-TLS-OSSH") {
-        (
-            entry
-                .get("inproxyTlsOSSHPort")
-                .and_then(Json::as_port)
-                .or_else(|| entry.get("inproxyMeekPort").and_then(Json::as_port)),
-            NetworkProtocol::Tcp,
-            "INPROXY-WEBRTC-TLS-OSSH",
-        )
-    } else if !tls && has("INPROXY-WEBRTC-QUIC-OSSH") {
-        (
-            entry.get("inproxyQUICPort").and_then(Json::as_port),
-            NetworkProtocol::Udp,
-            "INPROXY-WEBRTC-QUIC-OSSH",
-        )
-    } else {
-        return None;
+    let allowed = |protocol: &str| {
+        protocols.is_empty()
+            || protocols
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(protocol))
     };
+    let candidates = if tls {
+        [
+            (
+                has("INPROXY-WEBRTC-TLS-OSSH"),
+                entry
+                    .get("inproxyTlsOSSHPort")
+                    .and_then(Json::as_port)
+                    .or_else(|| entry.get("inproxyMeekPort").and_then(Json::as_port)),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-TLS-OSSH",
+            ),
+            (false, None, NetworkProtocol::Tcp, ""),
+            (false, None, NetworkProtocol::Tcp, ""),
+            (false, None, NetworkProtocol::Tcp, ""),
+        ]
+    } else {
+        [
+            (
+                has("INPROXY-WEBRTC-OSSH"),
+                entry.get("inproxyOSSHPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-SSH"),
+                entry.get("inproxySSHPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-SSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-SHADOWSOCKS-OSSH"),
+                entry.get("inproxyShadowsocksPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-SHADOWSOCKS-OSSH",
+            ),
+            (false, None, NetworkProtocol::Tcp, ""),
+        ]
+    };
+    let (_, port, network_protocol, protocol) =
+        candidates
+            .into_iter()
+            .find(|(present, port, _, protocol)| {
+                *present && port.is_some_and(|port| port > 0) && allowed(protocol)
+            })?;
     let port = port.filter(|port| *port > 0)?;
     let address = if host.contains(':') {
         format!("[{host}]:{port}")
@@ -168,7 +194,6 @@ pub(crate) fn destination(entry: &Json, host: &str, tls: bool) -> Option<Destina
 #[derive(Clone, Copy)]
 enum NetworkProtocol {
     Tcp = 0,
-    Udp = 1,
 }
 
 fn pack_server_entry(entry: &Json) -> Option<Vec<u8>> {
@@ -306,6 +331,8 @@ impl Client {
         front: &Front,
         timeout: Duration,
         proxy: Option<&Proxy>,
+        headers: &[(String, String)],
+        dns: &[SocketAddr],
     ) -> Result<Self, String> {
         let sni = if front.disable_sni || front.dial.parse::<std::net::IpAddr>().is_ok() {
             String::new()
@@ -324,8 +351,11 @@ impl Client {
             fronts: vec![(front.dial.clone(), front.port)],
             hosts: vec![front.host.clone()],
             https: true,
+            quic: false,
             fronted: true,
             protocol: "INPROXY-BROKER",
+            headers: headers.to_vec(),
+            dns: dns.to_vec(),
         };
         let http = psiphon_meek::MeekHttp::new_plain(meek, proxy.cloned(), timeout, BROKER_PATH);
         let transport = Box::new(MeekTransport { http });

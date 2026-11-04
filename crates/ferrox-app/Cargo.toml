@@ -18,6 +18,8 @@ ferrox-core = { workspace = true }
 getrandom = "0.4"
 hkdf = "0.13"
 quiche = "0.30"
+rustls = { workspace = true, features = ["ring"] }
+chacha20 = "0.10"
 libc = "0.2"
 md5 = "0.8"
 mlua = { version = "0.12", features = ["lua51", "vendored", "send"] }
@@ -39,6 +41,7 @@ crypto_box = "0.9"
 snow = "0.10"
 curve25519-dalek = "4"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
+maxminddb = { version = "0.32.0", default-features = false }
 
 [dev-dependencies]
 chacha20poly1305 = "0.11"
