@@ -2076,6 +2076,62 @@ mod tests {
         }
     }
 
+    /// The pending-record batch keeps its allocation across flushes.
+    #[test]
+    fn a_batch_reuses_its_pending_buffer() {
+        let config = DeviceConfig {
+            secret: [0x11; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: vec![PeerConfig {
+                public: [0x22; 32],
+                preshared: [0; 32],
+                endpoint: None,
+                endpoints: Vec::new(),
+                keepalive: 0,
+                allowed: vec![("10.0.0.0".parse().unwrap(), 8)],
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let peers = peers(&config, [0; 12]);
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        let target = UdpSocket::bind("127.0.0.1:0")
+            .expect("target")
+            .local_addr()
+            .expect("address");
+        let (to_stack, _packets) = mpsc::channel();
+        let mut sends = Vec::new();
+        let mut capacity = 0;
+        for _ in 0..2 {
+            let mut events: Vec<Event> = (0..4)
+                .map(|index| Event::Send {
+                    endpoint: target,
+                    packet: vec![index; 32],
+                })
+                .collect();
+            flush(
+                &mut events,
+                &socket,
+                &to_stack,
+                None,
+                &peers,
+                Some(0),
+                false,
+                &mut sends,
+            );
+            assert_eq!(sends.len(), 0, "the batch is drained by the flush");
+            if capacity == 0 {
+                capacity = sends.capacity();
+                assert!(capacity >= 4, "the batch held the four records");
+            } else {
+                assert_eq!(sends.capacity(), capacity, "the batch does not reallocate");
+            }
+        }
+    }
+
     /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
     #[test]
     fn a_truncated_answer_is_asked_again_over_tcp() {
