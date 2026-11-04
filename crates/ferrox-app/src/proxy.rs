@@ -5177,8 +5177,8 @@ fn serve_sealed_mux<S>(
 fn sealed_window(buffer: Option<usize>) -> usize {
     buffer
         .filter(|window| *window > 0)
-        .map_or(RELAY_SMALL_BUFFER, |window| {
-            window.clamp(RELAY_SMALL_BUFFER, RELAY_BUFFER)
+        .map_or(64 * 1024, |window| {
+            window.clamp(64 * 1024, RELAY_BUFFER)
         })
 }
 
