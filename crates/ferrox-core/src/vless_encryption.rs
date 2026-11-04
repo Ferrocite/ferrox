@@ -2119,6 +2119,88 @@ mod tests {
         );
     }
 
+    /// A masked batch leaves the unmasked prefix alone, masks every record with the same keystream,
+    /// and reads back through a matching masked reader.
+    #[test]
+    fn a_masked_batched_record_write_is_one_call_and_reads_back() {
+        use std::io::{Cursor, Read as _, Write as _};
+
+        struct Sink {
+            calls: usize,
+            wire: Vec<u8>,
+        }
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.wire.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn masked(key: &[u8], pre_write: &[u8]) -> EncryptedStream<Sink> {
+            let mut stream = EncryptedStream::new(
+                Sink {
+                    calls: 0,
+                    wire: Vec::new(),
+                },
+                key.to_vec(),
+                Aead::with_cipher(pre_write, key, false),
+                None,
+                ReadStage::Records,
+            );
+            stream.set_pre_write(pre_write.to_vec());
+            stream.set_out_mask(HeaderMask::new(
+                Some(new_ctr(key, pre_write)),
+                pre_write.len(),
+            ));
+            stream
+        }
+
+        let key = vec![7u8; 32];
+        let pre_write = vec![0x5a; 16];
+        let payload: Vec<u8> = (0..MAX_BATCH_PLAINTEXT)
+            .map(|at| (at as u8).wrapping_mul(31).wrapping_add(5))
+            .collect();
+
+        let mut batched = masked(&key, &pre_write);
+        batched.write_all(&payload).unwrap();
+        assert_eq!(batched.get_ref().calls, 1, "one write for the whole batch");
+        assert_eq!(
+            batched.get_ref().wire.len(),
+            pre_write.len() + 8 * (HEADER_LEN + MAX_RECORD_PLAINTEXT + TAG_LEN),
+            "the batch is eight masked records after the unmasked prefix"
+        );
+
+        let mut singles = masked(&key, &pre_write);
+        for chunk in payload.chunks(MAX_RECORD_PLAINTEXT) {
+            singles.write_all(chunk).unwrap();
+        }
+        assert_eq!(singles.get_ref().calls, 8);
+        assert_eq!(
+            batched.get_ref().wire,
+            singles.get_ref().wire,
+            "masking a batch adds no byte and skips the same prefix"
+        );
+
+        let wire = batched.get_ref().wire.clone();
+        let mut reader = EncryptedStream::new(
+            Cursor::new(wire),
+            key.clone(),
+            Aead::with_cipher(&pre_write, &key, false),
+            None,
+            ReadStage::ServerRandom,
+        );
+        reader.set_in_mask(HeaderMask::new(Some(new_ctr(&key, &pre_write)), 0));
+        let mut got = vec![0u8; payload.len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, payload, "the masked batch reads back its plaintext");
+    }
+
     #[test]
     fn a_record_write_allocates_nothing_after_warmup() {
         use std::io::Write as _;
