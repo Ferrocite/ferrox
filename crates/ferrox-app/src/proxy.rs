@@ -28402,10 +28402,12 @@ pub(crate) fn socket_addr_of(
         libc::AF_INET6 if len as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
             // SAFETY: the family says the storage holds a `sockaddr_in6`, and the length says it is whole.
             let sin6 = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in6>() };
-            Some(SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr),
                 u16::from_be(sin6.sin6_port),
-            ))
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
         }
         _ => None,
     }
@@ -32654,6 +32656,29 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ipv6_socket_address_keeps_its_scope() {
+        // SAFETY: `storage` is a zeroed `sockaddr_storage`, large enough for the `sockaddr_in6` written through it.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // SAFETY: the family and length below say the storage holds this `sockaddr_in6`.
+        let sin6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
+        sin6.sin6_family = libc::AF_INET6 as _;
+        sin6.sin6_port = 1234u16.to_be();
+        sin6.sin6_addr.s6_addr = std::net::Ipv6Addr::LOCALHOST.octets();
+        sin6.sin6_flowinfo = 0x1234;
+        sin6.sin6_scope_id = 7;
+        let Some(SocketAddr::V6(address)) = socket_addr_of(
+            &storage,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        ) else {
+            panic!("the address is IPv6");
+        };
+        assert_eq!(address.port(), 1234);
+        assert_eq!(address.flowinfo(), 0x1234);
+        assert_eq!(address.scope_id(), 7);
+    }
     use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN, SINK_GRACE};
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
