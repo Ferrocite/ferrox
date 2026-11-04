@@ -7069,43 +7069,41 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
     #[cfg(target_os = "linux")]
     {
         let (finished, end) = std::sync::mpsc::channel();
+        let mut buf = udp_buffer();
+        let mut staging = Vec::with_capacity(8192);
         lane_pool::submit(
-            Box::new(move || {
-                let mut buf = udp_buffer();
-                let mut staging = Vec::with_capacity(8192);
-                match read.recv_from(&mut buf) {
-                    Ok((n, source)) => {
-                        if done.load(Ordering::Relaxed) {
-                            return Next::Done;
-                        }
-                        let keep = ferrox_core::mux::Outgoing {
-                            id: id.load(Ordering::Relaxed),
-                            status: ferrox_core::mux::Status::Keep,
-                            options: ferrox_core::mux::DATA,
-                            target: Some(mux_target_of(source)),
-                            global_id: None,
-                        };
-                        if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
-                            return Next::Done;
-                        }
-                        Next::More
+            Box::new(move || match read.recv_from(&mut buf) {
+                Ok((n, source)) => {
+                    if done.load(Ordering::Relaxed) {
+                        return Next::Done;
                     }
-                    Err(error) if is_timeout(&error) => {
-                        if done.load(Ordering::Relaxed) {
-                            Next::Done
-                        } else {
-                            Next::Idle
-                        }
+                    let keep = ferrox_core::mux::Outgoing {
+                        id: id.load(Ordering::Relaxed),
+                        status: ferrox_core::mux::Status::Keep,
+                        options: ferrox_core::mux::DATA,
+                        target: Some(mux_target_of(source)),
+                        global_id: None,
+                    };
+                    if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                        return Next::Done;
                     }
-                    Err(error) if is_udp_gone(&error) => {
-                        if done.load(Ordering::Relaxed) {
-                            Next::Done
-                        } else {
-                            Next::Idle
-                        }
-                    }
-                    Err(_) => Next::Done,
+                    Next::More
                 }
+                Err(error) if is_timeout(&error) => {
+                    if done.load(Ordering::Relaxed) {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                Err(error) if is_udp_gone(&error) => {
+                    if done.load(Ordering::Relaxed) {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                Err(_) => Next::Done,
             }),
             Box::new(move || {
                 let _ = finished.send(Ok(()));
@@ -23129,10 +23127,21 @@ fn relay_lanes(
         let _ = connection.set_read_timeout(Some(RELAY_POLL));
         let _ = connection.set_write_timeout(Some(RELAY_POLL));
     }
+    let forward_stall = client_read
+        .policy()
+        .or_else(|| target_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let reply_stall = target_read
+        .policy()
+        .or_else(|| client_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let flow = RelayFinish::new(false, close, None);
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
+    forward.stall = forward_stall;
     lane_pool::submit(
         Box::new(move || forward.step(&first)),
         Box::new({
@@ -23145,6 +23154,7 @@ fn relay_lanes(
     );
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
+    reply.stall = reply_stall;
     lane_pool::submit(
         Box::new(move || reply.step(&second)),
         Box::new({
@@ -23240,7 +23250,7 @@ impl TcpCopy {
                     note_wait_fd(self.src.as_raw_fd());
                     note_wait_finish(flow);
                 }
-                if flow.ended() && flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                if flow.ended() && flow.ended_and_idle(self.stall) {
                     self.end();
                     Next::Done
                 } else {
