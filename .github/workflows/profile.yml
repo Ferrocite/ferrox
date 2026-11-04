@@ -31,7 +31,7 @@ env:
 jobs:
   profile:
     name: profile ${{ inputs.cell }} on ${{ inputs.engine }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq linux-tools-common linux-tools-generic protobuf-compiler
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic protobuf-compiler strace
           perf=""
           for candidate in /usr/lib/linux-tools/*/perf "$(command -v perf || true)"; do
             [[ -n "$candidate" && -x "$candidate" ]] || continue
@@ -61,6 +61,14 @@ jobs:
       - name: fetch the reference
         shell: bash
         run: ./scripts/fetch-upstream.sh --only xray-core
+      - name: wrap the reference client
+        shell: bash
+        run: |
+          set -euo pipefail
+          real=target/parity-engines/xray-core
+          mv "$real" "$real.real"
+          printf '%s\n' '#!/bin/bash' 'exec strace -f -w -c -o "/tmp/xray-$$.strace" -e trace=read,write,recvfrom,sendto,recvmsg,sendmsg,epoll_wait,epoll_pwait,futex "$0.real" "$@"' > "$real"
+          chmod +x "$real"
       - name: build with symbols and frame pointers
         shell: bash
         env:
@@ -109,6 +117,10 @@ jobs:
               > "$base.annotate.txt" 2>&1 || true
           done
           du -sh profile || true
+      - name: collect client syscalls
+        if: always()
+        shell: bash
+        run: cp /tmp/xray-*.strace profile/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
           name: profile-${{ github.run_id }}
