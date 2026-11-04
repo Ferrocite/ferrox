@@ -722,38 +722,6 @@ impl Connection {
         }
     }
 
-    /// Bound the bytes the kernel queues but has not put on the wire, so a peer that reads slowly
-    /// cannot grow a multi-megabyte send queue whose first burst then fills the peer's window.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn set_notsent_lowat(&self, bytes: i32) {
-        match self {
-            Connection::Tcp(stream) => Self::apply_notsent_lowat(stream, bytes),
-            Connection::Masked(masked) => Self::apply_notsent_lowat(&masked.stream, bytes),
-            Connection::Metered(metered) => metered.inner.set_notsent_lowat(bytes),
-            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
-                inner.set_notsent_lowat(bytes)
-            }
-            #[cfg(any(unix, windows))]
-            Connection::Unix(_) => {}
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn apply_notsent_lowat(stream: &TcpStream, bytes: i32) {
-        use std::os::fd::AsRawFd as _;
-        let value = bytes;
-        // The option's failure is a shortfall in pacing, not a broken connection: the socket stays usable.
-        unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                std::ptr::addr_of!(value).cast(),
-                std::mem::size_of_val(&value) as libc::socklen_t,
-            );
-        }
-    }
-
     /// Read back the armed wait bound, so a caller can save and restore it around a stage that
     /// tightens it. TCP asks `std`; a Unix stream reads the same `SO_RCVTIMEO`/`SO_SNDTIMEO`
     /// `timeval` back through `getsockopt`, so the save/restore is as exact as the set was.
