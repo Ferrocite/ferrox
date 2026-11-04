@@ -101,6 +101,7 @@ impl PooledStream {
             sock: Arc::clone(&self.sock),
             id: self.id,
             meter: crate::stats::Meter::default(),
+            peer_fin: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -3486,6 +3487,8 @@ pub(crate) struct QuicStream {
     sock: Arc<Datagram>,
     id: u64,
     meter: crate::stats::Meter,
+    /// The peer's FIN can arrive with the last bytes, and `Read` has nowhere to report it; keeping it makes the next read the EOF instead of a read the poll repeats.
+    peer_fin: Arc<AtomicBool>,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -3497,6 +3500,9 @@ const STREAM_POLL: Duration = Duration::from_millis(5);
 impl Read for QuicStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.peer_fin.load(Ordering::Relaxed) {
             return Ok(0);
         }
         let deadline = Instant::now() + STREAM_QUANTUM;
@@ -3516,11 +3522,13 @@ impl Read for QuicStream {
                         }
                     };
                     if n > 0 {
+                        self.peer_fin.store(fin, Ordering::Relaxed);
                         flush_egress(&mut conn, &self.sock);
                         self.meter.read(n);
                         return Ok(n);
                     }
                     if fin {
+                        self.peer_fin.store(true, Ordering::Relaxed);
                         return Ok(0);
                     }
                 }
@@ -3972,6 +3980,7 @@ fn reap(
             sock: Arc::clone(sock),
             id: stream,
             meter: crate::stats::Meter::default(),
+            peer_fin: Arc::new(AtomicBool::new(false)),
         };
         let serve = Arc::clone(serve);
         std::thread::spawn(move || serve(session));

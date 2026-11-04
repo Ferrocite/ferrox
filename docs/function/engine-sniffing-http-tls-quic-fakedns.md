@@ -25,7 +25,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 1220 | scripts/count-ops.sh |
+| ops-retired-instructions | 1228 | scripts/count-ops.sh |
 | http-host-and-tls-sni-recognized | 2 | ferrox-app-sniff::tests::reads_http_host_and_tls_sni |
 | quic-initial-sni-recognized | 1 | ferrox-app-sniff::tests::reads_a_quic_initial_sni |
 | bittorrent-and-utp-recognized | 2 | ferrox-app-sniff::tests::reads_bittorrent_and_utp |
@@ -43,7 +43,7 @@ Syscalls: one TCP probe issues `peek` calls on the client until the HTTP head or
   sniff::tests::a_warm_probe_costs_the_documented_instructions 'ferrox_app::sniff::Sniffing::inspect'
 ```
 
-1220 retired instructions for one pre-warmed inspection, the row in `scripts/expected-ops.txt`; the test filter is that row's third column because the default filter never calls the sniffer. The buffer is resized and zeroed before the counted call, so the row prices the peek and the host parse rather than the 32 KiB growth the first call pays — `the_probe_buffer_is_the_worker_threads_not_the_flows` still holds that buffer's base and capacity across two flows, and holds the second inspection at zero zeroed allocations and one allocation.
+1228 retired instructions for one pre-warmed inspection, the row in `scripts/expected-ops.txt`; the test filter is that row's third column because the default filter never calls the sniffer. The buffer is resized and zeroed before the counted call, so the row prices the peek and the host parse rather than the 32 KiB growth the first call pays — `the_probe_buffer_is_the_worker_threads_not_the_flows` still holds that buffer's base and capacity across two flows, and holds the second inspection at zero zeroed allocations and one allocation.
 
 ## Time
 

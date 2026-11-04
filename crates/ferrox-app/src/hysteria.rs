@@ -595,6 +595,8 @@ pub(crate) struct Flow {
     wake: Option<Arc<StreamWake>>,
     /// The `[0, 0]` acknowledgement still owed to the stream's first read: two on a client-opened flow, none on the server's, because the server reads the request the client already sent.
     reply: usize,
+    /// The peer's FIN arrived, possibly with the last bytes: the next read after the backlog ends reports EOF instead of waiting for a connection close.
+    peer_fin: bool,
     meter: crate::stats::Meter,
 }
 
@@ -629,6 +631,7 @@ impl Flow {
         stream: u64,
         backlog: Vec<u8>,
         drive: bool,
+        peer_fin: bool,
     ) -> Self {
         Self {
             session: Session {
@@ -646,6 +649,7 @@ impl Flow {
             drive,
             wake: None,
             reply: 0,
+            peer_fin,
             meter: crate::stats::Meter::default(),
         }
     }
@@ -679,7 +683,11 @@ impl Flow {
                 }
                 match conn.stream_recv(self.stream, &mut room.as_mut()[..want]) {
                     Ok((0, true)) => return Err(broken()),
-                    Ok((n, _)) => {
+                    Ok((n, fin)) => {
+                        if fin && self.reply > n {
+                            return Err(broken());
+                        }
+                        self.peer_fin |= fin;
                         crate::quic::flush_egress(&mut conn, &self.session.sock);
                         Some(n)
                     }
@@ -740,6 +748,9 @@ impl Flow {
             self.meter.read(n);
             return Ok(Some(n));
         }
+        if self.peer_fin {
+            return Ok(Some(0));
+        }
         loop {
             let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
             let read = {
@@ -750,7 +761,8 @@ impl Flow {
                     return Ok(Some(0));
                 }
                 match conn.stream_recv(self.stream, buf) {
-                    Ok((n, _)) => {
+                    Ok((n, fin)) => {
+                        self.peer_fin |= fin;
                         crate::quic::flush_egress(&mut conn, &self.session.sock);
                         Some(n)
                     }
@@ -760,6 +772,9 @@ impl Flow {
             };
             if let Some(n) = read {
                 self.meter.read(n);
+                if n == 0 && self.peer_fin {
+                    return Ok(Some(0));
+                }
                 return Ok(Some(n));
             }
             if self.drive {
@@ -849,6 +864,7 @@ fn open_flow_with_reply(
         drive,
         wake,
         reply,
+        peer_fin: false,
         meter: crate::stats::Meter::default(),
     })
 }
@@ -1006,6 +1022,30 @@ pub(crate) fn close_pooled() {
         }
         if let Ok(mut conn) = entry.session.shared.lock() {
             let _ = conn.close(false, 0, b"pool closed by test");
+        }
+    }
+}
+
+pub(crate) fn open(dial: &Dial, header: &[u8], reply: usize) -> Option<Flow> {
+    open_pooled(dial, header, reply)
+}
+
+/// A flow's read in a lane's shape: one turn, `WouldBlock` when it waited, so the relay hands its
+/// worker back rather than parking inside `Read`.
+pub(crate) struct FlowRead(Flow);
+
+impl FlowRead {
+    #[must_use]
+    pub(crate) fn new(flow: Flow) -> Self {
+        Self(flow)
+    }
+}
+
+impl Read for FlowRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.read_step(buf)? {
+            Some(n) => Ok(n),
+            None => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
         }
     }
 }
@@ -1236,6 +1276,7 @@ fn serve_stream(
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
+    let mut peer_fin = false;
     let prefix = loop {
         if head.len() >= 8 {
             return;
@@ -1246,8 +1287,12 @@ fn serve_stream(
                 return;
             };
             match conn.stream_recv(stream, room.as_mut()) {
+                Ok((0, true)) => return,
                 Ok((0, _)) | Err(quiche::Error::Done) => None,
-                Ok((n, _)) => Some(n),
+                Ok((n, fin)) => {
+                    peer_fin |= fin;
+                    Some(n)
+                }
                 Err(_) => return,
             }
         };
@@ -1290,6 +1335,7 @@ fn serve_stream(
         stream,
         head,
         false,
+        peer_fin,
     );
     flow.wake = Some(wake);
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
@@ -2426,6 +2472,39 @@ fn route_packet(
     }
 }
 
+/// The socket and validated server configuration a served hysteria loop needs, built where a bind
+/// failure can still be reported instead of inside the detached thread.
+pub(crate) struct Prepared {
+    sock: crate::quic::Datagram,
+    local: std::net::SocketAddr,
+    template: quiche::Config,
+}
+
+pub(crate) fn prepare(
+    address: &str,
+    identity: &ferrox_core::tls::TlsServerConfig,
+    cc: hysteria::Congestion,
+    obfs_password: &str,
+    quic: Option<&hysteria::QuicParams>,
+) -> Option<Prepared> {
+    let bound = address
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())?;
+    let sock = crate::quic::bind_datagram(address).ok()?;
+    let local = sock.local_addr().unwrap_or(bound);
+    let template = server_config(identity, cc, quic)?;
+    let sock = match hysteria::Salamander::new(obfs_password) {
+        Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
+        None => crate::quic::Datagram::plain(sock),
+    };
+    Some(Prepared {
+        sock,
+        local,
+        template,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_loop(
     address: &str,
@@ -2438,20 +2517,25 @@ pub(crate) fn serve_loop(
     udp_idle: Duration,
     quic: Option<&hysteria::QuicParams>,
 ) {
-    let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+    let Some(prepared) = prepare(address, identity, cc, obfs_password, quic) else {
         return;
     };
-    let Ok(sock) = crate::quic::bind_datagram(address) else {
-        return;
-    };
-    let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(identity, cc, quic) else {
-        return;
-    };
-    let sock = match hysteria::Salamander::new(obfs_password) {
-        Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
-        None => crate::quic::Datagram::plain(sock),
-    };
+    serve_prepared(prepared, auths, masq, serve, udp_idle, quic);
+}
+
+pub(crate) fn serve_prepared(
+    prepared: Prepared,
+    auths: &[String],
+    masq: &Masquerade,
+    serve: &Serve,
+    udp_idle: Duration,
+    quic: Option<&hysteria::QuicParams>,
+) {
+    let Prepared {
+        sock,
+        local,
+        mut template,
+    } = prepared;
     let mut router = Router {
         sock: Arc::new(sock),
         local,
@@ -3186,6 +3270,7 @@ mod tests {
             FIRST_FLOW_STREAM,
             head,
             true,
+            false,
         );
         // The state serve_stream hands over: the frame type stepped over, nothing moved.
         flow.at = hysteria::read_tcp_prefix(&flow.backlog).expect("prefix");
