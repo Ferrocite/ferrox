@@ -215,7 +215,10 @@ for have in ${built[@]+"${built[@]}"}; do
 done
 engines=(${ordered[@]+"${ordered[@]}"})
 if [[ -n "${PROFILE_STRACE:-}" ]]; then
-  probe="$(engine_path xray-core)"
+  probe=""
+  for have in "${engines[@]}"; do
+    [[ "${have%%=*}" == "xray-core" ]] && probe="${have#*=}"
+  done
   cp -p "$probe" "$probe.real"
   printf '%s\n' '#!/bin/bash' "exec strace -f -w -c -o \"$PROFILE_STRACE.\$\$.strace\" -e trace=read,write,recvfrom,sendto,recvmsg,sendmsg,epoll_wait,epoll_pwait,futex \"$probe.real\" \"\$@\"" > "$probe"
   chmod +x "$probe"
