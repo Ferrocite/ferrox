@@ -264,6 +264,58 @@ impl std::os::windows::io::AsRawSocket for Connection {
 /// session over either arm keeps the same record alignment the TCP path had.
 impl ferrox_core::tls::RecordAlignment for Connection {}
 
+impl Connection {
+    /// One relay read that never waits: an empty socket answers `WouldBlock` at once, and the lane
+    /// parks on the descriptor its timeout names instead of spending the poll quantum in a worker.
+    pub(crate) fn read_ready(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            let result = match self {
+                Connection::Tcp(stream) => recv_ready(stream, buf),
+                Connection::Masked(masked) => recv_ready(&masked.stream, buf),
+                Connection::Metered(metered) => match metered.inner.read_ready(buf) {
+                    Ok(n) => {
+                        metered.meter.read(n);
+                        Ok(n)
+                    }
+                    Err(error) => Err(error),
+                },
+                Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                    inner.read_ready(buf)
+                }
+                Connection::Unix(stream) => recv_ready(stream, buf),
+            };
+            if result.as_ref().is_err_and(crate::proxy::is_descriptor_wait) {
+                crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(&*self));
+            }
+            result
+        }
+        #[cfg(not(unix))]
+        {
+            self.read(buf)
+        }
+    }
+}
+
+/// `recv` with `MSG_DONTWAIT`, the per-call form of a non-blocking read: the descriptor keeps the
+/// blocking shape and read timeout the rest of the relay arms on it.
+#[cfg(unix)]
+fn recv_ready<S: std::os::fd::AsRawFd>(stream: &S, buf: &mut [u8]) -> io::Result<usize> {
+    let count = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if count < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(count as usize)
+    }
+}
+
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let result = match self {
@@ -1995,6 +2047,33 @@ mod tests {
             let error = HttpUrl::parse(raw).expect_err("refused");
             assert!(!error.contains("secret"), "{raw}: {error}");
         }
+    }
+
+    /// A relay read on an empty socket answers instead of waiting out the read clock, which is what
+    /// lets the lane park on the descriptor with the worker free.
+    #[cfg(unix)]
+    #[test]
+    fn a_relay_read_never_waits_out_the_clock() {
+        let (side, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut stream = Connection::Unix(side);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("arms the read clock");
+        let began = std::time::Instant::now();
+        let error = stream
+            .read_ready(&mut [0u8; 8])
+            .expect_err("nothing was sent");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "an empty socket is a wait, not an end: {error:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "the read waited out its clock instead of handing the lane a park"
+        );
     }
 
     #[test]

@@ -27439,7 +27439,7 @@ where
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
-                peer_read.read(buffer.as_mut())
+                peer_read.read_ready(buffer.as_mut())
             };
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
                 forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
@@ -27507,7 +27507,7 @@ where
                 }
                 // A record still arriving is not an idle peer: the reader stays open and the lane requeues.
                 Err(error) if is_driven_yield(&error) => (Next::Retry, false),
-                // A socket carrier read that times out takes another turn at once, because the frame granting the sibling's window arrives on it; a queued body parks instead, since its demux reads that frame.
+                // A carrier that waits on its own source parks there; one whose window credit arrives on another read keeps the turn.
                 Err(error) if is_timeout(&error) => (
                     if reader.parks_on_timeout() {
                         Next::Idle
@@ -27527,6 +27527,8 @@ where
                     && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
                 {
                     Next::Done
+                } else if reader.parks_on_timeout() {
+                    Next::Idle
                 } else {
                     Next::More
                 }
@@ -27537,6 +27539,9 @@ where
             if ended_request && !upload.half_closed {
                 let _ = peer_write.shutdown(Shutdown::Write);
                 upload.half_closed = true;
+            }
+            if next == Next::Idle {
+                note_wait_finish(&upload_flow);
             }
             if next != Next::Done {
                 return next;

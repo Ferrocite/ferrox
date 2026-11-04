@@ -599,6 +599,12 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
         }
         Ok(crate::proxy::Window::new(&self.have, spans, len))
     }
+
+    /// A frame that is not there yet is a descriptor wait, not a turn to retake: control frames and
+    /// window credit arrive on the same socket, so its readiness wakes the lane with the worker free.
+    fn parks_on_timeout(&self) -> bool {
+        true
+    }
 }
 
 impl WsWriter {
@@ -1794,6 +1800,90 @@ mod tests {
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// An idle carrier lane parks on the frame's socket: while the peer sends nothing the lane must
+    /// stop reading, or sixteen downloads on six workers spend their turns inside a poll read each.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_carrier_lane_parks_instead_of_reading() {
+        use crate::proxy::{CarrierSink, Window, WindowRead};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct Counting<R> {
+            inner: R,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl<R: Read> Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+
+        impl<R: WindowRead> WindowRead for Counting<R> {
+            fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.inner.read_window()
+            }
+
+            fn parks_on_timeout(&self) -> bool {
+                self.inner.parks_on_timeout()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Sink;
+
+        impl CarrierSink for Sink {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+
+            fn close(&self) {}
+        }
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (reader, _writer) = accept(stream, "/frame").expect("upgrades");
+            reader
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let plain = EarlyData::split("/frame");
+        let (client, _) =
+            connect(stream, "127.0.0.1", &plain.path, plain.budget, b"", &[], 0).expect("upgrades");
+        let mut reader = server.join().expect("joins");
+        reader.set_poll(Some(crate::budgets::RELAY_POLL));
+
+        let (peer, peer_other) = crate::reverse::loopback_pair().expect("pair");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let flow = crate::proxy::relay_sink_window_with(
+            Counting {
+                inner: reader,
+                reads: Arc::clone(&reads),
+            },
+            &Sink,
+            &peer,
+            |_: &mut Counting<WsReader>| {},
+            |_: &mut Counting<WsReader>| false,
+        )
+        .expect("relays");
+        let before = reads.load(Ordering::Relaxed);
+        let began = Instant::now();
+        thread::sleep(Duration::from_millis(300));
+        let turns = reads.load(Ordering::Relaxed) - before;
+        assert!(
+            turns < 50,
+            "an idle carrier lane made {turns} reads in {:?}",
+            began.elapsed()
+        );
+        drop(client);
+        drop(peer_other);
+        drop(flow);
     }
 
     #[test]
