@@ -24849,10 +24849,9 @@ pub(crate) mod lane_pool {
         slot.put_lane(lane);
         // Watch before reading the end, so a racing end either wakes this slot or leaves the grace it arms.
         let ended = slot.finish.as_ref().map(|flow| flow.watch_park(&slot));
-        // A flow with a living sibling arms no clock; no sibling, or one already ended, keeps the check.
+        // The idle clock always arms, so the lane comes back to check its stall; a sibling's end wakes it out of turn.
         let due = match ended {
-            None => Some(std::time::Instant::now() + idle),
-            Some(None) => None,
+            None | Some(None) => Some(std::time::Instant::now() + idle),
             Some(Some(at)) => Some(at + idle),
         };
         let _ = slot.due.set(due);
@@ -26062,10 +26061,10 @@ pub(crate) mod lane_pool {
             );
         }
 
-        /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
-        /// then does the response-idle grace arm.
+        /// A lane whose sibling still lives keeps the response-idle clock so its stall check runs,
+        /// and ending the sibling wakes it out of turn instead of waiting the clock out.
         #[test]
-        fn a_parked_lane_waits_for_its_sibling_not_the_clock() {
+        fn a_parked_lane_keeps_the_stall_clock_and_wakes_early_on_its_sibling() {
             use std::io::Read as _;
 
             let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -26108,18 +26107,23 @@ pub(crate) mod lane_pool {
             while pool.last_ready_due.lock().unwrap().is_none() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(2));
             }
-            assert_eq!(
-                *pool.last_ready_due.lock().unwrap(),
-                Some(ReadyClock::None),
-                "a lane whose sibling still lives armed a clock"
+            let Some(ReadyClock::At(clock)) = *pool.last_ready_due.lock().unwrap() else {
+                panic!("a lane whose sibling still lives armed no stall clock");
+            };
+            assert!(
+                clock <= Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE,
+                "the stall clock was further out than one idle budget"
             );
             assert_eq!(pool.ended_wakes.load(Ordering::Relaxed), 0);
-            // A full response-idle window with no sibling end must cost the reaper no wake at all.
-            thread::sleep(Duration::from_millis(1200));
+            // The idle clock brings the lane back to check its stall; no sibling end finishes it.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.ready_parks.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
             assert_eq!(
                 pool.ready_parks.load(Ordering::Relaxed),
-                1,
-                "the reaper woke a lane whose sibling still lives"
+                2,
+                "the idle clock never brought the lane back to check its stall"
             );
             assert_eq!(completed.load(Ordering::Relaxed), 0);
             submit_to(

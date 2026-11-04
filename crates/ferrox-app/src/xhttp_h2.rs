@@ -1430,11 +1430,14 @@ impl H2Conn {
     /// Only the reader's own drop frees its waker: retiring a stream earlier could close a
     /// descriptor the reactor is still polling for that reader's lane.
     fn drop_body_waker(&self, sid: u32) {
-        self.body_wait
+        let mut wait = self
+            .body_wait
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .wakers
-            .remove(&sid);
+            .unwrap_or_else(PoisonError::into_inner);
+        wait.wakers.remove(&sid);
+        if wait.parked.remove(&sid) && wait.parked.is_empty() {
+            self.body_parked_any.store(false, Ordering::Relaxed);
+        }
     }
 
     /// The session is over, so the uploads that shared it are too: mark each one ended and wake its parked reader before the connection's death is the only way out.
