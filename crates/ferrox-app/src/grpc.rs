@@ -3843,8 +3843,7 @@ mod tests {
             let total: usize = parts.iter().map(|part| part.len()).sum();
             let body = total - frames * 9;
             self.offered.lock().unwrap().push(body);
-            use std::sync::atomic::Ordering::Relaxed;
-            if body as u64 > self.limit.load(Relaxed) {
+            if body as u64 > self.limit.load(Ordering::Relaxed) {
                 return Accepted::Full;
             }
             for part in parts {
@@ -3856,10 +3855,9 @@ mod tests {
             self.limit.load(std::sync::atomic::Ordering::Relaxed)
         }
         fn wait_room(&self, _turn: Duration) {
-            use std::sync::atomic::Ordering::Relaxed;
-            let limit = self.grant.swap(u64::MAX, Relaxed);
+            let limit = self.grant.swap(u64::MAX, Ordering::Relaxed);
             if limit != u64::MAX {
-                self.limit.store(limit, Relaxed);
+                self.limit.store(limit, Ordering::Relaxed);
             }
         }
     }
