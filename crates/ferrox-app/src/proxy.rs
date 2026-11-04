@@ -26674,6 +26674,7 @@ pub(crate) mod lane_pool {
                 id: 1,
                 due: std::sync::OnceLock::new(),
                 fd: 0,
+                write: false,
                 finish: Some(std::sync::Arc::clone(&flow)),
                 lane: Mutex::new(None),
                 pool: std::sync::Weak::new(),
