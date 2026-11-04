@@ -6659,6 +6659,9 @@ fn serve_mux_wire(
         return;
     };
     // A client that stops reading must park a write, not the session: the deadline turns it into an error the loop unwinds on.
+    #[cfg(target_os = "linux")]
+    wire.set_write_timeout(budgets::RELAY_RESPONSE_IDLE);
+    #[cfg(not(target_os = "linux"))]
     wire.set_write_timeout(budgets::relay_stall());
     let table: MuxTable = Arc::new(Mutex::new(MuxState {
         flows: HashMap::new(),
@@ -7066,14 +7069,16 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
     let wire = session.wire.clone();
     let id = Arc::clone(&session.id);
     let done = Arc::clone(&session.done);
-    Some(RelayPool::global().run(move || {
+    #[cfg(target_os = "linux")]
+    {
+        let (finished, end) = std::sync::mpsc::channel();
         let mut buf = udp_buffer();
         let mut staging = Vec::with_capacity(8192);
-        loop {
-            match read.recv_from(&mut buf) {
+        lane_pool::submit(
+            Box::new(move || match read.recv_from(&mut buf) {
                 Ok((n, source)) => {
                     if done.load(Ordering::Relaxed) {
-                        return;
+                        return Next::Done;
                     }
                     let keep = ferrox_core::mux::Outgoing {
                         id: id.load(Ordering::Relaxed),
@@ -7083,24 +7088,70 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
                         global_id: None,
                     };
                     if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
-                        return;
+                        return Next::Done;
                     }
+                    Next::More
                 }
                 Err(error) if is_timeout(&error) => {
                     if done.load(Ordering::Relaxed) {
-                        return;
+                        Next::Done
+                    } else {
+                        Next::Idle
                     }
                 }
                 Err(error) if is_udp_gone(&error) => {
-                    thread::sleep(RELAY_POLL);
                     if done.load(Ordering::Relaxed) {
-                        return;
+                        Next::Done
+                    } else {
+                        Next::Idle
                     }
                 }
-                Err(_) => return,
+                Err(_) => Next::Done,
+            }),
+            Box::new(move || {
+                let _ = finished.send(Ok(()));
+            }),
+        );
+        Some(end)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(RelayPool::global().run(move || {
+            let mut buf = udp_buffer();
+            let mut staging = Vec::with_capacity(8192);
+            loop {
+                match read.recv_from(&mut buf) {
+                    Ok((n, source)) => {
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let keep = ferrox_core::mux::Outgoing {
+                            id: id.load(Ordering::Relaxed),
+                            status: ferrox_core::mux::Status::Keep,
+                            options: ferrox_core::mux::DATA,
+                            target: Some(mux_target_of(source)),
+                            global_id: None,
+                        };
+                        if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                            return;
+                        }
+                    }
+                    Err(error) if is_timeout(&error) => {
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    Err(error) if is_udp_gone(&error) => {
+                        thread::sleep(RELAY_POLL);
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
             }
-        }
-    }))
+        }))
+    }
 }
 
 /// The QUIC identity an inbound serves: QUIC mandates TLS, so anything without a certificate serves nothing.
@@ -9486,6 +9537,30 @@ pub(crate) fn take_wait_finish() -> Option<std::sync::Arc<RelayFinish>> {
 #[cfg(unix)]
 pub(crate) fn forget_wait_finish() {
     WAIT_FINISH.with(|slot| slot.borrow_mut().take());
+}
+
+#[cfg(unix)]
+thread_local! {
+    /// The idle budget of the flow a timed-out step belongs to: its parked leg wakes on that budget,
+    /// not on the shorter default the readiness scheduler used before the policy was read.
+    static WAIT_IDLE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+pub(crate) fn note_wait_idle(idle: Duration) {
+    if relay_step_owns_poll() {
+        WAIT_IDLE.with(|slot| slot.set(Some(idle)));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn take_wait_idle() -> Option<Duration> {
+    WAIT_IDLE.with(std::cell::Cell::take)
+}
+
+#[cfg(unix)]
+pub(crate) fn forget_wait_idle() {
+    WAIT_IDLE.with(|slot| slot.set(None));
 }
 
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
@@ -23048,6 +23123,7 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
+    #[cfg(not(target_os = "linux"))]
     if !target_write.masked()
         && !client_write.masked()
         && !client_read.metered()
@@ -23057,7 +23133,7 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
         let _ends = poll_handoff(client_read, target_write, target_read, client_write);
         return;
     }
-    // A masked or metered flow rides the lane pool the UDP association already uses.
+    // On Linux every accepted flow rides the lane pool; a readiness worker beside it would add a thread per flow.
     relay_lanes(client_read, target_write, target_read, client_write);
 }
 
@@ -23078,10 +23154,22 @@ fn relay_lanes(
         let _ = connection.set_read_timeout(Some(RELAY_POLL));
         let _ = connection.set_write_timeout(Some(RELAY_POLL));
     }
+    let forward_stall = client_read
+        .policy()
+        .or_else(|| target_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let reply_stall = target_read
+        .policy()
+        .or_else(|| client_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let flow = RelayFinish::new(false, close, None);
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
+    forward.stall = forward_stall;
+    forward.reply_idle = forward_stall;
     lane_pool::submit(
         Box::new(move || forward.step(&first)),
         Box::new({
@@ -23094,6 +23182,8 @@ fn relay_lanes(
     );
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
+    reply.stall = reply_stall;
+    reply.reply_idle = reply_stall;
     lane_pool::submit(
         Box::new(move || reply.step(&second)),
         Box::new({
@@ -23116,6 +23206,7 @@ struct TcpCopy {
     ended: bool,
     stalled: Option<std::time::Instant>,
     stall: Duration,
+    reply_idle: Duration,
 }
 
 impl TcpCopy {
@@ -23130,6 +23221,7 @@ impl TcpCopy {
             ended: false,
             stalled: None,
             stall: crate::budgets::relay_stall(),
+            reply_idle: crate::budgets::RELAY_RESPONSE_IDLE,
         }
     }
 
@@ -23187,9 +23279,10 @@ impl TcpCopy {
                 {
                     use std::os::fd::AsRawFd as _;
                     note_wait_fd(self.src.as_raw_fd());
+                    note_wait_idle(self.reply_idle);
                     note_wait_finish(flow);
                 }
-                if flow.ended() && flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                if flow.ended() && flow.ended_and_idle(self.reply_idle) {
                     self.end();
                     Next::Done
                 } else {
@@ -23220,7 +23313,7 @@ impl TcpCopy {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn poll_available() -> bool {
     poll_relay::available()
 }
@@ -23230,7 +23323,7 @@ fn poll_available() -> bool {
     poll_copy::available()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn poll_handoff(
     client_read: Connection,
     target_write: Connection,
@@ -24170,6 +24263,7 @@ pub(crate) mod lane_pool {
             {
                 crate::proxy::forget_wait_fd();
                 crate::proxy::forget_wait_finish();
+                crate::proxy::forget_wait_idle();
             }
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
@@ -24368,11 +24462,19 @@ pub(crate) mod lane_pool {
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
-    /// queued and no worker is idle, so a one-flow cell holds two lanes.
+    /// queued and no worker is idle, so a one-flow cell holds two lanes. Six leaves room for the
+    /// accept path and the parking reaper under the reference's ten-thread server peak.
+    #[cfg(target_os = "linux")]
+    pub(crate) const RELAY_LANES: usize = 6;
+    /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
+    #[cfg(not(target_os = "linux"))]
     pub(crate) const RELAY_LANES: usize = 8;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
-    /// relay worker with it. Two keep the setup peak under the reference's server threads.
+    /// relay worker with it. Two keep a blocked stream setup from holding the only one.
+    #[cfg(target_os = "linux")]
+    pub(crate) const SETUP_LANES: usize = 2;
+    #[cfg(not(target_os = "linux"))]
     pub(crate) const SETUP_LANES: usize = 2;
 
     /// Accepted work past the setup workers waits in this queue; past it the handshake runs on its
@@ -24380,7 +24482,7 @@ pub(crate) mod lane_pool {
     const SETUP_PENDING: usize = 8;
 
     /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
-    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave six relay
+    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave four relay
     /// workers for the flows behind them.
     const SETUP_BORROW_LANES: usize = 2;
 
@@ -24661,14 +24763,17 @@ pub(crate) mod lane_pool {
     #[cfg(unix)]
     fn park_ready(pool: &std::sync::Arc<Pool>, lane: Lane) -> Result<(), Lane> {
         if !lane.relay {
+            crate::proxy::forget_wait_idle();
             return Err(lane);
         }
         let Some(fd) = crate::proxy::take_wait_fd() else {
+            crate::proxy::forget_wait_idle();
             return Err(lane);
         };
         if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
             return Err(lane);
         }
+        let idle = crate::proxy::take_wait_idle().unwrap_or(crate::budgets::RELAY_RESPONSE_IDLE);
         let slot = std::sync::Arc::new(ReadySlot {
             id: pool
                 .next_slot
@@ -24684,9 +24789,9 @@ pub(crate) mod lane_pool {
         let ended = slot.finish.as_ref().map(|flow| flow.watch_park(&slot));
         // A flow with a living sibling arms no clock; no sibling, or one already ended, keeps the check.
         let due = match ended {
-            None => Some(std::time::Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE),
+            None => Some(std::time::Instant::now() + idle),
             Some(None) => None,
-            Some(Some(at)) => Some(at + crate::budgets::RELAY_RESPONSE_IDLE),
+            Some(Some(at)) => Some(at + idle),
         };
         let _ = slot.due.set(due);
         #[cfg(all(test, unix))]
@@ -25418,17 +25523,16 @@ pub(crate) mod lane_pool {
             }
         }
 
-        /// Every lane in the fixed set must be able to sit in its own read at once: a cell's
-        /// download lanes each cost a blocking wait, and a lane without a worker is a flow the
-        /// sink cannot feed.
+        /// Every lane in the fixed set must have a worker; six carry a full cell because an idle
+        /// lane parks its descriptor and the reaper wakes it instead of one blocking thread per flow.
         #[test]
         fn every_lane_of_a_full_cell_has_a_worker() {
             let pool = TestPool(spawn_pool());
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
             let lanes = RELAY_LANES;
             assert!(
-                lanes >= 8,
-                "the pool carries {lanes} lanes, below the widest cell's flows"
+                lanes >= 6,
+                "the pool carries {lanes} lanes, below the cell's carriers"
             );
             let gate = Arc::new(Gate {
                 state: Mutex::new((0, false)),
@@ -26305,7 +26409,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -26348,13 +26452,13 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 struct SplicePipe {
     fds: [libc::c_int; 2],
     capacity: libc::size_t,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 impl SplicePipe {
     fn new() -> Option<Self> {
         let mut fds = [-1; 2];
@@ -26375,14 +26479,14 @@ impl SplicePipe {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 const SPLICE_PIPE_BYTES: usize = DEFAULT_SPLICE_PIPE_BYTES;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 const DEFAULT_SPLICE_PIPE_BYTES: usize = 256 * 1024;
 
 /// The pipe's size, asked once: the environment is read at startup, and a relay that read it per pipe paid an environment lookup and a `String` for every connection it carried.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn splice_pipe_bytes() -> libc::c_int {
     static ASKED: OnceLock<libc::c_int> = OnceLock::new();
     *ASKED.get_or_init(|| {
@@ -26395,7 +26499,7 @@ fn splice_pipe_bytes() -> libc::c_int {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for SplicePipe {
     fn drop(&mut self) {
         unsafe {
@@ -34181,7 +34285,7 @@ mod tests {
             let _ = peer.shutdown(Shutdown::Both);
         }
         let lanes = lane_pool::workers();
-        assert!(lanes >= 8, "the lane count is the bound: {lanes}");
+        assert!(lanes >= 6, "the lane count is the bound: {lanes}");
         assert!(
             grown <= lanes + 8,
             "{flows} wrapped flows grew the process by {grown} threads, past {lanes} lanes plus slack"
@@ -61227,6 +61331,7 @@ mod poll_copy {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 mod poll_relay {
     use super::{Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;
