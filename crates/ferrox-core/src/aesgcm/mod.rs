@@ -1427,6 +1427,20 @@ mod tests {
                     let tag = engine.seal_from(&nonce, &aad, &plain, &mut dst);
                     assert_eq!(tag, want, "tag: aad {aad_len} len {len}");
                     assert_eq!(dst, in_place, "ciphertext: aad {aad_len} len {len}");
+                    let mut uninit: Vec<std::mem::MaybeUninit<u8>> =
+                        std::iter::repeat_with(std::mem::MaybeUninit::uninit)
+                            .take(len)
+                            .collect();
+                    let tag = engine.seal_from_uninit(&nonce, &aad, &plain, &mut uninit);
+                    assert_eq!(tag, want, "uninit tag: aad {aad_len} len {len}");
+                    // SAFETY: seal_from_uninit wrote every byte of the destination.
+                    let uninit = unsafe {
+                        std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len())
+                    };
+                    assert_eq!(
+                        uninit, in_place,
+                        "uninit ciphertext: aad {aad_len} len {len}"
+                    );
                     assert_eq!(
                         plain,
                         (0..len)
