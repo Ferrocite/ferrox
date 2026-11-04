@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1265,17 +1265,26 @@ fn measure_once(
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
+    // The client's settle runs while the sink drains, so the server's window ends at the last byte the sink counted rather than at the client's last write or after the settle.
+    let settle_until = Instant::now() + SETTLE;
+    while Instant::now() < settle_until && sink_thread.received() < moved.sent {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let server = match server {
+        Some(server) => Some(server.finish()?),
+        None => None,
+    };
 
     std::thread::sleep(SAMPLE_INTERVAL + Duration::from_millis(20));
     stop.store(true, Ordering::Relaxed);
     let _ = sampler_thread.join();
     let mut samples = startup_samples;
     samples.extend(rx.try_iter());
-    samples.extend(sample_for(pid, Phase::Settle, SETTLE)?);
-    let server = match server {
-        Some(server) => Some(server.finish()?),
-        None => None,
-    };
+    samples.extend(sample_for(
+        pid,
+        Phase::Settle,
+        settle_until.saturating_duration_since(Instant::now()),
+    )?);
 
     engine.reap();
     let sink_reasons = sink_thread.reasons();
@@ -1372,11 +1381,30 @@ fn straggler_tail(windows: &[Duration]) -> Option<Duration> {
     Some(tail)
 }
 
+/// A server still draining the previous run is not this run's cost: the window opens once two
+/// reads a sample apart agree on the cpu count, bounded so a server that never rests is measured.
+fn quiesced(
+    deadline: Instant,
+    mut read: impl FnMut() -> Result<ps::Sample, Error>,
+) -> Result<ps::Sample, Error> {
+    let mut previous = read()?;
+    while Instant::now() < deadline {
+        std::thread::sleep(SAMPLE_INTERVAL);
+        let next = read()?;
+        if next.cpu_millis == previous.cpu_millis {
+            return Ok(next);
+        }
+        previous = next;
+    }
+    Ok(previous)
+}
+
 /// The server process beside the client: sampled from the same clock, stopped from `Drop` so a
 /// disturbed attempt cannot leave a sampler forking `ps` into the next one.
 struct ServerSampler {
     pid: u32,
     first: ps::Sample,
+    started: Instant,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     rx: mpsc::Receiver<(Phase, ps::Sample)>,
@@ -1384,13 +1412,16 @@ struct ServerSampler {
 
 impl ServerSampler {
     fn start(pid: u32) -> Result<Self, Error> {
-        let first = sample_at(Host::current(), pid, 0)?;
+        let started = Instant::now();
+        let host = Host::current();
+        let first = quiesced(started + SETTLE, || sample_at(host, pid, 0))?;
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let thread = spawn_sampler(pid, Arc::clone(&stop), tx);
         Ok(Self {
             pid,
             first,
+            started,
             stop,
             thread: Some(thread),
             rx,
@@ -1398,13 +1429,19 @@ impl ServerSampler {
     }
 
     fn finish(mut self) -> Result<Server, Error> {
+        let cutoff_ms = self.started.elapsed().as_millis();
+        let last = sample_at(Host::current(), self.pid, cutoff_ms)?;
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let last = sample_at(Host::current(), self.pid, 0)?;
         let mut samples = vec![self.first];
-        samples.extend(self.rx.try_iter().map(|(_, sample)| sample));
+        samples.extend(
+            self.rx
+                .try_iter()
+                .map(|(_, sample)| sample)
+                .filter(|sample| sample.elapsed_ms <= cutoff_ms),
+        );
         samples.push(last);
         Ok(summarise_server(&samples))
     }
@@ -1718,6 +1755,7 @@ struct SinkThread {
     accept: JoinHandle<()>,
     reasons: Arc<std::sync::Mutex<Vec<String>>>,
     done: Arc<AtomicBool>,
+    received: Arc<AtomicU64>,
 }
 
 impl SinkThread {
@@ -1727,6 +1765,11 @@ impl SinkThread {
             .join()
             .map_err(|_| Error::Workload("the sink thread panicked".into()))?;
         Ok(())
+    }
+
+    /// Every byte the client counts has reached the sink, so the engine's window can close there.
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 
     fn reasons(&self) -> Vec<String> {
@@ -2585,7 +2628,8 @@ fn spawn_sink(
     let accept_reasons = Arc::clone(&reasons);
     let accept_desync = Arc::clone(desync);
     let done = Arc::new(AtomicBool::new(false));
-    let sink_done = Arc::clone(&done);
+    let received = Arc::new(AtomicU64::new(0));
+    let (sink_done, sink_received) = (Arc::clone(&done), Arc::clone(&received));
     let accept = std::thread::spawn(move || {
         let done = sink_done;
         let mut handles = Vec::with_capacity(listeners.len() + udp_sockets.len());
@@ -2593,7 +2637,7 @@ fn spawn_sink(
             let flow = Arc::new(rotate(&pattern, index, flows));
             let sink_reasons = Arc::clone(&accept_reasons);
             let sink_desync = Arc::clone(&accept_desync);
-            let thread_done = Arc::clone(&done);
+            let (thread_done, thread_received) = (Arc::clone(&done), Arc::clone(&sink_received));
             handles.push(std::thread::spawn(move || {
                 let listener_done = thread_done;
                 loop {
@@ -2626,7 +2670,7 @@ fn spawn_sink(
                         return;
                     }
                     if latency {
-                        echo_stream(stream, &listener_done);
+                        echo_stream(stream, &listener_done, &thread_received);
                         return;
                     }
                     if let Some(reason) = serve_flow(
@@ -2636,6 +2680,7 @@ fn spawn_sink(
                         upload_bytes,
                         download_bytes,
                         &sink_desync,
+                        &thread_received,
                     ) {
                         if let Ok(mut slot) = sink_reasons.lock() {
                             slot.push(reason);
@@ -2646,8 +2691,8 @@ fn spawn_sink(
             }));
         }
         for socket in udp_sockets {
-            let thread_done = Arc::clone(&done);
-            handles.push(std::thread::spawn(move || serve_udp(socket, &thread_done)));
+            let (d, r) = (Arc::clone(&done), Arc::clone(&sink_received));
+            handles.push(std::thread::spawn(move || serve_udp(socket, &d, &r)));
         }
         for handle in handles {
             let _ = handle.join();
@@ -2657,6 +2702,7 @@ fn spawn_sink(
         accept,
         reasons,
         done,
+        received,
     })
 }
 
@@ -2668,12 +2714,13 @@ fn hold_stream(stream: TcpStream, done: &AtomicBool) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn echo_stream(mut stream: TcpStream, done: &AtomicBool) {
+fn echo_stream(mut stream: TcpStream, done: &AtomicBool, received: &AtomicU64) {
     let mut buffer = vec![0u8; DOWNLOAD_CHUNK];
     while !done.load(Ordering::Relaxed) {
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                received.fetch_add(n as u64, Ordering::Relaxed);
                 if stream.write_all(&buffer[..n]).is_err() {
                     break;
                 }
@@ -2685,12 +2732,13 @@ fn echo_stream(mut stream: TcpStream, done: &AtomicBool) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn serve_udp(socket: UdpSocket, done: &AtomicBool) {
+fn serve_udp(socket: UdpSocket, done: &AtomicBool, received: &AtomicU64) {
     let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
     let mut buffer = vec![0u8; 65_536 + 64];
     while !done.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buffer) {
             Ok((n, from)) => {
+                received.fetch_add(n as u64, Ordering::Relaxed);
                 let _ = socket.send_to(&buffer[..n], from);
             }
             Err(e)
@@ -2710,6 +2758,7 @@ fn serve_flow(
     upload_bytes: u64,
     download_bytes: u64,
     desync: &Desync,
+    received: &AtomicU64,
 ) -> Option<String> {
     let downloader = if download_bytes > 0 {
         let Ok(read_half) = stream.try_clone() else {
@@ -2726,7 +2775,7 @@ fn serve_flow(
     };
 
     let upload_reason = if upload_bytes > 0 {
-        validate(stream, pattern, index, upload_bytes, desync)
+        validate(stream, pattern, index, upload_bytes, desync, received)
     } else {
         None
     };
@@ -2746,6 +2795,7 @@ fn validate(
     index: usize,
     expect: u64,
     desync: &Desync,
+    received: &AtomicU64,
 ) -> Option<String> {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut seen = 0u64;
@@ -2782,6 +2832,7 @@ fn validate(
         }
         offset = (offset + n) % pattern.len();
         seen += n as u64;
+        received.fetch_add(n as u64, Ordering::Relaxed);
     }
     None
 }
@@ -3268,6 +3319,35 @@ mod tests {
             threads,
             io: None,
         }
+    }
+
+    /// The server's window opens on a settled process: the previous run's drain is not charged
+    /// here, and a server that never rests is still measured at the deadline.
+    #[test]
+    fn a_server_window_opens_once_the_cpu_stops_moving() {
+        let mut scripted = [
+            sampled(100, Some(2)),
+            sampled(180, Some(9)),
+            sampled(180, Some(3)),
+            sampled(900, Some(9)),
+        ]
+        .into_iter();
+        let first = quiesced(Instant::now() + Duration::from_secs(5), || {
+            scripted
+                .next()
+                .ok_or_else(|| Error::Invalid("scripted samples exhausted".to_owned()))
+        })
+        .expect("reads");
+        assert_eq!(first.cpu_millis, 180);
+        assert_eq!(first.threads, Some(3));
+
+        let mut busy = [sampled(10, None), sampled(20, None)].into_iter();
+        let first = quiesced(Instant::now(), || {
+            busy.next()
+                .ok_or_else(|| Error::Invalid("scripted samples exhausted".to_owned()))
+        })
+        .expect("reads");
+        assert_eq!(first.cpu_millis, 10);
     }
 
     #[test]
@@ -3918,7 +3998,7 @@ mod tests {
         let engine = TcpStream::connect(addr).expect("connects");
         let slot: Desync = Arc::new(std::sync::Mutex::new(None));
         let feed = engine.try_clone().expect("clone for the reader");
-        let reason = validate(feed, &Arc::new(pattern), 2, 16, &slot)
+        let reason = validate(feed, &Arc::new(pattern), 2, 16, &slot, &AtomicU64::new(0))
             .expect("a forged byte is a reason, returned not exited");
         assert!(
             reason.contains("flow 2 upload desynced at byte 15"),
@@ -3970,6 +4050,7 @@ mod tests {
                 upload_bytes,
                 download_bytes,
                 &serve_desync,
+                &AtomicU64::new(0),
             );
             let _ = done_tx.send(reason);
         });

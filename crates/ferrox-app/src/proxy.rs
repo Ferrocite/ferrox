@@ -172,6 +172,10 @@ fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
 
 #[allow(clippy::too_many_lines)]
 fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
+    // Sized before the first lane, so every flow from here reads the ceiling its role named.
+    if dials_a_proxy(root) {
+        lane_pool::mark_proxy_peer();
+    }
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply_config(
         &crate::config::budgets(root)
@@ -24494,21 +24498,46 @@ pub(crate) mod lane_pool {
     static DEMUX_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
     static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// The widest standard cell (eight connections) queues one download read per flow, and every
-    /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
-    /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
-    /// queued and no worker is idle, so a one-flow cell holds two lanes. Six leaves room for the
-    /// accept path and the parking reaper under the reference's ten-thread server peak.
+    /// A server's flow parks one leg on the peer's window, so six carries the widest standard cell
+    /// (eight connections) and leaves room for the accept path and the parking reaper under the
+    /// reference's ten-thread server peak. A worker starts only when a lane is queued and no
+    /// worker is idle, so this is the ceiling, not the shape.
     #[cfg(target_os = "linux")]
     pub(crate) const RELAY_LANES: usize = 6;
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
     #[cfg(not(target_os = "linux"))]
     pub(crate) const RELAY_LANES: usize = 8;
 
+    /// A client pumps both legs of a flow at once, so its ceiling is two legs for every flow of
+    /// the widest standard cell.
+    pub(crate) const CLIENT_LANES: usize = 16;
+
+    static PROXY_PEER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Called once by a process whose config dials a proxy peer, before its first flow.
+    pub(crate) fn mark_proxy_peer() {
+        PROXY_PEER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The relay ceiling for a role: the client's two legs per flow, the server's thread peak.
+    pub(crate) fn cap_for(proxy_peer: bool) -> usize {
+        if proxy_peer {
+            CLIENT_LANES
+        } else {
+            RELAY_LANES
+        }
+    }
+
+    fn relay_cap() -> usize {
+        cap_for(PROXY_PEER.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// A muxed connection's demux is the lane that turns the peer's window grants into the wake a
     /// parked relay is waiting for, so it runs on its own workers: a full-duplex cell queues two
     /// relay legs per flow, and a demux behind them delays every grant by a relay turn.
-    pub(crate) const DEMUX_LANES: usize = RELAY_LANES;
+    pub(crate) fn demux_lanes() -> usize {
+        relay_cap()
+    }
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
     /// relay worker with it. Two keep a blocked stream setup from holding the only one.
@@ -24537,7 +24566,7 @@ pub(crate) mod lane_pool {
     }
 
     fn demux_pool() -> std::sync::Arc<Pool> {
-        std::sync::Arc::clone(DEMUX_POOL.get_or_init(|| spawn_pool_with(DEMUX_LANES, None)))
+        std::sync::Arc::clone(DEMUX_POOL.get_or_init(|| spawn_pool_with(demux_lanes(), None)))
     }
 
     fn setup_pool() -> std::sync::Arc<Pool> {
@@ -24547,7 +24576,7 @@ pub(crate) mod lane_pool {
     }
 
     fn spawn_pool() -> std::sync::Arc<Pool> {
-        spawn_pool_with(RELAY_LANES, None)
+        spawn_pool_with(relay_cap(), None)
     }
 
     fn spawn_pool_with(cap: usize, pending: Option<usize>) -> std::sync::Arc<Pool> {
@@ -25637,6 +25666,19 @@ pub(crate) mod lane_pool {
                 state.1 = true;
                 self.wake.notify_all();
             }
+        }
+
+        /// A client pumps both legs of a flow at once, so its ceiling is the two legs of every
+        /// flow in the widest standard cell; a server keeps its thread peak.
+        #[test]
+        fn a_client_ceiling_carries_two_legs_per_flow() {
+            assert_eq!(cap_for(false), RELAY_LANES);
+            assert_eq!(cap_for(true), CLIENT_LANES);
+            let widest = 2 * 8;
+            assert!(
+                cap_for(true) >= widest,
+                "the widest cell's eight flows queue {widest} legs against a {CLIENT_LANES}-lane ceiling"
+            );
         }
 
         /// Every lane in the fixed set must have a worker; six carry a full cell because an idle
@@ -29718,6 +29760,22 @@ fn has_protocol(root: &Json, array: &str, protocol: &str) -> bool {
     })
 }
 
+/// An outbound that dials a peer makes this process a client for its flows: the lane ceiling is
+/// wider than a server's. `freedom`, `blackhole`, `dns` and `loopback` reach no proxy peer.
+fn dials_a_proxy(root: &Json) -> bool {
+    const LOCAL: [&str; 4] = ["freedom", "blackhole", "dns", "loopback"];
+    root.get("outbounds")
+        .and_then(Json::as_arr)
+        .is_some_and(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound
+                    .get("protocol")
+                    .and_then(Json::as_str)
+                    .is_some_and(|named| !LOCAL.contains(&canonical_protocol(named)))
+            })
+        })
+}
+
 fn inbound_method(inbound: &Json) -> String {
     inbound
         .get("settings")
@@ -32377,6 +32435,21 @@ mod tests {
         );
     }
 
+    /// The lane ceiling follows the role: an outbound that dials a peer is a client, and the four
+    /// that reach no peer are not, including a config with no outbounds at all.
+    #[test]
+    fn a_config_that_dials_a_peer_reads_as_a_client() {
+        let client = crate::json::parse(r#"{"outbounds":[{"protocol":"vless"}]}"#).expect("config");
+        assert!(dials_a_proxy(&client));
+        let server = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom"},{"protocol":"blackhole"},{"protocol":"dns"}]}"#,
+        )
+        .expect("config");
+        assert!(!dials_a_proxy(&server));
+        let none = crate::json::parse(r"{}").expect("config");
+        assert!(!dials_a_proxy(&none));
+    }
+
     /// A relay half that is read by one thread and written by another: the reader parks
     /// where the kernel would park, and the writer must not wait for it.
     struct Parked {
@@ -34592,9 +34665,9 @@ mod tests {
         drop(peers);
         serving.join().expect("joins");
         assert!(
-            grown <= lane_pool::DEMUX_LANES + 1,
+            grown <= lane_pool::demux_lanes() + 1,
             "eight muxed connections grew the process by {grown} threads past the demux pool's {} lanes and its one reaper: a thread per connection and more",
-            lane_pool::DEMUX_LANES
+            lane_pool::demux_lanes()
         );
     }
 
