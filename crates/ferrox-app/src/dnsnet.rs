@@ -209,7 +209,7 @@ fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
     if length > ferrox_core::dns::MESSAGE_MAX {
         return Err("dns answer over the message bound".to_owned());
     }
-    let mut body = vec![0u8; length];
+    let mut body = crate::proxy::unfilled(length);
     stream
         .read_exact(&mut body)
         .map_err(|error| format!("dns stream answer: {error}"))?;
@@ -312,4 +312,28 @@ fn frame(stream: &mut impl Write, kind: u8, flags: u8, id: u32, body: &[u8]) -> 
         .write_all(&frame_head(body.len(), kind, flags, id))
         .and_then(|()| stream.write_all(body))
         .map_err(|error| format!("dns doh write: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_frame;
+    use std::io::Cursor;
+
+    /// The framed answer is read into room no zero pass filled first: the read writes every
+    /// byte the frame reports before the caller sees one. The `zeroed` counter is the witness.
+    #[test]
+    fn a_dns_frame_read_does_not_zero_its_read_target() {
+        let body = b"answer-bytes";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        wire.extend_from_slice(body);
+        let mut stream = Cursor::new(wire);
+        let (frame, counts) = ferrox_core::alloc_count::measure(|| read_frame(&mut stream));
+        assert_eq!(
+            frame.expect("the frame"),
+            body.as_slice(),
+            "the bytes are the frame"
+        );
+        assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+    }
 }
