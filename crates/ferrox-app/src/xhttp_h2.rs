@@ -2649,13 +2649,17 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     return self.end();
                 };
                 let body = std::mem::take(&mut self.body);
-                if !pump_frame(conn, service, kind, flags, sid, body, &mut self.frag) {
+                if !pump_frame(
+                    conn,
+                    service,
+                    kind,
+                    flags,
+                    sid,
+                    body,
+                    &mut self.frag,
+                    self.opened.as_ref(),
+                ) {
                     return self.end();
-                }
-                if kind == T_HEADERS {
-                    if let Some(opened) = &self.opened {
-                        opened.store(true, Ordering::Relaxed);
-                    }
                 }
                 self.head_have = 0;
                 self.phase = Phase::Head;
@@ -2840,6 +2844,7 @@ fn pump_frame(
     sid: u32,
     mut body: Vec<u8>,
     frag: &mut Option<(u32, Vec<u8>, bool)>,
+    opened: Option<&Arc<AtomicBool>>,
 ) -> bool {
     if let Some(alive) = control_frame(conn, kind, flags, sid, &body) {
         return alive;
@@ -2881,6 +2886,9 @@ fn pump_frame(
                     return true;
                 }
                 service.open(conn, sid, &block, end_stream);
+                if let Some(opened) = opened {
+                    opened.store(true, Ordering::Relaxed);
+                }
             } else {
                 *frag = Some((sid, block, end_stream));
             }
@@ -2900,6 +2908,9 @@ fn pump_frame(
                 gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
                     service.open(conn, sid, &gathered, end_stream);
+                    if let Some(opened) = opened {
+                        opened.store(true, Ordering::Relaxed);
+                    }
                 } else {
                     *frag = Some((sid, gathered, end_stream));
                 }
@@ -2971,6 +2982,19 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
+
+    /// The production pump with no demux clock: a unit test drives frames, not a connection's handshake.
+    fn pump_frame(
+        conn: &Arc<H2Conn>,
+        service: &dyn H2Service,
+        kind: u8,
+        flags: u8,
+        sid: u32,
+        body: Vec<u8>,
+        frag: &mut Option<(u32, Vec<u8>, bool)>,
+    ) -> bool {
+        super::pump_frame(conn, service, kind, flags, sid, body, frag, None)
+    }
 
     fn test_service(settings: &XhttpSettings) -> XhttpService {
         let users = crate::proxy::one_user([0u8; 16]);
@@ -4687,6 +4711,49 @@ mod tests {
         assert!(
             took < Duration::from_secs(2),
             "the demux did not end at its clock: {took:?}"
+        );
+        drop(client);
+    }
+
+    /// A HEADERS on stream 0 is not a request: it must not clear the clock, or a silent peer keeps
+    /// the demux worker without ever opening a stream.
+    #[test]
+    fn a_headers_on_stream_zero_keeps_the_handshake_clock() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let opened = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&opened);
+        let server = thread::spawn(crate::budgets::carrying(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
+                .expect("arms the poll");
+            let service = XhttpSessionService::new(
+                test_settings("stream-up"),
+                Arc::new(move |_, _, _| {
+                    seen.store(true, Ordering::SeqCst);
+                }),
+            );
+            let began = std::time::Instant::now();
+            serve_h2_service(read, stream, &service, None);
+            began.elapsed()
+        }));
+        let mut client = Connection::connect(addr).expect("connects");
+        client.write_all(MAGIC).expect("writes the preface");
+        // HEADERS, END_STREAM|END_HEADERS, stream 0: ignored by the demux.
+        client
+            .write_all(&[0, 0, 1, T_HEADERS, F_END | F_END_HEADERS, 0, 0, 0, 0, 0x82])
+            .expect("writes the ignored head");
+        let took = server.join().expect("joins");
+        crate::budgets::clear();
+        assert!(!opened.load(Ordering::SeqCst), "no stream opened");
+        assert!(
+            took < Duration::from_secs(2),
+            "the ignored head cleared the clock: {took:?}"
         );
         drop(client);
     }

@@ -4295,6 +4295,10 @@ impl<R: Read> HandshakeRead<R> {
         self.until = None;
         self.step = None;
     }
+
+    pub(crate) fn into_inner(self) -> R {
+        self.inner
+    }
 }
 
 impl<R: Read> Read for HandshakeRead<R> {
@@ -19163,13 +19167,17 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
 }
 
 fn serve_trojan_xhttp_accepted(
-    mut creader: Box<dyn crate::proxy::WindowRead + Send>,
+    creader: Box<dyn crate::proxy::WindowRead + Send>,
     cwriter: crate::xhttp::XhttpWriter,
     key: &[[u8; 56]],
     freedom: bool,
 ) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
-    let Some((cmd, target)) = decode_trojan_request(&mut creader, key) else {
+    let mut bounded = crate::proxy::HandshakeRead::new(creader, crate::budgets::handshake());
+    let decoded = decode_trojan_request(&mut bounded, key);
+    bounded.disarm();
+    let creader = bounded.into_inner();
+    let Some((cmd, target)) = decoded else {
         echo_trace("session xhttp trojan decode refused");
         cwriter.finish();
         return;
@@ -66562,5 +66570,64 @@ mod hc_tests {
             exchange(port, b"GET /other HTTP/1.1\r\n\r\n"),
             Vec::<u8>::new()
         );
+    }
+}
+
+#[cfg(test)]
+mod h2_carrier_tests {
+    use super::*;
+
+    /// A silent h2 stream that never sends a trojan header ends at the handshake budget: the decode
+    /// claims the poll, so it cannot retry poll timeouts for the relay stall.
+    #[test]
+    fn a_silent_trojan_stream_ends_at_the_handshake_budget() {
+        struct Silent(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    relay_step_owns_poll(),
+                    "a trojan decode read ran outside the poll"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl crate::proxy::WindowRead for Silent {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                unreachable!("the trojan header reads through Read")
+            }
+        }
+
+        struct Sink;
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl FrameWrite for Sink {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                true
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
+        let began = Instant::now();
+        serve_trojan_xhttp_accepted(
+            Box::new(Silent(Arc::clone(&polled))),
+            crate::xhttp::XhttpWriter::new(Sink),
+            &[[0x11u8; 56]],
+            true,
+        );
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 }
