@@ -5172,6 +5172,16 @@ fn serve_sealed_mux<S>(
     serve_mux_wire(&wire, &dial, &udp, None, &[]);
 }
 
+/// The sealed relay reads at least one full record, even where the reference's policy buffer
+/// default is 4 KiB: a 4 KiB read would seal a 4 KiB record and double the peer's wakeups.
+fn sealed_window(buffer: Option<usize>) -> usize {
+    buffer
+        .filter(|window| *window > 0)
+        .map_or(RELAY_SMALL_BUFFER, |window| {
+            window.clamp(RELAY_SMALL_BUFFER, RELAY_BUFFER)
+        })
+}
+
 /// A relay over two independently sealed halves, so a parked read never stops the other direction.
 fn relay_split<R, W>(
     mut sealed_read: R,
@@ -5194,10 +5204,7 @@ fn relay_split<R, W>(
     let stall = policy
         .and_then(|flow| flow.conn_idle())
         .unwrap_or_else(budgets::relay_stall);
-    let window = policy
-        .and_then(|flow| flow.buffer())
-        .filter(|window| *window > 0)
-        .map_or(RELAY_SMALL_BUFFER, |window| window.min(RELAY_BUFFER));
+    let window = sealed_window(policy.and_then(|flow| flow.buffer()));
     let _ = plain_read.set_read_timeout(Some(stall));
     let _ = plain_write.set_write_timeout(Some(stall));
     let ended = Arc::new(AtomicBool::new(false));
@@ -36725,6 +36732,21 @@ mod tests {
                 "a read did not realloc the window"
             );
         }
+    }
+
+    /// The reference's ARM policy default is a 4 KiB buffer, but a sealed relay must not emit a
+    /// 4 KiB record: the peer then wakes twice per 8 KiB of payload. The floor is one small window.
+    #[test]
+    fn a_sealed_relay_reads_at_least_one_record() {
+        for buffer in [None, Some(0), Some(4096), Some(8192)] {
+            assert_eq!(
+                sealed_window(buffer),
+                RELAY_SMALL_BUFFER,
+                "a {buffer:?}-byte policy buffer must not cut the seal below a record"
+            );
+        }
+        assert_eq!(sealed_window(Some(32 * 1024)), 32 * 1024);
+        assert_eq!(sealed_window(Some(usize::MAX)), RELAY_BUFFER);
     }
 
     /// A finished flow hands its window back: the next flow takes the same zeroed allocation from the local pool, and the promotion draws from the large pool rather than paying a fresh zeroing pass. The gate is the allocator's own zeroed-allocation count rather than a timing.
