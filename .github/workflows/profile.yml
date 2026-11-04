@@ -72,7 +72,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p profile
-          sudo tcpdump -i lo -s 0 -U -w profile/loopback.pcap >/tmp/tcpdump.log 2>&1 &
+          sudo tcpdump -i lo -s 128 -U -w profile/loopback.pcap >/tmp/tcpdump.log 2>&1 &
           echo $! >/tmp/tcpdump.pid
           sleep 1
       - name: measure one cell under perf
@@ -107,11 +107,34 @@ jobs:
           sleep 1
           sudo chown "$(id -u):$(id -g)" profile/loopback.pcap 2>/dev/null || true
           cat /tmp/tcpdump.log 2>/dev/null || true
+          python3 - <<'PY' > profile/wire-summary.txt
+          import collections, re, subprocess
+          text = subprocess.run(
+              ["tcpdump", "-nr", "profile/loopback.pcap", "-nn", "-tt"],
+              capture_output=True, text=True,
+          ).stdout
+          counts = collections.Counter()
+          sizes = collections.defaultdict(collections.Counter)
+          for line in text.splitlines():
+              m = re.search(r"IP (\S+) > (\S+): tcp (\d+)", line)
+              if not m:
+                  continue
+              src, dst, length = m.group(1), m.group(2), int(m.group(3))
+              if length == 0:
+                  continue
+              key = (src.split(".")[-1], dst.split(".")[-1])
+              counts[key] += 1
+              sizes[key][length] += 1
+          for key, count in counts.most_common(24):
+              print(key, "packets", count, "sizes", sizes[key].most_common(10))
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wire-${{ github.run_id }}
-          path: profile/loopback.pcap
+          path: |
+            profile/loopback.pcap
+            profile/wire-summary.txt
           if-no-files-found: warn
           retention-days: 7
       - name: collapse the profiles
