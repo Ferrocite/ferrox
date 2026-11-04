@@ -615,6 +615,34 @@ impl WsWriter {
         write_frame(&mut **stream, self.masked, OP_DATA, data)
     }
 
+    pub(crate) fn push_ready(&self, data: &[u8]) -> crate::proxy::Push {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return crate::proxy::Push::Lost;
+        };
+        if self.masked {
+            return if write_frame(&mut **stream, self.masked, OP_DATA, data) {
+                crate::proxy::Push::Took(data.len())
+            } else {
+                crate::proxy::Push::Lost
+            };
+        }
+        match write_frame_ready(&mut **stream, OP_DATA, data) {
+            None => {
+                if write_frame(&mut **stream, self.masked, OP_DATA, data) {
+                    crate::proxy::Push::Took(data.len())
+                } else {
+                    crate::proxy::Push::Lost
+                }
+            }
+            Some(Ok(0)) => crate::proxy::Push::Parked,
+            Some(Ok(taken)) => crate::proxy::Push::Took(taken),
+            Some(Err(error)) if crate::proxy::is_descriptor_wait(&error) => {
+                crate::proxy::Push::Parked
+            }
+            Some(Err(_)) => crate::proxy::Push::Lost,
+        }
+    }
+
     pub(crate) fn close(&self) {
         if self.shared.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -644,27 +672,62 @@ thread_local! {
     static MASKED_FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+fn frame_head(opcode: u8, len: usize, masked: bool) -> ([u8; 10], usize) {
+    let flag: u8 = if masked { 0x80 } else { 0 };
+    let mut head = [0u8; 10];
+    head[0] = 0x80 | (opcode & 0x0F);
+    let hlen = if len < 126 {
+        head[1] = flag | len as u8;
+        2
+    } else if u16::try_from(len).is_ok() {
+        head[1] = flag | 0x7E;
+        head[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        4
+    } else {
+        head[1] = flag | 0x7F;
+        head[2..10].copy_from_slice(&(len as u64).to_be_bytes());
+        10
+    };
+    (head, hlen)
+}
+
+/// One unmasked data frame offered without waiting; `None` when the transport cannot report a
+/// partial take, so the caller sends the blocking frame instead.
+fn write_frame_ready(
+    stream: &mut dyn crate::proxy::FrameWrite,
+    opcode: u8,
+    data: &[u8],
+) -> Option<std::io::Result<usize>> {
+    let (head, hlen) = frame_head(opcode, data.len(), false);
+    let mut taken = match stream.write_ready(&[&head[..hlen], data])? {
+        Ok(n) if n >= hlen => n - hlen,
+        Ok(n) => {
+            // A header cut on the wire is finished before the lane parks; it is ten bytes at most.
+            if let Err(error) = stream.write_all(&head[n..hlen]) {
+                return Some(Err(error));
+            }
+            0
+        }
+        Err(error) => return Some(Err(error)),
+    };
+    if taken == 0 && !data.is_empty() {
+        // The socket took the head and none of the payload; the next offer is the bare payload,
+        // which is where a full socket reports itself and the lane learns its descriptor.
+        taken = match stream.write_ready(&[data])? {
+            Ok(n) => n,
+            Err(error) => return Some(Err(error)),
+        };
+    }
+    Some(Ok(taken))
+}
+
 fn write_frame(
     stream: &mut dyn crate::proxy::FrameWrite,
     masked: bool,
     opcode: u8,
     data: &[u8],
 ) -> bool {
-    let flag: u8 = if masked { 0x80 } else { 0 };
-    let mut head = [0u8; 10];
-    head[0] = 0x80 | (opcode & 0x0F);
-    let hlen = if data.len() < 126 {
-        head[1] = flag | data.len() as u8;
-        2
-    } else if u16::try_from(data.len()).is_ok() {
-        head[1] = flag | 0x7E;
-        head[2..4].copy_from_slice(&(data.len() as u16).to_be_bytes());
-        4
-    } else {
-        head[1] = flag | 0x7F;
-        head[2..10].copy_from_slice(&(data.len() as u64).to_be_bytes());
-        10
-    };
+    let (head, hlen) = frame_head(opcode, data.len(), masked);
     if !masked {
         return stream.write_slices(&[&head[..hlen], data]);
     }
@@ -944,6 +1007,10 @@ impl crate::proxy::CarrierSink for WsWriter {
     #[inline]
     fn send(&self, bytes: &[u8]) -> bool {
         self.send(bytes)
+    }
+    #[inline]
+    fn push_ready(&self, bytes: &[u8]) -> crate::proxy::Push {
+        self.push_ready(bytes)
     }
     #[inline]
     fn close(&self) {

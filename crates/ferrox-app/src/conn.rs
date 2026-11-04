@@ -297,6 +297,89 @@ impl Connection {
     }
 }
 
+impl Connection {
+    /// One relay write that never waits: a socket with no room answers `WouldBlock` at once, and the
+    /// lane parks on the descriptor's writability instead of spending the send clock in a worker.
+    #[cfg(unix)]
+    pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
+        let result = match self {
+            Connection::Tcp(stream) => sendmsg_ready(stream, parts),
+            Connection::Masked(masked) => sendmsg_ready(&masked.stream, parts),
+            Connection::Metered(metered) => match metered.inner.write_ready(parts) {
+                Ok(n) => {
+                    metered.meter.write(n);
+                    Ok(n)
+                }
+                Err(error) => Err(error),
+            },
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.write_ready(parts)
+            }
+            Connection::Unix(stream) => sendmsg_ready(stream, parts),
+        };
+        if result.as_ref().is_err_and(crate::proxy::is_descriptor_wait) {
+            crate::proxy::note_wait_fd_write(std::os::fd::AsRawFd::as_raw_fd(&*self));
+        }
+        result
+    }
+}
+
+/// `sendmsg` with `MSG_DONTWAIT`, the per-call form of a non-blocking write: the descriptor keeps the
+/// blocking shape every other arm writes through.
+#[cfg(unix)]
+fn sendmsg_ready<S: std::os::fd::AsRawFd>(stream: &S, parts: &[&[u8]]) -> io::Result<usize> {
+    const CAP: usize = 16;
+    if parts.len() > CAP {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
+    let mut made = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; CAP];
+    let mut count = 0usize;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        made[count] = libc::iovec {
+            iov_base: part.as_ptr().cast_mut().cast(),
+            iov_len: part.len(),
+        };
+        count += 1;
+    }
+    // SAFETY: a zeroed `msghdr` names no address, no control and no segment; the fields below are the
+    // caller's slices, which outlive the call.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = made.as_mut_ptr();
+    message.msg_iovlen = count as _;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        return if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Darwin ignores `MSG_DONTWAIT` on a full send buffer, so the descriptor's own flag is the
+        // portable form; it is restored before the borrow ends, so no other writer sees it.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sent = unsafe { libc::sendmsg(fd, &message, 0) };
+        let error = (sent < 0).then(io::Error::last_os_error);
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        match error {
+            Some(error) => Err(error),
+            None => Ok(sent as usize),
+        }
+    }
+}
+
 /// `recv` with `MSG_DONTWAIT`, the per-call form of a non-blocking read: the descriptor keeps the
 /// blocking shape and read timeout the rest of the relay arms on it.
 #[cfg(unix)]
@@ -2074,6 +2157,47 @@ mod tests {
             began.elapsed() < Duration::from_secs(1),
             "the read waited out its clock instead of handing the lane a park"
         );
+    }
+
+    /// A full socket answers the relay's offer at once instead of spending a worker in the send
+    /// clock, and the lane learns which descriptor the reactor must watch for a write.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_socket_write_never_waits_out_the_clock() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let _peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (side, _) = listener.accept().expect("accepts");
+        let mut stream = Connection::Tcp(side);
+        let mut filled = 0usize;
+        loop {
+            match stream.write_ready(&[&[0u8; 4096][..]]) {
+                Ok(n) => filled += n,
+                Err(error) if crate::proxy::is_descriptor_wait(&error) => break,
+                Err(error) => panic!("the fill ended: {error:?}"),
+            }
+            assert!(filled < 64 * 1024 * 1024, "the socket never filled");
+        }
+        let step = crate::proxy::RelayStep::enter();
+        let began = std::time::Instant::now();
+        let error = stream
+            .write_ready(&[&[0u8; 64][..]])
+            .expect_err("a full socket took the bytes");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "a full socket is a wait, not an end: {error:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "the write waited out the send clock instead of handing the lane a park"
+        );
+        assert!(
+            crate::proxy::write_wait_pending(),
+            "the lane was not told to wait on writability"
+        );
+        drop(step);
     }
 
     #[test]

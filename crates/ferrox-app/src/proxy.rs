@@ -9542,9 +9542,23 @@ thread_local! {
     static WAIT_FD: std::cell::Cell<Option<WaitFd>> = const { std::cell::Cell::new(None) };
 }
 
+thread_local! {
+    /// Whether the socket above is waited for a write rather than a read: a full carrier parks on
+    /// its writability while an empty one parks on its readability.
+    static WAIT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn note_wait_fd(fd: WaitFd) {
     if relay_step_owns_poll() {
+        WAIT_WRITE.with(|slot| slot.set(false));
         WAIT_FD.with(|slot| slot.set(Some(fd)));
+    }
+}
+
+pub(crate) fn note_wait_fd_write(fd: WaitFd) {
+    if relay_step_owns_poll() {
+        WAIT_FD.with(|slot| slot.set(Some(fd)));
+        WAIT_WRITE.with(|slot| slot.set(true));
     }
 }
 
@@ -9552,8 +9566,19 @@ pub(crate) fn take_wait_fd() -> Option<WaitFd> {
     WAIT_FD.with(std::cell::Cell::take)
 }
 
+pub(crate) fn take_wait_write() -> bool {
+    WAIT_WRITE.with(std::cell::Cell::take)
+}
+
+/// Whether the step's last wait is for writability, so a refused offer can park the lane instead of
+/// retaking its turn on the clock.
+pub(crate) fn write_wait_pending() -> bool {
+    WAIT_WRITE.with(std::cell::Cell::get)
+}
+
 pub(crate) fn forget_wait_fd() {
     WAIT_FD.with(|slot| slot.set(None));
+    WAIT_WRITE.with(|slot| slot.set(false));
 }
 
 thread_local! {
@@ -24894,6 +24919,8 @@ pub(crate) mod lane_pool {
         id: u64,
         due: std::sync::OnceLock<Option<std::time::Instant>>,
         fd: WaitFd,
+        /// The side of the descriptor the lane waits on: a full carrier wants a write, an empty one a read.
+        write: bool,
         finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
         lane: Mutex<Option<Lane>>,
         pool: std::sync::Weak<Pool>,
@@ -25382,10 +25409,13 @@ pub(crate) mod lane_pool {
             crate::proxy::forget_wait_idle();
             return Err(lane);
         }
+        let write = crate::proxy::write_wait_pending();
         let Some(fd) = crate::proxy::take_wait_fd() else {
             crate::proxy::forget_wait_idle();
+            crate::proxy::take_wait_write();
             return Err(lane);
         };
+        let _ = crate::proxy::take_wait_write();
         if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
             return Err(lane);
         }
@@ -25396,6 +25426,7 @@ pub(crate) mod lane_pool {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             due: std::sync::OnceLock::new(),
             fd,
+            write,
             finish: crate::proxy::take_wait_finish(),
             lane: Mutex::new(None),
             pool: std::sync::Arc::downgrade(pool),
@@ -25471,6 +25502,8 @@ pub(crate) mod lane_pool {
         #[cfg(windows)]
         wake: WaitFd,
         fds: std::collections::HashMap<WaitFd, Vec<u64>>,
+        /// Descriptors whose interest includes writability, because a parked lane's carrier is full.
+        write: std::collections::HashSet<WaitFd>,
         slots: std::collections::HashMap<u64, std::sync::Arc<ReadySlot>>,
         due: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>,
         #[cfg(target_os = "linux")]
@@ -25491,6 +25524,7 @@ pub(crate) mod lane_pool {
             let mut reactor = Self {
                 ep,
                 fds: std::collections::HashMap::new(),
+                write: std::collections::HashSet::new(),
                 slots: std::collections::HashMap::new(),
                 due: std::collections::BinaryHeap::new(),
                 events: Vec::new(),
@@ -25498,7 +25532,7 @@ pub(crate) mod lane_pool {
             reactor
                 .events
                 .resize(64, libc::epoll_event { events: 0, u64: 0 });
-            if !reactor.add(wake) {
+            if !reactor.add(wake, false) {
                 return None;
             }
             Some(reactor)
@@ -25513,6 +25547,7 @@ pub(crate) mod lane_pool {
             let mut reactor = Self {
                 kq,
                 fds: std::collections::HashMap::new(),
+                write: std::collections::HashSet::new(),
                 slots: std::collections::HashMap::new(),
                 due: std::collections::BinaryHeap::new(),
                 events: Vec::new(),
@@ -25528,7 +25563,7 @@ pub(crate) mod lane_pool {
                     udata: std::ptr::null_mut(),
                 },
             );
-            if !reactor.add(wake) {
+            if !reactor.add(wake, false) {
                 return None;
             }
             Some(reactor)
@@ -25539,15 +25574,17 @@ pub(crate) mod lane_pool {
             Some(Self {
                 wake,
                 fds: std::collections::HashMap::new(),
+                write: std::collections::HashSet::new(),
                 slots: std::collections::HashMap::new(),
                 due: std::collections::BinaryHeap::new(),
             })
         }
 
         #[cfg(target_os = "linux")]
-        fn add(&mut self, fd: WaitFd) -> bool {
+        fn add(&mut self, fd: WaitFd, write: bool) -> bool {
             let mut row = libc::epoll_event {
-                events: u32::try_from(libc::EPOLLIN).unwrap_or(u32::MAX),
+                events: u32::try_from(libc::EPOLLIN | if write { libc::EPOLLOUT } else { 0 })
+                    .unwrap_or(u32::MAX),
                 u64: u64::try_from(fd).unwrap_or(u64::MAX),
             };
             let added = unsafe {
@@ -25561,7 +25598,37 @@ pub(crate) mod lane_pool {
             if added == 0 {
                 return true;
             }
-            std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return false;
+            }
+            if write {
+                return (unsafe {
+                    libc::epoll_ctl(
+                        self.ep,
+                        libc::EPOLL_CTL_MOD,
+                        fd,
+                        std::ptr::from_mut(&mut row),
+                    )
+                }) == 0;
+            }
+            true
+        }
+
+        #[cfg(target_os = "linux")]
+        fn change_interest(&mut self, fd: WaitFd, write: bool) -> bool {
+            let mut row = libc::epoll_event {
+                events: u32::try_from(libc::EPOLLIN | if write { libc::EPOLLOUT } else { 0 })
+                    .unwrap_or(u32::MAX),
+                u64: u64::try_from(fd).unwrap_or(u64::MAX),
+            };
+            (unsafe {
+                libc::epoll_ctl(
+                    self.ep,
+                    libc::EPOLL_CTL_MOD,
+                    fd,
+                    std::ptr::from_mut(&mut row),
+                )
+            }) == 0
         }
 
         #[cfg(target_os = "linux")]
@@ -25572,10 +25639,10 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn change(&self, fd: WaitFd, flags: u16) -> bool {
+        fn change_filter(&self, fd: WaitFd, filter: i16, flags: u16) -> bool {
             let change = libc::kevent {
                 ident: usize::try_from(fd).unwrap_or(usize::MAX),
-                filter: libc::EVFILT_READ,
+                filter,
                 flags,
                 fflags: 0,
                 data: 0,
@@ -25594,17 +25661,37 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn add(&mut self, fd: WaitFd) -> bool {
+        fn change(&self, fd: WaitFd, flags: u16) -> bool {
+            self.change_filter(fd, libc::EVFILT_READ, flags)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn add(&mut self, fd: WaitFd, write: bool) -> bool {
             self.change(fd, libc::EV_ADD | libc::EV_ENABLE)
+                && (!write || self.change_interest(fd, true))
+        }
+
+        #[cfg(target_os = "macos")]
+        fn change_interest(&mut self, fd: WaitFd, write: bool) -> bool {
+            if write {
+                return self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ENABLE);
+            }
+            true
         }
 
         #[cfg(target_os = "macos")]
         fn del(&mut self, fd: WaitFd) {
             self.change(fd, libc::EV_DELETE);
+            self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
         }
 
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        fn add(&mut self, _: WaitFd) -> bool {
+        fn add(&mut self, _: WaitFd, _: bool) -> bool {
+            true
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn change_interest(&mut self, _: WaitFd, _: bool) -> bool {
             true
         }
 
@@ -25670,9 +25757,13 @@ pub(crate) mod lane_pool {
                 revents: 0,
             });
             for fd in self.fds.keys() {
+                let mut events = libc::POLLIN;
+                if self.write.contains(fd) {
+                    events |= libc::POLLOUT;
+                }
                 rows.push(libc::pollfd {
                     fd: *fd,
-                    events: libc::POLLIN,
+                    events,
                     revents: 0,
                 });
             }
@@ -25697,6 +25788,7 @@ pub(crate) mod lane_pool {
             Some(Self {
                 wake,
                 fds: std::collections::HashMap::new(),
+                write: std::collections::HashSet::new(),
                 slots: std::collections::HashMap::new(),
                 due: std::collections::BinaryHeap::new(),
                 rows: Vec::new(),
@@ -25705,7 +25797,12 @@ pub(crate) mod lane_pool {
 
         // `WSAPoll` takes the whole set per wait, so a socket joins the rows and leaves with its slot.
         #[cfg(windows)]
-        fn add(&mut self, _: WaitFd) -> bool {
+        fn add(&mut self, _: WaitFd, _: bool) -> bool {
+            true
+        }
+
+        #[cfg(windows)]
+        fn change_interest(&mut self, _: WaitFd, _: bool) -> bool {
             true
         }
 
@@ -25715,7 +25812,7 @@ pub(crate) mod lane_pool {
         #[cfg(windows)]
         fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
             use windows_sys::Win32::Networking::WinSock::{
-                WSAPoll, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+                WSAPoll, POLLIN, POLLRDNORM, POLLWRNORM, SOCKET, WSAPOLLFD,
             };
             let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
             self.rows.clear();
@@ -25725,9 +25822,13 @@ pub(crate) mod lane_pool {
                 revents: 0,
             });
             for fd in self.fds.keys() {
+                let mut events = POLLIN | POLLRDNORM;
+                if self.write.contains(fd) {
+                    events |= POLLWRNORM;
+                }
                 self.rows.push(WSAPOLLFD {
                     fd: *fd as SOCKET,
-                    events: POLLIN | POLLRDNORM,
+                    events,
                     revents: 0,
                 });
             }
@@ -25764,7 +25865,7 @@ pub(crate) mod lane_pool {
             }
             let fd = slot.fd;
             // A stale id can outlive its closed descriptor, so a reused number is added again.
-            if !self.add(fd) {
+            if !self.watch(fd, slot.write) {
                 // A descriptor the reactor cannot watch keeps the poll's pace instead of spinning the worker.
                 self.due.push(std::cmp::Reverse((
                     std::time::Instant::now() + crate::budgets::RELAY_POLL,
@@ -25776,6 +25877,27 @@ pub(crate) mod lane_pool {
             self.fds.entry(fd).or_default().push(slot.id);
             self.slots.insert(slot.id, slot);
             None
+        }
+
+        /// Joins the descriptor's interest set, upgrading it to writability when a full carrier parks
+        /// on the same socket a reader already waits on.
+        fn watch(&mut self, fd: WaitFd, write: bool) -> bool {
+            if !self.fds.contains_key(&fd) {
+                if !self.add(fd, write) {
+                    return false;
+                }
+                if write {
+                    self.write.insert(fd);
+                }
+                return true;
+            }
+            if write && !self.write.contains(&fd) {
+                if !self.change_interest(fd, true) {
+                    return false;
+                }
+                self.write.insert(fd);
+            }
+            true
         }
 
         fn retire(&mut self, id: u64) {
@@ -25790,6 +25912,7 @@ pub(crate) mod lane_pool {
             }
             if last {
                 self.fds.remove(&fd);
+                self.write.remove(&fd);
                 self.del(fd);
             }
         }
@@ -25800,6 +25923,7 @@ pub(crate) mod lane_pool {
             let Some(ids) = self.fds.remove(&fd) else {
                 return;
             };
+            self.write.remove(&fd);
             self.del(fd);
             for id in ids {
                 let Some(slot) = self.slots.remove(&id) else {
@@ -25844,6 +25968,7 @@ pub(crate) mod lane_pool {
             }
             if empty {
                 self.fds.remove(&fd);
+                self.write.remove(&fd);
                 self.del(fd);
             }
         }
@@ -26539,6 +26664,7 @@ pub(crate) mod lane_pool {
                     id,
                     due: std::sync::OnceLock::new(),
                     fd,
+                    write: false,
                     finish: None,
                     lane: Mutex::new(None),
                     pool: std::sync::Arc::downgrade(&pool),
@@ -26605,6 +26731,7 @@ pub(crate) mod lane_pool {
                 id: 1,
                 due: std::sync::OnceLock::new(),
                 fd,
+                write: false,
                 finish: None,
                 lane: Mutex::new(None),
                 pool: std::sync::Arc::downgrade(&pool),
@@ -26626,6 +26753,60 @@ pub(crate) mod lane_pool {
             reactor.wake_due(park + crate::budgets::RELAY_POLL * 4, &mut lanes);
             assert_eq!(lanes.len(), 1, "the unwatchable descriptor never came back");
             let _ = std::fs::remove_file(&path);
+        }
+
+        /// A lane parked on a full carrier is woken by the socket taking bytes again, not by the clock.
+        #[test]
+        fn a_write_slot_waits_for_the_socket_to_drain() {
+            use std::io::{Read as _, Write as _};
+            use std::os::fd::AsRawFd;
+
+            let (mut side, mut peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+            side.set_nonblocking(true).expect("non-blocking");
+            while side.write(&[0u8]).is_ok() {}
+            side.set_nonblocking(false).expect("blocking");
+            peer.set_nonblocking(true).expect("non-blocking");
+            let fd = side.as_raw_fd();
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = |id: u64, write: bool| {
+                let slot = std::sync::Arc::new(ReadySlot {
+                    id,
+                    due: std::sync::OnceLock::new(),
+                    fd,
+                    write,
+                    finish: None,
+                    lane: Mutex::new(None),
+                    pool: std::sync::Arc::downgrade(&pool),
+                });
+                slot.put_lane(Lane {
+                    step: Box::new(|| Next::Done),
+                    complete: Some(Box::new(|| {})),
+                    idle: 0,
+                    relay: true,
+                });
+                slot
+            };
+            assert!(
+                reactor.park(slot(1, false)).is_none(),
+                "the reader was refused"
+            );
+            assert!(
+                reactor.park(slot(2, true)).is_none(),
+                "the writer was refused on a socket the reader already holds"
+            );
+            assert!(
+                reactor.wait(Duration::from_millis(50)).is_empty(),
+                "a full socket reported itself writable"
+            );
+            let mut sink = [0u8; 64 * 1024];
+            while peer.read(&mut sink).is_ok() {}
+            assert_eq!(
+                reactor.wait(Duration::from_secs(2)),
+                vec![fd],
+                "the drained socket did not wake its writer"
+            );
         }
 
         /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
@@ -27593,6 +27774,11 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
             Push::Lost
         }
     }
+    /// One window offered without waiting on a full socket: a carrier that can report a partial take
+    /// parks the lane on its writability, and the default keeps the blocking send.
+    fn push_ready(&self, bytes: &[u8]) -> Push {
+        self.push(bytes)
+    }
     /// Bytes a parked push accepted but the socket did not take yet: a lane that owes none still
     /// drains them, so a stalled record is not stranded behind an idle read.
     fn settle(&self) -> Settle {
@@ -27631,6 +27817,13 @@ pub(crate) enum Settle {
 pub(crate) trait FrameWrite: Write + Send {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
 
+    /// One framed offer that never waits on a full socket: `Some` is the payload prefix the
+    /// transport took, `None` a transport that cannot report a partial take (a sealed record, a
+    /// masked frame), whose caller keeps the blocking `write_slices`.
+    fn write_ready(&mut self, _parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        None
+    }
+
     /// Every byte is taken, but a transport with a paced tail may not have put it on the wire yet:
     /// it owns the rest, so a lane never waits on a socket the peer has not drained.
     fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
@@ -27662,6 +27855,11 @@ pub(crate) trait FrameWrite: Write + Send {
 impl FrameWrite for Connection {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        Some(Connection::write_ready(self, parts))
     }
 
     fn arm_write(&mut self, timeout: Duration) {
@@ -28029,12 +28227,16 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
 /// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
 fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
     while at.sent < at.pending {
-        match uplink.push(&buffer.prefix(at.pending)[at.sent..]) {
+        match uplink.push_ready(&buffer.prefix(at.pending)[at.sent..]) {
             Push::Took(n) if n > 0 => {
                 at.sent += n;
                 at.spins = 0;
             }
-            // A full window is another lane's frame away, so the leg rejoins the queue at once: a quantum spent here is a window the peer cannot grant.
+            // A full socket hands the lane to the reactor; a full window is another lane's frame away
+            // and rejoins the queue at once, because a quantum spent here is a window the peer cannot grant.
+            Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
+                return Some(Next::Idle);
+            }
             Push::Took(_) | Push::Parked => {
                 at.spins += 1;
                 if at.spins < RELAY_SPINS {
@@ -37177,6 +37379,64 @@ mod tests {
             Some(fd),
             "a socket carrier parks on its descriptor"
         );
+    }
+
+    /// A full carrier parks the lane on the socket's writability instead of spending a worker in the
+    /// send clock: the offer returns at once and names the descriptor the reactor must watch.
+    #[test]
+    fn a_full_carrier_parks_the_lane_instead_of_the_worker() {
+        use std::time::{Duration, Instant};
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            crate::ws::accept(stream, "/frame").expect("upgrades")
+        });
+        let stream = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (client, _client_writer) =
+            crate::ws::connect(stream, "127.0.0.1", "/frame", 0, b"", &[], 0).expect("upgrades");
+        let (_reader, writer) = server.join().expect("joins");
+
+        let chunk = vec![7u8; 32 * 1024];
+        let mut filled = 0usize;
+        loop {
+            match writer.push_ready(&chunk) {
+                Push::Took(n) if n > 0 => filled += n,
+                Push::Parked => break,
+                _ => panic!("the carrier ended while filling"),
+            }
+            assert!(filled < 256 * 1024 * 1024, "the socket never filled");
+        }
+
+        // The peer drains after the send clock the parked lane must not pay.
+        let drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            std::thread::sleep(Duration::from_millis(250));
+            let mut sink = [0u8; 8192];
+            let mut client = client;
+            let _ = client.read(&mut sink);
+        });
+
+        let mut buffer = RelayBuf::with_len(64 * 1024);
+        buffer.as_mut()[..1024].fill(1);
+        let mut at = Forward::new();
+        at.pending = 1024;
+        let step = crate::proxy::RelayStep::enter();
+        let began = Instant::now();
+        let next = forward_flush(&buffer, &writer, &mut at);
+        let waited = began.elapsed();
+        assert_eq!(next, Some(Next::Idle), "a full socket held the lane");
+        assert!(
+            waited < Duration::from_millis(100),
+            "the lane waited {waited:?} for a socket the reactor will wake it on"
+        );
+        assert!(
+            crate::proxy::write_wait_pending(),
+            "the lane parked without naming the descriptor it waits on"
+        );
+        drop(step);
+        let _ = drain.join();
     }
 
     #[test]
