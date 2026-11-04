@@ -24263,6 +24263,7 @@ pub(crate) mod lane_pool {
             {
                 crate::proxy::forget_wait_fd();
                 crate::proxy::forget_wait_finish();
+                crate::proxy::forget_wait_idle();
             }
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
