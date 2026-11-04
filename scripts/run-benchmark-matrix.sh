@@ -214,6 +214,12 @@ for have in ${built[@]+"${built[@]}"}; do
   [[ "$seen" == "0" ]] && ordered+=("$have")
 done
 engines=(${ordered[@]+"${ordered[@]}"})
+if [[ -n "${PROFILE_STRACE:-}" ]]; then
+  probe="$(engine_path xray-core)"
+  cp -p "$probe" "$probe.real"
+  printf '%s\n' '#!/bin/bash' "exec strace -f -w -c -o \"$PROFILE_STRACE.\$\$.strace\" -e trace=read,write,recvfrom,sendto,recvmsg,sendmsg,epoll_wait,epoll_pwait,futex \"$probe.real\" \"\$@\"" > "$probe"
+  chmod +x "$probe"
+fi
 build_engine_args() {
   engine_args=()
   local have label shape dialect

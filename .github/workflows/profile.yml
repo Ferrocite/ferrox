@@ -61,14 +61,6 @@ jobs:
       - name: fetch the reference
         shell: bash
         run: ./scripts/fetch-upstream.sh --only xray-core
-      - name: wrap the reference client
-        shell: bash
-        run: |
-          set -euo pipefail
-          real=target/parity-engines/xray-core
-          mv "$real" "$real.real"
-          printf '%s\n' '#!/bin/bash' 'exec strace -f -w -c -o "/tmp/xray-$$.strace" -e trace=read,write,recvfrom,sendto,recvmsg,sendmsg,epoll_wait,epoll_pwait,futex "$0.real" "$@"' > "$real"
-          chmod +x "$real"
       - name: build with symbols and frame pointers
         shell: bash
         env:
@@ -80,6 +72,7 @@ jobs:
         env:
           CELL: ${{ inputs.cell }}
           PROFILE_SERVER: ${{ inputs.engine }}
+          PROFILE_STRACE: /tmp/xray
         run: |
           PROFILE_DIR="$PWD/profile" timeout --kill-after=30s 900 ./scripts/run-benchmark-matrix.sh \
             --tier full --only "$CELL" --engines xray-core,ferrox \
