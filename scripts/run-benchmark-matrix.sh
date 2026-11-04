@@ -599,6 +599,12 @@ while read -r id traffic connections iterations payload duration_ms; do
     if matrix_udp_carrier "$id" && ! matrix_wait_udp 127.0.0.1 "$srvport"; then
       echo "::warning::$cell: $server has not bound udp/$srvport yet; the harness will say if it cannot carry" >&2
     fi
+    ss_pid=""
+    if [[ -n "${PROFILE_SS:-}" ]]; then
+      mkdir -p "$PROFILE_DIR"
+      ( while :; do printf '\n### %s\n' "$(date +%s.%N)"; ss -tinm "sport = :$srvport or dport = :$srvport" 2>/dev/null; sleep 0.1; done ) >"$PROFILE_DIR/$cell.ss.log" &
+      ss_pid=$!
+    fi
     perf_pid=""
     if [[ -n "${PROFILE_DIR:-}" && "$server" == "${PROFILE_SERVER:-ferrox}" ]]; then
       mkdir -p "$PROFILE_DIR"
@@ -633,6 +639,10 @@ while read -r id traffic connections iterations payload duration_ms; do
         grep -rhE "panicked at|panic:|memory allocation|index out of bounds|attempt to .* zero|stack overflow" \
           "$celldir/runs" 2>/dev/null | sort -u | head -20 || true
       } >&2
+    fi
+    if [[ -n "$ss_pid" ]]; then
+      kill "$ss_pid" 2>/dev/null || true
+      wait "$ss_pid" 2>/dev/null || true
     fi
     if [[ -n "$perf_pid" ]]; then
       kill -INT "$perf_pid" 2>/dev/null || true
