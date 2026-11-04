@@ -1344,11 +1344,11 @@ fn flush_sends(
 }
 
 #[cfg(target_os = "linux")]
-fn send_batch(socket: &UdpSocket, _ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
+fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
     use std::os::fd::AsRawFd as _;
 
     debug_assert!(packets.len() <= SEND_BATCH);
-    let to = send_endpoint(endpoint, _ipv6);
+    let to = send_endpoint(endpoint, ipv6);
     let (storage, name_len) = crate::proxy::sockaddr_of(to);
     let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
         iov_base: std::ptr::null_mut(),
@@ -1372,8 +1372,7 @@ fn send_batch(socket: &UdpSocket, _ipv6: bool, endpoint: SocketAddr, packets: &[
     }
     let mut done = 0;
     while done < packets.len() {
-        // SAFETY: every header names the one iovec and packet at the same index,
-        // `storage` outlives the call, and only the entries from `done` are named.
+        // SAFETY: each header names its own iovec and packet, and `storage` outlives the call.
         let sent = unsafe {
             libc::sendmmsg(
                 socket.as_raw_fd(),
