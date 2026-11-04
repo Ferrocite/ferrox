@@ -25550,6 +25550,13 @@ pub(crate) mod lane_pool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn demux_workers() -> usize {
+        demux_pool()
+            .workers
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -34426,7 +34433,8 @@ mod tests {
     }
 
     /// A plaintext muxed gRPC connection is demuxed by a lane parked on its socket, so an
-    /// eight-connection cell grows the process by the reaper, not by a thread per connection.
+    /// eight-connection cell grows the process by the demux pool's lanes and one reaper, not by a
+    /// thread per connection and its reaper.
     #[cfg(target_os = "linux")]
     #[test]
     fn muxed_grpc_connections_share_the_lane_pool() {
@@ -34500,8 +34508,9 @@ mod tests {
         drop(peers);
         serving.join().expect("joins");
         assert!(
-            grown < 2,
-            "eight muxed connections grew the process by {grown} threads past the pools' caps and the one reaper: a demux thread per connection"
+            grown <= lane_pool::DEMUX_LANES + 1,
+            "eight muxed connections grew the process by {grown} threads past the demux pool's {} lanes and its one reaper: a thread per connection and more",
+            lane_pool::DEMUX_LANES
         );
     }
 
