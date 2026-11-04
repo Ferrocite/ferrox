@@ -999,6 +999,9 @@ fn io(
     let mut peers = peers(&config, epoch);
     let mut cookies = CookieGuard::default();
     let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut receive_batch = ReceiveBatch::new();
+    #[cfg(not(target_os = "linux"))]
     let mut buf = vec![0u8; 65_535];
     let mut incoming = Vec::new();
     let mut events = Vec::new();
@@ -1087,59 +1090,113 @@ fn io(
             );
         }
 
-        let mut received = 0;
-        let mut nonblocking = false;
-        loop {
-            match socket.recv_from(&mut buf) {
-                Ok((n, source)) if n >= 4 => {
-                    let source = recv_endpoint(source, ipv6_socket);
-                    receive_datagram(
-                        &mut peers,
-                        &mut cookies,
-                        now,
-                        source,
-                        &mut buf[..n],
-                        &socket,
-                        &to_stack,
-                        &mut incoming,
-                        routes.as_ref(),
-                        ipv6_socket,
-                        &mut sends,
-                    );
-                    received += 1;
-                    if received >= RX_BURST {
-                        break;
-                    }
-                    if !nonblocking {
-                        if socket.set_nonblocking(true).is_err() {
+        #[cfg(target_os = "linux")]
+        {
+            let mut first = true;
+            let mut received = 0;
+            loop {
+                match receive_batch.recv(&socket, first) {
+                    Ok(0) => break,
+                    Ok(got) => {
+                        first = false;
+                        for at in 0..got {
+                            if let Some(source) = receive_batch.source(at) {
+                                let source = recv_endpoint(source, ipv6_socket);
+                                let packet = receive_batch.packet(at);
+                                if packet.len() >= 4 {
+                                    receive_datagram(
+                                        &mut peers,
+                                        &mut cookies,
+                                        now,
+                                        source,
+                                        packet,
+                                        &socket,
+                                        &to_stack,
+                                        &mut incoming,
+                                        routes.as_ref(),
+                                        ipv6_socket,
+                                        &mut sends,
+                                    );
+                                }
+                            }
+                        }
+                        received += got;
+                        if got < RX_BATCH || received >= RX_BURST {
                             break;
                         }
-                        nonblocking = true;
                     }
-                }
-                Ok(_) => break,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    break;
-                }
-                Err(_) => {
-                    if nonblocking {
-                        let _ = socket.set_nonblocking(false);
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        break;
                     }
-                    return;
+                    Err(_) => return,
                 }
             }
         }
-        if nonblocking {
-            let _ = socket.set_nonblocking(false);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut received = 0;
+            let mut nonblocking = false;
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, source)) if n >= 4 => {
+                        let source = recv_endpoint(source, ipv6_socket);
+                        receive_datagram(
+                            &mut peers,
+                            &mut cookies,
+                            now,
+                            source,
+                            &mut buf[..n],
+                            &socket,
+                            &to_stack,
+                            &mut incoming,
+                            routes.as_ref(),
+                            ipv6_socket,
+                            &mut sends,
+                        );
+                        received += 1;
+                        if received >= RX_BURST {
+                            break;
+                        }
+                        if !nonblocking {
+                            if socket.set_nonblocking(true).is_err() {
+                                break;
+                            }
+                            nonblocking = true;
+                        }
+                    }
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(_) => {
+                        if nonblocking {
+                            let _ = socket.set_nonblocking(false);
+                        }
+                        return;
+                    }
+                }
+            }
+            if nonblocking {
+                let _ = socket.set_nonblocking(false);
+            }
         }
     }
 }
@@ -1190,6 +1247,102 @@ fn receive_datagram(
 /// receive queue.
 const RX_BURST: usize = 256;
 const TX_DRAIN: usize = 128;
+
+#[cfg(target_os = "linux")]
+const RX_BATCH: usize = 64;
+
+/// Read a batch of tunnel datagrams in one `recvmmsg`, so a fast lane is paced
+/// by the wire rather than by one syscall for every record.
+#[cfg(target_os = "linux")]
+struct ReceiveBatch {
+    slots: Vec<Vec<u8>>,
+    iovecs: Vec<libc::iovec>,
+    headers: Vec<libc::mmsghdr>,
+    names: Vec<libc::sockaddr_storage>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveBatch {
+    fn new() -> Self {
+        Self {
+            slots: (0..RX_BATCH).map(|_| vec![0u8; 65_535]).collect(),
+            iovecs: (0..RX_BATCH)
+                .map(|_| libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                })
+                .collect(),
+            headers: (0..RX_BATCH)
+                .map(|_| libc::mmsghdr {
+                    msg_hdr: libc::msghdr {
+                        msg_name: std::ptr::null_mut(),
+                        msg_namelen: 0,
+                        msg_iov: std::ptr::null_mut(),
+                        msg_iovlen: 0,
+                        msg_control: std::ptr::null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    },
+                    msg_len: 0,
+                })
+                .collect(),
+            names: (0..RX_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+        }
+    }
+
+    fn recv(&mut self, socket: &UdpSocket, first: bool) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+
+        let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        for at in 0..RX_BATCH {
+            self.iovecs[at] = libc::iovec {
+                iov_base: self.slots[at].as_mut_ptr().cast(),
+                iov_len: self.slots[at].len(),
+            };
+            self.headers[at].msg_hdr = libc::msghdr {
+                msg_name: (&raw mut self.names[at]).cast(),
+                msg_namelen: room,
+                msg_iov: (&raw mut self.iovecs[at]).cast(),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+            self.headers[at].msg_len = 0;
+        }
+        let mut flags = libc::MSG_WAITFORONE as libc::c_int;
+        if !first {
+            flags |= libc::MSG_DONTWAIT;
+        }
+        // SAFETY: every header names a slot, an iovec and a name in `self`, all of which outlive the call, and the kernel writes each slot only as far as the datagram it read.
+        let got = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                self.headers.as_mut_ptr(),
+                RX_BATCH as libc::c_uint,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if got < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        usize::try_from(got).map_err(|_| std::io::Error::other("recvmmsg count"))
+    }
+
+    fn packet(&mut self, at: usize) -> &mut [u8] {
+        let len = usize::try_from(self.headers[at].msg_len)
+            .unwrap_or(0)
+            .min(self.slots[at].len());
+        &mut self.slots[at][..len]
+    }
+
+    fn source(&self, at: usize) -> Option<SocketAddr> {
+        crate::proxy::socket_addr_of(&self.names[at], self.headers[at].msg_hdr.msg_namelen)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn handle_initiation(
@@ -1638,6 +1791,28 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(packets.try_recv().is_ok(), "the peer owns its own source");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_receives_every_datagram() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let address = receiver.local_addr().expect("address");
+        for packet in &packets {
+            sender.send_to(packet, address).expect("datagram");
+        }
+        let mut batch = ReceiveBatch::new();
+        let got = batch.recv(&receiver, true).expect("batch");
+        assert_eq!(got, packets.len(), "the batch reads all four");
+        for at in 0..got {
+            assert_eq!(batch.packet(at), packets[at].as_slice());
+            assert_eq!(batch.source(at), Some(sender.local_addr().unwrap()));
+        }
     }
 
     #[cfg(target_os = "linux")]
