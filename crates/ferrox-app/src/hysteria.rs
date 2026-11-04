@@ -2984,6 +2984,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_retransmitted_initial_reuses_its_lane_without_a_second_route() {
         // A retransmit names the first flight's DCID and source CID; route_packet must drive it on the lane accept already made rather than add a second route. The client's next flight is the observable that `drive` reaches that lane.
         let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
