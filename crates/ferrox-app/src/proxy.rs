@@ -25175,8 +25175,7 @@ pub(crate) mod lane_pool {
             let fd = slot.fd;
             // A stale id can outlive its closed descriptor, so a reused number is added again.
             if !self.add(fd) {
-                // A descriptor that cannot be watched keeps the poll's pace: hand it back on the clock
-                // instead of at once, so a registration that keeps failing cannot spin the worker.
+                // A descriptor the reactor cannot watch keeps the poll's pace instead of spinning the worker.
                 self.due.push(std::cmp::Reverse((
                     std::time::Instant::now() + crate::budgets::RELAY_POLL,
                     slot.id,
