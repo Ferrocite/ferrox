@@ -191,12 +191,14 @@ proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_read
 # but this probe's messages do not walk it. The messages, offsets, prefixes and
 # bytes are unchanged.
 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
-# The sniff probe's frame in the app binary, read from ops.yml's wide artefact on
-# 2026-11-03: one pre-warmed inspection prices the peek and the host parse, 1220.
+# The sniff probe's frame in the app binary, re-measured by count-ops on
+# 2026-11-04: one pre-warmed inspection prices the peek and the host parse, 1228.
+# The 2026-11-03 blessing of 1220 was read before the relay-path work that moved
+# this frame's codegen; the messages, offsets and bytes are unchanged.
 # The test that used to carry this row measured 35898 for two inspections, most
 # of it the first call's 32 KiB buffer growth, so the row named more than the
 # page's claim; the warm count test holds exactly one call and the buffer is the
 # worker thread's before it. `the_probe_buffer_is_the_worker_threads_not_the_flows`
 # stays as the witness for that buffer's identity and capacity, which this row
 # cannot see.
-ferrox_app::sniff::Sniffing::inspect 1220 sniff::tests::a_warm_probe_costs_the_documented_instructions
+ferrox_app::sniff::Sniffing::inspect 1228 sniff::tests::a_warm_probe_costs_the_documented_instructions
