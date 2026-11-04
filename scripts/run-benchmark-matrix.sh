@@ -220,7 +220,7 @@ if [[ -n "${PROFILE_STRACE:-}" ]]; then
     [[ "${have%%=*}" == "xray-core" ]] && probe="${have#*=}"
   done
   cp -p "$probe" "$probe.real"
-  printf '%s\n' '#!/bin/bash' "exec strace -f -tt -T -s 0 -o \"$PROFILE_STRACE.\$\$.strace\" -e trace=read,write,recvfrom,sendto,recvmsg,sendmsg,epoll_pwait \"$probe.real\" \"\$@\"" > "$probe"
+  printf '%s\n' '#!/bin/bash' "exec strace -f -tt -T -s 0 -o \"$PROFILE_STRACE.\$\$.strace\" -e trace=read,write,splice,sendfile,copy_file_range,tee,vmsplice,io_uring_enter,recvfrom,sendto,recvmsg,sendmsg,epoll_pwait \"$probe.real\" \"\$@\"" > "$probe"
   chmod +x "$probe"
 fi
 build_engine_args() {
