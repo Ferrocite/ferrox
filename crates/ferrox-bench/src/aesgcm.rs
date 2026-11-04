@@ -244,13 +244,14 @@ fn check_and_time_256_from(len: usize, plain: &[u8]) -> Row {
     let mut ours_run = || {
         fresh_buf.clear();
         let start = fresh_buf.len();
-        fresh_buf.resize(start + len, 0);
-        let tag = ours.seal_from(
+        let tag = ours.seal_from_uninit(
             std::hint::black_box(&nonce),
             aad,
             std::hint::black_box(plain),
-            &mut fresh_buf[start..],
+            &mut fresh_buf.spare_capacity_mut()[..len],
         );
+        // SAFETY: seal_from_uninit wrote every byte of the spare range.
+        unsafe { fresh_buf.set_len(start + len) };
         fresh_buf.extend_from_slice(&tag);
         fresh_buf.len()
     };
@@ -313,13 +314,14 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
     );
     let _ = writeln!(
         out,
-        "\n| bytes | reference ns/seal+open | ferrox ns/seal+open | speedup |"
+        "\n| comparison | bytes | reference ns | ferrox ns | speedup |"
     );
-    let _ = writeln!(out, "| ---: | ---: | ---: | ---: |");
+    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: |");
     for r in rows {
         let _ = writeln!(
             out,
-            "| {} | {:.1} | {:.1} | {:.2}x |",
+            "| {} | {} | {:.1} | {:.1} | {:.2}x |",
+            r.name,
             r.bytes,
             r.base * 1e9,
             r.ours * 1e9,

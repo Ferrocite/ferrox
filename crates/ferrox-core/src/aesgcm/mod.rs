@@ -1584,10 +1584,7 @@ mod tests_aes256 {
                     let tag = engine.seal_from(&nonce, &aad, &plain, &mut dst);
                     assert_eq!(tag, want, "tag: aad {aad_len} len {len}");
                     assert_eq!(dst, in_place, "ciphertext: aad {aad_len} len {len}");
-                    let mut uninit: Vec<std::mem::MaybeUninit<u8>> =
-                        std::iter::repeat_with(std::mem::MaybeUninit::uninit)
-                            .take(len)
-                            .collect();
+                    let mut uninit = vec![std::mem::MaybeUninit::new(0xa5u8); len];
                     let tag = engine.seal_from_uninit(&nonce, &aad, &plain, &mut uninit);
                     assert_eq!(tag, want, "uninit tag: aad {aad_len} len {len}");
                     // SAFETY: seal_from_uninit wrote every byte of the destination.
