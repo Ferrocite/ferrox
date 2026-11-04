@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1267,7 +1267,7 @@ fn measure_once(
     let wall_elapsed = wall.elapsed();
     // The client's settle runs while the sink drains, so the server's window ends at the last byte the sink counted rather than at the client's last write or after the settle.
     let settle_until = Instant::now() + SETTLE;
-    while Instant::now() < settle_until && !sink_thread.drained() {
+    while Instant::now() < settle_until && sink_thread.received() < moved.sent {
         std::thread::sleep(Duration::from_millis(5));
     }
     let server = match server {
@@ -1755,7 +1755,7 @@ struct SinkThread {
     accept: JoinHandle<()>,
     reasons: Arc<std::sync::Mutex<Vec<String>>>,
     done: Arc<AtomicBool>,
-    drained: Arc<AtomicBool>,
+    received: Arc<AtomicU64>,
 }
 
 impl SinkThread {
@@ -1767,9 +1767,9 @@ impl SinkThread {
         Ok(())
     }
 
-    /// Every flow's expected bytes have reached the sink, so the engine's window can close there.
-    fn drained(&self) -> bool {
-        self.drained.load(Ordering::Relaxed)
+    /// Every byte the client counts has reached the sink, so the engine's window can close there.
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 
     fn reasons(&self) -> Vec<String> {
@@ -2628,8 +2628,8 @@ fn spawn_sink(
     let accept_reasons = Arc::clone(&reasons);
     let accept_desync = Arc::clone(desync);
     let done = Arc::new(AtomicBool::new(false));
-    let drained = Arc::new(AtomicBool::new(false));
-    let (sink_done, sink_drained) = (Arc::clone(&done), Arc::clone(&drained));
+    let received = Arc::new(AtomicU64::new(0));
+    let (sink_done, sink_received) = (Arc::clone(&done), Arc::clone(&received));
     let accept = std::thread::spawn(move || {
         let done = sink_done;
         let mut handles = Vec::with_capacity(listeners.len() + udp_sockets.len());
@@ -2637,7 +2637,7 @@ fn spawn_sink(
             let flow = Arc::new(rotate(&pattern, index, flows));
             let sink_reasons = Arc::clone(&accept_reasons);
             let sink_desync = Arc::clone(&accept_desync);
-            let thread_done = Arc::clone(&done);
+            let (thread_done, thread_received) = (Arc::clone(&done), Arc::clone(&sink_received));
             handles.push(std::thread::spawn(move || {
                 let listener_done = thread_done;
                 loop {
@@ -2670,7 +2670,7 @@ fn spawn_sink(
                         return;
                     }
                     if latency {
-                        echo_stream(stream, &listener_done);
+                        echo_stream(stream, &listener_done, &thread_received);
                         return;
                     }
                     if let Some(reason) = serve_flow(
@@ -2680,6 +2680,7 @@ fn spawn_sink(
                         upload_bytes,
                         download_bytes,
                         &sink_desync,
+                        &thread_received,
                     ) {
                         if let Ok(mut slot) = sink_reasons.lock() {
                             slot.push(reason);
@@ -2690,19 +2691,18 @@ fn spawn_sink(
             }));
         }
         for socket in udp_sockets {
-            let thread_done = Arc::clone(&done);
-            handles.push(std::thread::spawn(move || serve_udp(socket, &thread_done)));
+            let (d, r) = (Arc::clone(&done), Arc::clone(&sink_received));
+            handles.push(std::thread::spawn(move || serve_udp(socket, &d, &r)));
         }
         for handle in handles {
             let _ = handle.join();
         }
-        sink_drained.store(true, Ordering::Relaxed);
     });
     Ok(SinkThread {
         accept,
         reasons,
         done,
-        drained,
+        received,
     })
 }
 
@@ -2714,12 +2714,13 @@ fn hold_stream(stream: TcpStream, done: &AtomicBool) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn echo_stream(mut stream: TcpStream, done: &AtomicBool) {
+fn echo_stream(mut stream: TcpStream, done: &AtomicBool, received: &AtomicU64) {
     let mut buffer = vec![0u8; DOWNLOAD_CHUNK];
     while !done.load(Ordering::Relaxed) {
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                received.fetch_add(n as u64, Ordering::Relaxed);
                 if stream.write_all(&buffer[..n]).is_err() {
                     break;
                 }
@@ -2731,12 +2732,13 @@ fn echo_stream(mut stream: TcpStream, done: &AtomicBool) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn serve_udp(socket: UdpSocket, done: &AtomicBool) {
+fn serve_udp(socket: UdpSocket, done: &AtomicBool, received: &AtomicU64) {
     let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
     let mut buffer = vec![0u8; 65_536 + 64];
     while !done.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buffer) {
             Ok((n, from)) => {
+                received.fetch_add(n as u64, Ordering::Relaxed);
                 let _ = socket.send_to(&buffer[..n], from);
             }
             Err(e)
@@ -2756,6 +2758,7 @@ fn serve_flow(
     upload_bytes: u64,
     download_bytes: u64,
     desync: &Desync,
+    received: &AtomicU64,
 ) -> Option<String> {
     let downloader = if download_bytes > 0 {
         let Ok(read_half) = stream.try_clone() else {
@@ -2772,7 +2775,7 @@ fn serve_flow(
     };
 
     let upload_reason = if upload_bytes > 0 {
-        validate(stream, pattern, index, upload_bytes, desync)
+        validate(stream, pattern, index, upload_bytes, desync, received)
     } else {
         None
     };
@@ -2792,6 +2795,7 @@ fn validate(
     index: usize,
     expect: u64,
     desync: &Desync,
+    received: &AtomicU64,
 ) -> Option<String> {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut seen = 0u64;
@@ -2828,6 +2832,7 @@ fn validate(
         }
         offset = (offset + n) % pattern.len();
         seen += n as u64;
+        received.fetch_add(n as u64, Ordering::Relaxed);
     }
     None
 }
@@ -3993,7 +3998,7 @@ mod tests {
         let engine = TcpStream::connect(addr).expect("connects");
         let slot: Desync = Arc::new(std::sync::Mutex::new(None));
         let feed = engine.try_clone().expect("clone for the reader");
-        let reason = validate(feed, &Arc::new(pattern), 2, 16, &slot)
+        let reason = validate(feed, &Arc::new(pattern), 2, 16, &slot, &AtomicU64::new(0))
             .expect("a forged byte is a reason, returned not exited");
         assert!(
             reason.contains("flow 2 upload desynced at byte 15"),
@@ -4045,6 +4050,7 @@ mod tests {
                 upload_bytes,
                 download_bytes,
                 &serve_desync,
+                &AtomicU64::new(0),
             );
             let _ = done_tx.send(reason);
         });
