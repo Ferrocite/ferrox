@@ -112,6 +112,10 @@ impl Aead {
         self.nonce
     }
 
+    #[allow(
+        clippy::uninit_vec,
+        reason = "seal_from writes every byte of the claimed room before the tag is appended"
+    )]
     fn seal_into(
         &mut self,
         nonce: Option<[u8; 12]>,
@@ -120,11 +124,17 @@ impl Aead {
         out: &mut Vec<u8>,
     ) {
         let nonce = nonce.unwrap_or_else(|| self.next_nonce());
-        let start = out.len();
-        out.extend_from_slice(plaintext);
-        let tag = match &self.cipher {
-            Cipher::Aes(cipher) => cipher.seal_in_place(&nonce, aad, &mut out[start..]),
+        match &self.cipher {
+            Cipher::Aes(cipher) => {
+                let start = out.len();
+                out.reserve(plaintext.len());
+                unsafe { out.set_len(start + plaintext.len()) };
+                let tag = cipher.seal_from(&nonce, aad, plaintext, &mut out[start..]);
+                out.extend_from_slice(&tag);
+            }
             Cipher::ChaCha(cipher) => {
+                let start = out.len();
+                out.extend_from_slice(plaintext);
                 let tag = cipher
                     .encrypt_inout_detached(
                         &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
@@ -134,10 +144,9 @@ impl Aead {
                     .expect("AEAD seal cannot fail for these sizes");
                 let mut bytes = [0u8; TAG_LEN];
                 bytes.copy_from_slice(&tag);
-                bytes
+                out.extend_from_slice(&bytes);
             }
-        };
-        out.extend_from_slice(&tag);
+        }
     }
 
     fn open_in_place(
