@@ -3005,12 +3005,12 @@ mod tests {
             udp: HashMap::new(),
             cc_rx: 0,
         };
-        let mut routes = HashMap::new();
-        routes.insert(
+        let mut by_scid = HashMap::new();
+        by_scid.insert(
             first_key.clone(),
             inbound(first.clone(), first_dcid.clone()),
         );
-        routes.insert(
+        by_scid.insert(
             second_key.clone(),
             inbound(second.clone(), second_dcid.clone()),
         );
@@ -3025,7 +3025,7 @@ mod tests {
             udp_idle: Duration::from_secs(60),
             cc_rx: 0,
             stateless_reset: false,
-            routes,
+            routes: by_scid,
             by_client_cid: HashMap::from([
                 (first.clone(), first_key.clone()),
                 (second.clone(), second_key.clone()),
