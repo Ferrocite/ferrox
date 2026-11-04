@@ -24489,7 +24489,7 @@ pub(crate) mod lane_pool {
     /// queued and no worker is idle, so a one-flow cell holds two lanes. Six leaves room for the
     /// accept path and the parking reaper under the reference's ten-thread server peak.
     #[cfg(target_os = "linux")]
-    pub(crate) const RELAY_LANES: usize = 6;
+    pub(crate) const RELAY_LANES: usize = 16;
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
     #[cfg(not(target_os = "linux"))]
     pub(crate) const RELAY_LANES: usize = 8;
