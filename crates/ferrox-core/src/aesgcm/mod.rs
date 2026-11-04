@@ -814,8 +814,7 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
             ksv[3].xor(V::load(&sq[3])),
         ];
         let at = group * 64;
-        // SAFETY: the caller guarantees `dst` has at least `src.len()` bytes, and each
-        // store writes one full block inside that range.
+        // SAFETY: the caller guarantees `dst` has room for every byte stored here.
         unsafe {
             V::store_ptr(ct4[0], dst.add(at));
             V::store_ptr(ct4[1], dst.add(at + 16));
