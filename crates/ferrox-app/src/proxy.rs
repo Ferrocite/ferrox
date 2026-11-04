@@ -23142,6 +23142,7 @@ fn relay_lanes(
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
     forward.stall = forward_stall;
+    forward.reply_idle = forward_stall;
     lane_pool::submit(
         Box::new(move || forward.step(&first)),
         Box::new({
@@ -23155,6 +23156,7 @@ fn relay_lanes(
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
     reply.stall = reply_stall;
+    reply.reply_idle = reply_stall;
     lane_pool::submit(
         Box::new(move || reply.step(&second)),
         Box::new({
@@ -23177,6 +23179,7 @@ struct TcpCopy {
     ended: bool,
     stalled: Option<std::time::Instant>,
     stall: Duration,
+    reply_idle: Duration,
 }
 
 impl TcpCopy {
@@ -23191,6 +23194,7 @@ impl TcpCopy {
             ended: false,
             stalled: None,
             stall: crate::budgets::relay_stall(),
+            reply_idle: crate::budgets::RELAY_RESPONSE_IDLE,
         }
     }
 
@@ -23250,7 +23254,7 @@ impl TcpCopy {
                     note_wait_fd(self.src.as_raw_fd());
                     note_wait_finish(flow);
                 }
-                if flow.ended() && flow.ended_and_idle(self.stall) {
+                if flow.ended() && flow.ended_and_idle(self.reply_idle) {
                     self.end();
                     Next::Done
                 } else {
