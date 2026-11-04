@@ -635,6 +635,7 @@ impl WsWriter {
         let mut taken = 0;
         // A bare second offer starts the payload when the first only landed the head, so a full socket parks here.
         loop {
+            let before = (owed, cut);
             let offer = if cut > 0 {
                 write_cut_ready(&mut **stream, cut, owed, data)
             } else if owed == 0 {
@@ -667,7 +668,7 @@ impl WsWriter {
                     };
                 }
             }
-            if taken > 0 || (owed == 0 && cut == 0) {
+            if taken > 0 || (owed == 0 && cut == 0) || before == (owed, cut) {
                 break;
             }
         }
