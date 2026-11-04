@@ -49451,7 +49451,11 @@ mod tests {
         });
         let mut zeroed = vec![0u8; frame.frame_len(0)];
         let written = frame.encode_into(None, &mut zeroed);
-        assert_eq!(claimed, zeroed[..written], "the claimed bytes are the frame");
+        assert_eq!(
+            claimed,
+            zeroed[..written],
+            "the claimed bytes are the frame"
+        );
         assert_eq!(
             counts.zeroed, 0,
             "the encoder fills the prefix it returns: {counts:?}"
