@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
-use str0m::channel::{ChannelConfig, ChannelId};
+use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
@@ -46,6 +46,7 @@ impl WebRtc {
         stun_servers: &[String],
         timeout: Duration,
         servers: &[SocketAddr],
+        unreliable: bool,
     ) -> Result<(Self, String), String> {
         let socket = bind_socket(destination)?;
         let local = socket
@@ -64,10 +65,17 @@ impl WebRtc {
             }
         }
         let mut changes = rtc.sdp_api();
-        let channel = changes.add_channel_with_config(ChannelConfig {
+        let config = ChannelConfig {
             label: label(),
+            ordered: !unreliable,
+            reliability: if unreliable {
+                Reliability::MaxRetransmits { retransmits: 0 }
+            } else {
+                Reliability::Reliable
+            },
             ..ChannelConfig::default()
-        });
+        };
+        let channel = changes.add_channel_with_config(config);
         let (offer, pending) = changes
             .apply()
             .ok_or_else(|| "psiphon webrtc: no offer".to_owned())?;
@@ -175,7 +183,12 @@ impl WebRtc {
 
     /// Move the engine onto a driver thread and expose it as an `io` stream.
     pub(crate) fn into_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
-        WebRtcStream::spawn(self, timeout)
+        WebRtcStream::spawn(self, timeout, false)
+    }
+
+    /// Move the engine onto a driver thread and preserve each write as one datagram.
+    pub(crate) fn into_datagram_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
+        WebRtcStream::spawn(self, timeout, true)
     }
 
     /// Drain engine output, sending every transmitted datagram.
@@ -424,6 +437,8 @@ pub(crate) struct WebRtcStream {
     write_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
+impl ferrox_core::tls::RecordAlignment for WebRtcStream {}
+
 impl Clone for WebRtcStream {
     fn clone(&self) -> Self {
         Self {
@@ -440,15 +455,15 @@ impl Clone for WebRtcStream {
 
 impl WebRtcStream {
     /// Start the driver thread and the bounded queues.
-    fn spawn(webrtc: WebRtc, timeout: Duration) -> Result<Self, String> {
+    fn spawn(webrtc: WebRtc, timeout: Duration, raw: bool) -> Result<Self, String> {
         let (out, out_rx) = mpsc::sync_channel(64);
         let (input_tx, input) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let padding_sent = Arc::new(AtomicBool::new(false));
+        let padding_sent = Arc::new(AtomicBool::new(raw));
         thread::Builder::new()
             .name("psiphon-webrtc".to_owned())
-            .spawn(move || drive(webrtc, out_rx, input_tx, thread_stop))
+            .spawn(move || drive(webrtc, out_rx, input_tx, thread_stop, raw))
             .map_err(|error| format!("psiphon webrtc driver: {error}"))?;
         Ok(Self {
             out,
@@ -592,6 +607,7 @@ fn drive(
     out: Receiver<Vec<u8>>,
     input: SyncSender<Result<Vec<u8>, String>>,
     stop: Arc<AtomicBool>,
+    raw: bool,
 ) {
     let mut peer_padding_done = false;
     let mut backlog: VecDeque<Result<Vec<u8>, String>> = VecDeque::new();
@@ -638,6 +654,11 @@ fn drive(
             MESSAGE_TIMEOUT
         };
         match webrtc.receive(timeout) {
+            Ok(Some(data)) if raw => {
+                if !data.is_empty() {
+                    backlog.push_back(Ok(data));
+                }
+            }
             Ok(Some(data)) => match unframe(&data, &mut peer_padding_done) {
                 Ok(Some(payload)) if !payload.is_empty() => backlog.push_back(Ok(payload)),
                 Ok(_) => {}
@@ -809,6 +830,7 @@ impl Conduit {
     }
 
     /// Dial the destination through the first broker front that answers.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn open(
         &self,
         address: IpAddr,
@@ -820,7 +842,17 @@ impl Conduit {
         }
         if !matches!(
             destination.base_protocol(),
-            "OSSH" | "SSH" | "TLS-OSSH" | "SHADOWSOCKS-OSSH"
+            "OSSH"
+                | "SSH"
+                | "TLS-OSSH"
+                | "SHADOWSOCKS-OSSH"
+                | "QUIC-OSSH"
+                | "UNFRONTED-MEEK-OSSH"
+                | "UNFRONTED-MEEK-HTTPS-OSSH"
+                | "UNFRONTED-MEEK-SESSION-TICKET-OSSH"
+                | "FRONTED-MEEK-OSSH"
+                | "FRONTED-MEEK-HTTP-OSSH"
+                | "FRONTED-MEEK-QUIC-OSSH"
         ) {
             return Err(format!(
                 "psiphon conduit: {} is not carried by this lane",
@@ -841,14 +873,23 @@ impl Conduit {
         let metrics = Metrics::from_identity(identity);
         let mut why = String::new();
         for front in &self.fronts {
-            let (mut webrtc, sdp) =
-                match WebRtc::offer(address, &self.stun_servers, self.timeout, &self.dns) {
-                    Ok(offer) => offer,
-                    Err(error) => {
-                        why = error;
-                        continue;
-                    }
-                };
+            let unreliable = matches!(
+                destination.base_protocol(),
+                "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
+            );
+            let (mut webrtc, sdp) = match WebRtc::offer(
+                address,
+                &self.stun_servers,
+                self.timeout,
+                &self.dns,
+                unreliable,
+            ) {
+                Ok(offer) => offer,
+                Err(error) => {
+                    why = error;
+                    continue;
+                }
+            };
             let mut client = match Client::connect(
                 self.broker.clone(),
                 front,
@@ -903,7 +944,14 @@ impl Conduit {
                     continue;
                 }
             }
-            let stream = webrtc.into_stream(self.timeout)?;
+            let stream = if matches!(
+                destination.base_protocol(),
+                "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
+            ) {
+                webrtc.into_datagram_stream(self.timeout)?
+            } else {
+                webrtc.into_stream(self.timeout)?
+            };
             return Ok((
                 stream,
                 Relay {
@@ -1018,6 +1066,7 @@ mod tests {
             &[],
             Duration::from_secs(1),
             &[],
+            false,
         )
         .expect("offer");
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -1104,6 +1153,7 @@ mod tests {
             &[],
             Duration::from_secs(1),
             &[],
+            false,
         )
         .expect("offer");
         assert!(sdp.contains("m=application"));

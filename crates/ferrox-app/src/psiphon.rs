@@ -2,8 +2,9 @@
 //! [`crate::psiphon_ssh`], and the loopback SOCKS edge the proxy dials.
 
 use crate::json::{self, Json};
-use crate::psiphon_ssh::{Channel, ChannelChunk, Identity, Proxy, Server, Session};
+use crate::psiphon_ssh::{Channel, ChannelChunk, Identity, Proxy, Server, Session, TlsShape};
 use crate::socks::{Credential, Destination, Version};
+use ferrox_core::tls::Fingerprint;
 use flate2::read::ZlibDecoder;
 use ring::signature;
 use sha2::{Digest, Sha256};
@@ -104,6 +105,7 @@ struct Settings {
     protocols: Vec<String>,
     initial_protocols: Vec<String>,
     fronted: bool,
+    fronted_fallback: bool,
     cdn_ips: Vec<String>,
     cdn_snis: Vec<String>,
     fronted_overrides: Vec<FrontedOverride>,
@@ -133,6 +135,8 @@ struct Settings {
     dns_servers: Vec<SocketAddr>,
     limit_quic_versions: Vec<String>,
     quic_noise: Option<String>,
+    tls_shape: TlsShape,
+    meek_padding: (u16, u16),
     relay_buffer: usize,
     disable_tactics: bool,
     meek_headers: Vec<(String, String)>,
@@ -457,6 +461,7 @@ impl Inner {
             let client_features = self.settings.client_features.clone();
             let proxy = self.settings.proxy.clone();
             let keepalive = self.settings.keepalive;
+            let tls_shape = self.settings.tls_shape.clone();
             let conduit =
                 if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
                     match self.conduit() {
@@ -493,6 +498,7 @@ impl Inner {
                     proxy.as_ref(),
                     conduit.as_deref(),
                     keepalive,
+                    &tls_shape,
                 )
             };
             match race(batch, attempt, budget, stagger, lead) {
@@ -1285,6 +1291,7 @@ impl Settings {
                 false
             }
         };
+        let fronted_fallback = !conduit && !fronted;
         let conduit_mode = match text(settings, "conduitMode")
             .or_else(|| text(settings, "conduit_mode"))
             .map(|mode| mode.to_ascii_lowercase())
@@ -1336,6 +1343,56 @@ impl Settings {
         let reject_cidrs = string_list(settings, "InproxyRejectProxyCIDRs");
         let limit_quic_versions = string_list(settings, "LimitQUICVersions");
         let quic_noise = text(settings, "QUICNoiseProfile").filter(|profile| !profile.is_empty());
+        let mut sni_names = string_list(settings, "TLSOSSHSNIServerNames");
+        if sni_names.is_empty() {
+            if let Some(name) = text(settings, "TLSOSSHSNIServerName") {
+                sni_names.push(name);
+            }
+        }
+        // Both reference coins must land, so one setting alone never turns a name into a random one.
+        let transform_probability = decimal(settings, "TransformHostNameProbability")
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0)
+            * decimal(settings, "CustomHostNameProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+        let meek_padding = (
+            u16::try_from(
+                number(settings, "MeekMinTLSPadding")
+                    .unwrap_or(0)
+                    .min(65_535),
+            )
+            .unwrap_or(0),
+            u16::try_from(
+                number(settings, "MeekMaxTLSPadding")
+                    .unwrap_or(0)
+                    .min(65_535),
+            )
+            .unwrap_or(0),
+        );
+        let tls_shape = TlsShape {
+            min_padding: u16::try_from(
+                number(settings, "TLSTunnelMinTLSPadding")
+                    .unwrap_or(0)
+                    .min(65_535),
+            )
+            .unwrap_or(0),
+            max_padding: u16::try_from(
+                number(settings, "TLSTunnelMaxTLSPadding")
+                    .unwrap_or(0)
+                    .min(65_535),
+            )
+            .unwrap_or(0),
+            sni_names,
+            transform_probability,
+            hostname_patterns: string_list(settings, "CustomHostNameRegexes"),
+            limit_protocols: protocol_list_named(settings, "CustomHostNameLimitProtocols"),
+            profiles: tls_profiles(settings),
+            randomized_probability: decimal(settings, "SelectRandomizedTLSProfileProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            shadowsocks_prefix: shadowsocks_prefix(settings),
+        };
         let mut cdn_ips: Vec<String> = string_list(settings, "cdnIps")
             .into_iter()
             .flat_map(|raw| expand_cidr(&raw))
@@ -1587,6 +1644,7 @@ impl Settings {
             protocols: protocol_list(settings),
             initial_protocols,
             fronted,
+            fronted_fallback,
             cdn_ips,
             cdn_snis,
             fronted_overrides,
@@ -1615,6 +1673,8 @@ impl Settings {
             dns_servers,
             limit_quic_versions,
             quic_noise,
+            tls_shape,
+            meek_padding,
             relay_buffer,
             keepalive,
             disable_tactics: flag(settings, "DisableTactics", "AETHER_PSIPHON_DISABLE_TACTICS"),
@@ -1754,6 +1814,70 @@ fn decimal(settings: Option<&Json>, key: &str) -> Option<f64> {
         Json::Str(text) => text.trim().parse().ok(),
         _ => None,
     }
+}
+
+/// The `ShadowsocksPrefixSpecs` transform, its scope map and its probability.
+fn shadowsocks_prefix(settings: Option<&Json>) -> crate::psiphon_ssh::ShadowsocksPrefix {
+    let mut prefix = crate::psiphon_ssh::ShadowsocksPrefix {
+        probability: decimal(settings, "ShadowsocksPrefixProbability")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        ..crate::psiphon_ssh::ShadowsocksPrefix::default()
+    };
+    if let Some(Json::Obj(fields)) =
+        settings.and_then(|settings| settings.get("ShadowsocksPrefixSpecs"))
+    {
+        for (name, spec) in fields {
+            let generator = spec
+                .as_arr()
+                .and_then(|transforms| transforms.first())
+                .and_then(Json::as_arr)
+                .and_then(|transform| transform.get(1))
+                .and_then(Json::as_str);
+            if let Some(generator) = generator {
+                prefix.specs.push((name.clone(), generator.to_owned()));
+            }
+        }
+    }
+    if let Some(Json::Obj(scopes)) =
+        settings.and_then(|settings| settings.get("ShadowsocksPrefixScopedSpecNames"))
+    {
+        prefix.scoped = scopes
+            .iter()
+            .map(|(scope, names)| {
+                (
+                    scope.clone(),
+                    names
+                        .as_arr()
+                        .map(|names| {
+                            names
+                                .iter()
+                                .filter_map(Json::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+    }
+    prefix
+}
+
+/// The configured `LimitTLSProfiles` parrots, or the scalar `TLSProfile` when one is named.
+fn tls_profiles(settings: Option<&Json>) -> Vec<Fingerprint> {
+    let names = if settings
+        .and_then(|settings| settings.get("LimitTLSProfiles"))
+        .is_some()
+    {
+        string_list(settings, "LimitTLSProfiles")
+    } else {
+        text(settings, "TLSProfile").into_iter().collect()
+    };
+    names
+        .iter()
+        .filter_map(|name| Fingerprint::resolve(name))
+        .collect()
 }
 
 fn protocol_list_named(settings: Option<&Json>, key: &str) -> Vec<String> {
@@ -1995,6 +2119,22 @@ const KNOWN_SETTINGS: &[&str] = &[
     "LimitQUICVersions",
     "QUICNoiseProfile",
     "InproxyRejectProxyCIDRs",
+    "TLSTunnelMinTLSPadding",
+    "TLSTunnelMaxTLSPadding",
+    "MeekMinTLSPadding",
+    "MeekMaxTLSPadding",
+    "TLSTunnelTrafficShapingProbability",
+    "TLSOSSHSNIServerName",
+    "TLSOSSHSNIServerNames",
+    "TransformHostNameProbability",
+    "CustomHostNameRegexes",
+    "CustomHostNameProbability",
+    "CustomHostNameLimitProtocols",
+    "SplitTunnelOwnRegion",
+    "SplitTunnelRegions",
+    "ShadowsocksPrefixSpecs",
+    "ShadowsocksPrefixScopedSpecNames",
+    "ShadowsocksPrefixProbability",
 ];
 
 /// Report settings fields this lane does not consume.
@@ -2243,11 +2383,13 @@ fn webrtc_offer(
     sdp: Option<&str>,
     timeout: std::time::Duration,
     dns: &[SocketAddr],
+    unreliable: bool,
 ) -> Result<(Option<crate::psiphon_webrtc::WebRtc>, String), String> {
     if let Some(sdp) = sdp {
         return Ok((None, sdp.to_owned()));
     }
-    let (webrtc, sdp) = crate::psiphon_webrtc::WebRtc::offer(address, stun_servers, timeout, dns)?;
+    let (webrtc, sdp) =
+        crate::psiphon_webrtc::WebRtc::offer(address, stun_servers, timeout, dns, unreliable)?;
     Ok((Some(webrtc), sdp))
 }
 
@@ -2323,6 +2465,7 @@ pub(crate) fn broker_offer(
             sdp,
             timeout,
             &settings.dns_servers,
+            server.inproxy.as_ref().is_some_and(inproxy_uses_quic),
         )?;
         let mut client = match crate::psiphon_broker::Client::connect(
             crate::psiphon_broker::Broker {
@@ -2495,13 +2638,19 @@ fn apply_session_settings(servers: &mut [Server], settings: &Settings) {
     for server in servers {
         server.channel_window = settings.ssh_channel_window;
         server.quic_noise.clone_from(&settings.quic_noise);
-        for meek in [server.meek.as_mut(), server.unfronted_meek.as_mut()]
-            .into_iter()
-            .flatten()
-            .chain(server.tactics.as_mut().map(|tactics| &mut tactics.meek))
+        for meek in [
+            server.meek.as_mut(),
+            server.unfronted_meek.as_mut(),
+            server.inproxy_meek.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(server.tactics.as_mut().map(|tactics| &mut tactics.meek))
         {
             meek.headers.clone_from(&settings.meek_headers);
             meek.dns.clone_from(&settings.dns_servers);
+            meek.shape = settings.tls_shape.clone();
+            (meek.shape.min_padding, meek.shape.max_padding) = settings.meek_padding;
         }
     }
 }
@@ -2536,12 +2685,13 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     let mut servers = if settings.target.is_some() {
         servers
     } else {
-        select_protocols(
+        select_protocols_with(
             servers,
             &settings.protocols,
             &settings.initial_protocols,
             settings.initial_count,
             settings.fronted,
+            settings.fronted_fallback,
         )
     };
     apply_fronting_overrides(&mut servers, settings);
@@ -2689,11 +2839,33 @@ fn limit_quic_versions(mut servers: Vec<Server>, settings: &Settings) -> Vec<Ser
         return servers;
     }
     servers.retain_mut(|server| {
-        if !settings
-            .limit_quic_versions
+        let explicit = !server.quic_versions.is_empty();
+        if explicit {
+            server.quic_versions.retain(|version| {
+                settings
+                    .limit_quic_versions
+                    .iter()
+                    .any(|limit| limit == version)
+            });
+            if server.quic_versions.is_empty() {
+                server.quic_port = None;
+                if server.inproxy.as_ref().is_some_and(inproxy_uses_quic) {
+                    server.inproxy = None;
+                }
+                if server.quic {
+                    return false;
+                }
+            }
+        } else {
+            server
+                .quic_versions
+                .clone_from(&settings.limit_quic_versions);
+        }
+        let plain = server
+            .quic_versions
             .iter()
-            .any(|version| matches!(version.as_str(), "QUICv1" | "RANDOMIZED-QUICv1"))
-        {
+            .any(|version| matches!(version.as_str(), "QUICv1" | "RANDOMIZED-QUICv1"));
+        if !plain {
             if let Some(meek) = server.meek.as_mut().filter(|meek| meek.quic) {
                 meek.quic = false;
                 meek.protocol = match meek.protocol {
@@ -2702,26 +2874,31 @@ fn limit_quic_versions(mut servers: Vec<Server>, settings: &Settings) -> Vec<Ser
                     other => other,
                 };
             }
+            if server
+                .inproxy
+                .as_ref()
+                .is_some_and(|destination| destination.base_protocol() == "FRONTED-MEEK-QUIC-OSSH")
+            {
+                server.inproxy = None;
+            }
         }
-        if server.quic_versions.is_empty() {
-            server
-                .quic_versions
-                .clone_from(&settings.limit_quic_versions);
-            return true;
-        }
-        server.quic_versions.retain(|version| {
-            settings
-                .limit_quic_versions
-                .iter()
-                .any(|limit| limit == version)
-        });
-        if server.quic_versions.is_empty() {
-            server.quic_port = None;
-            return !server.quic;
-        }
-        true
+        server.direct
+            || server.ss
+            || server.meek.is_some()
+            || server.unfronted_meek.is_some()
+            || server.tactics.is_some()
+            || server.inproxy.is_some()
+            || server.tls_inproxy.is_some()
     });
     servers
+}
+
+/// Whether a destination's tunnel runs over QUIC.
+fn inproxy_uses_quic(destination: &crate::psiphon_broker::Destination) -> bool {
+    matches!(
+        destination.base_protocol(),
+        "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2761,6 +2938,12 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<Shape> {
             | "UNFRONTED-MEEK-HTTP-OSSH"
             | "INPROXY-WEBRTC-OSSH"
             | "INPROXY-WEBRTC-QUIC-OSSH"
+            | "INPROXY-WEBRTC-UNFRONTED-MEEK-OSSH"
+            | "INPROXY-WEBRTC-UNFRONTED-MEEK-HTTPS-OSSH"
+            | "INPROXY-WEBRTC-UNFRONTED-MEEK-SESSION-TICKET-OSSH"
+            | "INPROXY-WEBRTC-FRONTED-MEEK-OSSH"
+            | "INPROXY-WEBRTC-FRONTED-MEEK-HTTP-OSSH"
+            | "INPROXY-WEBRTC-FRONTED-MEEK-QUIC-OSSH"
             | "INPROXY-QUIC-OSSH"
             | "FRONTED-MEEK-OSSH"
             | "FRONTED-MEEK-CDN-OSSH"
@@ -2823,7 +3006,7 @@ fn inproxy_base(protocol: &str) -> &str {
 
 /// Whether a server is allowed by a limit that names no meek transport.
 fn matches_direct_limit(server: &Server, shape: Shape, protocols: &[String]) -> bool {
-    if !(server.direct || server.inproxy.is_some()) || server.meek.is_some() {
+    if !(server.direct || server.inproxy.is_some()) {
         return false;
     }
     let named_inproxy = protocols
@@ -2844,6 +3027,9 @@ fn matches_direct_limit(server: &Server, shape: Shape, protocols: &[String]) -> 
         {
             return false;
         }
+    }
+    if server.meek.is_some() {
+        return false;
     }
     matches_shape(server, shape)
 }
@@ -3188,12 +3374,32 @@ fn string_list_in(item: &Json, key: &str) -> Vec<String> {
 }
 
 /// Plain SSH and unfronted OSSH are the shapes this transport dials; a limit naming neither keeps the full list.
+#[cfg(test)]
 fn select_protocols(
     servers: Vec<Server>,
     protocols: &[String],
     initial_protocols: &[String],
     initial_count: usize,
     fronted: bool,
+) -> Vec<Server> {
+    select_protocols_with(
+        servers,
+        protocols,
+        initial_protocols,
+        initial_count,
+        fronted,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn select_protocols_with(
+    servers: Vec<Server>,
+    protocols: &[String],
+    initial_protocols: &[String],
+    initial_count: usize,
+    fronted: bool,
+    fronted_fallback: bool,
 ) -> Vec<Server> {
     let mut servers = servers;
     let normal = shape_filter(protocols, "LimitTunnelProtocols");
@@ -3237,6 +3443,9 @@ fn select_protocols(
             }
             if let Some(unfronted) = server.unfronted_meek.take() {
                 server.meek = Some(unfronted);
+                return true;
+            }
+            if fronted_fallback && server.meek.as_ref().is_some_and(|meek| meek.fronted) {
                 return true;
             }
             false
@@ -3515,6 +3724,16 @@ fn decode_entry_with(
         || (tls_port.is_some() && obfuscated_key.is_some());
     let inproxy = crate::psiphon_broker::destination(&entry, &host, false, conduit_protocols);
     let tls_inproxy = crate::psiphon_broker::destination(&entry, &host, true, conduit_protocols);
+    let inproxy_meek = inproxy.as_ref().and_then(|destination| {
+        let base = destination.base_protocol();
+        (base.starts_with("UNFRONTED-MEEK")
+            || matches!(
+                base,
+                "FRONTED-MEEK-OSSH" | "FRONTED-MEEK-HTTP-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
+            ))
+        .then(|| meek_entry(&entry, &host, base))
+        .flatten()
+    });
     let inproxy_port = inproxy
         .as_ref()
         .or(tls_inproxy.as_ref())
@@ -3611,6 +3830,7 @@ fn decode_entry_with(
         shadowsocks,
         meek,
         unfronted_meek,
+        inproxy_meek,
         tactics,
         inproxy,
         tls_inproxy,
@@ -3655,13 +3875,45 @@ fn tactics_entry(entry: &Json, host: &str) -> Option<crate::psiphon_tactics::Key
     })
 }
 
+/// A capability name with the legacy mask and CDN marker removed, as the reference matches it.
+fn capability_name(name: &str) -> String {
+    let stripped = name
+        .replace("-PASSTHROUGH-v2", "")
+        .replace("-PASSTHROUGH", "");
+    if stripped == "QUICv1" {
+        return "QUIC".to_owned();
+    }
+    let base = match stripped.as_str() {
+        "FRONTED-MEEK-CDN" => "FRONTED-MEEK",
+        "FRONTED-MEEK-CDN-HTTP" => "FRONTED-MEEK-HTTP",
+        "FRONTED-MEEK-CDN-QUIC" => "FRONTED-MEEK-QUIC",
+        other => other,
+    };
+    base.strip_suffix("-OSSH").unwrap_or(base).to_owned()
+}
+
+/// Whether one advertised capability satisfies a required one.
+fn capability_matches(advertised: &str, required: &str) -> bool {
+    let required = capability_name(required);
+    capability_name(advertised) == required
+        || (required == "TLS"
+            && matches!(
+                advertised,
+                "UNFRONTED-MEEK-HTTPS-PASSTHROUGH-v2"
+                    | "UNFRONTED-MEEK-SESSION-TICKET-PASSTHROUGH-v2"
+            ))
+}
+
 /// The capability name an entry advertises for a tunnel protocol.
 fn capability_protocol(entry: &Json, candidates: &[(&str, &'static str)]) -> Option<&'static str> {
     let capabilities = entry.get("capabilities").and_then(Json::as_arr)?;
     let names: Vec<&str> = capabilities.iter().filter_map(Json::as_str).collect();
-    candidates
-        .iter()
-        .find_map(|(name, protocol)| names.contains(name).then_some(*protocol))
+    candidates.iter().find_map(|(name, protocol)| {
+        names
+            .iter()
+            .any(|advertised| capability_matches(advertised, name))
+            .then_some(*protocol)
+    })
 }
 
 /// The fronted or unfronted meek capability an entry offers.
@@ -3696,7 +3948,7 @@ fn meek_protocol(entry: &Json) -> Option<&'static str> {
 }
 
 /// Whether an entry names a plain IETF QUIC version HTTP/3 can carry.
-fn fronted_quic_supported(entry: &Json) -> bool {
+pub(crate) fn fronted_quic_supported(entry: &Json) -> bool {
     let Some(versions) = entry.get("limitQUICVersions").and_then(Json::as_arr) else {
         return true;
     };
@@ -3817,6 +4069,7 @@ fn meek_entry(
             protocol,
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
     }
     let (host, hosts) = meek_hosts(entry, host);
@@ -3869,6 +4122,7 @@ fn meek_entry(
         protocol,
         headers: Vec::new(),
         dns: Vec::new(),
+        shape: TlsShape::default(),
     })
 }
 
@@ -4743,18 +4997,81 @@ mod tests {
     }
 
     #[test]
-    fn an_inproxy_quic_destination_falls_back_to_its_tls_sibling() {
+    fn a_passthrough_session_ticket_entry_gets_a_tls_port() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedKey":"k","sshHostKey":"AAAA","meekServerPort":2050,"capabilities":["UNFRONTED-MEEK-SESSION-TICKET-PASSTHROUGH-v2"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert!(server.tls);
+        assert_eq!(server.port, 2050);
+    }
+
+    #[test]
+    fn a_passthrough_https_capability_keeps_its_unfronted_shape() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","meekServerPort":2050,"meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","capabilities":["UNFRONTED-MEEK-HTTPS-PASSTHROUGH-v2"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert_eq!(
+            server.meek.as_ref().map(|meek| meek.protocol),
+            Some("UNFRONTED-MEEK-HTTPS-OSSH")
+        );
+    }
+
+    #[test]
+    fn an_inproxy_quic_destination_keeps_its_udp_shape() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","capabilities":["INPROXY-WEBRTC-TLS-OSSH","INPROXY-WEBRTC-QUIC-OSSH"],"inproxyTlsOSSHPort":8443,"inproxyQUICPort":443,"signature":"AA=="}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
         let server = decode_entry_with(&encoded, true, &[]).expect("entry");
-        assert!(server.tls);
-        assert_eq!(
-            server
-                .inproxy
-                .as_ref()
-                .map(crate::psiphon_broker::Destination::base_protocol),
-            Some("TLS-OSSH")
-        );
+        assert!(!server.tls);
+        let destination = server.inproxy.expect("destination");
+        assert_eq!(destination.base_protocol(), "QUIC-OSSH");
+        assert_eq!(destination.address, "192.0.2.1:443");
+        assert_eq!(destination.network_protocol, 1);
+    }
+
+    #[test]
+    fn an_inproxy_unfronted_meek_destination_keeps_its_http_shape() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","capabilities":["INPROXY-WEBRTC-UNFRONTED-MEEK-HTTPS-OSSH"],"inproxyMeekPort":2050,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true, &[]).expect("entry");
+        assert!(!server.tls);
+        assert!(server.meek.is_none());
+        let destination = server.inproxy.expect("destination");
+        assert_eq!(destination.base_protocol(), "UNFRONTED-MEEK-HTTPS-OSSH");
+        assert_eq!(destination.address, "192.0.2.1:2050");
+        assert_eq!(destination.network_protocol, 0);
+        let meek = server.inproxy_meek.expect("in-proxy meek");
+        assert!(meek.https);
+        assert_eq!(meek.protocol, "UNFRONTED-MEEK-HTTPS-OSSH");
+    }
+
+    #[test]
+    fn an_inproxy_fronted_meek_destination_keeps_its_http_shape() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","meekFrontingHosts":["cdn.example"],"meekFrontingDomain":"front.example","capabilities":["INPROXY-WEBRTC-FRONTED-MEEK-HTTP-OSSH"],"inproxyMeekPort":2050,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true, &[]).expect("entry");
+        assert!(!server.tls);
+        let destination = server.inproxy.expect("destination");
+        assert_eq!(destination.base_protocol(), "FRONTED-MEEK-HTTP-OSSH");
+        assert_eq!(destination.address, "192.0.2.1:2050");
+        let meek = server.inproxy_meek.expect("in-proxy meek");
+        assert!(meek.fronted);
+        assert!(!meek.https);
+        assert_eq!(meek.host, "cdn.example");
+    }
+
+    #[test]
+    fn an_inproxy_fronted_quic_destination_keeps_its_udp_shape() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","meekFrontingAddresses":["front.example:443"],"meekFrontingHosts":["cdn.example"],"capabilities":["INPROXY-WEBRTC-FRONTED-MEEK-QUIC-OSSH"],"inproxyMeekPort":2050,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true, &[]).expect("entry");
+        assert!(!server.tls);
+        let destination = server.inproxy.expect("destination");
+        assert_eq!(destination.base_protocol(), "FRONTED-MEEK-QUIC-OSSH");
+        assert_eq!(destination.address, "192.0.2.1:2050");
+        assert_eq!(destination.network_protocol, 1);
+        let meek = server.inproxy_meek.expect("in-proxy meek");
+        assert!(meek.quic && meek.https && meek.fronted);
+        assert_eq!(meek.host, "cdn.example");
     }
 
     #[test]
@@ -4863,6 +5180,19 @@ mod tests {
         assert_eq!(meek.protocol, "UNFRONTED-MEEK-HTTPS-OSSH");
         assert_eq!(meek.dial, "192.0.2.1");
         assert_eq!(meek.port, 8443);
+    }
+
+    #[test]
+    fn auto_prefers_unfronted_over_a_fronted_fallback_when_both_exist() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        let selected = select_protocols_with(vec![server], &[], &[], 0, false, true);
+        assert_eq!(selected.len(), 1);
+        let meek = selected[0].meek.as_ref().expect("unfronted");
+        assert!(!meek.fronted);
+        assert_eq!(meek.protocol, "UNFRONTED-MEEK-HTTPS-OSSH");
+        assert_eq!(meek.dial, "192.0.2.1");
     }
 
     #[test]
@@ -5007,6 +5337,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
@@ -5051,6 +5382,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
@@ -5100,6 +5432,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
@@ -5136,6 +5469,7 @@ mod tests {
                 protocol: "FRONTED-MEEK-OSSH",
                 headers: Vec::new(),
                 dns: Vec::new(),
+                shape: TlsShape::default(),
             });
             servers.push(server);
         }
@@ -5185,6 +5519,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
@@ -5250,6 +5585,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
@@ -5289,6 +5625,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let selected = select_protocols(vec![test_server(false), fronted], &[], &[], 0, true);
         assert_eq!(selected.len(), 1);
@@ -5314,6 +5651,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         };
         let mut direct = test_server(true);
         direct.meek = Some(meek());
@@ -5324,6 +5662,41 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert!(selected[0].direct);
         assert!(selected[0].meek.is_none());
+    }
+
+    #[test]
+    fn auto_keeps_front_only_entries_as_a_fallback() {
+        let mut front_only = test_server(true);
+        front_only.direct = false;
+        front_only.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let selected = select_protocols_with(
+            vec![test_server(false), front_only],
+            &[],
+            &[],
+            0,
+            false,
+            true,
+        );
+        assert_eq!(selected.len(), 2);
+        assert!(selected[1].meek.is_some());
     }
 
     #[test]
@@ -5347,6 +5720,7 @@ mod tests {
             protocol: "UNFRONTED-MEEK-HTTPS-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         });
         let selected = select_protocols(vec![test_server(false), unfronted], &[], &[], 0, false);
         assert_eq!(selected.len(), 2);
@@ -5500,6 +5874,59 @@ mod tests {
     }
 
     #[test]
+    fn a_client_quic_limit_drops_an_inproxy_fronted_h3_destination() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","meekFrontingAddresses":["front.example:443"],"meekFrontingHosts":["cdn.example"],"capabilities":["INPROXY-WEBRTC-FRONTED-MEEK-QUIC-OSSH"],"inproxyMeekPort":2050,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true, &[]).expect("entry");
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"LimitQUICVersions":["OBFUSCATED-QUICv1"]}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(limit_quic_versions(vec![server], &settings).is_empty());
+    }
+
+    #[test]
+    fn a_client_quic_limit_drops_an_inproxy_quic_destination_without_a_shared_version() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","limitQUICVersions":["QUICv1"],"capabilities":["INPROXY-WEBRTC-QUIC-OSSH"],"inproxyQUICPort":443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true, &[]).expect("entry");
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"LimitQUICVersions":["OBFUSCATED-QUICv1"]}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(limit_quic_versions(vec![server], &settings).is_empty());
+    }
+
+    #[test]
+    fn session_headers_reach_an_inproxy_meek_entry() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","meekFrontingAddresses":["front.example:443"],"meekFrontingHosts":["cdn.example"],"capabilities":["INPROXY-WEBRTC-FRONTED-MEEK-OSSH"],"inproxyMeekPort":2050,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true, &[]).expect("entry");
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"MeekAdditionalHeaders":{"X-Test":"one"}}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = [server];
+        apply_session_settings(&mut servers, &settings);
+        let meek = servers[0].inproxy_meek.as_ref().expect("in-proxy meek");
+        assert_eq!(meek.headers, vec![("X-Test".to_owned(), "one".to_owned())]);
+    }
+
+    #[test]
+    fn a_target_with_an_inproxy_destination_and_a_meek_sibling_is_accepted() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","capabilities":["UNFRONTED-MEEK-HTTPS","INPROXY-WEBRTC-UNFRONTED-MEEK-HTTPS-OSSH"],"meekServerPort":8443,"inproxyMeekPort":2050,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let text = format!(
+            r#"{{"TargetServerEntry":"{encoded}","LimitTunnelProtocols":["INPROXY-WEBRTC-UNFRONTED-MEEK-HTTPS-OSSH"]}}"#
+        );
+        let settings =
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
+        let server = load_target_entry(&settings, &encoded, true, true).expect("target");
+        let destination = server.inproxy.expect("in-proxy destination");
+        assert_eq!(destination.base_protocol(), "UNFRONTED-MEEK-HTTPS-OSSH");
+    }
+
+    #[test]
     fn a_client_quic_limit_demotes_a_fronted_h3_entry() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","FRONTED-MEEK-QUIC"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -5609,6 +6036,7 @@ mod tests {
             shadowsocks: None,
             meek: None,
             unfronted_meek: None,
+            inproxy_meek: None,
             tactics: None,
             inproxy: None,
             tls_inproxy: None,
@@ -6275,6 +6703,83 @@ mod tests {
     }
 
     #[test]
+    fn a_shadowsocks_prefix_spec_generates_its_bytes() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"ShadowsocksPrefixSpecs":{"p":[["","\\x16\\x03\\x01"]]},"ShadowsocksPrefixScopedSpecNames":{"":["p"]},"ShadowsocksPrefixProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.tls_shape.shadowsocks_prefix("9000"),
+            Some(vec![0x16, 0x03, 0x01])
+        );
+    }
+
+    #[test]
+    fn a_limited_tls_profile_reaches_every_tls_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"LimitTLSProfiles":["Chrome-120","Firefox-105"],"TLSTunnelMinTLSPadding":17,"MeekMinTLSPadding":23,"MeekMaxTLSPadding":29}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.profiles.len(), 2);
+        assert!(settings
+            .tls_shape
+            .profiles
+            .contains(&Fingerprint::resolve("chrome_120").expect("chrome")));
+        let mut servers = vec![test_server(true)];
+        servers[0].meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        apply_session_settings(&mut servers, &settings);
+        let padding = servers[0]
+            .meek
+            .as_ref()
+            .expect("meek")
+            .shape
+            .padding()
+            .expect("meek padding");
+        assert!((23..=29).contains(&padding));
+    }
+
+    #[test]
+    fn tls_padding_and_a_cover_name_reach_the_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"TLSTunnelMinTLSPadding":32,"TLSTunnelMaxTLSPadding":64,"TLSOSSHSNIServerNames":["a.test","b.test"],"CustomHostNameRegexes":["[a-z]{4}\\.test"],"CustomHostNameProbability":1,"TransformHostNameProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.min_padding, 32);
+        assert_eq!(settings.tls_shape.max_padding, 64);
+        assert_eq!(settings.tls_shape.sni_names, vec!["a.test", "b.test"]);
+        assert_eq!(settings.tls_shape.transform_probability, 1.0);
+        let padding = settings.tls_shape.padding().expect("padding");
+        assert!((32..=64).contains(&padding));
+    }
+
+    #[test]
     fn censored_country_switch_expands_to_the_android_regions() {
         let settings = Settings::from_json(Some(
             &json::parse(r#"{"rejectCensoredCountryProxies":true}"#).expect("settings"),
@@ -6438,6 +6943,7 @@ mod tests {
                 shadowsocks: None,
                 meek: None,
                 unfronted_meek: None,
+                inproxy_meek: None,
                 tactics: None,
                 inproxy: None,
                 tls_inproxy: None,
@@ -6490,6 +6996,7 @@ mod tests {
                 shadowsocks: None,
                 meek: None,
                 unfronted_meek: None,
+                inproxy_meek: None,
                 tactics: None,
                 inproxy: None,
                 tls_inproxy: None,
