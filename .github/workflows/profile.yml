@@ -113,7 +113,7 @@ jobs:
       - name: collect client syscalls
         if: always()
         shell: bash
-        run: cp /tmp/xray-*.strace profile/ 2>/dev/null || true
+        run: cp /tmp/xray.*.strace profile/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
           name: profile-${{ github.run_id }}
