@@ -727,8 +727,8 @@ impl Connection {
     #[cfg(target_os = "linux")]
     pub(crate) fn set_notsent_lowat(&self, bytes: i32) {
         match self {
-            Connection::Tcp(stream) => set_notsent_lowat(stream, bytes),
-            Connection::Masked(masked) => set_notsent_lowat(&masked.stream, bytes),
+            Connection::Tcp(stream) => Self::apply_notsent_lowat(stream, bytes),
+            Connection::Masked(masked) => Self::apply_notsent_lowat(&masked.stream, bytes),
             Connection::Metered(metered) => metered.inner.set_notsent_lowat(bytes),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 inner.set_notsent_lowat(bytes)
@@ -739,7 +739,7 @@ impl Connection {
     }
 
     #[cfg(target_os = "linux")]
-    fn set_notsent_lowat(stream: &TcpStream, bytes: i32) {
+    fn apply_notsent_lowat(stream: &TcpStream, bytes: i32) {
         use std::os::fd::AsRawFd as _;
         let value = bytes;
         // The option's failure is a shortfall in pacing, not a broken connection: the socket stays usable.
