@@ -24480,6 +24480,7 @@ pub(crate) mod lane_pool {
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
     static SETUP_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static DEMUX_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
     static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// The widest standard cell (eight connections) queues one download read per flow, and every
@@ -24492,6 +24493,11 @@ pub(crate) mod lane_pool {
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
     #[cfg(not(target_os = "linux"))]
     pub(crate) const RELAY_LANES: usize = 8;
+
+    /// A muxed connection's demux is the lane that turns the peer's window grants into the wake a
+    /// parked relay is waiting for, so it runs on its own workers: a full-duplex cell queues two
+    /// relay legs per flow, and a demux behind them delays every grant by a relay turn.
+    pub(crate) const DEMUX_LANES: usize = RELAY_LANES;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
     /// relay worker with it. Two keep a blocked stream setup from holding the only one.
@@ -24517,6 +24523,10 @@ pub(crate) mod lane_pool {
 
     fn pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
+    }
+
+    fn demux_pool() -> std::sync::Arc<Pool> {
+        std::sync::Arc::clone(DEMUX_POOL.get_or_init(|| spawn_pool_with(DEMUX_LANES, None)))
     }
 
     fn setup_pool() -> std::sync::Arc<Pool> {
@@ -25412,6 +25422,11 @@ pub(crate) mod lane_pool {
         submit_to(&pool(), step, complete);
     }
 
+    /// The demux of a muxed carrier, kept off the relay workers it feeds.
+    pub(crate) fn submit_demux(step: Step, complete: Complete) {
+        submit_to(&demux_pool(), step, complete);
+    }
+
     /// A muxed stream's handshake: queued behind the accept path's setup lanes instead of taking a
     /// thread of its own for every stream the peer opens.
     pub(crate) fn submit_stream_setup(body: impl FnOnce() + Send + 'static) {
@@ -25535,6 +25550,13 @@ pub(crate) mod lane_pool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn demux_workers() -> usize {
+        demux_pool()
+            .workers
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -25641,6 +25663,50 @@ pub(crate) mod lane_pool {
                 "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
             );
             assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// A demux lane carries the window grant a parked relay is waiting on, so it must not
+        /// queue behind the relay workers a duplex cell fills: every relay worker blocked is the
+        /// shape of an eight-flow duplex cell, and the demux still has to run.
+        #[test]
+        fn a_demux_lane_runs_while_every_relay_worker_is_blocked() {
+            let pool = pool();
+            let gate = Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                wake: Condvar::new(),
+            });
+            for _ in 0..RELAY_LANES {
+                let gate = Arc::clone(&gate);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        gate.arrive_and_wait();
+                        Next::Done
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+            let waiting = gate.wait_for(RELAY_LANES, Duration::from_secs(5));
+            let ran = Arc::new(AtomicUsize::new(0));
+            let mark = Arc::clone(&ran);
+            submit_demux(
+                Box::new(move || {
+                    mark.fetch_add(1, Ordering::Relaxed);
+                    Next::Done
+                }),
+                Box::new(|| {}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while ran.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let seen = ran.load(Ordering::Relaxed);
+            gate.release();
+            assert_eq!(
+                waiting, RELAY_LANES,
+                "{waiting} of {RELAY_LANES} relay lanes reached their read"
+            );
+            assert_eq!(seen, 1, "the demux waited behind every relay worker");
         }
 
         /// An idle lane must not hold a worker: the pool parks it, one parker thread pays the wait
@@ -34367,7 +34433,8 @@ mod tests {
     }
 
     /// A plaintext muxed gRPC connection is demuxed by a lane parked on its socket, so an
-    /// eight-connection cell grows the process by the reaper, not by a thread per connection.
+    /// eight-connection cell grows the process by the demux pool's lanes and one reaper, not by a
+    /// thread per connection and its reaper.
     #[cfg(target_os = "linux")]
     #[test]
     fn muxed_grpc_connections_share_the_lane_pool() {
@@ -34441,8 +34508,9 @@ mod tests {
         drop(peers);
         serving.join().expect("joins");
         assert!(
-            grown < 2,
-            "eight muxed connections grew the process by {grown} threads past the pools' caps and the one reaper: a demux thread per connection"
+            grown <= lane_pool::DEMUX_LANES + 1,
+            "eight muxed connections grew the process by {grown} threads past the demux pool's {} lanes and its one reaper: a thread per connection and more",
+            lane_pool::DEMUX_LANES
         );
     }
 

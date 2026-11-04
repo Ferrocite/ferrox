@@ -998,19 +998,19 @@ impl H2Conn {
     }
 
     fn room(&self, stream: u32) -> u64 {
-        let Some(state) = self
-            .streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&stream)
-            .cloned()
-        else {
-            return 0;
-        };
         let conn = *self
             .send_conn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let state = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned();
+        let Some(state) = state else {
+            return 0;
+        };
         let window = *state
             .send_window
             .lock()
@@ -1019,20 +1019,31 @@ impl H2Conn {
     }
 
     /// The caller already knows its batch does not fit, so any wait here is the poll it would pay
-    /// anyway; holding the connection window across it is what keeps the grant and the wake atomic.
+    /// anyway; holding the connection window across the recheck is what keeps a grant that landed
+    /// between the caller's look and this wait from being slept out as a whole poll.
     fn wait_room(&self, stream: u32, turn: std::time::Duration) {
-        if !self
-            .streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&stream)
-        {
-            return;
-        }
         let conn = self
             .send_conn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let state = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned();
+        let Some(state) = state else {
+            return;
+        };
+        {
+            let window = *state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *conn > 0 && window > 0 {
+                return;
+            }
+        }
         let _ = self.wake.wait_timeout(conn, turn);
     }
 
@@ -2455,11 +2466,11 @@ fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> O
             if inc == 0 {
                 return Some(true);
             }
+            let mut conn_window = conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if sid == 0 {
-                let mut conn_window = conn
-                    .send_conn
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
                 *conn_window = conn_window.saturating_add(inc).min((1 << 31) - 1);
             } else if let Some(state) = conn
                 .streams
@@ -5102,6 +5113,41 @@ mod tests {
             "the ended request's response is still sent"
         );
         crate::budgets::clear();
+    }
+
+    /// A credit that landed between the caller's look at the room and its wait is already paid for:
+    /// sleeping the whole poll would cap a peer that grants one window at a time, which is what a
+    /// small initial window does.
+    #[test]
+    fn a_credit_that_landed_before_the_wait_is_not_slept_out() {
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                abandoned: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(4),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 4;
+        let began = std::time::Instant::now();
+        conn.wait_room(1, Duration::from_millis(250));
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "the paid window was slept out"
+        );
     }
 
     /// A reset stream has no window left to grant, so its writer must be woken by the reset, not

@@ -2112,7 +2112,7 @@ pub(crate) fn serve_muxed<R: Read + Send + 'static, W: FrameWrite + Send + 'stat
     let mut step = crate::xhttp_h2::h2_lane(read, write, service, None, Some((until, opened)));
     let sniffing = crate::sniff::current();
     let access = crate::accesslog::snapshot();
-    crate::proxy::lane_pool::submit(
+    crate::proxy::lane_pool::submit_demux(
         Box::new(move || {
             crate::sniff::install_current(sniffing.clone());
             let _flow = crate::accesslog::install_snapshot(access.clone());
@@ -2138,7 +2138,7 @@ pub(crate) fn serve_muxed_conn(
     // A lane runs on whichever worker is free, so the accept thread's sniffing and access-log target are installed into each step.
     let sniffing = crate::sniff::current();
     let access = crate::accesslog::snapshot();
-    crate::proxy::lane_pool::submit(
+    crate::proxy::lane_pool::submit_demux(
         Box::new(move || {
             crate::sniff::install_current(sniffing.clone());
             let _flow = crate::accesslog::install_snapshot(access.clone());
@@ -4880,7 +4880,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A sealed connection's demux is a lane, not a thread: sixteen silent connections cost the pool's cap.
+    /// A sealed connection's demux is a lane, not a thread: sixteen silent connections cost the demux pool's cap.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_sealed_demux_rides_the_lane_pool() {
@@ -4899,16 +4899,16 @@ mod tests {
             serve_muxed(Silent, NullSink, &settings, &[], true);
         }
         let until = Instant::now() + Duration::from_secs(5);
-        while crate::proxy::lane_pool::workers() == 0 && Instant::now() < until {
+        while crate::proxy::lane_pool::demux_workers() == 0 && Instant::now() < until {
             thread::sleep(Duration::from_millis(10));
         }
-        let lanes = crate::proxy::lane_pool::workers();
+        let lanes = crate::proxy::lane_pool::demux_workers();
         assert!(lanes >= 1, "the sealed demux never reached the lane pool");
         let grown = crate::conn::live_threads().saturating_sub(before);
         assert!(
-            grown <= crate::proxy::lane_pool::RELAY_LANES,
-            "sixteen sealed demuxes grew the process by {grown} threads past the pool's {} lanes",
-            crate::proxy::lane_pool::RELAY_LANES
+            grown <= crate::proxy::lane_pool::DEMUX_LANES + 1,
+            "sixteen sealed demuxes grew the process by {grown} threads past the demux pool's {} lanes and its reaper",
+            crate::proxy::lane_pool::DEMUX_LANES
         );
     }
 }
