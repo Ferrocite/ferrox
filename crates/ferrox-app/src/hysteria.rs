@@ -3059,15 +3059,17 @@ mod tests {
         let mut down = [0u8; 2048];
         loop {
             match client_sock.recv_from(&mut down) {
-                Ok((n, from)) => client
-                    .recv(
-                        &mut down[..n],
-                        quiche::RecvInfo {
-                            from,
-                            to: client_addr,
-                        },
-                    )
-                    .expect("the client reads the server"),
+                Ok((n, from)) => {
+                    client
+                        .recv(
+                            &mut down[..n],
+                            quiche::RecvInfo {
+                                from,
+                                to: client_addr,
+                            },
+                        )
+                        .expect("the client reads the server");
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
