@@ -37343,6 +37343,7 @@ mod tests {
 
     /// A full carrier parks the lane on the socket's writability instead of spending a worker in the
     /// send clock: the offer returns at once and names the descriptor the reactor must watch.
+    #[cfg(unix)]
     #[test]
     fn a_full_carrier_parks_the_lane_instead_of_the_worker() {
         use std::time::{Duration, Instant};
