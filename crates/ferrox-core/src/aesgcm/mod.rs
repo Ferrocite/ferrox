@@ -946,6 +946,7 @@ pub(crate) fn seal_impl_from_256<V: Lanes>(
 
 /// Seal `src` into initialization-free `dst` with the fused pass, returning the tag.
 #[inline(always)]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn seal_impl_from_256_uninit<V: Lanes>(
     rk: &[V; 15],
     h: &[(V, V); 4],
