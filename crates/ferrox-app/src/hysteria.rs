@@ -2985,13 +2985,20 @@ mod tests {
 
     #[test]
     fn a_retransmitted_initial_reuses_its_lane_without_a_second_route() {
-        // A retransmit names the first flight's DCID and source CID; route_packet must drive it on the lane accept already made rather than add a second route.
-        let session = idle_session();
+        // A retransmit names the first flight's DCID and source CID; route_packet must drive it on the lane accept already made rather than add a second route. The client's next flight is the observable that `drive` reaches that lane.
+        let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let local = server_sock.local_addr().expect("addr");
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client_sock.connect(local).expect("connects");
+        client_sock
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("arms");
+        let client_addr = client_sock.local_addr().expect("addr");
         let auths: Vec<String> = Vec::new();
         let handler: Serve = Arc::new(|_| {});
         let mut router = Router {
-            sock: Arc::clone(&session.sock),
-            local: session.local,
+            sock: Arc::new(crate::quic::Datagram::plain(server_sock)),
+            local,
             auths: &auths,
             serve: &handler,
             masq: Arc::new(Masquerade::NotFound),
@@ -3003,7 +3010,6 @@ mod tests {
             by_initial_dcid: HashMap::new(),
         };
         let mut template = server_template(&hysteria::Config::default());
-        let client_addr: SocketAddr = "127.0.0.1:50000".parse().expect("addr");
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
         client_config.verify_peer(false);
         client_config
@@ -3014,7 +3020,7 @@ mod tests {
             None,
             &quiche::ConnectionId::from_ref(&client_cid),
             client_addr,
-            session.local,
+            local,
             &mut client_config,
         )
         .expect("connects");
@@ -3050,13 +3056,43 @@ mod tests {
                 .stats()
                 .recv
         };
+        let mut down = [0u8; 2048];
+        loop {
+            match client_sock.recv_from(&mut down) {
+                Ok((n, from)) => client
+                    .recv(
+                        &mut down[..n],
+                        quiche::RecvInfo {
+                            from,
+                            to: client_addr,
+                        },
+                    )
+                    .expect("the client reads the server"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("the server's answer: {error}"),
+            }
+        }
+        let (n, _) = client
+            .send(room.as_mut())
+            .expect("the client's next flight");
+        let next = room.as_mut()[..n].to_vec();
         let before = received(&router);
-        let mut wire = initial;
+        let mut wire = next;
         route_packet(&mut router, &mut template, &mut wire, client_addr);
         assert!(
             received(&router) > before,
-            "the retransmit reached the existing connection"
+            "the next flight reached the existing connection"
         );
+        assert_eq!(router.routes.len(), 1, "the next flight adds no route");
+        let mut wire = initial;
+        route_packet(&mut router, &mut template, &mut wire, client_addr);
         assert_eq!(router.routes.len(), 1, "a retransmit adds no route");
         assert_eq!(router.by_initial_dcid.len(), 1);
         assert_eq!(router.by_client_cid.len(), 1);
