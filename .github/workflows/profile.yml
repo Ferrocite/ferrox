@@ -74,6 +74,8 @@ jobs:
           mkdir -p profile
           sudo tcpdump -i lo -s 128 -U -w profile/loopback.pcap >/tmp/tcpdump.log 2>&1 &
           echo $! >/tmp/tcpdump.pid
+          ( while :; do date +%s.%N; ss -tin; sleep 1; done ) > profile/ss.log 2>&1 &
+          echo $! >/tmp/ss.pid
           sleep 1
       - name: measure one cell under perf
         shell: bash
@@ -104,6 +106,9 @@ jobs:
           if [[ -f /tmp/tcpdump.pid ]]; then
             kill "$(cat /tmp/tcpdump.pid)" 2>/dev/null || true
           fi
+          if [[ -f /tmp/ss.pid ]]; then
+            kill "$(cat /tmp/ss.pid)" 2>/dev/null || true
+          fi
           sleep 1
           sudo chown "$(id -u):$(id -g)" profile/loopback.pcap 2>/dev/null || true
           cat /tmp/tcpdump.log 2>/dev/null || true
@@ -116,7 +121,7 @@ jobs:
           counts = collections.Counter()
           sizes = collections.defaultdict(collections.Counter)
           for line in text.splitlines():
-              m = re.search(r"IP (\S+) > (\S+): tcp (\d+)", line)
+              m = re.search(r"IP (\S+) > (\S+): .*length (\d+)", line)
               if not m:
                   continue
               src, dst, length = m.group(1), m.group(2), int(m.group(3))
@@ -135,6 +140,7 @@ jobs:
           path: |
             profile/loopback.pcap
             profile/wire-summary.txt
+            profile/ss.log
           if-no-files-found: warn
           retention-days: 7
       - name: collapse the profiles
