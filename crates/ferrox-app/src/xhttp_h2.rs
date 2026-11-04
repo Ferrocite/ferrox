@@ -416,6 +416,9 @@ pub(crate) struct H2Conn {
     /// The client frame a previous lane turn left half-read: a poll boundary hands the lane back,
     /// so bytes already taken from the transport are kept here instead of being read again.
     client_partial: Mutex<PartialFrame>,
+    /// A response head split across `HEADERS` and `CONTINUATION` frames, gathered until
+    /// `END_HEADERS` before `:status` is decoded.
+    client_head: Mutex<Option<(u32, Vec<u8>, bool)>>,
     raw: Option<Arc<crate::conn::Connection>>,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 }
@@ -1644,33 +1647,68 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
     }
     match kind {
         T_HEADERS => {
-            let status = if flags & F_END_HEADERS != 0 {
-                conn.response_status(&body)
+            let mut block = body;
+            let mut skip = 0;
+            if flags & F_PADDED != 0 {
+                let Some(&pad) = block.first() else {
+                    return true;
+                };
+                skip = 1 + pad as usize;
+                if skip > block.len() {
+                    return true;
+                }
+            }
+            if flags & F_PRIORITY != 0 {
+                skip += 5;
+                if skip > block.len() {
+                    return true;
+                }
+            }
+            block.drain(..skip);
+            let end_stream = flags & F_END != 0;
+            if flags & F_END_HEADERS != 0 {
+                *conn
+                    .client_head
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                client_headers(conn, sid, &block, end_stream);
             } else {
-                None
-            };
-            let state = conn
-                .streams
+                *conn
+                    .client_head
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some((sid, block, end_stream));
+            }
+            true
+        }
+        T_CONT => {
+            let pending = conn
+                .client_head
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .get(&sid)
-                .cloned();
-            if let Some(state) = state {
-                state.responded.store(true, Ordering::SeqCst);
-                let done = {
-                    let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    if status.is_some() {
-                        st.status = status;
-                    }
-                    if flags & F_END != 0 {
-                        st.ended = true;
-                    }
-                    state.cv.notify_all();
-                    st.both_ended()
-                };
-                if done {
-                    conn.retire(sid);
-                }
+                .take();
+            let Some((pending_sid, mut gathered, end_stream)) = pending else {
+                return true;
+            };
+            if pending_sid != sid {
+                *conn
+                    .client_head
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    Some((pending_sid, gathered, end_stream));
+                return true;
+            }
+            if gathered.len() + body.len() > HEAD_CAP {
+                conn.refuse(E_PROTOCOL);
+                return false;
+            }
+            gathered.extend_from_slice(&body);
+            if flags & F_END_HEADERS != 0 {
+                client_headers(conn, sid, &gathered, end_stream);
+            } else {
+                *conn
+                    .client_head
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some((sid, gathered, end_stream));
             }
             true
         }
@@ -1684,6 +1722,35 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
             true
         }
         _ => true,
+    }
+}
+
+/// A complete response head: decode its `:status`, retire the stream when the peer's `END_STREAM`
+/// already rode the head, and wake a reader parked on the answer.
+fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) {
+    let status = conn.response_status(block);
+    let state = conn
+        .streams
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&sid)
+        .cloned();
+    if let Some(state) = state {
+        state.responded.store(true, Ordering::SeqCst);
+        let done = {
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if status.is_some() {
+                st.status = status;
+            }
+            if end_stream {
+                st.ended = true;
+            }
+            state.cv.notify_all();
+            st.both_ended()
+        };
+        if done {
+            conn.retire(sid);
+        }
     }
 }
 
@@ -1739,6 +1806,7 @@ impl H2Client {
             refused: AtomicBool::new(false),
             client_read: Some(Mutex::new(Box::new(read))),
             client_partial: Mutex::new(PartialFrame::default()),
+            client_head: Mutex::new(None),
             raw,
             decryption: None,
         });
@@ -1867,7 +1935,7 @@ impl H2Client {
                 Ok(0) => {
                     return reader
                         .status()
-                        .is_none_or(|code| (200..300).contains(&code))
+                        .is_some_and(|code| (200..300).contains(&code))
                 }
                 Ok(_) => {}
                 Err(_) => return false,
@@ -2499,6 +2567,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     refused: AtomicBool::new(false),
                     client_read: None,
                     client_partial: Mutex::new(PartialFrame::default()),
+                    client_head: Mutex::new(None),
                     raw: None,
                     decryption: self.decryption.take(),
                 });
@@ -4204,6 +4273,7 @@ mod tests {
             refused: AtomicBool::new(false),
             client_read: Some(Mutex::new(read)),
             client_partial: Mutex::new(PartialFrame::default()),
+            client_head: Mutex::new(None),
             raw: None,
             decryption: None,
         });
@@ -4226,6 +4296,24 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(1, Arc::clone(&state));
         (conn, state, written)
+    }
+
+    /// A response head split across `HEADERS` and `CONTINUATION` decodes its `:status` once the
+    /// block completes; dropping the continuation left it `None` and the packet path read that as
+    /// success.
+    #[test]
+    fn a_fragmented_response_head_decodes_its_status() {
+        let (conn, state, _) = reading_conn(Box::new(Silent));
+        assert!(client_frame(&conn, T_HEADERS, 0, 1, Vec::new()));
+        assert!(client_frame(&conn, T_CONT, F_END_HEADERS, 1, vec![0x8d]));
+        assert_eq!(
+            state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .status,
+            Some(404)
+        );
     }
 
     /// A downlink that finishes leaves no body to deliver: the upload reader parked on the same
@@ -4478,6 +4566,7 @@ mod tests {
             refused: AtomicBool::new(false),
             client_read: None,
             client_partial: Mutex::new(PartialFrame::default()),
+            client_head: Mutex::new(None),
             raw: None,
             decryption: None,
         })
