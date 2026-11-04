@@ -24220,7 +24220,103 @@ impl Default for RelayBuf {
 /// A relay lane: one direction's loop, run a step at a time so a fixed set of threads carries
 /// every wrapped flow. A step is one read and the write it feeds, bounded by the read clock the
 /// lane's source was armed with; the step says whether the direction is still moving.
+/// Release-visible counters for a lane-pool hunt: an instrumented build prints them every two
+/// seconds from the reaper or the timer parker, so a benchmark cell reports where its lanes wait.
+pub(crate) mod lane_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    pub(crate) static STEPS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static MORE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static RETRY: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static IDLE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DONE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PARKS_READY: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PARKS_TIMER: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WAKES_READY: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WOKEN_IDS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WOKEN_MAX: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WAKES_DUE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WAKES_ENDED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static POLL_FAILS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static READS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static READ_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static READ_US: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static READ_MAX_US: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static QUEUE_MAX: AtomicU64 = AtomicU64::new(0);
+
+    static AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+    #[inline]
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add(counter: &AtomicU64, value: u64) {
+        counter.fetch_add(value, Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn peak(counter: &AtomicU64, value: u64) {
+        counter.fetch_max(value, Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn read(elapsed: Duration, timed_out: bool) {
+        READS.fetch_add(1, Relaxed);
+        if timed_out {
+            READ_TIMEOUTS.fetch_add(1, Relaxed);
+        }
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        READ_US.fetch_add(us, Relaxed);
+        READ_MAX_US.fetch_max(us, Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn queue(depth: usize) {
+        QUEUE_MAX.fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Relaxed);
+    }
+
+    pub(crate) fn report(parked: usize, fds: usize) {
+        let mut at = AT.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        match *at {
+            Some(prev) if now.duration_since(prev) < Duration::from_secs(2) => return,
+            _ => *at = Some(now),
+        }
+        drop(at);
+        eprintln!(
+            "ferrox-lane-census steps={} more={} retry={} idle={} done={} pready={} ptimer={} \
+             rwake={} rids={} rmax={} dwake={} ewake={} pfail={} reads={} rtimeouts={} \
+             read_us={} read_max_us={} qmax={} parked={} fds={}",
+            STEPS.load(Relaxed),
+            MORE.load(Relaxed),
+            RETRY.load(Relaxed),
+            IDLE.load(Relaxed),
+            DONE.load(Relaxed),
+            PARKS_READY.load(Relaxed),
+            PARKS_TIMER.load(Relaxed),
+            WAKES_READY.load(Relaxed),
+            WOKEN_IDS.load(Relaxed),
+            WOKEN_MAX.load(Relaxed),
+            WAKES_DUE.load(Relaxed),
+            WAKES_ENDED.load(Relaxed),
+            POLL_FAILS.load(Relaxed),
+            READS.load(Relaxed),
+            READ_TIMEOUTS.load(Relaxed),
+            READ_US.load(Relaxed),
+            READ_MAX_US.load(Relaxed),
+            QUEUE_MAX.load(Relaxed),
+            parked,
+            fds
+        );
+    }
+}
+
 pub(crate) mod lane_pool {
+    use super::lane_census;
     use super::WaitFd;
     use std::collections::VecDeque;
     use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
@@ -24359,6 +24455,7 @@ pub(crate) mod lane_pool {
 
         /// The sibling ended: hand this lane back now, and wake the reaper so it drops the empty slot.
         pub(crate) fn wake_ended(&self) {
+            lane_census::bump(&lane_census::WAKES_ENDED);
             let Some(lane) = self.take_lane() else {
                 return;
             };
@@ -24622,6 +24719,7 @@ pub(crate) mod lane_pool {
                         return;
                     }
                     if let Some(lane) = ready.pop_front() {
+                        lane_census::queue(ready.len());
                         break lane;
                     }
                     pool.idle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -24651,9 +24749,11 @@ pub(crate) mod lane_pool {
             let mut streak = 0usize;
             loop {
                 let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
+                lane_census::bump(&lane_census::STEPS);
                 match stepped {
                     // Still has bytes: keep the worker for a streak, then rejoin the queue behind the lanes waiting there.
                     Ok(Next::More) => {
+                        lane_census::bump(&lane_census::MORE);
                         lane.idle = 0;
                         streak += 1;
                         if streak < LANE_STREAK {
@@ -24666,15 +24766,21 @@ pub(crate) mod lane_pool {
                         break;
                     }
                     Ok(Next::Idle) => {
+                        lane_census::bump(&lane_census::IDLE);
                         lane.idle = lane.idle.saturating_add(1);
                         match park_ready(pool, lane) {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                lane_census::bump(&lane_census::PARKS_READY);
+                                break;
+                            }
                             Err(parked) => lane = parked,
                         }
+                        lane_census::bump(&lane_census::PARKS_TIMER);
                         park(pool, lane);
                         break;
                     }
                     Ok(Next::Retry) => {
+                        lane_census::bump(&lane_census::RETRY);
                         lane.idle = 0;
                         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                         ready.push_back(lane);
@@ -24683,6 +24789,7 @@ pub(crate) mod lane_pool {
                         break;
                     }
                     Ok(Next::Done) => {
+                        lane_census::bump(&lane_census::DONE);
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             lane.finish();
                         }));
@@ -24709,6 +24816,7 @@ pub(crate) mod lane_pool {
     /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
     /// deadline already parked.
     fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
+        lane_census::report(0, 0);
         #[cfg(test)]
         pool.timer_parks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -25139,6 +25247,7 @@ pub(crate) mod lane_pool {
                 )
             };
             if polled < 0 {
+                lane_census::bump(&lane_census::POLL_FAILS);
                 // A socket closed under the poll fails the call for the whole set; the retire list drops it on the next pass.
                 std::thread::sleep(crate::budgets::RELAY_POLL);
                 return Vec::new();
@@ -25194,6 +25303,15 @@ pub(crate) mod lane_pool {
             let Some(ids) = self.fds.remove(&fd) else {
                 return;
             };
+            lane_census::bump(&lane_census::WAKES_READY);
+            lane_census::add(
+                &lane_census::WOKEN_IDS,
+                u64::try_from(ids.len()).unwrap_or(u64::MAX),
+            );
+            lane_census::peak(
+                &lane_census::WOKEN_MAX,
+                u64::try_from(ids.len()).unwrap_or(u64::MAX),
+            );
             self.del(fd);
             for id in ids {
                 let Some(slot) = self.slots.remove(&id) else {
@@ -25210,6 +25328,7 @@ pub(crate) mod lane_pool {
         }
 
         fn wake_due(&mut self, now: std::time::Instant, ready: &mut Vec<Lane>) {
+            lane_census::bump(&lane_census::WAKES_DUE);
             while let Some(std::cmp::Reverse((at, id))) = self.due.peek().copied() {
                 if at > now {
                     break;
@@ -25267,6 +25386,7 @@ pub(crate) mod lane_pool {
 
     fn reaper_loop(pool: &std::sync::Weak<Pool>, mut reactor: Reactor) {
         loop {
+            lane_census::report(reactor.slots.len(), reactor.fds.len());
             let Some(pool) = pool.upgrade() else {
                 return;
             };
@@ -27371,10 +27491,15 @@ where
             if let Some(limit) = uplink.read_window() {
                 buffer.set_limit(limit);
             }
+            let read_started = std::time::Instant::now();
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
                 peer_read.read(buffer.as_mut())
             };
+            crate::proxy::lane_census::read(
+                read_started.elapsed(),
+                read.as_ref().is_err_and(is_timeout),
+            );
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
                 forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
             });
@@ -27406,7 +27531,12 @@ where
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
         Box::new(move || {
+            let read_started = std::time::Instant::now();
             let read = reader.read_window();
+            crate::proxy::lane_census::read(
+                read_started.elapsed(),
+                read.as_ref().is_err_and(is_timeout),
+            );
             let (next, timed_out) = match read {
                 Ok(window) if !window.is_empty() => {
                     if upload.first {
