@@ -27381,17 +27381,20 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
 
 /// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
 fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+    let mut waited = false;
     while at.sent < at.pending {
         match uplink.push(&buffer.prefix(at.pending)[at.sent..]) {
             Push::Took(n) if n > 0 => {
                 at.sent += n;
                 at.spins = 0;
+                waited = false;
             }
-            // A carrier the peer wakes holds its worker for no turn: the grant is read on the demux, so a lap per sibling buys nothing.
-            Push::Parked if uplink.room_wakes() => {
+            // A carrier the peer wakes holds its worker for no turn: the grant is read on the demux, so the wait and the retry are the same turn.
+            Push::Parked if uplink.room_wakes() && !waited => {
                 uplink.wait_for_room(crate::budgets::RELAY_POLL);
-                return Some(Next::Retry);
+                waited = true;
             }
+            Push::Parked if uplink.room_wakes() => return Some(Next::Retry),
             // A full window is another lane's frame away, so the leg rejoins the queue at once: a quantum spent here is a window the peer cannot grant.
             Push::Took(_) | Push::Parked => {
                 at.spins += 1;
@@ -36374,20 +36377,30 @@ mod tests {
         struct Sink {
             pushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
             waits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            /// The bytes the peer's grant makes room for once `wait_for_room` returns.
+            grant: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl CarrierSink for Sink {
             fn send(&self, _: &[u8]) -> bool {
                 false
             }
-            fn push(&self, _: &[u8]) -> Push {
+            fn push(&self, bytes: &[u8]) -> Push {
                 self.pushes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Push::Parked
+                let room = self.grant.load(std::sync::atomic::Ordering::Relaxed);
+                if room == 0 {
+                    return Push::Parked;
+                }
+                let n = room.min(bytes.len());
+                self.grant
+                    .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+                Push::Took(n)
             }
             fn wait_for_room(&self, _: std::time::Duration) {
                 self.waits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.grant.store(8, std::sync::atomic::Ordering::Relaxed);
             }
             fn room_wakes(&self) -> bool {
                 true
@@ -36403,8 +36416,13 @@ mod tests {
         let sink = Sink {
             pushes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             waits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            grant: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
-        assert_eq!(forward_flush(&buffer, &sink, &mut at), Some(Next::Retry));
+        assert_eq!(
+            forward_flush(&buffer, &sink, &mut at),
+            None,
+            "the granted window did not clear in the wait's own turn"
+        );
         assert_eq!(
             sink.waits.load(std::sync::atomic::Ordering::Relaxed),
             1,
@@ -36412,11 +36430,12 @@ mod tests {
         );
         assert_eq!(
             sink.pushes.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "the grant cost no sibling lane's turn"
+            2,
+            "the grant cost a second turn"
         );
         assert_eq!(at.spins, 0, "a woken carrier keeps no spin streak");
-        assert_eq!(at.sent, 0);
+        assert_eq!(at.sent, 8, "the whole window moved in one turn");
+        assert_eq!(at.pending, 0);
     }
 
     #[test]
