@@ -32504,6 +32504,17 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                     | Carrier::Xhttp { .. }
                     | Carrier::HttpHeader { .. }
             ) {
+                let network = match &carrier {
+                    Carrier::Quic => "quic",
+                    Carrier::Kcp(_) => "kcp",
+                    Carrier::Hysteria(_) => "hysteria",
+                    Carrier::Masque => "masque",
+                    Carrier::Xdrive { .. } => "xdrive",
+                    Carrier::Http => "http",
+                    Carrier::Unknown { network } => network.as_str(),
+                    _ => "that transport",
+                };
+                eprintln!("vmess reality on {address}: not carried on {network}; outbound refused");
                 return None;
             }
             let reality = outbound_reality(outbound, &address)?;
