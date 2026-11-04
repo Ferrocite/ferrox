@@ -5172,14 +5172,19 @@ fn serve_sealed_mux<S>(
     serve_mux_wire(&wire, &dial, &udp, None, &[]);
 }
 
-/// The sealed relay reads at least one full record, even where the reference's policy buffer
-/// default is 4 KiB: a 4 KiB read would seal a 4 KiB record and double the peer's wakeups.
+/// The sealed relay reads exactly one full record, even where the reference's policy buffer
+/// default is 4 KiB: a 4 KiB read would seal a 4 KiB record and double the peer's wakeups, and a
+/// 16 KiB read would hold a record back until its neighbour arrives.
 fn sealed_window(buffer: Option<usize>) -> usize {
-    buffer
-        .filter(|window| *window > 0)
-        .map_or(RELAY_SMALL_BUFFER, |window| {
-            window.clamp(RELAY_SMALL_BUFFER, RELAY_BUFFER)
-        })
+    buffer.filter(|window| *window > 0).map_or(
+        ferrox_core::vless_encryption::MAX_RECORD_PLAINTEXT,
+        |window| {
+            window.clamp(
+                ferrox_core::vless_encryption::MAX_RECORD_PLAINTEXT,
+                RELAY_BUFFER,
+            )
+        },
+    )
 }
 
 /// A relay over two independently sealed halves, so a parked read never stops the other direction.
@@ -36558,7 +36563,7 @@ mod tests {
         for buffer in [None, Some(0), Some(4096), Some(8192)] {
             assert_eq!(
                 sealed_window(buffer),
-                RELAY_SMALL_BUFFER,
+                ferrox_core::vless_encryption::MAX_RECORD_PLAINTEXT,
                 "a {buffer:?}-byte policy buffer must not cut the seal below a record"
             );
         }
