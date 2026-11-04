@@ -54,6 +54,9 @@ pub(crate) fn gate_aesgcm() -> (Vec<Row>, Vec<Window>) {
             .collect();
         rows.push(check_and_time(len, &plain, &mut windows));
         rows.push(check_and_time_256(len, &plain, &mut windows));
+        if len >= 4096 {
+            rows.push(check_and_time_256_from(len, &plain));
+        }
     }
     (rows, windows)
 }
@@ -202,6 +205,66 @@ fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> R
     )
 }
 
+/// Time the source seal against the staging copy, asserting the same bytes first.
+#[allow(
+    clippy::uninit_vec,
+    reason = "seal_from_uninit initializes the spare capacity before set_len"
+)]
+fn check_and_time_256_from(len: usize, plain: &[u8]) -> Row {
+    let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(5));
+    let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(1));
+    let aad: &[u8] = b"";
+    let ours = Aes256Gcm::new(&key);
+
+    let mut old = Vec::with_capacity(len + 16);
+    old.extend_from_slice(plain);
+    let tag = ours.seal_in_place(&nonce, aad, &mut old);
+    old.extend_from_slice(&tag);
+
+    let mut fresh = Vec::with_capacity(len + 16);
+    let start = fresh.len();
+    let tag = ours.seal_from_uninit(&nonce, aad, plain, &mut fresh.spare_capacity_mut()[..len]);
+    // SAFETY: seal_from_uninit wrote every byte of the spare range.
+    unsafe { fresh.set_len(start + len) };
+    fresh.extend_from_slice(&tag);
+    assert_eq!(old, fresh, "{len}: the same ciphertext and tag either way");
+
+    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
+
+    let mut old_buf = Vec::with_capacity(len + 16);
+    let mut base = || {
+        old_buf.clear();
+        old_buf.extend_from_slice(std::hint::black_box(plain));
+        let tag = ours.seal_in_place(std::hint::black_box(&nonce), aad, &mut old_buf);
+        old_buf.extend_from_slice(&tag);
+        old_buf.len()
+    };
+
+    let mut fresh_buf = Vec::with_capacity(len + 16);
+    let mut ours_run = || {
+        fresh_buf.clear();
+        let start = fresh_buf.len();
+        let tag = ours.seal_from_uninit(
+            std::hint::black_box(&nonce),
+            aad,
+            std::hint::black_box(plain),
+            &mut fresh_buf.spare_capacity_mut()[..len],
+        );
+        // SAFETY: seal_from_uninit wrote every byte of the spare range.
+        unsafe { fresh_buf.set_len(start + len) };
+        fresh_buf.extend_from_slice(&tag);
+        fresh_buf.len()
+    };
+
+    timed_row(
+        format!("aes-256-gcm source seal, {len}B"),
+        len,
+        iters,
+        &mut ours_run,
+        &mut base,
+    )
+}
+
 const ALLOC_ITERS: u64 = 64;
 
 fn check_allocs(len: usize, plain: &[u8], ours: &Aes128Gcm, windows: &mut Vec<Window>) {
@@ -251,13 +314,14 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
     );
     let _ = writeln!(
         out,
-        "\n| bytes | reference ns/seal+open | ferrox ns/seal+open | speedup |"
+        "\n| comparison | bytes | reference ns | ferrox ns | speedup |"
     );
-    let _ = writeln!(out, "| ---: | ---: | ---: | ---: |");
+    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: |");
     for r in rows {
         let _ = writeln!(
             out,
-            "| {} | {:.1} | {:.1} | {:.2}x |",
+            "| {} | {} | {:.1} | {:.1} | {:.2}x |",
+            r.name,
             r.bytes,
             r.base * 1e9,
             r.ours * 1e9,

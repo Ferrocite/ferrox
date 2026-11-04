@@ -15,6 +15,7 @@ const HEADER_LEN: usize = 5;
 const TAG_LEN: usize = 16;
 const MAX_RECORD_PLAINTEXT: usize = 8192;
 const MAX_BATCH_PLAINTEXT: usize = 8 * MAX_RECORD_PLAINTEXT;
+const SOURCE_SEAL_MIN: usize = 4096;
 const MIN_RECORD: usize = 1 + TAG_LEN;
 const MAX_RECORD: usize = 16640;
 const X25519_LEN: usize = 32;
@@ -112,6 +113,11 @@ impl Aead {
         self.nonce
     }
 
+    /// Seal one record into `out` and append its tag.
+    #[allow(
+        clippy::uninit_vec,
+        reason = "seal_from_uninit initializes the spare capacity before set_len"
+    )]
     fn seal_into(
         &mut self,
         nonce: Option<[u8; 12]>,
@@ -120,11 +126,29 @@ impl Aead {
         out: &mut Vec<u8>,
     ) {
         let nonce = nonce.unwrap_or_else(|| self.next_nonce());
-        let start = out.len();
-        out.extend_from_slice(plaintext);
-        let tag = match &self.cipher {
-            Cipher::Aes(cipher) => cipher.seal_in_place(&nonce, aad, &mut out[start..]),
+        match &self.cipher {
+            Cipher::Aes(cipher) => {
+                let start = out.len();
+                let tag = if plaintext.len() >= SOURCE_SEAL_MIN {
+                    out.reserve(plaintext.len());
+                    let tag = cipher.seal_from_uninit(
+                        &nonce,
+                        aad,
+                        plaintext,
+                        &mut out.spare_capacity_mut()[..plaintext.len()],
+                    );
+                    // SAFETY: seal_from_uninit wrote every byte of the spare range.
+                    unsafe { out.set_len(start + plaintext.len()) };
+                    tag
+                } else {
+                    out.extend_from_slice(plaintext);
+                    cipher.seal_in_place(&nonce, aad, &mut out[start..])
+                };
+                out.extend_from_slice(&tag);
+            }
             Cipher::ChaCha(cipher) => {
+                let start = out.len();
+                out.extend_from_slice(plaintext);
                 let tag = cipher
                     .encrypt_inout_detached(
                         &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
@@ -134,10 +158,9 @@ impl Aead {
                     .expect("AEAD seal cannot fail for these sizes");
                 let mut bytes = [0u8; TAG_LEN];
                 bytes.copy_from_slice(&tag);
-                bytes
+                out.extend_from_slice(&bytes);
             }
-        };
-        out.extend_from_slice(&tag);
+        }
     }
 
     fn open_in_place(
