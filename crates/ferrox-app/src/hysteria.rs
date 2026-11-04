@@ -2358,6 +2358,7 @@ impl Router<'_> {
     }
 }
 
+/// Drop a route's reverse names when they still point at it, so a replaced or reaped lane leaves no stale lookup.
 fn forget_route(
     by_client_cid: &mut HashMap<Vec<u8>, Vec<u8>>,
     by_initial_dcid: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -2984,36 +2985,8 @@ mod tests {
 
     #[test]
     fn a_retransmitted_initial_reuses_its_lane_without_a_second_route() {
-        // A retransmit names the first flight's DCID and source CID; both reverse names must point at the lane that already carries it, so the second packet is driven on the first rather than added beside it.
+        // A retransmit names the first flight's DCID and source CID; route_packet must drive it on the lane accept already made rather than add a second route.
         let session = idle_session();
-        let first = vec![1u8; 8];
-        let second = vec![2u8; 8];
-        let first_dcid = vec![0x11u8; 8];
-        let second_dcid = vec![0x22u8; 8];
-        let first_key = vec![0xa1u8; SCID_LEN];
-        let second_key = vec![0xb2u8; SCID_LEN];
-        let inbound = |client_cid: Vec<u8>, initial_dcid: Vec<u8>| Inbound {
-            conn: Arc::clone(&session.shared),
-            client_cid,
-            initial_dcid,
-            authed: false,
-            settings_sent: false,
-            settings_done: false,
-            auth_buf: Vec::new(),
-            served: HashSet::new(),
-            wakes: Driver::new(),
-            udp: HashMap::new(),
-            cc_rx: 0,
-        };
-        let mut by_scid = HashMap::new();
-        by_scid.insert(
-            first_key.clone(),
-            inbound(first.clone(), first_dcid.clone()),
-        );
-        by_scid.insert(
-            second_key.clone(),
-            inbound(second.clone(), second_dcid.clone()),
-        );
         let auths: Vec<String> = Vec::new();
         let handler: Serve = Arc::new(|_| {});
         let mut router = Router {
@@ -3025,47 +2998,97 @@ mod tests {
             udp_idle: Duration::from_secs(60),
             cc_rx: 0,
             stateless_reset: false,
-            routes: by_scid,
-            by_client_cid: HashMap::from([
-                (first.clone(), first_key.clone()),
-                (second.clone(), second_key.clone()),
-            ]),
-            by_initial_dcid: HashMap::from([
-                (first_dcid.clone(), first_key.clone()),
-                (second_dcid.clone(), second_key.clone()),
-            ]),
+            routes: HashMap::new(),
+            by_client_cid: HashMap::new(),
+            by_initial_dcid: HashMap::new(),
         };
+        let mut template = server_template(&hysteria::Config::default());
+        let client_addr: SocketAddr = "127.0.0.1:50000".parse().expect("addr");
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        client_config.verify_peer(false);
+        client_config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let client_cid = [0x42u8; SCID_LEN];
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            session.local,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut room = Unfilled::<MAX_DATAGRAM>::new();
+        let (n, _) = client.send(room.as_mut()).expect("an Initial");
+        let initial = room.as_mut()[..n].to_vec();
+        let header = quiche::Header::from_slice(&initial, SCID_LEN).expect("an Initial header");
+        let initial_dcid = header.dcid.as_ref().to_vec();
+        let peer_cid = header.scid.as_ref().to_vec();
+        let mut wire = initial.clone();
+        route_packet(&mut router, &mut template, &mut wire, client_addr);
+        assert_eq!(router.routes.len(), 1, "the first Initial makes one route");
+        let key = router.routes.keys().next().expect("a route").clone();
         assert_eq!(
-            router.initial_route(&first_dcid, &first),
-            Some(first_key.clone())
+            router.by_initial_dcid.get(initial_dcid.as_slice()),
+            Some(&key)
         );
+        assert_eq!(router.by_client_cid.get(peer_cid.as_slice()), Some(&key));
         assert_eq!(
-            router.initial_route(&first_dcid, &first),
-            Some(first_key.clone()),
-            "the retransmit reuses the lane it already named"
-        );
-        assert_eq!(
-            router.initial_route(&second_dcid, &second),
-            Some(second_key.clone())
-        );
-        assert_eq!(
-            router.initial_route(&[0x99u8; 8], &first),
-            Some(first_key.clone()),
+            router.initial_route(&[0x99u8; 8], &peer_cid),
+            Some(key),
             "a source CID alone names its lane"
         );
-        assert_eq!(router.routes.len(), 2, "a retransmit adds no route");
-        forget_route(
-            &mut router.by_client_cid,
-            &mut router.by_initial_dcid,
-            &first_key,
-            &first,
-            &first_dcid,
-        );
-        assert_eq!(router.initial_route(&first_dcid, &first), None);
-        assert_eq!(
-            router.initial_route(&second_dcid, &second),
-            Some(second_key)
-        );
+        let mut wire = initial;
+        route_packet(&mut router, &mut template, &mut wire, client_addr);
+        assert_eq!(router.routes.len(), 1, "a retransmit adds no route");
+        assert_eq!(router.by_initial_dcid.len(), 1);
+        assert_eq!(router.by_client_cid.len(), 1);
+    }
+
+    #[test]
+    fn an_idle_reap_drops_a_closed_routes_reverse_names() {
+        let session = idle_session();
+        {
+            let mut conn = session.shared.lock().expect("locks");
+            let _ = conn.close(false, 0, b"done");
+        }
+        let client = vec![2u8; 8];
+        let initial = vec![3u8; 8];
+        let key = vec![1u8; SCID_LEN];
+        let auths: Vec<String> = Vec::new();
+        let handler: Serve = Arc::new(|_| {});
+        let mut router = Router {
+            sock: Arc::clone(&session.sock),
+            local: session.local,
+            auths: &auths,
+            serve: &handler,
+            masq: Arc::new(Masquerade::NotFound),
+            udp_idle: Duration::from_secs(60),
+            cc_rx: 0,
+            stateless_reset: false,
+            routes: HashMap::from([(
+                key.clone(),
+                Inbound {
+                    conn: Arc::clone(&session.shared),
+                    client_cid: client.clone(),
+                    initial_dcid: initial.clone(),
+                    authed: false,
+                    settings_sent: false,
+                    settings_done: false,
+                    auth_buf: Vec::new(),
+                    served: HashSet::new(),
+                    wakes: Driver::new(),
+                    udp: HashMap::new(),
+                    cc_rx: 0,
+                },
+            )]),
+            by_client_cid: HashMap::from([(client, key.clone())]),
+            by_initial_dcid: HashMap::from([(initial, key)]),
+        };
+        router.idle();
+        assert!(router.routes.is_empty());
+        assert!(router.by_client_cid.is_empty());
+        assert!(router.by_initial_dcid.is_empty());
     }
 
     fn idle_session() -> Session {
