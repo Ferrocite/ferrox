@@ -1644,6 +1644,7 @@ impl Channel {
     }
 
     /// One queued chunk and the window credit it releases, without waiting.
+    #[cfg(test)]
     fn take_chunk(&self) -> (Option<ChannelChunk>, u64) {
         let adjust_at = window_adjust_at(self.session.channel_window);
         let mut adjust = 0u64;
@@ -1682,6 +1683,7 @@ impl Channel {
     }
 
     /// The next packet's payload without copying it out of the receive buffer.
+    #[cfg(test)]
     pub(crate) fn next_chunk(&mut self) -> io::Result<Option<ChannelChunk>> {
         loop {
             let (chunk, adjust) = self.take_chunk();
@@ -1710,56 +1712,97 @@ impl Channel {
         }
     }
 
-    /// Move every queued chunk up to `limit` under one receive lock.
-    pub(crate) fn drain_chunks(&self, batch: &mut Vec<ChannelChunk>, limit: usize) {
+    /// Wait for the first chunk, then take every queued chunk up to `limit` under one receive lock.
+    pub(crate) fn next_batch(
+        &mut self,
+        batch: &mut Vec<ChannelChunk>,
+        limit: usize,
+    ) -> io::Result<bool> {
         let adjust_at = window_adjust_at(self.session.channel_window);
-        let mut adjust = 0u64;
-        {
-            let mut recv = lock(&self.state.recv);
-            while batch.len() < limit {
-                let Some((start, end)) = recv.chunks.front().map(|front| (front.start, front.end))
-                else {
-                    break;
-                };
-                if start >= end {
-                    let spent = recv
-                        .chunks
-                        .pop_front()
-                        .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
-                    recycle(&self.state.pool, spent.buffer);
-                    continue;
-                }
-                recv.pending_adjust += (end - start) as u64;
-                if recv.pending_adjust >= adjust_at {
-                    adjust += recv.pending_adjust;
-                    recv.local_window += recv.pending_adjust;
-                    recv.pending_adjust = 0;
-                }
-                let chunk = recv
-                    .chunks
-                    .pop_front()
-                    .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
-                batch.push(ChannelChunk {
-                    buffer: chunk.buffer,
-                    start: chunk.start,
-                    end: chunk.end,
-                });
+        loop {
+            let (adjust, spent, eof) = {
+                let mut recv = lock(&self.state.recv);
+                let (adjust, spent) = take_batch(&mut recv, batch, limit, adjust_at);
+                let eof = recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire);
+                (adjust, spent, eof)
+            };
+            if !spent.is_empty() {
+                self.recycle_buffers(spent);
             }
-        }
-        if adjust != 0 {
-            self.adjust(adjust);
+            if adjust != 0 {
+                self.adjust(adjust);
+            }
+            if !batch.is_empty() {
+                return Ok(true);
+            }
+            if eof {
+                return Ok(false);
+            }
+            let mut recv = lock(&self.state.recv);
+            if !recv.chunks.is_empty() {
+                continue;
+            }
+            if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let (guard, _) = self
+                .state
+                .cond
+                .wait_timeout(recv, IO_TIMEOUT)
+                .unwrap_or_else(PoisonError::into_inner);
+            recv = guard;
+            if recv.chunks.is_empty() && (recv.eof || recv.closed) {
+                return Ok(false);
+            }
         }
     }
 
     /// Hand consumed chunks back to the packet pool under one lock.
     pub(crate) fn recycle_chunks(&self, chunks: impl Iterator<Item = ChannelChunk>) {
+        self.recycle_buffers(chunks.map(|chunk| chunk.buffer));
+    }
+
+    /// Hand packet buffers back to the shared pool under one lock.
+    fn recycle_buffers(&self, buffers: impl IntoIterator<Item = Vec<u8>>) {
         let mut pool = lock(&self.state.pool);
-        for chunk in chunks {
+        for buffer in buffers {
             if pool.len() < PACKET_POOL {
-                pool.push(chunk.buffer);
+                pool.push(buffer);
             }
         }
     }
+}
+
+/// Take queued payloads and the window credit they release, leaving empty buffers for recycling.
+fn take_batch(
+    recv: &mut Recv,
+    batch: &mut Vec<ChannelChunk>,
+    limit: usize,
+    adjust_at: u64,
+) -> (u64, Vec<Vec<u8>>) {
+    let mut adjust = 0u64;
+    let mut spent = Vec::new();
+    while batch.len() < limit {
+        let Some(chunk) = recv.chunks.pop_front() else {
+            break;
+        };
+        if chunk.start >= chunk.end {
+            spent.push(chunk.buffer);
+            continue;
+        }
+        recv.pending_adjust += (chunk.end - chunk.start) as u64;
+        if recv.pending_adjust >= adjust_at {
+            adjust += recv.pending_adjust;
+            recv.local_window += recv.pending_adjust;
+            recv.pending_adjust = 0;
+        }
+        batch.push(ChannelChunk {
+            buffer: chunk.buffer,
+            start: chunk.start,
+            end: chunk.end,
+        });
+    }
+    (adjust, spent)
 }
 
 impl Read for Channel {
@@ -3816,15 +3859,20 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_drains_and_recycles_under_one_lock() {
+    fn next_batch_drains_and_recycles() {
         let payloads: Vec<&[u8]> = (0..40).map(|_| &b"x"[..]).collect();
-        let channel = test_channel_with_chunks(&payloads);
+        let mut channel = test_channel_with_chunks(&payloads);
         let pool = Arc::clone(&channel.session.pool);
         let mut batch = Vec::new();
-        channel.drain_chunks(&mut batch, 32);
+        assert!(channel.next_batch(&mut batch, 32).expect("batch"));
         assert_eq!(batch.len(), 32);
         channel.recycle_chunks(batch.drain(..));
         assert_eq!(lock(&pool).len(), 32);
+        assert!(channel.next_batch(&mut batch, 32).expect("rest"));
+        assert_eq!(batch.len(), 8);
+        channel.recycle_chunks(batch.drain(..));
+        assert_eq!(lock(&pool).len(), 40);
+        assert!(!channel.next_batch(&mut batch, 32).expect("eof"));
     }
 
     #[test]
