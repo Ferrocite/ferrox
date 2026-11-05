@@ -116,6 +116,7 @@ struct Settings {
     latency: Latency,
     establish: Option<Duration>,
     workers: usize,
+    intensive_workers: usize,
     stagger: Duration,
     pause: Duration,
     affinity_grace: Duration,
@@ -435,6 +436,7 @@ impl Inner {
         };
         let mut last = String::new();
         let mut offset = 0;
+        let mut first_batch = true;
         while offset < limit {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -444,11 +446,20 @@ impl Inner {
             if width == 0 {
                 break;
             }
-            let batch: Vec<Server> = (0..width)
-                .map(|step| entries[(start + offset + step) % entries.len()].clone())
-                .collect();
-            offset += width;
-            let lead = if offset == width {
+            let (batch, taken) = take_dial_batch(
+                entries,
+                start,
+                offset,
+                limit,
+                width,
+                self.settings.intensive_workers,
+                self.settings.conduit,
+            );
+            offset += taken;
+            if taken == 0 {
+                break;
+            }
+            let lead = if std::mem::take(&mut first_batch) {
                 affinity_lead
             } else {
                 Duration::ZERO
@@ -461,7 +472,7 @@ impl Inner {
             let last_delay = lead.saturating_add(
                 self.settings
                     .stagger
-                    .saturating_mul(u32::try_from(width - 1).unwrap_or(u32::MAX)),
+                    .saturating_mul(u32::try_from(taken.saturating_sub(1)).unwrap_or(u32::MAX)),
             );
             let stagger = if last_delay.saturating_add(timeout) <= remaining {
                 self.settings.stagger
@@ -1008,17 +1019,14 @@ fn trace_flow(channel: &Channel) {
 fn pump_channel(channel: &mut Channel, sink: &mut impl Write) {
     let mut batch: Vec<ChannelChunk> = Vec::with_capacity(RELAY_BATCH);
     loop {
-        if let Ok(Some(chunk)) = channel.next_chunk() {
-            batch.push(chunk);
-        } else {
-            if !batch.is_empty() {
-                let _ = flush_chunks(channel, sink, &mut batch);
+        batch.clear();
+        match channel.next_batch(&mut batch, RELAY_BATCH) {
+            Ok(true) => {
+                if !flush_chunks(channel, sink, &mut batch) {
+                    return;
+                }
             }
-            return;
-        }
-        channel.drain_chunks(&mut batch, RELAY_BATCH);
-        if !flush_chunks(channel, sink, &mut batch) {
-            return;
+            _ => return,
         }
     }
 }
@@ -1614,6 +1622,10 @@ impl Settings {
         } else {
             workers
         };
+        let intensive_workers = number(settings, "LimitIntensiveConnectionWorkers")
+            .unwrap_or(0)
+            .min(u64::try_from(workers).unwrap_or(u64::MAX))
+            as usize;
         let stagger = Duration::from_millis(
             number(settings, "StaggerConnectionWorkersMilliseconds")
                 .or_else(|| env("AETHER_PSIPHON_STAGGER_MS").and_then(|value| value.parse().ok()))
@@ -1700,6 +1712,7 @@ impl Settings {
             latency,
             establish,
             workers,
+            intensive_workers,
             stagger,
             pause,
             affinity_grace,
@@ -2238,6 +2251,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "tunnelPoolSize",
     "ConnectionWorkerPoolSize",
     "ConnectionWorkerPoolMaxSize",
+    "LimitIntensiveConnectionWorkers",
     "DisableConnectionWorkerPool",
     "EstablishTunnelTimeoutSeconds",
     "EstablishTunnelPausePeriodSeconds",
@@ -4665,6 +4679,40 @@ fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("psiphon: system entropy");
     bytes
+}
+
+/// The reference's resource-intensive protocols: meek, QUIC, and an in-proxy transport that is dialled.
+fn server_is_intensive(server: &Server, conduit: bool) -> bool {
+    server.meek.is_some()
+        || server.unfronted_meek.is_some()
+        || server.quic
+        || (conduit && (server.inproxy.is_some() || server.tls_inproxy.is_some()))
+}
+
+/// Fill one batch, stopping before an intensive candidate over the limit so the next batch starts there.
+fn take_dial_batch(
+    entries: &[Server],
+    start: usize,
+    offset: usize,
+    limit: usize,
+    width: usize,
+    intensive_limit: usize,
+    conduit: bool,
+) -> (Vec<Server>, usize) {
+    let mut batch = Vec::with_capacity(width);
+    let mut intensive = 0;
+    while batch.len() < width && offset + batch.len() < limit {
+        let server = &entries[(start + offset + batch.len()) % entries.len()];
+        if intensive_limit > 0 && server_is_intensive(server, conduit) {
+            if intensive >= intensive_limit {
+                break;
+            }
+            intensive += 1;
+        }
+        batch.push(server.clone());
+    }
+    let taken = batch.len();
+    (batch, taken)
 }
 
 /// Dial a batch at once and hand back the first answer inside the budget, so a
@@ -7209,6 +7257,45 @@ mod tests {
                 .workers,
             8
         );
+    }
+
+    #[test]
+    fn limit_intensive_connection_workers_caps_one_batch() {
+        let settings =
+            json::parse(r#"{"LimitIntensiveConnectionWorkers":2,"ConnectionWorkerPoolSize":8}"#)
+                .expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert_eq!(settings.intensive_workers, 2);
+        let intensive = || {
+            let mut server = test_server(true);
+            server.quic = true;
+            server
+        };
+        let entries = vec![
+            intensive(),
+            test_server(true),
+            intensive(),
+            intensive(),
+            test_server(false),
+        ];
+        let (first, taken) = take_dial_batch(&entries, 0, 0, entries.len(), 5, 2, false);
+        assert_eq!(taken, 3);
+        assert!(first[0].quic && first[2].quic);
+        assert!(!first[1].quic);
+        let (second, taken) = take_dial_batch(&entries, 0, taken, entries.len(), 5, 2, false);
+        assert_eq!(taken, 2);
+        assert_eq!(first.len() + second.len(), entries.len());
+        assert!(second.iter().any(|server| server.quic));
+        assert!(second.iter().any(|server| !server.quic));
+        let mut inproxy = test_server(false);
+        inproxy.inproxy = Some(crate::psiphon_broker::Destination {
+            address: "192.0.2.1".to_owned(),
+            network_protocol: 0,
+            protocol: "INPROXY-WEBRTC-OSSH",
+            packed_server_entry: Vec::new(),
+        });
+        assert!(!server_is_intensive(&inproxy, false));
+        assert!(server_is_intensive(&inproxy, true));
     }
 
     #[test]
