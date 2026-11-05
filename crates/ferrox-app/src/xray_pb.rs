@@ -163,7 +163,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (listen, ports, stream, sniffing) =
+    let (listen, ports, stream, sniffing, receive_original) =
         receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
     let (name, value) = settings.ok_or("xray.core.InboundHandlerConfig: no proxy settings")?;
     let (protocol, inbound_settings) = match name.as_str() {
@@ -196,6 +196,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
                 ("protocol", Json::Str(protocol.to_owned())),
                 ("port", Json::Num(f64::from(port))),
                 ("listen", Json::Str(listen.clone())),
+                ("receiveOriginalDestination", Json::Bool(receive_original)),
             ];
             if let Some(tag) = &tag {
                 pairs.push(("tag", Json::Str(tag.clone())));
@@ -306,7 +307,7 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
     Ok(object(pairs))
 }
 
-type ReceiverConfig = (String, Vec<u16>, Option<Json>, Option<Json>);
+type ReceiverConfig = (String, Vec<u16>, Option<Json>, Option<Json>, bool);
 
 fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.ReceiverConfig");
@@ -314,6 +315,7 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
     let mut listen = None;
     let mut stream = None;
     let mut sniffing = None;
+    let mut receive_original = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => ports = Some(port_list(reader.bytes()?)?),
@@ -322,9 +324,7 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
                 // A receiver's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
                 stream = Some(stream_settings(reader.bytes()?)?);
             }
-            (4, 0) => {
-                reader.varint()?;
-            }
+            (4, 0) => receive_original = reader.varint()? != 0,
             (6, 2) => sniffing = Some(sniffing_settings(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -336,6 +336,7 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
         ports,
         stream,
         sniffing,
+        receive_original,
     ))
 }
 
@@ -4667,6 +4668,12 @@ mod tests {
             .and_then(|settings| settings.get("followRedirect"))
             .and_then(Json::as_bool);
         assert_eq!(follow, Some(true));
+        assert_eq!(
+            inbound
+                .get("receiveOriginalDestination")
+                .and_then(Json::as_bool),
+            Some(true)
+        );
         let tproxy = inbound
             .get("streamSettings")
             .and_then(|settings| settings.get("sockopt"))
