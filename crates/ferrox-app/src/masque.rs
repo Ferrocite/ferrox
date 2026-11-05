@@ -31,6 +31,18 @@ const RETRY: Duration = Duration::from_millis(1);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
+/// The authority and path xray's WARP transport dials when the config names none.
+const WARP_HOST: &str = "cloudflareaccess.com";
+const WARP_PROTOCOL: &[u8] = b"cf-connect-ip";
+/// The draft-datagram setting Cloudflare's endpoint reads.
+const SETTINGS_DATAGRAM_DRAFT: u64 = 0x276;
+/// The resolvers xray's MASQUE client asks when `remoteDNS` names none.
+const DEFAULT_REMOTE_DNS: [IpAddr; 4] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+];
 pub(crate) const DEFAULT_MTU: usize = 1280;
 pub(crate) const QUEUE: usize = 512;
 /// Frames the connection may hold before `dgram_send` refuses more: the
@@ -65,14 +77,6 @@ struct Inner {
 
 impl MasqueOut {
     pub(crate) fn new(outbound: &Json) -> Result<Self, String> {
-        if outbound
-            .get("settings")
-            .and_then(|settings| settings.get("remoteDNS"))
-            .and_then(Json::as_arr)
-            .is_some_and(|dns| !dns.is_empty())
-        {
-            eprintln!("masque: `remoteDNS` is not carried; names resolve on the host");
-        }
         if outbound
             .get("streamSettings")
             .and_then(|settings| settings.get("masqueSettings"))
@@ -114,16 +118,16 @@ impl MasqueOut {
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
-        let Some(destination) = asked.socket() else {
-            eprintln!("masque: destination `{asked:?}` does not resolve");
-            return;
-        };
         let inner = match self.ensure() {
             Ok(inner) => inner,
             Err(reason) => {
                 eprintln!("masque: {reason}");
                 return;
             }
+        };
+        let Some(destination) = self.resolve(&inner, asked) else {
+            eprintln!("masque: destination `{asked:?}` does not resolve");
+            return;
         };
         if inner
             .flows
@@ -141,6 +145,7 @@ impl MasqueOut {
     pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
         match self.ensure() {
             Ok(inner) => {
+                let remote = self.spec.remote_dns.as_slice();
                 wg_stack::client_udp(
                     relay,
                     &inner.config,
@@ -148,6 +153,16 @@ impl MasqueOut {
                     &inner.routes,
                     associate,
                     &|host, port| {
+                        if let Some(answer) = wg_stack::resolve_over_tunnel(
+                            &inner.config,
+                            &inner.to_tunnel,
+                            &inner.routes,
+                            remote,
+                            host,
+                            port,
+                        ) {
+                            return vec![answer];
+                        }
                         crate::proxy::resolve_endpoint(host, port)
                             .into_iter()
                             .collect()
@@ -157,6 +172,23 @@ impl MasqueOut {
             }
             Err(reason) => eprintln!("masque: {reason}"),
         }
+    }
+
+    /// A name resolves inside the tunnel the reference names, then falls back to
+    /// the host so an unreachable DNS server never makes a name undialable.
+    fn resolve(&self, inner: &Inner, asked: &Destination) -> Option<SocketAddr> {
+        let Destination::Name(host, port) = asked else {
+            return asked.socket();
+        };
+        wg_stack::resolve_over_tunnel(
+            &inner.config,
+            &inner.to_tunnel,
+            &inner.routes,
+            &self.spec.remote_dns,
+            host,
+            *port,
+        )
+        .or_else(|| crate::proxy::resolve_endpoint(host, *port))
     }
 }
 
@@ -206,10 +238,16 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
                 spec.address, spec.port
             )
         })?;
+    let mut authority = authority(spec);
+    if spec.warp.is_some() && split_host_port(&authority).is_none() {
+        authority = format!("{authority}:443");
+    }
     let mut client = crate::masque_h2::Client::dial(
         &spec.tls,
+        spec.tls.insecure,
+        spec.warp.as_ref(),
         edge,
-        &authority(spec),
+        &authority,
         &spec.path,
         &spec.headers,
     )
@@ -300,6 +338,8 @@ struct ClientSpec {
     path: String,
     host: Option<String>,
     headers: Vec<(String, String)>,
+    remote_dns: Vec<IpAddr>,
+    warp: Option<Warp>,
 }
 
 impl ClientSpec {
@@ -339,45 +379,24 @@ impl ClientSpec {
         let transport = outbound
             .get("streamSettings")
             .and_then(|settings| settings.get("masqueSettings"));
+        let warp = transport
+            .and_then(|settings| settings.get("warp"))
+            .map(Warp::from)
+            .transpose()?;
         let path = transport
             .and_then(|settings| settings.get("path"))
             .and_then(Json::as_str)
             .filter(|path| !path.is_empty())
-            .unwrap_or(DEFAULT_PATH)
+            .unwrap_or(if warp.is_some() { "/" } else { DEFAULT_PATH })
             .to_owned();
         let host = transport
             .and_then(|settings| settings.get("host"))
             .and_then(Json::as_str)
             .filter(|host| !host.is_empty())
-            .map(str::to_owned);
-        let mut headers: Vec<(String, String)> =
-            match transport.and_then(|settings| settings.get("headers")) {
-                Some(Json::Arr(items)) => items
-                    .iter()
-                    .filter_map(|entry| {
-                        Some((
-                            entry.get("name")?.as_str()?.to_ascii_lowercase(),
-                            entry.get("value")?.as_str()?.to_owned(),
-                        ))
-                    })
-                    .collect(),
-                Some(Json::Obj(pairs)) => pairs
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.to_ascii_lowercase(),
-                            value.as_str().unwrap_or_default().to_owned(),
-                        )
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-        headers.retain(|(name, _)| {
-            !name.eq_ignore_ascii_case("capsule-protocol")
-                && !name.eq_ignore_ascii_case("host")
-                && !name.starts_with(':')
-        });
-        browser_user_agent(&mut headers);
+            .map(str::to_owned)
+            .or_else(|| warp.as_ref().map(|_| WARP_HOST.to_owned()));
+        let headers = client_headers(transport);
+        let remote_dns = remote_dns(settings)?;
         Ok(Self {
             address,
             port,
@@ -385,8 +404,304 @@ impl ClientSpec {
             path,
             host,
             headers,
+            remote_dns,
+            warp,
         })
     }
+}
+
+fn client_headers(transport: Option<&Json>) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> =
+        match transport.and_then(|settings| settings.get("headers")) {
+            Some(Json::Arr(items)) => items
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("name")?.as_str()?.to_ascii_lowercase(),
+                        entry.get("value")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect(),
+            Some(Json::Obj(pairs)) => pairs
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_ascii_lowercase(),
+                        value.as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("capsule-protocol")
+            && !name.eq_ignore_ascii_case("host")
+            && !name.starts_with(':')
+    });
+    browser_user_agent(&mut headers);
+    headers
+}
+
+fn remote_dns(settings: &Json) -> Result<Vec<IpAddr>, String> {
+    match settings.get("remoteDNS") {
+        Some(Json::Arr(items)) if !items.is_empty() => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .ok_or("masque `remoteDNS` is not an array of addresses")?
+                    .parse()
+                    .map_err(|_| "masque `remoteDNS` names a non-address".to_owned())
+            })
+            .collect(),
+        Some(Json::Arr(_)) | None => Ok(DEFAULT_REMOTE_DNS.to_vec()),
+        Some(_) => Err("masque `remoteDNS` is not an array".to_owned()),
+    }
+}
+
+/// Cloudflare's WARP dialect of the same tunnel: the config carries the key
+/// pair instead of a password, the client mints its own certificate from that
+/// key, the endpoint authenticates by its public key rather than a chain, and
+/// the static addresses replace the proxy's assignment.
+#[derive(Debug, Clone)]
+pub(crate) struct Warp {
+    public_key: Vec<u8>,
+    certificate: Vec<u8>,
+    key: Vec<u8>,
+    addresses: Vec<IpAddr>,
+}
+
+impl Warp {
+    fn from(json: &Json) -> Result<Self, String> {
+        let private = json
+            .get("privateKey")
+            .and_then(Json::as_str)
+            .ok_or("masque warp has no `privateKey`")?;
+        let public = json
+            .get("publicKey")
+            .and_then(Json::as_str)
+            .ok_or("masque warp has no `publicKey`")?;
+        let addresses = json
+            .get("address")
+            .and_then(Json::as_arr)
+            .ok_or("masque warp has no `address`")?;
+        let private = warp_pkcs8(&warp_key(private)?)?;
+        let (certificate, key) = warp_identity(&private)?;
+        Ok(Self {
+            public_key: warp_key(public)?,
+            certificate,
+            key,
+            addresses: warp_addresses(addresses)?,
+        })
+    }
+
+    pub(crate) fn local_addresses(&self) -> Vec<IpAddr> {
+        self.addresses.clone()
+    }
+
+    pub(crate) fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    pub(crate) fn certificate(&self) -> &[u8] {
+        &self.certificate
+    }
+
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.key
+    }
+}
+
+/// A key is a PEM block or base64 DER, the two forms xray's decoder accepts.
+fn warp_key(text: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let text = text.trim();
+    let body: String = if text.contains("-----BEGIN") {
+        text.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    } else {
+        text.to_owned()
+    };
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|_| "masque warp key is neither PEM nor base64".to_owned())?;
+    if der.is_empty() {
+        return Err("masque warp key is empty".to_owned());
+    }
+    Ok(der)
+}
+
+/// xray accepts a PKCS #8 or SEC 1 private key; the backend here reads PKCS #8,
+/// so a SEC 1 key is wrapped in the fixed P-256 PKCS #8 envelope first.
+fn warp_pkcs8(der: &[u8]) -> Result<Vec<u8>, String> {
+    let mut at = 0;
+    let Some((0x30, body, _)) = der_next(der, &mut at) else {
+        return Err("masque warp private key is not DER".to_owned());
+    };
+    let mut inner = 0;
+    let Some((0x02, _, _)) = der_next(body, &mut inner) else {
+        return Err("masque warp private key has no version".to_owned());
+    };
+    let Some((tag, _, _)) = der_next(body, &mut inner) else {
+        return Err("masque warp private key is truncated".to_owned());
+    };
+    match tag {
+        0x30 => Ok(der.to_vec()),
+        0x04 => Ok(wrap_sec1(der)),
+        _ => Err("masque warp private key is not PKCS #8 or SEC 1".to_owned()),
+    }
+}
+
+fn wrap_sec1(sec1: &[u8]) -> Vec<u8> {
+    let algorithm = [
+        0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+    ];
+    let mut inner = vec![0x02, 0x01, 0x00];
+    inner.extend_from_slice(&algorithm);
+    inner.push(0x04);
+    der_length(sec1.len(), &mut inner);
+    inner.extend_from_slice(sec1);
+    let mut out = vec![0x30];
+    der_length(inner.len(), &mut out);
+    out.extend_from_slice(&inner);
+    out
+}
+
+/// The certificate xray mints for a WARP dial: a P-256 self-signed identity
+/// with a fresh serial and a long validity, carrying the config's key.
+fn warp_identity(private: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let key = rcgen::KeyPair::try_from(private)
+        .map_err(|error| format!("masque warp private key: {error}"))?;
+    if key.algorithm() != &rcgen::PKCS_ECDSA_P256_SHA256 {
+        return Err("masque warp private key is not a P-256 key".to_owned());
+    }
+    let mut serial = [0u8; 16];
+    getrandom::fill(&mut serial).map_err(|error| format!("masque warp serial: {error}"))?;
+    let mut params = rcgen::CertificateParams::default();
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2100, 1, 1);
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+    let certificate = params
+        .self_signed(&key)
+        .map_err(|error| format!("masque warp certificate: {error}"))?;
+    Ok((certificate.der().to_vec(), key.serialize_der()))
+}
+
+/// At most one IPv4 and one IPv6 prefix, the bind xray enforces; the address is
+/// the local endpoint the config names, not a subnet's network address.
+fn warp_addresses(items: &[Json]) -> Result<Vec<IpAddr>, String> {
+    let mut addresses = Vec::with_capacity(items.len());
+    let mut has4 = false;
+    let mut has6 = false;
+    for item in items {
+        let text = item
+            .as_str()
+            .ok_or("masque warp `address` is not a string")?;
+        let (address, prefix) = if let Some((address, prefix)) = text.split_once('/') {
+            (
+                address
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("masque warp address `{text}` is not an address"))?,
+                prefix
+                    .parse::<u8>()
+                    .map_err(|_| format!("masque warp prefix `{text}` is not a number"))?,
+            )
+        } else {
+            let address = text
+                .parse::<IpAddr>()
+                .map_err(|_| format!("masque warp address `{text}` is not an address"))?;
+            let bits = if address.is_ipv4() { 32 } else { 128 };
+            (address, bits)
+        };
+        let bits = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > bits {
+            return Err(format!("masque warp prefix `{text}` is too long"));
+        }
+        if address.is_ipv4() {
+            if has4 {
+                return Err("masque warp `address` names two IPv4 addresses".to_owned());
+            }
+            has4 = true;
+        } else {
+            if has6 {
+                return Err("masque warp `address` names two IPv6 addresses".to_owned());
+            }
+            has6 = true;
+        }
+        addresses.push(address);
+    }
+    if addresses.is_empty() {
+        return Err("masque warp needs an address".to_owned());
+    }
+    Ok(addresses)
+}
+
+/// One DER element: tag, value and the raw bytes the tag and length cover.
+fn der_next<'a>(buf: &'a [u8], at: &mut usize) -> Option<(u8, &'a [u8], &'a [u8])> {
+    let start = *at;
+    let tag = *buf.get(start)?;
+    let mut at_value = start.checked_add(1)?;
+    let first = *buf.get(at_value)?;
+    at_value += 1;
+    let length = if first & 0x80 == 0 {
+        usize::from(first)
+    } else {
+        let octets = usize::from(first & 0x7f);
+        if octets == 0 || octets > 3 {
+            return None;
+        }
+        let mut length = 0usize;
+        for _ in 0..octets {
+            length = (length << 8) | usize::from(*buf.get(at_value)?);
+            at_value += 1;
+        }
+        length
+    };
+    let end = at_value.checked_add(length)?;
+    let value = buf.get(at_value..end)?;
+    *at = end;
+    Some((tag, value, &buf[start..end]))
+}
+
+fn der_length(len: usize, out: &mut Vec<u8>) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else {
+        out.push(0x82);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
+}
+
+/// The `SubjectPublicKeyInfo` inside a leaf certificate, the field xray pins
+/// WARP's endpoint to: the certificate's eighth child once the optional version
+/// is counted.
+pub(crate) fn warp_spki(leaf: &[u8]) -> Option<&[u8]> {
+    let mut at = 0;
+    let (tag, certificate, _) = der_next(leaf, &mut at)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let mut tbs_at = 0;
+    let (tag, tbs, _) = der_next(certificate, &mut tbs_at)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let mut first_at = 0;
+    let (first, _, _) = der_next(tbs, &mut first_at)?;
+    let target = usize::from(first == 0xa0) + 5;
+    let mut index = 0;
+    let mut at = 0;
+    while let Some((_, _, raw)) = der_next(tbs, &mut at) {
+        if index == target {
+            return Some(raw);
+        }
+        index += 1;
+    }
+    None
 }
 
 /// xray reads a browser name as a request for its own masked set rather than a literal value, and a
@@ -424,6 +739,9 @@ fn split_host_port(text: &str) -> Option<(String, u16)> {
 }
 
 fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
+    if let Some(warp) = &spec.warp {
+        return warp_config(warp);
+    }
     let mut config = if spec.tls.insecure || !spec.tls.cert_pins.is_empty() {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|error| format!("masque TLS: {error}"))?;
@@ -438,6 +756,66 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
     Ok(config)
+}
+
+/// The WARP TLS handshake: the client presents the certificate minted from the
+/// config's key and accepts the endpoint's certificate, whose public key
+/// `verify_edge` checks once the handshake finishes.
+fn warp_config(warp: &Warp) -> Result<quiche::Config, String> {
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|error| format!("masque TLS: {error}"))?;
+    config.verify_peer(false);
+    if !quic::tune(&mut config, quic::ALPN) {
+        return Err("masque cannot name the h3 protocol".to_owned());
+    }
+    let sequence = STAGED.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir();
+    let certificate = base.join(format!("ferrox-warp-{}-{sequence}.crt", std::process::id()));
+    let key = base.join(format!("ferrox-warp-{}-{sequence}.key", std::process::id()));
+    stage_private(
+        &certificate,
+        &quic::der_to_pem(&warp.certificate, "CERTIFICATE"),
+    )?;
+    if let Err(reason) = stage_private(&key, &quic::der_to_pem(&warp.key, "PRIVATE KEY")) {
+        let _ = std::fs::remove_file(&certificate);
+        return Err(reason);
+    }
+    let loaded = certificate
+        .to_str()
+        .and_then(|certificate| {
+            key.to_str()
+                .map(|key| (certificate.to_owned(), key.to_owned()))
+        })
+        .ok_or("masque warp: the staged path is not UTF-8".to_owned());
+    let loaded = loaded.and_then(|(certificate, key)| {
+        config
+            .load_cert_chain_from_pem_file(&certificate)
+            .map_err(|error| format!("masque warp certificate: {error}"))?;
+        config
+            .load_priv_key_from_pem_file(&key)
+            .map_err(|error| format!("masque warp key: {error}"))
+    });
+    let _ = std::fs::remove_file(&certificate);
+    let _ = std::fs::remove_file(&key);
+    loaded?;
+    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+    Ok(config)
+}
+
+fn stage_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("masque warp staging: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    std::io::Write::write_all(&mut file, bytes)
+        .map_err(|error| format!("masque warp staging: {error}"))
 }
 
 fn establish(
@@ -456,7 +834,7 @@ fn attempt(
     local: SocketAddr,
 ) -> Result<Lane, String> {
     let mut config = client_config(spec)?;
-    let mut scid = [0u8; 16];
+    let mut scid = vec![0u8; if spec.warp.is_some() { 20 } else { 16 }];
     getrandom::fill(&mut scid).map_err(|error| format!("masque: no connection id: {error}"))?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut conn = quiche::connect(Some(&spec.tls.server_name), &cid, local, peer, &mut config)
@@ -469,6 +847,16 @@ fn attempt(
     let status = stream.wait_head(&mut conn, sock, local, HEAD_TIMEOUT)?;
     if !(200..300).contains(&status) {
         return Err(format!("masque: the edge answered {status}"));
+    }
+    if let Some(warp) = &spec.warp {
+        return Ok(Lane {
+            conn,
+            stream: stream.id,
+            addresses: warp.local_addresses(),
+            mtu: DEFAULT_MTU,
+            packets: stream.packets,
+            alive: Arc::new(AtomicBool::new(true)),
+        });
     }
     send_address_requests(&mut conn, stream.id)?;
     let deadline = Instant::now() + HEAD_TIMEOUT;
@@ -500,6 +888,20 @@ fn attempt(
 }
 
 fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), String> {
+    if let Some(warp) = &spec.warp {
+        if spec.tls.insecure {
+            return Ok(());
+        }
+        let leaf = conn
+            .peer_cert()
+            .ok_or("masque warp: the edge sent no certificate")?;
+        let spki = warp_spki(leaf).ok_or("masque warp: the edge certificate is malformed")?;
+        return if spki == warp.public_key.as_slice() {
+            Ok(())
+        } else {
+            Err("masque warp: the edge public key does not match".to_owned())
+        };
+    }
     if spec.tls.cert_pins.is_empty() {
         return Ok(());
     }
@@ -518,10 +920,21 @@ fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), Strin
 }
 
 fn open_h3(conn: &mut quiche::Connection, spec: &ClientSpec) -> Result<(), String> {
-    send_server_settings(conn, 2, 6, 10)?;
+    send_server_settings(conn, 2, 6, 10, spec.warp.is_some())?;
     let authority = authority(spec);
     let mut block = Vec::with_capacity(256 + spec.path.len());
-    connectip::connect_ip_qpack_named(&authority, &spec.path, &spec.headers, &mut block);
+    let protocol = if spec.warp.is_some() {
+        WARP_PROTOCOL
+    } else {
+        b"connect-ip"
+    };
+    connectip::connect_ip_qpack_named_protocol(
+        &authority,
+        &spec.path,
+        protocol,
+        &spec.headers,
+        &mut block,
+    );
     let mut head = Vec::with_capacity(16 + block.len());
     frames::quic_varint(&mut head, frames::H3_HEADERS);
     frames::quic_varint(&mut head, block.len() as u64);
@@ -534,8 +947,9 @@ fn send_server_settings(
     control: u64,
     encoder: u64,
     decoder: u64,
+    warp: bool,
 ) -> Result<(), String> {
-    let settings = h3_settings();
+    let settings = h3_settings(warp);
     let mut frame = Vec::with_capacity(17 + settings.len());
     frames::quic_varint(&mut frame, 0x00);
     frames::quic_varint(&mut frame, H3_SETTINGS);
@@ -546,8 +960,8 @@ fn send_server_settings(
     send_stream(conn, decoder, &[0x03], false)
 }
 
-fn h3_settings() -> Vec<u8> {
-    let mut out = Vec::with_capacity(18);
+fn h3_settings(warp: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(if warp { 25 } else { 18 });
     for (id, value) in [
         (0x01u64, 0u64),
         (0x07, 0),
@@ -556,6 +970,10 @@ fn h3_settings() -> Vec<u8> {
     ] {
         frames::quic_varint(&mut out, id);
         frames::quic_varint(&mut out, value);
+    }
+    if warp {
+        frames::quic_varint(&mut out, SETTINGS_DATAGRAM_DRAFT);
+        frames::quic_varint(&mut out, 1);
     }
     out
 }
@@ -1667,7 +2085,7 @@ fn worker(
         }
         if conn.is_established() {
             if !tunnel.settings_sent {
-                send_server_settings(&mut conn, 3, 7, 11).ok();
+                send_server_settings(&mut conn, 3, 7, 11, false).ok();
                 tunnel.settings_sent = true;
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
@@ -2273,6 +2691,8 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             host: None,
             headers: Vec::new(),
+            remote_dns: Vec::new(),
+            warp: None,
         };
         let mut config = client_config(&spec).expect("config");
         let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
@@ -3067,6 +3487,78 @@ mod tests {
         let (stream, packet) = connectip::datagram_split(&out).expect("a datagram");
         assert_eq!(stream, 8);
         assert_eq!(packet, &[0x45, 0, 0, 20]);
+    }
+
+    #[test]
+    fn a_warp_identity_carries_the_key_it_was_given() {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let private = key.serialize_der();
+        let public = warp_key(&key.public_key_pem()).expect("the public key");
+        let (certificate, minted) = warp_identity(&private).expect("an identity");
+        assert_eq!(warp_spki(&certificate), Some(public.as_slice()));
+        assert_eq!(minted, private, "the minted key is the configured key");
+    }
+
+    #[test]
+    fn a_sec1_key_is_wrapped_in_the_pkcs8_envelope() {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let pkcs8 = key.serialize_der();
+        let mut at = 0;
+        let (_, body, _) = der_next(&pkcs8, &mut at).expect("the outer sequence");
+        let mut inner = 0;
+        der_next(body, &mut inner).expect("the version");
+        der_next(body, &mut inner).expect("the algorithm");
+        let (tag, sec1, _) = der_next(body, &mut inner).expect("the key");
+        assert_eq!(tag, 0x04);
+        assert_eq!(warp_pkcs8(sec1).expect("a wrapped key"), pkcs8);
+    }
+
+    #[test]
+    fn warp_addresses_are_one_prefix_per_family() {
+        let items = [
+            Json::Str("172.16.0.2/32".to_owned()),
+            Json::Str("2606:4700:110:8a36::1/128".to_owned()),
+        ];
+        let parsed = warp_addresses(&items).expect("two prefixes");
+        assert_eq!(
+            parsed,
+            vec![
+                "172.16.0.2".parse::<IpAddr>().expect("v4"),
+                "2606:4700:110:8a36::1".parse::<IpAddr>().expect("v6"),
+            ]
+        );
+        let twice = [
+            Json::Str("172.16.0.2/32".to_owned()),
+            Json::Str("172.16.0.3/32".to_owned()),
+        ];
+        assert!(warp_addresses(&twice).is_err());
+    }
+
+    #[test]
+    fn a_warp_client_config_loads_the_minted_identity() {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let (certificate, minted) = warp_identity(&key.serialize_der()).expect("an identity");
+        let warp = Warp {
+            public_key: warp_key(&key.public_key_pem()).expect("the public key"),
+            certificate,
+            key: minted,
+            addresses: vec!["172.16.0.2".parse().expect("v4")],
+        };
+        assert!(warp_config(&warp).is_ok());
+    }
+
+    #[test]
+    fn warp_h3_settings_name_the_draft_datagram() {
+        let settings = h3_settings(true);
+        assert!(
+            settings
+                .windows(3)
+                .any(|window| window == [0x42, 0x76, 0x01]),
+            "the draft-datagram setting is absent"
+        );
+        assert!(!h3_settings(false)
+            .windows(3)
+            .any(|window| window == [0x42, 0x76, 0x01]));
     }
 
     #[test]

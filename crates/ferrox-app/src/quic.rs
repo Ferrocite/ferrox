@@ -429,7 +429,6 @@ fn pem_capacity(der_len: usize, label_len: usize) -> usize {
     (11 + label_len + 6) + (full * 64 + rem.div_ceil(3) * 4) + lines + (9 + label_len + 6)
 }
 
-#[cfg(test)]
 pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
     let mut pem = Vec::with_capacity(pem_capacity(der.len(), label.len()));
     append_pem(&mut pem, der, label);

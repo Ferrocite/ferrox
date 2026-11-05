@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::{connectip, frames};
-use ferrox_core::tls::{TlsConfig, TlsProvider as _, TlsServerConfig};
+use ferrox_core::tls::{CertEntry, ServerKeyKind, TlsConfig, TlsProvider as _, TlsServerConfig};
 
 use crate::h2::{self, Decoder};
 use crate::masque::{self, deliver, withdrawn, Granted, ServerSpec, Shared, AUTH_REALM};
@@ -372,6 +372,7 @@ pub(crate) struct Client {
     pub(crate) packets: Vec<Vec<u8>>,
     to_stack: Option<Sender<Packet>>,
     routes: Option<UdpRoutes>,
+    warp: bool,
     end: bool,
 }
 
@@ -403,17 +404,26 @@ fn request_fields<'a>(
     authority: &'a str,
     path: &'a str,
     headers: &'a [(String, String)],
+    warp: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let mut fields = Vec::with_capacity(6 + headers.len());
     fields.push((":method", "CONNECT"));
-    fields.push((":protocol", "connect-ip"));
     fields.push((":scheme", "https"));
     fields.push((":path", path));
     fields.push((":authority", authority));
-    fields.push(("capsule-protocol", "?1"));
+    if warp {
+        fields.push(("cf-connect-proto", "cf-connect-ip"));
+        fields.push(("pq-enabled", "false"));
+    } else {
+        fields.push((":protocol", "connect-ip"));
+        fields.push(("capsule-protocol", "?1"));
+    }
     fields.extend(
         headers
             .iter()
+            .filter(|(name, _)| {
+                !(warp && matches!(name.as_str(), "cf-connect-proto" | "pq-enabled"))
+            })
             .map(|(name, value)| (name.as_str(), value.as_str())),
     );
     fields
@@ -422,6 +432,8 @@ fn request_fields<'a>(
 impl Client {
     pub(crate) fn dial(
         tls_config: &TlsConfig,
+        insecure: bool,
+        warp: Option<&masque::Warp>,
         edge: SocketAddr,
         authority: &str,
         path: &str,
@@ -431,13 +443,15 @@ impl Client {
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
         let (tcp, deadline) = handshake_stream(tcp);
-        let mut tls =
-            ferrox_core::tls::connect(tls_config, tcp).map_err(|error| format!("tls: {error}"))?;
+        let owned = warp_tls(tls_config, warp);
+        let mut tls = ferrox_core::tls::connect(owned.as_ref().unwrap_or(tls_config), tcp)
+            .map_err(|error| format!("tls: {error}"))?;
         tls.handshake()
             .map_err(|error| format!("tls handshake: {error}"))?;
         if tls.alpn() != Some(b"h2".as_slice()) {
             return Err("the edge did not negotiate h2".to_owned());
         }
+        verify_warp(&tls, insecure, warp)?;
         tls.get_ref().set_read_timeout(Some(READ_WAIT));
         tls.write_all(h2::MAGIC)
             .map_err(|error| format!("preface: {error}"))?;
@@ -464,6 +478,7 @@ impl Client {
             packets: Vec::new(),
             to_stack: None,
             routes: None,
+            warp: warp.is_some(),
             end: false,
         };
         let mut settings = Vec::with_capacity(12);
@@ -477,7 +492,7 @@ impl Client {
         {
             return Err("the edge closed while settings were written".to_owned());
         }
-        let block = h2::block_encode(&request_fields(authority, path, headers));
+        let block = h2::block_encode(&request_fields(authority, path, headers, warp.is_some()));
         if !client
             .wire
             .send(h2::T_HEADERS, h2::F_END_HEADERS, client.stream, &block)
@@ -499,27 +514,36 @@ impl Client {
         if !(200..300).contains(&status) {
             return Err(format!("the edge answered {status}"));
         }
+        if let Some(warp) = warp {
+            client.addresses = warp.local_addresses();
+        } else {
+            client.request_addresses()?;
+        }
+        client.wire.deadline.clear();
+        Ok(client)
+    }
+
+    fn request_addresses(&mut self) -> Result<(), String> {
         let v4 = [0u8; 4];
         let v6 = [0u8; 16];
         let mut requests = Vec::with_capacity(40);
         connectip::address_requests(&[(1, 4, &v4), (2, 6, &v6)], &mut requests);
-        client.capsule(&requests);
+        self.capsule(&requests);
         let deadline = Instant::now() + HANDSHAKE;
-        while client.addresses.is_empty() {
+        while self.addresses.is_empty() {
             if Instant::now() > deadline {
                 return Err("no address assigned".to_owned());
             }
-            client.flush();
-            client.pump();
-            if client.wire.closed || client.end {
+            self.flush();
+            self.pump();
+            if self.wire.closed || self.end {
                 return Err("the edge closed before assigning an address".to_owned());
             }
-            if client.addresses.is_empty() {
-                client.wire.fill();
+            if self.addresses.is_empty() {
+                self.wire.fill();
             }
         }
-        client.wire.deadline.clear();
-        Ok(client)
+        Ok(())
     }
 
     /// Delivers queued packets and pumps bounded tunnel batches until the session or wire ends.
@@ -552,7 +576,11 @@ impl Client {
                     break;
                 };
                 capsule.clear();
-                datagram(&packet, &mut capsule);
+                if self.warp {
+                    connectip::packet_encode_bare(&packet, &mut capsule);
+                } else {
+                    datagram(&packet, &mut capsule);
+                }
                 self.capsule(&capsule);
             }
             self.flush();
@@ -710,7 +738,12 @@ impl Client {
         let mut answers = Vec::new();
         if capsules.is_empty() {
             let mut used = 0;
-            while let Some((n, capsule)) = connectip::capsule_split(&bytes[used..]) {
+            let split: fn(&[u8]) -> Option<(usize, connectip::Capsule<'_>)> = if self.warp {
+                connectip::capsule_split_bare
+            } else {
+                connectip::capsule_split
+            };
+            while let Some((n, capsule)) = split(&bytes[used..]) {
                 used += n;
                 if let Some(answer) = self.handle(capsule) {
                     answers.push(answer);
@@ -722,7 +755,12 @@ impl Client {
         } else {
             at = self.capsule_at;
             capsules.extend_from_slice(bytes);
-            while let Some((n, capsule)) = connectip::capsule_split(&capsules[at..]) {
+            let split: fn(&[u8]) -> Option<(usize, connectip::Capsule<'_>)> = if self.warp {
+                connectip::capsule_split_bare
+            } else {
+                connectip::capsule_split
+            };
+            while let Some((n, capsule)) = split(&capsules[at..]) {
                 at += n;
                 if let Some(answer) = self.handle(capsule) {
                     answers.push(answer);
@@ -1220,6 +1258,41 @@ fn datagram(packet: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(packet);
 }
 
+fn warp_tls(tls_config: &TlsConfig, warp: Option<&masque::Warp>) -> Option<TlsConfig> {
+    let warp = warp?;
+    let mut config = tls_config.clone();
+    config.insecure = true;
+    config.client_cert = Some(Arc::new(CertEntry {
+        cert_chain: vec![warp.certificate().to_vec()],
+        key_der: warp.key().to_vec(),
+        key_kind: ServerKeyKind::Pkcs8,
+        reload: None,
+    }));
+    Some(config)
+}
+
+fn verify_warp(
+    tls: &impl ferrox_core::tls::TlsProvider,
+    insecure: bool,
+    warp: Option<&masque::Warp>,
+) -> Result<(), String> {
+    let Some(warp) = warp else {
+        return Ok(());
+    };
+    if insecure {
+        return Ok(());
+    }
+    let leaf = tls
+        .peer_leaf()
+        .ok_or("warp: the edge sent no certificate")?;
+    let spki = masque::warp_spki(leaf).ok_or("warp: the edge certificate is malformed")?;
+    if spki == warp.public_key() {
+        Ok(())
+    } else {
+        Err("warp: the edge public key does not match".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -1231,6 +1304,33 @@ mod tests {
 
     use super::*;
     use crate::json::Json;
+
+    #[test]
+    fn a_warp_request_names_its_protocol_in_a_header() {
+        let fields = request_fields("cloudflareaccess.com:443", "/", &[], true);
+        assert_eq!(
+            fields,
+            vec![
+                (":method", "CONNECT"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":authority", "cloudflareaccess.com:443"),
+                ("cf-connect-proto", "cf-connect-ip"),
+                ("pq-enabled", "false"),
+            ]
+        );
+        assert!(!fields
+            .iter()
+            .any(|(name, _)| *name == ":protocol" || *name == "capsule-protocol"));
+    }
+
+    #[test]
+    fn an_rfc_request_names_its_protocol_in_a_pseudo_header() {
+        let fields = request_fields("edge", "/.well-known/masque/ip/*/*/", &[], false);
+        assert!(fields.contains(&(":protocol", "connect-ip")));
+        assert!(fields.contains(&("capsule-protocol", "?1")));
+        assert!(!fields.iter().any(|(name, _)| *name == "cf-connect-proto"));
+    }
 
     #[test]
     fn a_full_h2_slot_table_refuses_another_connection() {
@@ -1273,6 +1373,7 @@ mod tests {
             packets: Vec::new(),
             to_stack: None,
             routes: None,
+            warp: false,
             end: false,
         }
     }
