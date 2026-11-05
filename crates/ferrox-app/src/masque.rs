@@ -184,8 +184,21 @@ impl MasqueOut {
     }
 }
 
+/// Open the carrier the configured security and ALPN select.
 fn open(spec: &ClientSpec) -> Result<Inner, String> {
-    if uses_h2(&spec.tls) {
+    let Some(tls) = spec.tls.as_deref() else {
+        if spec.warp.is_some() {
+            return Err("masque warp: security none is not a WARP carrier".to_owned());
+        }
+        return open_h2c(spec);
+    };
+    if uses_h1(tls) {
+        if spec.warp.is_some() {
+            return Err("masque warp: HTTP/1.1 is not a WARP carrier".to_owned());
+        }
+        return open_h1(spec);
+    }
+    if uses_h2(tls) {
         return open_h2(spec);
     }
     let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
@@ -214,6 +227,17 @@ fn uses_h2(tls: &TlsConfig) -> bool {
         && !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h3")
 }
 
+/// The reference has no HTTP/1.1 carrier; the RFC does, and an edge that names
+/// only `http/1.1` is asking for it.
+fn uses_h1(tls: &TlsConfig) -> bool {
+    tls.alpn
+        .iter()
+        .any(|protocol| protocol.as_slice() == b"http/1.1")
+        && !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h2")
+        && !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h3")
+}
+
+/// Open the TLS/HTTP-2 carrier and assemble its tunnel.
 fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     let edge = format!("{}:{}", spec.address, spec.port)
         .to_socket_addrs()
@@ -234,9 +258,13 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     if spec.warp.is_some() && split_host_port(&authority).is_none() {
         authority = format!("{authority}:443");
     }
+    let tls = spec
+        .tls
+        .as_deref()
+        .ok_or("masque: HTTP/2 requires security tls")?;
     let mut client = crate::masque_h2::Client::dial(
-        &spec.tls,
-        spec.tls.insecure,
+        tls,
+        tls.insecure,
         spec.warp.as_ref(),
         edge,
         &authority,
@@ -256,6 +284,71 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
             client.run(&from_tunnel, &to_stack, &routes);
         },
     ))
+}
+
+/// Open the TLS/HTTP-1.1 carrier and assemble its tunnel.
+fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
+    let tls = spec
+        .tls
+        .as_deref()
+        .ok_or("masque: HTTP/1.1 requires security tls")?;
+    let edge = resolve_edge(spec)?;
+    let authority = authority(spec);
+    let mut client =
+        crate::masque_h1::Client::dial(tls, edge, &authority, &spec.path, &spec.headers)
+            .map_err(|reason| format!("masque: {reason}"))?;
+    let addresses = client.addresses.clone();
+    let mtu = client.mtu;
+    let initial = std::mem::take(&mut client.packets);
+    Ok(assemble(
+        addresses,
+        mtu,
+        initial,
+        Arc::new(AtomicBool::new(true)),
+        move |from_tunnel, to_stack, routes| {
+            client.run(&from_tunnel, &to_stack, &routes);
+        },
+    ))
+}
+
+/// Open the cleartext prior-knowledge HTTP/2 carrier.
+fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
+    let edge = resolve_edge(spec)?;
+    let authority = authority(spec);
+    let mut client =
+        crate::masque_h2::Client::dial_cleartext(edge, &authority, &spec.path, &spec.headers)
+            .map_err(|reason| format!("masque: {reason}"))?;
+    let addresses = client.addresses.clone();
+    let mtu = client.mtu;
+    let initial = std::mem::take(&mut client.packets);
+    Ok(assemble(
+        addresses,
+        mtu,
+        initial,
+        Arc::new(AtomicBool::new(true)),
+        move |from_tunnel, to_stack, routes| {
+            client.run(&from_tunnel, &to_stack, &routes);
+        },
+    ))
+}
+
+/// Resolve the configured edge to the first address it names.
+fn resolve_edge(spec: &ClientSpec) -> Result<SocketAddr, String> {
+    format!("{}:{}", spec.address, spec.port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            format!(
+                "masque: cannot resolve `{}:{}`: {error}",
+                spec.address, spec.port
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "masque: `{}:{}` resolves to nothing",
+                spec.address, spec.port
+            )
+        })
 }
 
 /// The stack every carrier feeds, and the thread that hands the handshake's
@@ -326,7 +419,7 @@ struct Lane {
 struct ClientSpec {
     address: String,
     port: u16,
-    tls: Arc<TlsConfig>,
+    tls: Option<Arc<TlsConfig>>,
     path: String,
     host: Option<String>,
     headers: Vec<(String, String)>,
@@ -335,6 +428,7 @@ struct ClientSpec {
 }
 
 impl ClientSpec {
+    /// Parse an outbound's settings, transport, and WARP block.
     fn from(outbound: &Json) -> Result<Self, String> {
         let settings = outbound
             .get("settings")
@@ -367,7 +461,16 @@ impl ClientSpec {
                     (address.to_owned(), port)
                 }
             };
-        let tls = crate::config::outbound_tls(outbound, &address)?;
+        let security = outbound
+            .get("streamSettings")
+            .and_then(|settings| settings.get("security"))
+            .and_then(Json::as_str)
+            .unwrap_or("tls");
+        let tls = if security.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(crate::config::outbound_tls(outbound, &address)?)
+        };
         let transport = outbound
             .get("streamSettings")
             .and_then(|settings| settings.get("masqueSettings"));
@@ -402,6 +505,7 @@ impl ClientSpec {
     }
 }
 
+/// Read configured headers, lowercasing names as the reference does.
 fn client_headers(transport: Option<&Json>) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> =
         match transport.and_then(|settings| settings.get("headers")) {
@@ -734,7 +838,11 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
     if let Some(warp) = &spec.warp {
         return warp_config(warp);
     }
-    let mut config = if spec.tls.insecure || !spec.tls.cert_pins.is_empty() {
+    let tls = spec
+        .tls
+        .as_deref()
+        .ok_or("masque: the QUIC carrier requires security tls")?;
+    let mut config = if tls.insecure || !tls.cert_pins.is_empty() {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|error| format!("masque TLS: {error}"))?;
         config.verify_peer(false);
@@ -743,7 +851,7 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
         }
         config
     } else {
-        quic::quiche_config(&spec.tls.roots, None)
+        quic::quiche_config(&tls.roots, None)
             .ok_or("masque: no certificate authorities for the edge")?
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
@@ -825,17 +933,22 @@ fn establish(
     attempt(spec, sock, peer, local).map_err(|reason| format!("masque: {reason}"))
 }
 
+/// Open one QUIC attempt and take its assigned or configured addresses.
 fn attempt(
     spec: &ClientSpec,
     sock: &Datagram,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Result<Lane, String> {
+    let tls = spec
+        .tls
+        .as_deref()
+        .ok_or("masque: the QUIC carrier requires security tls")?;
     let mut config = client_config(spec)?;
     let mut scid = vec![0u8; if spec.warp.is_some() { 20 } else { 16 }];
     getrandom::fill(&mut scid).map_err(|error| format!("masque: no connection id: {error}"))?;
     let cid = quiche::ConnectionId::from_ref(&scid);
-    let mut conn = quiche::connect(Some(&spec.tls.server_name), &cid, local, peer, &mut config)
+    let mut conn = quiche::connect(Some(&tls.server_name), &cid, local, peer, &mut config)
         .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
     quic::drive_handshake_by(&mut conn, sock, local, ESTABLISH_TIMEOUT)
         .ok_or("the QUIC handshake did not finish")?;
@@ -885,9 +998,14 @@ fn attempt(
     })
 }
 
+/// Check the WARP public key or the configured certificate pins.
 fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), String> {
+    let tls = spec
+        .tls
+        .as_deref()
+        .ok_or("masque: the QUIC carrier requires security tls")?;
     if let Some(warp) = &spec.warp {
-        if spec.tls.insecure {
+        if tls.insecure {
             return Ok(());
         }
         let leaf = conn
@@ -900,7 +1018,7 @@ fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), Strin
             Err("masque warp: the edge public key does not match".to_owned())
         };
     }
-    if spec.tls.cert_pins.is_empty() {
+    if tls.cert_pins.is_empty() {
         return Ok(());
     }
     let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
@@ -910,7 +1028,7 @@ fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), Strin
             .map(|cert| vec![cert.to_vec()])
             .unwrap_or_default(),
     };
-    if ferrox_core::tls::verify_cert_pinned(&chain, &spec.tls.cert_pins, &spec.tls.server_name) {
+    if ferrox_core::tls::verify_cert_pinned(&chain, &tls.cert_pins, &tls.server_name) {
         Ok(())
     } else {
         Err("masque: the edge certificate does not match the pins".to_owned())
@@ -1015,13 +1133,18 @@ fn send_data(conn: &mut quiche::Connection, stream: u64, bytes: &[u8]) -> Result
     send_stream(conn, stream, &frame, false)
 }
 
+/// The request authority: configured host, else SNI, with a non-default port.
 fn authority(spec: &ClientSpec) -> String {
     if let Some(host) = &spec.host {
         return host.clone();
     }
-    let host = &spec.tls.server_name;
-    if spec.port == 443 {
-        return host.clone();
+    let host = spec
+        .tls
+        .as_deref()
+        .map_or(spec.address.as_str(), |tls| tls.server_name.as_str());
+    let default = if spec.tls.is_some() { 443 } else { 80 };
+    if spec.port == default {
+        return host.to_owned();
     }
     if host.parse::<Ipv6Addr>().is_ok() {
         return format!("[{host}]:{}", spec.port);
@@ -1453,14 +1576,25 @@ fn lane_udp_bind(address: &str) -> std::io::Result<UdpSocket> {
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
 pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
     let spec = Arc::new(ServerSpec::from(inbound)?);
+    let security = inbound
+        .get("streamSettings")
+        .and_then(|settings| settings.get("security"))
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    if security.eq_ignore_ascii_case("none") {
+        return serve_cleartext_inbound(&spec, out, address);
+    }
     let identity = crate::proxy::quic_inbound_identity(inbound)
-        .ok_or("masque inbound requires security tls with a certificate")?;
+        .ok_or("masque inbound requires security tls or none")?;
     let Some(mut config) = quic::serve_config(&identity) else {
         return Err("unreadable masque tls identity".to_owned());
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
-    let h2 = identity.alpn.iter().any(|alpn| alpn == b"h2");
-    let paired = if h2 && address.ends_with(":0") {
+    let tcp = identity
+        .alpn
+        .iter()
+        .any(|alpn| alpn == b"h2" || alpn == b"http/1.1");
+    let paired = if tcp && address.ends_with(":0") {
         pair_h2_ephemeral(address).ok()
     } else {
         None
@@ -1473,11 +1607,11 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         let local = sock
             .local_addr()
             .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
-        let h2_listener = if h2 {
+        let h2_listener = if tcp {
             if let Ok(listener) = TcpListener::bind(local) {
                 Some(listener)
             } else {
-                eprintln!("masque: no HTTP/2 listener on {local}; h3 still serves");
+                eprintln!("masque: no TCP listener on {local}; h3 still serves");
                 None
             }
         } else {
@@ -1528,6 +1662,45 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     Ok(local.port())
 }
 
+/// Open a cleartext inbound's TCP listener and spawn its stack and forwarder.
+fn serve_cleartext_inbound(
+    spec: &Arc<ServerSpec>,
+    out: &Outbound,
+    address: &str,
+) -> Result<u16, String> {
+    let listener = TcpListener::bind(address)
+        .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
+    let (packets, packets_rx) = mpsc::channel();
+    let shared = Arc::new(Shared {
+        pool: Mutex::new(spec.pool.clone()),
+        tunnels: Mutex::new(HashMap::new()),
+        packets,
+        local: spec.pool.server.clone(),
+    });
+    let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
+    let dispatcher = Arc::clone(&shared);
+    std::thread::spawn(move || dispatch(&dispatcher, from_stack));
+    crate::masque_h2::serve_cleartext(Arc::clone(&shared), Arc::clone(spec), listener);
+    let device = DeviceConfig {
+        secret: [0u8; 32],
+        addresses: spec.pool.server.clone(),
+        peers: Vec::new(),
+        mtu: spec.mtu,
+        reserved: [0u8; 3],
+        is_client: Some(false),
+        no_kernel_tun: true,
+        dns: Vec::new(),
+    };
+    let stack_out = out.clone();
+    std::thread::spawn(move || {
+        wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0, None);
+    });
+    Ok(local.port())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ServerSpec {
     users: Vec<(String, String)>,
@@ -1537,6 +1710,7 @@ pub(crate) struct ServerSpec {
 }
 
 impl ServerSpec {
+    /// Parse an inbound's prefixes, users, and limits.
     fn from(inbound: &Json) -> Result<Self, String> {
         let settings = inbound
             .get("settings")
@@ -2680,12 +2854,12 @@ mod tests {
         let spec = ClientSpec {
             address: "127.0.0.1".to_owned(),
             port: 443,
-            tls: Arc::new(TlsConfig {
+            tls: Some(Arc::new(TlsConfig {
                 server_name: "edge.example".to_owned(),
                 insecure: true,
                 cert_pins: vec![[7u8; 32]].into(),
                 ..TlsConfig::default()
-            }),
+            })),
             path: DEFAULT_PATH.to_owned(),
             host: None,
             headers: Vec::new(),
@@ -2696,7 +2870,7 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
         let local: SocketAddr = "127.0.0.1:50000".parse().expect("local");
         let peer: SocketAddr = "127.0.0.1:443".parse().expect("peer");
-        let conn = quiche::connect(Some(&spec.tls.server_name), &cid, local, peer, &mut config)
+        let conn = quiche::connect(Some("edge.example"), &cid, local, peer, &mut config)
             .expect("connection");
         assert!(
             verify_edge(&spec, &conn).is_err(),
@@ -3080,6 +3254,54 @@ mod tests {
         .expect("a masque inbound")
     }
 
+    fn inbound_h1(settings: &str) -> Json {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        crate::json::parse(&format!(
+            r#"{{"settings":{settings},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"alpn":["h3","http/1.1"],"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
+            pem_lines(&minted.cert.pem()),
+            pem_lines(&minted.signing_key.serialize_pem())
+        ))
+        .expect("a masque inbound")
+    }
+
+    fn inbound_h2c(settings: &str) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{settings},"streamSettings":{{"network":"masque","security":"none"}}}}"#
+        ))
+        .expect("a masque inbound")
+    }
+
+    fn outbound_h1(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"alpn":["http/1.1"]}},"masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
+        ))
+        .expect("a masque outbound")
+    }
+
+    fn outbound_h2c(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"none","masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
+        ))
+        .expect("a masque outbound")
+    }
+
+    fn serve_h1(redirect: &str) -> (Json, u16) {
+        let inbound = inbound_h1(
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+        );
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        (inbound, port)
+    }
+
+    fn serve_h2c(redirect: &str) -> (Json, u16) {
+        let inbound = inbound_h2c(
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+        );
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        (inbound, port)
+    }
+
     fn serve_h2(redirect: &str) -> (Json, u16) {
         let inbound = inbound_h2(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
@@ -3239,6 +3461,54 @@ mod tests {
         assert_eq!(&answer, b"hello");
     }
 
+    fn tcp_flow(serve: fn(&str) -> (Json, u16), outbound: fn(u16) -> Json) {
+        use std::io::{Read as _, Write as _};
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("address");
+        let target: SocketAddr = format!("192.0.2.1:{}", echo_address.port())
+            .parse()
+            .expect("a target");
+        std::thread::spawn(move || {
+            for stream in echo.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else {
+                            return;
+                        };
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let (_inbound, port) = serve(&echo_address.to_string());
+        let masque = MasqueOut::new(&outbound(port)).expect("outbound");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
+        app.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        app.write_all(b"hello").expect("write");
+        let mut answer = [0u8; 5];
+        app.read_exact(&mut answer).expect("read");
+        assert_eq!(&answer, b"hello");
+    }
+
+    #[test]
+    fn a_tcp_flow_crosses_the_h1_tunnel_to_a_freedom_dial() {
+        tcp_flow(serve_h1, outbound_h1);
+    }
+
+    #[test]
+    fn a_tcp_flow_crosses_the_h2c_tunnel_to_a_freedom_dial() {
+        tcp_flow(serve_h2c, outbound_h2c);
+    }
+
     #[test]
     fn a_datagram_flow_crosses_the_tunnel_to_a_freedom_dial() {
         let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
@@ -3316,6 +3586,9 @@ mod tests {
         assert!(!uses_h2(&alpn(&[b"h3", b"h2"])));
         assert!(!uses_h2(&alpn(&[b"h2", b"h3"])));
         assert!(!uses_h2(&alpn(&[])));
+        assert!(uses_h1(&alpn(&[b"http/1.1"])));
+        assert!(!uses_h1(&alpn(&[b"h2", b"http/1.1"])));
+        assert!(!uses_h1(&alpn(&[b"h3", b"http/1.1"])));
     }
 
     #[test]

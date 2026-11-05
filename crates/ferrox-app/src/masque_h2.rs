@@ -30,7 +30,7 @@ const DEFAULT_WINDOW: i64 = 65_535;
 const H2_CONNECTIONS: usize = 256;
 
 #[derive(Clone, Default)]
-struct Deadline(Arc<AtomicU64>);
+pub(crate) struct Deadline(Arc<AtomicU64>);
 
 fn monotonic_nanos() -> u64 {
     static BASE: OnceLock<Instant> = OnceLock::new();
@@ -47,7 +47,8 @@ impl Deadline {
         );
     }
 
-    fn clear(&self) {
+    /// Disarm the handshake clock.
+    pub(crate) fn clear(&self) {
         self.0.store(0, Ordering::Relaxed);
     }
 
@@ -57,7 +58,7 @@ impl Deadline {
     }
 }
 
-struct DeadlineStream {
+pub(crate) struct DeadlineStream {
     io: TcpStream,
     deadline: Deadline,
     read_wait: std::cell::Cell<Duration>,
@@ -76,7 +77,8 @@ impl DeadlineStream {
         }
     }
 
-    fn set_read_timeout(&self, wait: Option<Duration>) {
+    /// Set the steady-state read wait unless the handshake clock is tight.
+    pub(crate) fn set_read_timeout(&self, wait: Option<Duration>) {
         let wait = wait.unwrap_or(HANDSHAKE);
         self.read_wait.set(wait);
         if !self.read_tight.get() {
@@ -120,7 +122,8 @@ impl DeadlineStream {
     }
 }
 
-fn handshake_stream(tcp: TcpStream) -> (DeadlineStream, Deadline) {
+/// Wrap a TCP stream in the handshake clock and disable Nagle.
+pub(crate) fn handshake_stream(tcp: TcpStream) -> (DeadlineStream, Deadline) {
     let _ = tcp.set_nodelay(true);
     let deadline = Deadline::default();
     deadline.arm(Instant::now() + HANDSHAKE);
@@ -223,11 +226,13 @@ pub(crate) fn serve(
     });
 }
 
+/// Bound both directions until the TLS handshake finishes.
 fn handshake_timeouts(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(HANDSHAKE));
     let _ = stream.set_write_timeout(Some(HANDSHAKE));
 }
 
+/// Serve one TLS connection over h2 or h1, chosen by ALPN.
 fn connection(
     stream: TcpStream,
     identity: &TlsServerConfig,
@@ -240,12 +245,67 @@ fn connection(
     let Ok(mut tls) = ferrox_core::tls::accept(identity, io) else {
         return;
     };
-    if tls.handshake().is_err() || tls.alpn() != Some(b"h2") {
+    if tls.handshake().is_err() {
+        return;
+    }
+    if tls.alpn() == Some(b"http/1.1") {
+        deadline.clear();
+        tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));
+        crate::masque_h1::serve(tls, shared, spec);
+        return;
+    }
+    if tls.alpn() != Some(b"h2") {
         return;
     }
     tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));
     let mut wire = Wire {
         stream: Box::new(tls),
+        pending: Vec::new(),
+        closed: false,
+        deadline,
+    };
+    if wire.preface() {
+        Session::new(shared, spec).run(&mut wire);
+    }
+}
+
+/// The cleartext half of a MASQUE inbound: prior-knowledge HTTP/2 over a bare
+/// TCP socket, for a config that explicitly names `security: none`.
+pub(crate) fn serve_cleartext(shared: Arc<Shared>, spec: Arc<ServerSpec>, listener: TcpListener) {
+    let slots = H2Slots::new(H2_CONNECTIONS);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                continue;
+            };
+            let Some(slot) = slots.acquire() else {
+                continue;
+            };
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(READ_WAIT));
+            let _ = stream.set_write_timeout(Some(HANDSHAKE));
+            let shared = Arc::clone(&shared);
+            let spec = Arc::clone(&spec);
+            if let Err(error) = std::thread::Builder::new()
+                .name("ferrox-masque-h2c".into())
+                .spawn(move || {
+                    let _slot = slot;
+                    connection_cleartext(stream, shared, spec);
+                })
+            {
+                eprintln!("masque: cannot spawn HTTP/2 cleartext handler: {error}");
+            }
+        }
+    });
+}
+
+/// Serve one prior-knowledge h2c connection over bare TCP.
+fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
+    let deadline = Deadline::default();
+    let io = DeadlineStream::new(stream, deadline.clone());
+    io.set_read_timeout(Some(READ_WAIT));
+    let mut wire = Wire {
+        stream: Box::new(io),
         pending: Vec::new(),
         closed: false,
         deadline,
@@ -400,15 +460,17 @@ fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
     dial_until_bound(edge, |edge| TcpStream::connect_timeout(&edge, HANDSHAKE))
 }
 
+/// Build the CONNECT fields for WARP or RFC 9484 plus the configured headers.
 fn request_fields<'a>(
     authority: &'a str,
     path: &'a str,
     headers: &'a [(String, String)],
     warp: bool,
+    scheme: &'a str,
 ) -> Vec<(&'a str, &'a str)> {
     let mut fields = Vec::with_capacity(6 + headers.len());
     fields.push((":method", "CONNECT"));
-    fields.push((":scheme", "https"));
+    fields.push((":scheme", scheme));
     fields.push((":path", path));
     fields.push((":authority", authority));
     if warp {
@@ -429,7 +491,92 @@ fn request_fields<'a>(
     fields
 }
 
+/// Write settings and CONNECT, wait for 2xx, then bind or request addresses.
+fn handshake(
+    stream: Box<dyn ReadWrite + Send>,
+    deadline: Deadline,
+    warp: Option<&masque::Warp>,
+    authority: &str,
+    path: &str,
+    headers: &[(String, String)],
+    scheme: &str,
+) -> Result<Client, String> {
+    let mut client = Client {
+        wire: Wire {
+            stream,
+            pending: Vec::new(),
+            closed: false,
+            deadline,
+        },
+        decoder: Decoder::default(),
+        stream: 1,
+        status: None,
+        continuation: None,
+        send_window: DEFAULT_WINDOW,
+        peer_window: DEFAULT_WINDOW,
+        connection_window: DEFAULT_WINDOW,
+        queued: VecDeque::new(),
+        queued_at: 0,
+        capsules: Vec::new(),
+        capsule_at: 0,
+        addresses: Vec::new(),
+        mtu: masque::DEFAULT_MTU,
+        packets: Vec::new(),
+        to_stack: None,
+        routes: None,
+        warp: warp.is_some(),
+        end: false,
+    };
+    let mut settings = Vec::with_capacity(12);
+    settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
+    settings.extend_from_slice(&1u32.to_be_bytes());
+    settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW.to_be_bytes());
+    settings.extend_from_slice(&h2::WINDOW.to_be_bytes());
+    let raised = h2::WINDOW - u32::try_from(DEFAULT_WINDOW).expect("a positive window");
+    if !client.wire.send(h2::T_SETTINGS, 0, 0, &settings)
+        || !client.wire.send(h2::T_WINDOW, 0, 0, &raised.to_be_bytes())
+    {
+        return Err("the edge closed while settings were written".to_owned());
+    }
+    let block = h2::block_encode(&request_fields(
+        authority,
+        path,
+        headers,
+        warp.is_some(),
+        scheme,
+    ));
+    if !client
+        .wire
+        .send(h2::T_HEADERS, h2::F_END_HEADERS, client.stream, &block)
+    {
+        return Err("the edge closed while the request was written".to_owned());
+    }
+    let deadline = Instant::now() + HANDSHAKE;
+    while client.status.is_none() {
+        if Instant::now() > deadline {
+            return Err("the edge sent no response head".to_owned());
+        }
+        client.pump();
+        if client.wire.closed || client.end {
+            return Err("the edge closed before the response head".to_owned());
+        }
+        client.wire.fill();
+    }
+    let status = client.status.unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(format!("the edge answered {status}"));
+    }
+    if let Some(warp) = warp {
+        client.addresses = warp.local_addresses();
+    } else {
+        client.request_addresses()?;
+    }
+    client.wire.deadline.clear();
+    Ok(client)
+}
+
 impl Client {
+    /// Dial the edge over TLS, negotiate h2, and handshake.
     pub(crate) fn dial(
         tls_config: &TlsConfig,
         insecure: bool,
@@ -455,72 +602,42 @@ impl Client {
         tls.get_ref().set_read_timeout(Some(READ_WAIT));
         tls.write_all(h2::MAGIC)
             .map_err(|error| format!("preface: {error}"))?;
-        let mut client = Self {
-            wire: Wire {
-                stream: Box::new(tls),
-                pending: Vec::new(),
-                closed: false,
-                deadline,
-            },
-            decoder: Decoder::default(),
-            stream: 1,
-            status: None,
-            continuation: None,
-            send_window: DEFAULT_WINDOW,
-            peer_window: DEFAULT_WINDOW,
-            connection_window: DEFAULT_WINDOW,
-            queued: VecDeque::new(),
-            queued_at: 0,
-            capsules: Vec::new(),
-            capsule_at: 0,
-            addresses: Vec::new(),
-            mtu: masque::DEFAULT_MTU,
-            packets: Vec::new(),
-            to_stack: None,
-            routes: None,
-            warp: warp.is_some(),
-            end: false,
-        };
-        let mut settings = Vec::with_capacity(12);
-        settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
-        settings.extend_from_slice(&1u32.to_be_bytes());
-        settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW.to_be_bytes());
-        settings.extend_from_slice(&h2::WINDOW.to_be_bytes());
-        let raised = h2::WINDOW - u32::try_from(DEFAULT_WINDOW).expect("a positive window");
-        if !client.wire.send(h2::T_SETTINGS, 0, 0, &settings)
-            || !client.wire.send(h2::T_WINDOW, 0, 0, &raised.to_be_bytes())
-        {
-            return Err("the edge closed while settings were written".to_owned());
-        }
-        let block = h2::block_encode(&request_fields(authority, path, headers, warp.is_some()));
-        if !client
-            .wire
-            .send(h2::T_HEADERS, h2::F_END_HEADERS, client.stream, &block)
-        {
-            return Err("the edge closed while the request was written".to_owned());
-        }
-        let deadline = Instant::now() + HANDSHAKE;
-        while client.status.is_none() {
-            if Instant::now() > deadline {
-                return Err("the edge sent no response head".to_owned());
-            }
-            client.pump();
-            if client.wire.closed || client.end {
-                return Err("the edge closed before the response head".to_owned());
-            }
-            client.wire.fill();
-        }
-        let status = client.status.unwrap_or(0);
-        if !(200..300).contains(&status) {
-            return Err(format!("the edge answered {status}"));
-        }
-        if let Some(warp) = warp {
-            client.addresses = warp.local_addresses();
-        } else {
-            client.request_addresses()?;
-        }
-        client.wire.deadline.clear();
-        Ok(client)
+        handshake(
+            Box::new(tls),
+            deadline,
+            warp,
+            authority,
+            path,
+            headers,
+            "https",
+        )
+    }
+
+    /// Dial the edge over bare TCP and handshake prior-knowledge h2c.
+    pub(crate) fn dial_cleartext(
+        edge: SocketAddr,
+        authority: &str,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Result<Self, String> {
+        let tcp = connect_edge(edge)?;
+        let _ = tcp.set_read_timeout(Some(READ_WAIT));
+        let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let (tcp, deadline) = handshake_stream(tcp);
+        deadline.clear();
+        let mut tcp = tcp;
+        tcp.set_read_timeout(Some(READ_WAIT));
+        tcp.write_all(h2::MAGIC)
+            .map_err(|error| format!("preface: {error}"))?;
+        handshake(
+            Box::new(tcp),
+            deadline,
+            None,
+            authority,
+            path,
+            headers,
+            "http",
+        )
     }
 
     fn request_addresses(&mut self) -> Result<(), String> {
@@ -1307,7 +1424,7 @@ mod tests {
 
     #[test]
     fn a_warp_request_names_its_protocol_in_a_header() {
-        let fields = request_fields("cloudflareaccess.com:443", "/", &[], true);
+        let fields = request_fields("cloudflareaccess.com:443", "/", &[], true, "https");
         assert_eq!(
             fields,
             vec![
@@ -1326,7 +1443,7 @@ mod tests {
 
     #[test]
     fn an_rfc_request_names_its_protocol_in_a_pseudo_header() {
-        let fields = request_fields("edge", "/.well-known/masque/ip/*/*/", &[], false);
+        let fields = request_fields("edge", "/.well-known/masque/ip/*/*/", &[], false, "https");
         assert!(fields.contains(&(":protocol", "connect-ip")));
         assert!(fields.contains(&("capsule-protocol", "?1")));
         assert!(!fields.iter().any(|(name, _)| *name == "cf-connect-proto"));
