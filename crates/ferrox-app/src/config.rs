@@ -1927,7 +1927,7 @@ fn resolve_tcp_or_header(settings: Option<&Json>, network: &str) -> Carrier {
 /// The `finalmask.tcp` chain for a tcp carrier, in config order. `Some(empty)` means no finalmask at
 /// all; `None` refuses the carrier — a tcp mask type this tree does not ship, or a fragment the
 /// config cannot drive, must never dial or serve unmasked.
-fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask::Chain> {
+pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask::Chain> {
     let Some(tcp) = settings
         .and_then(|s| s.get("finalmask"))
         .and_then(|f| f.get("tcp"))

@@ -1347,6 +1347,29 @@ impl Listener {
         }
     }
 
+    /// Bind the listener a transparent inbound accepts on: the socket may receive
+    /// another host's traffic in either transparent mode.
+    pub(crate) fn bind_transparent(target: &Target) -> io::Result<Listener> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let Target::Ip(address) = target else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a transparent listener needs an IP address",
+            ));
+        };
+        let domain = if address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        crate::transparent::set_transparent(&socket, address.is_ipv6())?;
+        socket.bind(&(*address).into())?;
+        socket.listen(1024)?;
+        Ok(Listener::Tcp(std::net::TcpListener::from(socket)))
+    }
+
     /// The socket address a TCP listener holds. A Unix listener has no port to report, so it
     /// answers the error a caller expecting an ephemeral TCP port would get from no bind.
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {

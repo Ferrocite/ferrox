@@ -67,6 +67,7 @@ mod sniff;
 mod sockopt;
 mod socks;
 mod stats;
+mod transparent;
 mod tun;
 mod veepn;
 mod vision;

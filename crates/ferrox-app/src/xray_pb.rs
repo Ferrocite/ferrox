@@ -163,7 +163,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (listen, ports, stream, sniffing) =
+    let (listen, ports, stream, sniffing, receive_original) =
         receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
     let (name, value) = settings.ok_or("xray.core.InboundHandlerConfig: no proxy settings")?;
     let (protocol, inbound_settings) = match name.as_str() {
@@ -196,6 +196,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
                 ("protocol", Json::Str(protocol.to_owned())),
                 ("port", Json::Num(f64::from(port))),
                 ("listen", Json::Str(listen.clone())),
+                ("receiveOriginalDestination", Json::Bool(receive_original)),
             ];
             if let Some(tag) = &tag {
                 pairs.push(("tag", Json::Str(tag.clone())));
@@ -306,7 +307,7 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
     Ok(object(pairs))
 }
 
-type ReceiverConfig = (String, Vec<u16>, Option<Json>, Option<Json>);
+type ReceiverConfig = (String, Vec<u16>, Option<Json>, Option<Json>, bool);
 
 fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.ReceiverConfig");
@@ -314,6 +315,7 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
     let mut listen = None;
     let mut stream = None;
     let mut sniffing = None;
+    let mut receive_original = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => ports = Some(port_list(reader.bytes()?)?),
@@ -322,7 +324,7 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
                 // A receiver's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
                 stream = Some(stream_settings(reader.bytes()?)?);
             }
-            (4, 0) => return Err(reader.uncarried("receive_original_destination")),
+            (4, 0) => receive_original = reader.varint()? != 0,
             (6, 2) => sniffing = Some(sniffing_settings(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -334,6 +336,7 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
         ports,
         stream,
         sniffing,
+        receive_original,
     ))
 }
 
@@ -717,13 +720,28 @@ fn int32(raw: u64) -> i32 {
         .cast_signed()
 }
 
-/// xray's `SocketConfig` as far as a stream's dial reads it: the system dial this tree puts
-/// under `freedom` already resolves a name to an address, which is `USE_IP`; every other
-/// socket option shapes a dial this tree does not carry and is refused by number.
-fn socket_settings(bytes: &[u8]) -> Result<(), String> {
+/// xray's `SocketConfig` as far as a stream reads it: the system dial this tree puts under
+/// `freedom` already resolves a name to an address, which is `USE_IP`; a transparent front's
+/// `tproxy` mode is carried, its original-destination marker is read, and every other socket
+/// option shapes a dial this tree does not carry and is refused by number.
+fn socket_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.SocketConfig");
+    let mut tproxy = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
+            (3, 0) => {
+                tproxy = match reader.varint()? {
+                    0 => None,
+                    1 => Some("tproxy"),
+                    2 => Some("redirect"),
+                    mode => {
+                        return Err(reader.uncarried(&format!("socket tproxy mode {mode}")));
+                    }
+                };
+            }
+            (4, 0) => {
+                reader.varint()?;
+            }
             (8, 0) => {
                 let strategy = reader.varint()?;
                 if strategy > 1 {
@@ -733,7 +751,7 @@ fn socket_settings(bytes: &[u8]) -> Result<(), String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(())
+    Ok(tproxy.map(|tproxy| object(vec![("tproxy", Json::Str(tproxy.to_owned()))])))
 }
 
 /// One stream policy as this tree's JSON dialect spells it: the network, and the security the
@@ -746,6 +764,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut transport_settings: Option<Json> = None;
     let mut security_type = String::new();
     let mut security: Option<(&'static str, Json)> = None;
+    let mut sockopt = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (2, 2) => {
@@ -766,7 +785,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
                 }
             }
             (5, 2) => network = account_text(&mut reader)?,
-            (6, 2) => socket_settings(reader.bytes()?)?,
+            (6, 2) => sockopt = socket_settings(reader.bytes()?)?,
             (8..=12, _) => return Err(reader.uncarried("address, mask or quic policy on a stream")),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -780,6 +799,9 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
         return Err(format!("network `{network}` is not carried"));
     }
     let mut pairs = vec![("network", Json::Str(network.clone()))];
+    if let Some(sockopt) = sockopt {
+        pairs.push(("sockopt", sockopt));
+    }
     if let Some(settings) = transport_settings {
         let key = match network.as_str() {
             "masque" => "masqueSettings",
@@ -1595,13 +1617,15 @@ fn http_settings(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Dokodemo-door forwards what it accepts to the one address its config names, which is the
-/// shape every xray scenario writes. A `portMap` picks the target per port and a
-/// `followRedirect` reads the kernel's own answer instead; neither has a lane in this tree.
+/// Dokodemo-door forwards what it accepts to the address its config names, or to the
+/// original destination a `follow_redirect` asks the kernel for; a `portMap` picks the
+/// target per flow port.
 fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.dokodemo.Config");
     let mut address = None;
     let mut port = None;
+    let mut port_map = Vec::new();
+    let mut follow_redirect = false;
     let mut networks = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
@@ -1612,8 +1636,8 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
                     format!("xray.proxy.dokodemo.Config: rewrite port {value} is above 65535")
                 })?);
             }
-            (3, 2) => return Err(reader.uncarried("port_map")),
-            (5, 0) => return Err(reader.uncarried("follow_redirect")),
+            (3, 2) => port_map.push(dokodemo_port_map_entry(reader.bytes()?)?),
+            (5, 0) => follow_redirect = reader.varint()? != 0,
             (6, 0) => return Err(reader.uncarried("user_level")),
             // A repeated enum arrives packed into one field or per field, and the packed payload carries no keys.
             (7, 2) => {
@@ -1642,19 +1666,50 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
             }
         });
     }
-    Ok(object(vec![
-        (
-            "address",
-            Json::Str(address.ok_or("xray.proxy.dokodemo.Config: no rewrite address")?),
-        ),
-        (
-            "port",
-            Json::Num(f64::from(
-                port.ok_or("xray.proxy.dokodemo.Config: no rewrite port")?,
-            )),
-        ),
-        ("network", Json::Str(allowed.join(","))),
-    ]))
+    let mut settings = Vec::new();
+    if let Some(address) = address {
+        settings.push(("address", Json::Str(address)));
+    }
+    if let Some(port) = port {
+        settings.push(("port", Json::Num(f64::from(port))));
+    }
+    if !port_map.is_empty() {
+        settings.push(("portMap", Json::Obj(port_map)));
+    }
+    if follow_redirect {
+        settings.push(("followRedirect", Json::Bool(true)));
+    }
+    settings.push(("network", Json::Str(allowed.join(","))));
+    Ok(object(settings))
+}
+
+fn dokodemo_port_map_entry(bytes: &[u8]) -> Result<(String, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.dokodemo.Config.PortMapEntry");
+    let mut key = String::new();
+    let mut value = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| {
+                        "xray.proxy.dokodemo.Config.PortMapEntry: the key is not utf-8".to_owned()
+                    })?
+                    .clone_into(&mut key);
+            }
+            (2, 2) => {
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| {
+                        "xray.proxy.dokodemo.Config.PortMapEntry: the value is not utf-8".to_owned()
+                    })?
+                    .clone_into(&mut value);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if key.is_empty() {
+        return Err("xray.proxy.dokodemo.Config.PortMapEntry: no key".to_owned());
+    }
+    Ok((key, Json::Str(value)))
 }
 
 /// A vmess account: the user's uuid, the cipher it asks for when the config names one, and
@@ -4555,35 +4610,111 @@ mod tests {
     }
 
     #[test]
-    fn a_dokodemo_port_map_is_refused() {
-        let settings = message(&[
-            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
-            varint_field(2, 8080),
-            bytes_field(3, &[]),
-            varint_field(7, 2),
-        ]);
-        let error = to_json(&config(
-            &dokodemo_inbound(&receiver(8080, None), &settings),
-            &freedom_outbound(),
-        ))
-        .expect_err("refused");
-        assert!(error.contains("port_map"), "{error}");
-    }
-
-    #[test]
-    fn a_dokodemo_follow_redirect_is_refused() {
+    fn a_receiver_marker_stays_independent_of_follow_redirect() {
+        let range = message(&[varint_field(1, 8080), varint_field(2, 8080)]);
+        let list = message(&[bytes_field(1, &range)]);
+        let receiver = message(&[bytes_field(1, &list)]);
         let settings = message(&[
             bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
             varint_field(2, 8080),
             varint_field(5, 1),
             varint_field(7, 2),
         ]);
-        let error = to_json(&config(
+        let json = to_json(&config(
+            &dokodemo_inbound(&receiver, &settings),
+            &freedom_outbound(),
+        ))
+        .expect("followRedirect decodes");
+        let inbound = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            inbound
+                .get("settings")
+                .and_then(|settings| settings.get("followRedirect"))
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            inbound
+                .get("receiveOriginalDestination")
+                .and_then(Json::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_dokodemo_port_map_decodes() {
+        let entry = message(&[bytes_field(1, b"8080"), bytes_field(2, b"127.0.0.1:9090")]);
+        let settings = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 8080),
+            bytes_field(3, &entry),
+            varint_field(7, 2),
+        ]);
+        let json = to_json(&config(
             &dokodemo_inbound(&receiver(8080, None), &settings),
             &freedom_outbound(),
         ))
-        .expect_err("refused");
-        assert!(error.contains("follow_redirect"), "{error}");
+        .expect("portMap decodes");
+        let port_map = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("portMap"))
+            .expect("portMap");
+        assert_eq!(
+            port_map.get("8080").and_then(Json::as_str),
+            Some("127.0.0.1:9090")
+        );
+    }
+
+    #[test]
+    fn a_dokodemo_follow_redirect_decodes() {
+        let socket = message(&[varint_field(3, 2), varint_field(4, 1)]);
+        let stream = message(&[bytes_field(6, &socket)]);
+        let range = message(&[varint_field(1, 8080), varint_field(2, 8080)]);
+        let list = message(&[bytes_field(1, &range)]);
+        let receiver = message(&[
+            bytes_field(1, &list),
+            bytes_field(2, &bytes_field(1, &[127, 0, 0, 1])),
+            bytes_field(3, &stream),
+            varint_field(4, 1),
+        ]);
+        let settings = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 8080),
+            varint_field(5, 1),
+            varint_field(7, 2),
+        ]);
+        let json = to_json(&config(
+            &dokodemo_inbound(&receiver, &settings),
+            &freedom_outbound(),
+        ))
+        .expect("followRedirect decodes");
+        let inbound = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        let follow = inbound
+            .get("settings")
+            .and_then(|settings| settings.get("followRedirect"))
+            .and_then(Json::as_bool);
+        assert_eq!(follow, Some(true));
+        assert_eq!(
+            inbound
+                .get("receiveOriginalDestination")
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        let tproxy = inbound
+            .get("streamSettings")
+            .and_then(|settings| settings.get("sockopt"))
+            .and_then(|sockopt| sockopt.get("tproxy"))
+            .and_then(Json::as_str);
+        assert_eq!(tproxy, Some("redirect"));
     }
 
     #[test]
