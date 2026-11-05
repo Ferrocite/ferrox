@@ -2987,7 +2987,7 @@ fn pump_frame(
 mod tests {
     use super::*;
     use crate::conn::{test_bind, Connection};
-    use crate::h2::{read_head, MAGIC};
+    use crate::h2::{read_head, read_head_bounded, MAGIC};
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
@@ -3024,6 +3024,8 @@ mod tests {
     }
 
     impl H2Client {
+        /// Opens the test peer and reads the server's opening frames under the socket deadline, so a
+        /// demux that never answers fails the test instead of parking it.
         fn connect(addr: SocketAddr) -> Self {
             let mut stream = Connection::connect(addr).expect("connects");
             stream
@@ -3041,9 +3043,9 @@ mod tests {
                 held: VecDeque::new(),
             };
             for _ in 0..3 {
-                let (len, kind, flags, _) = read_head(&mut conn.stream).expect("frame");
+                let (len, kind, flags, _) = read_head_bounded(&mut conn.stream).expect("frame");
                 let mut body = crate::proxy::unfilled(len);
-                crate::proxy::read_exact(&mut conn.stream, &mut body).expect("body");
+                conn.stream.read_exact(&mut body).expect("body");
                 if kind == T_SETTINGS && flags & F_ACK == 0 {
                     write_frame(&mut conn.stream, T_SETTINGS, F_ACK, 0, &[]);
                 }
@@ -3134,9 +3136,9 @@ mod tests {
                 if let Some(at) = self.held.iter().position(|f| f.2 == id && want(f.0)) {
                     return self.held.remove(at).expect("the position just found");
                 }
-                let (len, kind, flags, got) = read_head(&mut self.stream).expect("frame");
+                let (len, kind, flags, got) = read_head_bounded(&mut self.stream).expect("frame");
                 let mut body = crate::proxy::unfilled(len);
-                crate::proxy::read_exact(&mut self.stream, &mut body).expect("body");
+                self.stream.read_exact(&mut body).expect("body");
                 if kind == T_PING && flags & F_ACK == 0 && body.len() == 8 {
                     write_frame(&mut self.stream, T_PING, F_ACK, 0, &body);
                     continue;
@@ -3703,6 +3705,7 @@ mod tests {
                             Ok(0) => break,
                             Ok(n) => body.extend_from_slice(&chunk[..n]),
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if crate::proxy::is_timeout(&e) => {}
                             Err(_) => break,
                         }
                     }
