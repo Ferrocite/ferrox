@@ -1388,7 +1388,8 @@ impl H2Conn {
             .remove(&stream);
     }
 
-    /// The session is over, so the uploads that shared it are too: mark each one ended and wake its parked reader before the connection's death is the only way out.
+    /// The session is over, so the uploads that shared it wake, but the stream stays in the table: a
+    /// stream-up POST still owes its deferred 200, and a reset here would discard it.
     fn end_uploads(&self, sid: &str) {
         let streams: Vec<u32> = {
             let mut uploads = self
@@ -1410,11 +1411,11 @@ impl H2Conn {
                 .streams
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .remove(&stream);
+                .get(&stream)
+                .cloned();
             if let Some(state) = state {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.ended = true;
-                st.dead = true;
                 state.cv.notify_all();
             }
         }
@@ -4215,6 +4216,96 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(2)),
             Ok(Ok(0)),
             "the ended session ends its parked upload"
+        );
+    }
+
+    /// A downlink that ends before its upload's body still owes the POST a 200: the upload's stream
+    /// stays in the table, so the deferred head is not answered by a reset.
+    #[test]
+    fn a_finished_downlink_leaves_its_upload_for_the_response() {
+        let sid = "h2-deferred-upload-answer";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, written, _slices) = bare_conn();
+        let upload_state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(2, Arc::clone(&upload_state));
+        let downlink = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 1,
+            _owner: None,
+            client: false,
+        };
+        downlink.bind_session(sid);
+        let upload = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 2,
+            _owner: None,
+            client: false,
+        };
+        upload.bind_upload(sid);
+        downlink.end();
+        assert!(
+            !crate::xhttp::session_is_carried(sid),
+            "the finished downlink ends its session"
+        );
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&2),
+            "the upload stays for its deferred 200"
+        );
+        let mut writer = H2StreamWriter {
+            conn: Arc::clone(&conn),
+            stream: 2,
+            head: Vec::new(),
+            headed: false,
+        };
+        writer
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("the deferred 200 goes out");
+        upload.end();
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut headers, mut end) = (false, false);
+        let mut at = 0;
+        while at + 9 <= bytes.len() {
+            let len = usize::from(bytes[at]) << 16
+                | usize::from(bytes[at + 1]) << 8
+                | usize::from(bytes[at + 2]);
+            let kind = bytes[at + 3];
+            let flags = bytes[at + 4];
+            let id =
+                u32::from_be_bytes([bytes[at + 5], bytes[at + 6], bytes[at + 7], bytes[at + 8]])
+                    & 0x7FFF_FFFF;
+            assert!(kind != T_RST || id != 2, "the upload was reset");
+            headers |= id == 2 && kind == T_HEADERS;
+            end |= id == 2 && kind == T_DATA && flags & F_END != 0;
+            at += 9 + len;
+        }
+        assert!(headers, "the POST receives its 200");
+        assert!(end, "the response ends the stream instead of a reset");
+        assert!(
+            !conn
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&2),
+            "the answered upload retires"
         );
     }
 

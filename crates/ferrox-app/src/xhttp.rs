@@ -2054,6 +2054,8 @@ impl SessionReader {
         self.session.cv.notify_all();
     }
 
+    /// The upload reached its own end, so the reader reports EOF but the session keeps the downlink
+    /// it is still relaying: a hard read error still ends the whole session instead.
     fn finish_upload(&mut self) {
         self.upload = None;
         let mut st = self.session.state.lock().expect("session lock");
