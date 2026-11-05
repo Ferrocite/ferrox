@@ -79,6 +79,10 @@ if [[ $fast == 0 ]]; then
   python3 scripts/rewrite-depinfo.py --selftest
   python3 scripts/psiphon-target.py --selftest
 
+  step "psiphon config map"
+  python3 scripts/check-psiphon-parity.py --selftest
+  python3 scripts/check-psiphon-parity.py
+
   step "cli arguments"
   python3 scripts/check-cli-args.py
   python3 scripts/check-cli-lane.py

@@ -1445,7 +1445,9 @@ impl Settings {
                 parsed
             })
             .collect();
-        if flag(settings, "disableTunnels", "AETHER_PSIPHON_DISABLE_TUNNELS") {
+        if flag(settings, "disableTunnels", "AETHER_PSIPHON_DISABLE_TUNNELS")
+            || flag(settings, "DisableTunnels", "AETHER_PSIPHON_DISABLE_TUNNELS")
+        {
             return Err(
                 "psiphon: disableTunnels opens no tunnel, so this lane would carry nothing"
                     .to_owned(),
@@ -2469,6 +2471,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "shareProxyOnNetworkPassword",
     "DisableTimeouts",
     "disableTunnels",
+    "DisableTunnels",
     "upstreamProxy",
     "upstream",
     "UpstreamProxyURL",
@@ -2552,6 +2555,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "MeekAdditionalHeaders",
     "SSHChannelWindowSize",
     "LimitQUICVersions",
+    "LimitTLSProfiles",
+    "TLSProfile",
     "QUICNoiseProfile",
     "InproxyRejectProxyCIDRs",
     "TLSTunnelMinTLSPadding",
@@ -2559,6 +2564,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "MeekMinTLSPadding",
     "MeekMaxTLSPadding",
     "TLSTunnelTrafficShapingProbability",
+    "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",
     "TLSOSSHSNIServerNames",
     "TransformHostNameProbability",
