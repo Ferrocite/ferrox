@@ -4312,6 +4312,66 @@ impl std::io::Read for HandshakeDeadline<'_> {
     }
 }
 
+/// An answer wait a raw upload extends: a server may hold its reply behind the payload, so each pump step buys another handshake budget and silence after the last step still ends the read.
+struct UploadDeadline<'a> {
+    inner: &'a mut dyn Read,
+    progress: &'a AtomicU64,
+    seen: u64,
+    until: Instant,
+}
+
+impl std::io::Read for UploadDeadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let progress = self.progress.load(Ordering::Relaxed);
+            if progress != self.seen {
+                self.seen = progress;
+                self.until = Instant::now() + crate::budgets::handshake();
+            }
+            if Instant::now() >= self.until {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            match self.inner.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    let left = self.until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    thread::sleep(left.min(RELAY_POLL));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// A websocket reader whose own handshake clock follows the upload, because the frame reader ends itself at a fixed budget before the outer wait can extend it.
+struct WsAnswerDeadline<'a> {
+    reader: &'a mut crate::ws::WsReader,
+    progress: &'a AtomicU64,
+    seen: u64,
+}
+
+impl std::io::Read for WsAnswerDeadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let progress = self.progress.load(Ordering::Relaxed);
+        if progress != self.seen {
+            self.seen = progress;
+            self.reader
+                .set_handshake_budget(Some(Instant::now() + crate::budgets::handshake()));
+        }
+        self.reader.read(buf)
+    }
+}
+
 /// An owned carried reader under the handshake clock: the frame reader sleeps through poll timeouts, so this claims the poll and ends the read at the deadline instead.
 pub(crate) struct HandshakeRead<R> {
     inner: R,
@@ -10024,6 +10084,23 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
+    dial_sealed_carried_armed(client, vless, header, reader, writer, close, |_, _| {})
+}
+
+fn dial_sealed_carried_armed<R, W, A>(
+    client: &Connection,
+    vless: &VlessOut,
+    header: &[u8],
+    reader: R,
+    writer: W,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    armed: A,
+) -> bool
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+    A: Fn(&mut R, bool),
+{
     let Some(encryption) = &vless.encryption else {
         return false;
     };
@@ -10035,7 +10112,14 @@ where
             return false;
         }
     };
-    if sealed.write_all(header).is_err() || read_vless_response(&mut sealed).is_none() {
+    if sealed.write_all(header).is_err() {
+        close();
+        return false;
+    }
+    armed(&mut sealed.get_mut().reader, true);
+    let answered = read_vless_response(&mut sealed).is_some();
+    armed(&mut sealed.get_mut().reader, false);
+    if !answered {
         close();
         return false;
     }
@@ -10068,16 +10152,33 @@ fn dial_vless_headed(
     };
     if vless.encryption.is_some() {
         let close = connection_closer(&write);
-        return dial_sealed_carried(client, vless, header, reader, write, &close);
+        return dial_sealed_carried_armed(
+            client,
+            vless,
+            header,
+            reader,
+            write,
+            &close,
+            |reader, arm| {
+                if arm {
+                    reader.set_poll(Some(RELAY_POLL));
+                }
+            },
+        );
     }
     let (mut reader, mut write) = (reader, write);
     if write.write_all(header).is_err() {
         return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
     }
+    reader.set_poll(Some(RELAY_POLL));
     let pump = Pump::to_stream(client, &write);
-    let answered = read_vless_response(&mut reader).is_some();
-    pump.end();
+    let answered = read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some();
+    let sent = pump.end();
     if !answered {
+        // The pump may have forwarded client bytes. Another rung cannot replay them.
+        if sent {
+            return true;
+        }
         return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
     }
     reader.set_poll(Some(RELAY_POLL));
@@ -10116,17 +10217,48 @@ fn dial_vless_rung(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
+                if dial_sealed_carried_armed(
+                    client,
+                    vless,
+                    header,
+                    reader,
+                    writer,
+                    &close,
+                    |reader, arm| {
+                        if arm {
+                            reader.set_poll(Some(RELAY_POLL));
+                            reader.set_handshake_budget(Some(
+                                Instant::now() + crate::budgets::handshake(),
+                            ));
+                        } else {
+                            reader.set_handshake_budget(None);
+                        }
+                    },
+                ) {
                     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
                     return true;
                 }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let mut reader = reader;
+            reader.set_poll(Some(RELAY_POLL));
+            let until = Instant::now() + crate::budgets::handshake();
+            reader.set_handshake_budget(Some(until));
             let pump = Pump::to_sink(client, &writer);
-            let answered = read_vless_response(&mut reader).is_some();
-            pump.end();
+            let progress = pump.progress_flag();
+            let mut bounded = WsAnswerDeadline {
+                reader: &mut reader,
+                progress,
+                seen: progress.load(Ordering::Relaxed),
+            };
+            let answered = read_vless_response_deferred(&mut bounded, progress).is_some();
+            let sent = pump.end();
+            reader.set_handshake_budget(None);
             if !answered {
+                // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
+                if sent {
+                    return true;
+                }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
@@ -10151,15 +10283,29 @@ fn dial_vless_rung(
             };
             if vless.encryption.is_some() {
                 let close = connection_closer(&write);
-                if dial_sealed_carried(client, vless, header, reader, write, &close) {
+                if dial_sealed_carried_armed(
+                    client,
+                    vless,
+                    header,
+                    reader,
+                    write,
+                    &close,
+                    |reader, arm| {
+                        if arm {
+                            reader.set_poll(Some(RELAY_POLL));
+                        }
+                    },
+                ) {
                     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
                     return true;
                 }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let mut reader = reader;
+            reader.set_poll(Some(RELAY_POLL));
             let pump = Pump::to_stream_now(client, &write);
-            let answered = read_vless_response(&mut reader).is_some();
+            let answered =
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some();
             let sent = pump.end();
             if !answered {
                 // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
@@ -10198,8 +10344,12 @@ fn dial_vless_rung(
             }
             let pump = Pump::to_sink(client, &writer);
             let answered = read_vless_response(&mut reader).is_some();
-            pump.end();
+            let sent = pump.end();
             if !answered {
+                // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
+                if sent {
+                    return true;
+                }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
@@ -10234,8 +10384,12 @@ fn dial_vless_rung(
             }
             let pump = Pump::to_sink(client, &writer);
             let answered = read_vless_response(&mut reader).is_some();
-            pump.end();
+            let sent = pump.end();
             if !answered {
+                // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
+                if sent {
+                    return true;
+                }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
@@ -10875,7 +11029,7 @@ fn dial_vless_kcp(
         let conn = Arc::clone(conn);
         move |bytes| conn.write(bytes).is_ok()
     });
-    let answered = read_vless_response(&mut io).is_some();
+    let answered = read_vless_response_deferred(&mut io, pump.progress_flag()).is_some();
     pump.end();
     if !answered {
         return;
@@ -29953,6 +30107,7 @@ pub(crate) struct Pump {
     stop: std::sync::mpsc::Sender<()>,
     running: Option<RelayEnd>,
     sent: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
 }
 
 impl Pump {
@@ -29974,6 +30129,8 @@ impl Pump {
         let (stop, stop_rx) = std::sync::mpsc::channel();
         let sent = Arc::new(AtomicBool::new(false));
         let pumped = Arc::clone(&sent);
+        let progress = Arc::new(AtomicU64::new(0));
+        let advanced = Arc::clone(&progress);
         let running = match peer.try_clone() {
             Ok(reading) => Some(RelayPool::run_once(move || {
                 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
@@ -29996,6 +30153,7 @@ impl Pump {
                     match reading.read(buffer.as_mut()) {
                         Ok(size) if size > 0 => {
                             pumped.store(true, Ordering::Relaxed);
+                            advanced.fetch_add(1, Ordering::Relaxed);
                             if !to_carrier(buffer.filled(size)) {
                                 break;
                             }
@@ -30013,6 +30171,7 @@ impl Pump {
             stop,
             running,
             sent,
+            progress,
         }
     }
 
@@ -30042,7 +30201,13 @@ impl Pump {
             stop,
             running: None,
             sent: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The leg's pumped steps, read while an answer wait decides how long silence may hold it.
+    fn progress_flag(&self) -> &AtomicU64 {
+        &self.progress
     }
 
     /// Stops the leg and waits for it, so the session's own upload leg is the only reader afterwards, and reports whether it spent any of the app's bytes.
@@ -30121,22 +30286,36 @@ impl<R: WindowRead> WindowRead for ReplyReader<R> {
     }
 }
 
-pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
+fn read_vless_response_body(stream: &mut dyn Read) -> Option<()> {
     let mut header = [0u8; 2 + 255];
-    let mut bounded = HandshakeDeadline {
-        inner: stream,
-        until: Instant::now() + crate::budgets::handshake(),
-    };
-    read_exact(&mut bounded, &mut header[..2]).ok()?;
+    read_exact(stream, &mut header[..2]).ok()?;
     let addons = usize::from(header[1]);
     if addons > 0 {
-        read_exact(&mut bounded, &mut header[2..2 + addons]).ok()?;
+        read_exact(stream, &mut header[2..2 + addons]).ok()?;
     }
     ferrox_core::vless::VlessLink::decode_response_header(&header[..2 + addons]).ok()?;
     if echo_trace_on() {
         echo_trace("response ok");
     }
     Some(())
+}
+
+pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
+    let mut bounded = HandshakeDeadline {
+        inner: stream,
+        until: Instant::now() + crate::budgets::handshake(),
+    };
+    read_vless_response_body(&mut bounded)
+}
+
+fn read_vless_response_deferred(stream: &mut dyn Read, progress: &AtomicU64) -> Option<()> {
+    let mut bounded = UploadDeadline {
+        inner: stream,
+        progress,
+        seen: progress.load(Ordering::Relaxed),
+        until: Instant::now() + crate::budgets::handshake(),
+    };
+    read_vless_response_body(&mut bounded)
 }
 
 const MUX_TARGET: SocketAddr =
