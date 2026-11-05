@@ -2103,7 +2103,8 @@ pub(crate) fn serve_xhttp_split<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((reader, writer)) = crate::xhttp::accept_split_with_settings(reader, writer, settings)
+    let Some((reader, writer)) =
+        crate::xhttp::accept_split_with_settings(reader, writer, settings, None)
     else {
         return;
     };

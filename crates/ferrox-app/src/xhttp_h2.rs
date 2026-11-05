@@ -211,6 +211,8 @@ struct StreamState {
     request_ended: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,
+    /// The session ended under the reader, so later DATA is discarded instead of queued for an answer already owed.
+    stopped: bool,
     /// The response status a client decoded, so a packet POST can refuse a non-2xx answer.
     status: Option<u16>,
     dead: bool,
@@ -1388,7 +1390,8 @@ impl H2Conn {
             .remove(&stream);
     }
 
-    /// The session is over, so the uploads that shared it are too: mark each one ended and wake its parked reader before the connection's death is the only way out.
+    /// The session is over, so the uploads that shared it wake, but the stream stays in the table: a
+    /// stream-up POST still owes its deferred 200, and a reset here would discard it.
     fn end_uploads(&self, sid: &str) {
         let streams: Vec<u32> = {
             let mut uploads = self
@@ -1410,11 +1413,12 @@ impl H2Conn {
                 .streams
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .remove(&stream);
+                .get(&stream)
+                .cloned();
             if let Some(state) = state {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.ended = true;
-                st.dead = true;
+                st.stopped = true;
                 state.cv.notify_all();
             }
         }
@@ -1497,6 +1501,7 @@ impl H2Conn {
                 ended: end_stream,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -2347,6 +2352,7 @@ fn open_stream(
             writer,
             &settings,
             Some(h2out.clone()),
+            None,
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
                 serve(ureader, xwriter, decryption);
@@ -2943,24 +2949,25 @@ fn pump_frame(
                 return true;
             };
             drop(streams);
-            let (finished, abandoned) = {
+            let (finished, abandoned, stopped) = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let finished = st.finished || st.request_ended;
                 let abandoned = st.abandoned;
-                if !abandoned && !st.dead {
+                let stopped = st.stopped;
+                if !abandoned && !st.dead && !stopped {
                     st.body.push_back(body);
                     if flags & F_END != 0 {
                         st.ended = true;
                     }
                 }
                 state.cv.notify_all();
-                (finished, abandoned)
+                (finished, abandoned, stopped)
             };
-            if abandoned {
+            if abandoned || stopped {
                 if !conn.replenish_connection(wire_len) {
                     return false;
                 }
-                if flags & F_END != 0 {
+                if abandoned && flags & F_END != 0 {
                     conn.retire(sid);
                 }
                 return true;
@@ -3386,6 +3393,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -3476,6 +3484,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -3538,6 +3547,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4171,6 +4181,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4215,6 +4226,123 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(2)),
             Ok(Ok(0)),
             "the ended session ends its parked upload"
+        );
+    }
+
+    /// A downlink that ends before its upload's body still owes the POST a 200: the upload's stream
+    /// stays in the table, so the deferred head is not answered by a reset.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_finished_downlink_leaves_its_upload_for_the_response() {
+        struct Discard;
+        impl H2Service for Discard {
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
+        }
+        let sid = "h2-deferred-upload-answer";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, written, _slices) = bare_conn();
+        let upload_state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                stopped: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(2, Arc::clone(&upload_state));
+        let downlink = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 1,
+            _owner: None,
+            client: false,
+        };
+        downlink.bind_session(sid);
+        let upload = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 2,
+            _owner: None,
+            client: false,
+        };
+        upload.bind_upload(sid);
+        downlink.end();
+        assert!(
+            !crate::xhttp::session_is_carried(sid),
+            "the finished downlink ends its session"
+        );
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&2),
+            "the upload stays for its deferred 200"
+        );
+        assert!(
+            pump_frame(&conn, &Discard, T_DATA, 0, 2, vec![0xa5; 4096], &mut None),
+            "a late upload frame is discarded instead of ending the connection"
+        );
+        assert!(
+            upload_state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .body
+                .is_empty(),
+            "the stopped upload queues nothing for an answer already owed"
+        );
+        let mut writer = H2StreamWriter {
+            conn: Arc::clone(&conn),
+            stream: 2,
+            head: Vec::new(),
+            headed: false,
+        };
+        writer
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("the deferred 200 goes out");
+        upload.end();
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut headers, mut end) = (false, false);
+        let mut at = 0;
+        while at + 9 <= bytes.len() {
+            let len = usize::from(bytes[at]) << 16
+                | usize::from(bytes[at + 1]) << 8
+                | usize::from(bytes[at + 2]);
+            let kind = bytes[at + 3];
+            let flags = bytes[at + 4];
+            let id =
+                u32::from_be_bytes([bytes[at + 5], bytes[at + 6], bytes[at + 7], bytes[at + 8]])
+                    & 0x7FFF_FFFF;
+            assert!(kind != T_RST || id != 2, "the upload was reset");
+            headers |= id == 2 && kind == T_HEADERS;
+            end |= id == 2 && kind == T_DATA && flags & F_END != 0;
+            at += 9 + len;
+        }
+        assert!(headers, "the POST receives its 200");
+        assert!(end, "the response ends the stream instead of a reset");
+        assert!(
+            !conn
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&2),
+            "the answered upload retires"
         );
     }
 
@@ -4422,6 +4550,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4507,6 +4636,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4557,6 +4687,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5510,6 +5641,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                stopped: false,
                 abandoned: true,
                 status: None,
                 dead: false,
@@ -5572,6 +5704,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5737,6 +5870,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5781,6 +5915,7 @@ mod tests {
                 ended: true,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5840,6 +5975,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5879,6 +6015,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -6005,6 +6142,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
