@@ -17549,6 +17549,21 @@ fn relay_vless_xhttp_session<R: WindowRead + Send + 'static>(
     if !writer.send(header) {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
+    let mut reader = reader;
+    if reader.awaits_head() {
+        let pump = Pump::to_sink(client, &writer);
+        reader.set_head_progress(pump.progress_handle());
+        let answered = read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some();
+        let sent = pump.end();
+        if !answered {
+            if !sent {
+                note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            return;
+        }
+        relay_sink_xhttp_drained(reader, &writer, client);
+        return;
+    }
     relay_sink_xhttp_drained(ReplyReader::new(reader), &writer, client);
 }
 
@@ -24907,6 +24922,7 @@ impl TcpCopy {
         }
         self.answer = crate::vision::Answer::None;
         self.refused = None;
+        flow.mark_progress();
         self.reply_idle = crate::budgets::RELAY_RESPONSE_IDLE;
         if let Some(success) = self.success.take() {
             success();
@@ -29276,6 +29292,13 @@ pub(crate) trait WindowRead: Read {
     fn parks_on_timeout(&self) -> bool {
         false
     }
+
+    /// A carrier whose first answer head may wait on the upload ties that read to the pump's progress.
+    fn set_head_progress(&mut self, _progress: Arc<AtomicU64>) {}
+
+    fn awaits_head(&self) -> bool {
+        false
+    }
 }
 
 impl<T: WindowRead + ?Sized> WindowRead for Box<T> {
@@ -29285,6 +29308,14 @@ impl<T: WindowRead + ?Sized> WindowRead for Box<T> {
 
     fn parks_on_timeout(&self) -> bool {
         (**self).parks_on_timeout()
+    }
+
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        (**self).set_head_progress(progress);
+    }
+
+    fn awaits_head(&self) -> bool {
+        (**self).awaits_head()
     }
 }
 

@@ -742,6 +742,14 @@ impl<R: Read> Read for Reader<R> {
 }
 
 impl<R: Read> crate::proxy::WindowRead for Reader<R> {
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        Reader::set_head_progress(self, progress);
+    }
+
+    fn awaits_head(&self) -> bool {
+        self.pending_head
+    }
+
     /// Every body the prefix already holds, as spans of it: the relay writes them in one gather without moving them again.
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         self.open()?;
