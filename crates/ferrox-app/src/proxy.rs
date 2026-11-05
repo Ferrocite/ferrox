@@ -1594,7 +1594,8 @@ enum Role {
         out: Outbound,
         dest: Option<Destination>,
         port_map: HashMap<u16, Destination>,
-        original_destination: bool,
+        follow_redirect: bool,
+        receive_original_destination: bool,
         transparent: Option<crate::sockopt::Tproxy>,
         mask: Option<ferrox_core::finalmask::Chain>,
         listen: Option<SocketAddr>,
@@ -12590,12 +12591,12 @@ fn serve_dokodemo(
         .and_then(|settings| settings.get("followRedirect"))
         .and_then(Json::as_bool)
         .unwrap_or(false);
-    let original_destination = inbound
+    let receive_original_destination = inbound
         .get("receiveOriginalDestination")
         .and_then(Json::as_bool)
         .unwrap_or(follow_redirect);
     let dest = dokodemo_target(inbound);
-    if dest.is_none() && !original_destination {
+    if dest.is_none() && !(follow_redirect && receive_original_destination) {
         eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
         return (0, false);
     }
@@ -12614,7 +12615,7 @@ fn serve_dokodemo(
             return (0, false);
         }
     };
-    let transparent = dokodemo_transparent(original_destination, mode);
+    let transparent = dokodemo_transparent(receive_original_destination, mode);
     if let Some(mode) = transparent {
         let available = match mode {
             crate::sockopt::Tproxy::Off => true,
@@ -12655,7 +12656,8 @@ fn serve_dokodemo(
                     out: out.clone(),
                     dest: dest.clone(),
                     port_map: port_map.clone(),
-                    original_destination,
+                    follow_redirect,
+                    receive_original_destination,
                     transparent,
                     mask,
                     listen,
@@ -12668,7 +12670,7 @@ fn serve_dokodemo(
     }
     if networks.contains(&"udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
-        let socket = if original_destination {
+        let socket = if transparent.is_some() {
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
                 return (armed, networks.contains(&"tcp"));
@@ -12682,7 +12684,7 @@ fn serve_dokodemo(
             return (armed, networks.contains(&"tcp"));
         };
         let door = out.clone();
-        if original_destination {
+        if follow_redirect && receive_original_destination {
             thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door));
         } else {
             let Some(dest) = dest else {
@@ -12751,15 +12753,15 @@ fn local_address(ip: std::net::IpAddr) -> bool {
     ip.is_loopback() || ip.is_unspecified() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
-/// xray's receiver marker turns a bare follow into the REDIRECT lookup, and leaves a named mode as it is.
+/// xray's receiver marker turns a bare follow into the REDIRECT lookup; a named mode arms the listener on its own.
 fn dokodemo_transparent(
-    original_destination: bool,
+    receive_original_destination: bool,
     mode: crate::sockopt::Tproxy,
 ) -> Option<crate::sockopt::Tproxy> {
-    match (original_destination, mode) {
+    match (receive_original_destination, mode) {
         (true, crate::sockopt::Tproxy::Off) => Some(crate::sockopt::Tproxy::Redirect),
-        (true, mode) => Some(mode),
-        (false, _) => None,
+        (false, crate::sockopt::Tproxy::Off) => None,
+        (_, mode) => Some(mode),
     }
 }
 
@@ -59747,8 +59749,8 @@ mod tests {
         );
         assert_eq!(
             dokodemo_transparent(false, Tproxy::Redirect),
-            None,
-            "a named mode without the receiver marker arms no transparent socket"
+            Some(Tproxy::Redirect),
+            "a named mode arms the listener without the receiver marker"
         );
     }
 
@@ -67072,23 +67074,28 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             out,
             dest,
             port_map,
-            original_destination,
+            follow_redirect,
+            receive_original_destination,
             transparent,
             mask: _,
             listen,
         } => {
             let local = stream.local_addr().ok();
-            let asked = if original_destination {
-                let found = match transparent.unwrap_or(crate::sockopt::Tproxy::Redirect) {
-                    crate::sockopt::Tproxy::Tproxy => local,
-                    crate::sockopt::Tproxy::Redirect | crate::sockopt::Tproxy::Off => {
-                        match stream.socket_peer() {
-                            Ok(peer) => dokodemo_original_destination(&stream, peer, local),
-                            Err(_) => None,
+            let asked = if follow_redirect {
+                if receive_original_destination {
+                    let found = match transparent.unwrap_or(crate::sockopt::Tproxy::Redirect) {
+                        crate::sockopt::Tproxy::Tproxy => local,
+                        crate::sockopt::Tproxy::Redirect | crate::sockopt::Tproxy::Off => {
+                            match stream.socket_peer() {
+                                Ok(peer) => dokodemo_original_destination(&stream, peer, local),
+                                Err(_) => None,
+                            }
                         }
-                    }
-                };
-                dokodemo_redirected(found, dest.as_ref(), listen)
+                    };
+                    dokodemo_redirected(found, dest.as_ref(), listen)
+                } else {
+                    dest.clone()
+                }
             } else {
                 // The flow's own port is the map's key: xray indexes by the flow's original port, which for a raw front is the listener's.
                 let port = local.map(|bound| bound.port()).unwrap_or_default();

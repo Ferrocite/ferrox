@@ -4610,6 +4610,41 @@ mod tests {
     }
 
     #[test]
+    fn a_receiver_marker_stays_independent_of_follow_redirect() {
+        let range = message(&[varint_field(1, 8080), varint_field(2, 8080)]);
+        let list = message(&[bytes_field(1, &range)]);
+        let receiver = message(&[bytes_field(1, &list)]);
+        let settings = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 8080),
+            varint_field(5, 1),
+            varint_field(7, 2),
+        ]);
+        let json = to_json(&config(
+            &dokodemo_inbound(&receiver, &settings),
+            &freedom_outbound(),
+        ))
+        .expect("followRedirect decodes");
+        let inbound = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            inbound
+                .get("settings")
+                .and_then(|settings| settings.get("followRedirect"))
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            inbound
+                .get("receiveOriginalDestination")
+                .and_then(Json::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn a_dokodemo_port_map_decodes() {
         let entry = message(&[bytes_field(1, b"8080"), bytes_field(2, b"127.0.0.1:9090")]);
         let settings = message(&[

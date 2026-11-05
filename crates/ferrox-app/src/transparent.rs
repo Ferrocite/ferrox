@@ -19,6 +19,8 @@ pub(crate) use linux::{
 #[cfg(target_os = "macos")]
 pub(crate) use darwin::{original_destination, set_transparent};
 
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) use other::original_destination;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) use other::set_transparent;
 
@@ -152,15 +154,12 @@ mod linux {
         set_transparent(&socket, v6)?;
         socket.set_reuse_address(true)?;
         let _ = enable(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT);
-        enable(
-            socket.as_raw_fd(),
-            if v6 { libc::SOL_IPV6 } else { libc::SOL_IP },
-            if v6 {
-                IPV6_RECVORIGDSTADDR
-            } else {
-                IP_RECVORIGDSTADDR
-            },
-        )?;
+        if v6 {
+            enable(socket.as_raw_fd(), libc::SOL_IPV6, IPV6_RECVORIGDSTADDR)?;
+            let _ = enable(socket.as_raw_fd(), libc::SOL_IP, IP_RECVORIGDSTADDR);
+        } else {
+            enable(socket.as_raw_fd(), libc::SOL_IP, IP_RECVORIGDSTADDR)?;
+        }
         socket.bind(&address.into())?;
         Ok(UdpSocket::from(socket))
     }
@@ -213,6 +212,13 @@ mod linux {
                         size,
                     );
                     if let Some(destination) = storage_address(&destination) {
+                        let client = match (client, destination) {
+                            (SocketAddr::V6(c), SocketAddr::V4(_)) => c
+                                .ip()
+                                .to_ipv4_mapped()
+                                .map_or(client, |ip| SocketAddr::new(ip.into(), c.port())),
+                            _ => client,
+                        };
                         return Ok((read as usize, client, destination));
                     }
                 }
@@ -307,6 +313,8 @@ mod darwin {
         let mut look: NatLook = unsafe { zeroed() };
         look.protocol = libc::IPPROTO_TCP as u8;
         look.direction = PF_OUT;
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+        let local = local.map(|local| SocketAddr::new(local.ip().to_canonical(), local.port()));
         let local = match local {
             Some(local) => local,
             None if peer.is_ipv4() => "127.0.0.1:0".parse().expect("literal"),
@@ -410,6 +418,15 @@ mod other {
     }
 
     pub(crate) fn set_transparent(_socket: &socket2::Socket, _v6: bool) -> io::Result<()> {
+        unsupported()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn original_destination(
+        _fd: std::os::fd::RawFd,
+        _peer: std::net::SocketAddr,
+        _local: Option<std::net::SocketAddr>,
+    ) -> io::Result<std::net::SocketAddr> {
         unsupported()
     }
 }

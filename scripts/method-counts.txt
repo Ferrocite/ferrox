@@ -728,6 +728,9 @@ socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 
 # --- dokodemo-door transparent inbound -----------------------------------------
 front-dokodemo ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-dokodemo syscalls-per-datagram UNBLESSED scripts/count-ops.sh
+front-dokodemo user-space-copies-per-datagram UNBLESSED no copy checker yet
+front-dokodemo seconds-per-datagram UNBLESSED CI bench.yml (no cell yet)
 front-dokodemo datagrams-carrying-to-the-target 1 ferrox-app-proxy::tests::a_dokodemo_door_carries_a_datagram_to_its_target
 front-dokodemo datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
 front-dokodemo associations-answering-with-the-relay 1 ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target
