@@ -230,6 +230,17 @@ def check_charts(charts_dir, results):
         scenario.get("ceilings_mib_s") for scenario in scenarios
     ):
         wanted.remove("ceiling.png")
+    priced = [
+        scenario
+        for scenario in scenarios
+        if "setup" not in scenario.get("id", "")
+        and not any(
+            word in scenario.get("id", "")
+            for word in ("idle", "reconnect", "held")
+        )
+    ]
+    if "cpu-per-gib.png" in wanted and not priced:
+        wanted.remove("cpu-per-gib.png")
     if any("setup" in scenario.get("id", "") for scenario in scenarios):
         wanted.append(SETUP_CHART)
     for name in wanted:
