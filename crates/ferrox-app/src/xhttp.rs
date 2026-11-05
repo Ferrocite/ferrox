@@ -4454,7 +4454,7 @@ mod tests {
         );
         assert!(
             head.ends_with(
-                "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
+                "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
             ),
             "{head}"
         );
