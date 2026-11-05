@@ -77,6 +77,12 @@ jobs:
       # owns the URL and the rev, and its checkout is disposable in CI.
       - name: Fetch the pinned console client
         run: ./scripts/fetch-upstream.sh --only psiphon-tunnel-core
+      # The map is checked against the same pinned Config the reference builds,
+      # so a field the console client gains cannot go missing here unnoticed.
+      - name: Check the config map
+        run: |
+          python3 scripts/check-psiphon-parity.py --selftest
+          python3 scripts/check-psiphon-parity.py
       # The vendored psiphon-tls compares its own ConnectionState copy against the
       # standard library's at init, so the pin's toolchain, not whatever is stable
       # today, is the only Go this client runs under.
