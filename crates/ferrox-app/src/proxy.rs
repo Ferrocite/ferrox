@@ -17553,7 +17553,10 @@ fn relay_vless_xhttp_session<R: WindowRead + Send + 'static>(
     if reader.awaits_head() {
         let pump = Pump::to_sink(client, &writer);
         reader.set_head_progress(pump.progress_handle());
-        let answered = read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some();
+        let answered = {
+            let _step = RelayStep::enter();
+            read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some()
+        };
         let sent = pump.end();
         if !answered {
             if !sent {
