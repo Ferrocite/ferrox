@@ -922,6 +922,7 @@ impl Engine {
         Ok(())
     }
 
+    /// The next timer this engine needs, from the oldest sent packet.
     fn wait_timeout(&self, now: Instant) -> Duration {
         let pto = self.pto();
         let next = self
@@ -962,6 +963,7 @@ impl Engine {
         self.crypto_sent[space] < self.crypto_send[space].len()
     }
 
+    /// Retransmit the expired prefix and reset the congestion window.
     fn expire(&mut self, now: Instant) {
         let pto = self.pto();
         let mut at = 0;
@@ -986,6 +988,7 @@ impl Engine {
         }
     }
 
+    /// Build, seal and send one packet in the space from ACKs, control frames and stream bytes.
     #[allow(clippy::too_many_lines)]
     fn send_space(&mut self, space: usize, udp: &mut Udp, now: Instant) -> Result<bool, String> {
         if self.keys(space).is_none() {
@@ -1165,6 +1168,7 @@ impl Engine {
         Some((offset, bytes.len() as u64))
     }
 
+    /// Seal a long-header packet around the frames, returning the header-protected bytes.
     fn seal(&self, space: usize, pn: u64, payload: &[u8]) -> Result<Vec<u8>, String> {
         let keys = self
             .keys(space)
@@ -1335,6 +1339,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Authenticate and decrypt a received packet, returning its space and payload range.
     fn open(
         &mut self,
         space: usize,
@@ -1597,6 +1602,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Process ACK ranges in one pass, keeping unacked packets in send order.
     fn ack(&mut self, space: usize, ranges: &[(u64, u64)], now: Instant) {
         let len = self.sent.len();
         let mut write = 0usize;
@@ -1688,6 +1694,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Place one stream frame at its offset and drain whatever became contiguous.
     fn feed_stream(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<(), String> {
         let end = offset.saturating_add(data.len() as u64);
         if end > self.max_stream || end > self.max_data {
@@ -1752,6 +1759,7 @@ impl Engine {
         }
     }
 
+    /// Move received bytes into the caller's buffer, swapping the whole window when it fits.
     fn pull_received(&mut self, out: &mut Vec<u8>, limit: usize) -> usize {
         if out.is_empty() && limit >= self.received.len() {
             std::mem::swap(out, &mut self.received);
@@ -1883,6 +1891,7 @@ fn drive(shared: &Arc<Shared>, mut udp: Udp, mut engine: Engine) {
 }
 
 impl Engine {
+    /// Send the CONNECTION_CLOSE frame in the narrowest space this engine has keys for.
     fn send_close(&mut self, udp: &mut Udp, now: Instant) -> Result<(), String> {
         let space = if self.one_rtt.is_some() {
             ONE_RTT
@@ -2141,6 +2150,7 @@ fn get_varint(buf: &[u8], at: &mut usize) -> Option<u64> {
     Some(value)
 }
 
+/// Encode the received packet numbers as an ACK frame from a stack-backed range array.
 fn put_ack(buf: &mut Vec<u8>, seen: &[u64]) {
     let mut iter = seen.iter().rev();
     let Some(&largest) = iter.next() else {
