@@ -23,7 +23,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | --- | --- |
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | both roles, both framing sets, and UDP over raw/ws/gRPC/xhttp/http header/httpUpgrade/KCP/Xdrive/QUIC/Hysteria with each carrier's TLS where it has one; the HTTP/2 transport carrier is not dialled |
 | Trojan share-link `trojan://` parser | implemented (`ferrox_core::trojan::TrojanLink`; `check`/`run` accept it beside `vless://`) |
-| Dokodemo transparent inbound | tcp rewrite served (row 24); udp relay and the `SO_ORIGINAL_DST`/TPROXY transparent spelling planned |
+| Dokodemo transparent inbound | done (row 24): tcp/udp rewrite, `portMap`, `followRedirect` over `SO_ORIGINAL_DST`/`DIOCNATLOOK` and Linux `TPROXY`, UDP ancillary original-destination replies on Linux, `finalmask.tcp` fragment chain, JSON and protobuf config; Windows, macOS UDP, the non-follow missing-rewrite fallback, and partial `portMap` spellings are named open |
 | Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 121, 124) |
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | `proxy/dns` outbound done (row 26); the resolver app planned (row 82) |
 | Blackhole outbound | partial (row 25): the three answers, the 403's bytes the reference's own (an oracle drives the pinned handler and the comparison is octet for octet), the flow ending when the peer is done; the datagram lane refuses the association with `0x07` ([blackhole](function/blackhole.md)) |

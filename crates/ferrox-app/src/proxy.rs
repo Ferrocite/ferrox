@@ -1588,11 +1588,16 @@ enum Role {
         accounts: Arc<SocksAccounts>,
     },
     /// dokodemo-door: a raw stream to the address its config rewrites every flow to,
-    /// where a `portMap` entry for the flow's own port replaces the address.
+    /// where a `portMap` entry for the flow's own port replaces the address. A
+    /// `followRedirect` flow asks the kernel where it was really going instead.
     Dokodemo {
         out: Outbound,
-        dest: Destination,
+        dest: Option<Destination>,
         port_map: HashMap<u16, Destination>,
+        follow_redirect: bool,
+        transparent: Option<crate::sockopt::Tproxy>,
+        mask: Option<ferrox_core::finalmask::Chain>,
+        listen: Option<SocketAddr>,
     },
     /// The role's first bytes are a PROXY protocol header, read before the carrier handshake.
     Proxied(Box<Role>),
@@ -1612,11 +1617,19 @@ impl Role {
             | Role::VmessTls { carrier, .. }
             | Role::VmessReality { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
+            Role::Dokodemo { mask, .. } => mask.as_ref(),
             // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
-            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
-                None
-            }
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
             Role::Proxied(inner) => inner.tcp_mask(),
+        }
+    }
+
+    /// The transparent spelling an accepted connection asks the kernel for.
+    fn transparent(&self) -> Option<crate::sockopt::Tproxy> {
+        match self {
+            Role::Dokodemo { transparent, .. } => *transparent,
+            Role::Proxied(inner) => inner.transparent(),
+            _ => None,
         }
     }
 
@@ -3539,8 +3552,11 @@ enum Udp443 {
 fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::sync::Arc<Stop>>) {
     let target = parse_target(address)
         .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
-    let listener = Listener::bind(&target)
-        .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+    let listener = match role.transparent() {
+        Some(_) => Listener::bind_transparent(&target),
+        None => Listener::bind(&target),
+    }
+    .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
     let sniffing = crate::sniff::for_listener(listener.local_addr().ok(), address);
     for stream in listener.incoming() {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
@@ -12561,6 +12577,7 @@ fn serve_vmess_reality(
 
 /// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
 /// inbounds it armed. The tcp flow and the udp flow are served when the config names them.
+#[allow(clippy::too_many_lines)]
 fn serve_dokodemo(
     address: &str,
     inbound: &Json,
@@ -12568,10 +12585,16 @@ fn serve_dokodemo(
     label: &str,
     stop: Option<&Arc<Stop>>,
 ) -> (usize, bool) {
-    let Some(dest) = dokodemo_target(inbound) else {
+    let follow_redirect = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("followRedirect"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let dest = dokodemo_target(inbound);
+    if dest.is_none() && !follow_redirect {
         eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
         return (0, false);
-    };
+    }
     let networks = dokodemo_networks(inbound);
     if !networks
         .iter()
@@ -12580,26 +12603,43 @@ fn serve_dokodemo(
         eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
         return (0, false);
     }
-    // A raw front has no tcp carrier to arm a chain on, so a masked inbound is refused rather than served unmasked.
-    if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
-        eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
-        return (0, false);
+    let mode = match crate::sockopt::inbound_tproxy(inbound.get("streamSettings")) {
+        Ok(mode) => mode,
+        Err(reason) => {
+            eprintln!("dokodemo-door sockopt in {label}: {reason}");
+            return (0, false);
+        }
+    };
+    let transparent = dokodemo_transparent(follow_redirect, mode);
+    if let Some(mode) = transparent {
+        let available = match mode {
+            crate::sockopt::Tproxy::Off => true,
+            crate::sockopt::Tproxy::Redirect => crate::transparent::REDIRECT,
+            crate::sockopt::Tproxy::Tproxy => crate::transparent::TPROXY,
+        };
+        if !available {
+            eprintln!("dokodemo-door in {label} needs a transparent mode this host does not provide: refused, not served");
+            return (0, false);
+        }
     }
-    // The transparent redirect is the kernel's to give: the original destination lives in a socket option this tree asks for nothing. A portMap is not that — it is a table the flow's own port indexes, and the reference replaces the rewrite with a hit (`proxy/dokodemo/dokodemo.go`), so it is carried.
-    if inbound
-        .get("settings")
-        .and_then(|settings| settings.get("followRedirect"))
-        .is_some()
-    {
-        eprintln!("dokodemo-door in {label} asks for `followRedirect`, which this tree cannot carry: refused, not served");
-        return (0, false);
-    }
+    let mask = match crate::config::tcp_mask(inbound.get("streamSettings")) {
+        Some(chain) if !chain.is_empty() => Some(chain),
+        Some(_) => None,
+        None => {
+            eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
+            return (0, false);
+        }
+    };
     let port_map = match dokodemo_port_map(inbound) {
         Ok(map) => map,
         Err(reason) => {
             eprintln!("dokodemo-door portMap in {label}: {reason}");
             return (0, false);
         }
+    };
+    let listen = match parse_target(address) {
+        Ok(crate::conn::Target::Ip(address)) => Some(address),
+        _ => None,
     };
     let mut armed = 0;
     if networks.contains(&"tcp") {
@@ -12611,6 +12651,10 @@ fn serve_dokodemo(
                     out: out.clone(),
                     dest: dest.clone(),
                     port_map: port_map.clone(),
+                    follow_redirect,
+                    transparent,
+                    mask,
+                    listen,
                 },
             ),
             inbound_tag(inbound),
@@ -12620,15 +12664,99 @@ fn serve_dokodemo(
     }
     if networks.contains(&"udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
-        let Ok(socket) = UdpSocket::bind(address) else {
+        let socket = if follow_redirect {
+            let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
+                eprintln!("dokodemo-door udp: {address} names no IP in {label}");
+                return (armed, networks.contains(&"tcp"));
+            };
+            crate::transparent::bind_udp(bound)
+        } else {
+            UdpSocket::bind(address)
+        };
+        let Ok(socket) = socket else {
             eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
             return (armed, networks.contains(&"tcp"));
         };
         let door = out.clone();
-        thread::spawn(move || dokodemo_udp_door(&socket, &dest, &port_map, &door));
+        if follow_redirect {
+            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door));
+        } else {
+            let Some(dest) = dest else {
+                return (armed, networks.contains(&"tcp"));
+            };
+            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &port_map, &door));
+        }
         armed += 1;
     }
     (armed, networks.contains(&"tcp"))
+}
+
+fn dokodemo_original_destination(
+    stream: &Connection,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    #[cfg(unix)]
+    {
+        crate::transparent::original_destination(
+            std::os::fd::AsRawFd::as_raw_fd(stream),
+            peer,
+            local,
+        )
+        .ok()
+    }
+    #[cfg(windows)]
+    {
+        let _ = (stream, peer, local);
+        None
+    }
+}
+
+/// The loop the reference closes when a transparent destination is the inbound's own address.
+fn dokodemo_loopback(dest: &Destination, listen: SocketAddr) -> bool {
+    let Destination::Address(dest) = dest else {
+        return false;
+    };
+    if listen.ip().is_unspecified() {
+        dest.port() == listen.port() && local_address(dest.ip())
+    } else {
+        *dest == listen
+    }
+}
+
+/// The destination a followed flow asks for: the kernel's answer, or the configured
+/// rewrite when the lookup has none; a loopback answer closes rather than falls back.
+fn dokodemo_redirected(
+    found: Option<SocketAddr>,
+    rewrite: Option<&Destination>,
+    listen: Option<SocketAddr>,
+) -> Option<Destination> {
+    let Some(found) = found else {
+        return rewrite.cloned();
+    };
+    let found = Destination::Address(found);
+    if listen.is_some_and(|listen| dokodemo_loopback(&found, listen)) {
+        None
+    } else {
+        Some(found)
+    }
+}
+
+/// xray's `IsLocal`: an address this host owns, which a wildcard listener answers on every one.
+fn local_address(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// xray turns `followRedirect` alone into the REDIRECT lookup, and leaves a named mode as it is.
+fn dokodemo_transparent(
+    follow_redirect: bool,
+    mode: crate::sockopt::Tproxy,
+) -> Option<crate::sockopt::Tproxy> {
+    match (follow_redirect, mode) {
+        (true, crate::sockopt::Tproxy::Off) => Some(crate::sockopt::Tproxy::Redirect),
+        (_, crate::sockopt::Tproxy::Off) => None,
+        (_, mode) => Some(mode),
+    }
 }
 
 /// The per-port rewrite table a dokodemo inbound names: the flow's own port is the key and the
@@ -21652,6 +21780,77 @@ fn dokodemo_udp_door(
             }
         };
         let out = socks_udp_frame(&mut frame, None, &target, &buf[..n]);
+        let _ = leg.0.send(out);
+    }
+}
+
+/// The transparent dokodemo UDP door: every datagram carries its own original destination,
+/// and the answer must leave from that destination or the client drops it.
+fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound) {
+    type Flow = (SocketAddr, SocketAddr);
+    let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    loop {
+        let (n, client, original) = match crate::transparent::receive_original(socket, &mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => {
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(error) if is_udp_gone(&error) => {
+                thread::sleep(UDP_POLL);
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(_) => return,
+        };
+        if n == 0 {
+            continue;
+        }
+        legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+        let key = (client, original);
+        if !legs.contains_key(&key) && legs.len() >= MAX_DOKODEMO_LEGS {
+            continue;
+        }
+        let leg = match legs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let outbound = out.clone();
+                let Some(association) =
+                    udp_association(move |conn| serve_socks(conn, &outbound, &no_accounts()))
+                else {
+                    eprintln!("dokodemo-door udp: the outbound refused the association");
+                    continue;
+                };
+                let Ok(leg) = relay_leg(association.relay) else {
+                    continue;
+                };
+                let Ok(writer) = crate::transparent::reply_socket(original) else {
+                    continue;
+                };
+                let Ok(reader) = leg.try_clone() else {
+                    continue;
+                };
+                let alive = Arc::new(AtomicBool::new(true));
+                let reader_alive = alive.clone();
+                thread::spawn(move || {
+                    let mut back = udp_buffer();
+                    while let Ok(read) = reader.recv(&mut back) {
+                        let Some((_source, payload)) = parse_socks_udp(&back[..read]) else {
+                            continue;
+                        };
+                        if writer.send_to(payload, client).is_err() {
+                            break;
+                        }
+                    }
+                    reader_alive.store(false, Ordering::Relaxed);
+                });
+                vacant.insert((leg, association.control, alive))
+            }
+        };
+        let out = socks_udp_frame(&mut frame, None, &original, &buf[..n]);
         let _ = leg.0.send(out);
     }
 }
@@ -59512,22 +59711,64 @@ mod tests {
         }
     }
 
-    /// The transparent redirect is refused by name: the original destination lives in a
-    /// socket option this tree asks for nothing, so a config naming it must not read
-    /// as served. A portMap is not that — the table is carried, the flow's port indexes it.
     #[test]
-    fn a_dokodemo_front_refuses_the_transparent_settings() {
-        let text = r#"{"inbounds":[{"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":80,"network":"tcp","followRedirect":true}}]}"#;
-        let root = crate::json::parse(text).expect("parses");
-        let inbound = &root
-            .get("inbounds")
-            .and_then(Json::as_arr)
-            .expect("inbounds")[0];
+    fn dokodemo_transparency_reads_follow_and_tproxy() {
+        use crate::sockopt::Tproxy;
+        assert_eq!(dokodemo_transparent(false, Tproxy::Off), None);
         assert_eq!(
-            serve_dokodemo("127.0.0.1:0", inbound, &freedom(), "test", None).0,
-            0,
-            "`followRedirect` is refused, not served as if the rewrite had been asked for"
+            dokodemo_transparent(true, Tproxy::Off),
+            Some(Tproxy::Redirect),
+            "a bare followRedirect is xray's REDIRECT lookup"
         );
+        assert_eq!(
+            dokodemo_transparent(true, Tproxy::Tproxy),
+            Some(Tproxy::Tproxy)
+        );
+        assert_eq!(
+            dokodemo_transparent(false, Tproxy::Redirect),
+            Some(Tproxy::Redirect)
+        );
+    }
+
+    #[test]
+    fn dokodemo_redirect_uses_the_kernel_or_the_rewrite() {
+        let rewrite = Destination::Address("127.0.0.1:9090".parse().expect("address"));
+        assert_eq!(
+            dokodemo_redirected(None, Some(&rewrite), None),
+            Some(rewrite.clone()),
+            "a failed lookup leaves xray's configured rewrite in place"
+        );
+        assert_eq!(dokodemo_redirected(None, None, None), None);
+        let found: SocketAddr = "127.0.0.1:80".parse().expect("address");
+        assert_eq!(
+            dokodemo_redirected(Some(found), Some(&rewrite), None),
+            Some(Destination::Address(found))
+        );
+        let listen: SocketAddr = "127.0.0.1:8080".parse().expect("address");
+        assert_eq!(
+            dokodemo_redirected(Some(listen), Some(&rewrite), Some(listen)),
+            None,
+            "a loopback answer closes even when a rewrite exists"
+        );
+    }
+
+    #[test]
+    fn dokodemo_loopback_is_the_listener_or_its_loopback_port() {
+        let listen: SocketAddr = "0.0.0.0:8080".parse().expect("address");
+        assert!(dokodemo_loopback(
+            &Destination::Address("127.0.0.1:8080".parse().expect("address")),
+            listen
+        ));
+        assert!(!dokodemo_loopback(
+            &Destination::Address("127.0.0.1:8081".parse().expect("address")),
+            listen
+        ));
+        let named: SocketAddr = "127.0.0.1:8080".parse().expect("address");
+        assert!(dokodemo_loopback(&Destination::Address(named), named));
+        assert!(!dokodemo_loopback(
+            &Destination::Name("example.test".to_owned(), 8080),
+            listen
+        ));
     }
 
     /// The rewrite table a `portMap` names: the flow's own port is the key and a hit
@@ -66809,15 +67050,31 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             out,
             dest,
             port_map,
+            follow_redirect,
+            transparent,
+            mask: _,
+            listen,
         } => {
-            // The flow's own port is the map's key: xray indexes by the flow's original port, which for a raw front is the listener's.
-            let port = stream
-                .local_addr()
-                .map(|bound| bound.port())
-                .unwrap_or_default();
-            let dest = port_map.get(&port).unwrap_or(&dest);
-            let (dial, target, tag) = sniff_lane(&out, dest, &stream, None, None);
-            let dest = dial.as_ref().unwrap_or(dest);
+            let local = stream.local_addr().ok();
+            let asked = if follow_redirect {
+                let found = match transparent.unwrap_or(crate::sockopt::Tproxy::Redirect) {
+                    crate::sockopt::Tproxy::Tproxy => local,
+                    crate::sockopt::Tproxy::Redirect | crate::sockopt::Tproxy::Off => {
+                        match stream.socket_peer() {
+                            Ok(peer) => dokodemo_original_destination(&stream, peer, local),
+                            Err(_) => None,
+                        }
+                    }
+                };
+                dokodemo_redirected(found, dest.as_ref(), listen)
+            } else {
+                // The flow's own port is the map's key: xray indexes by the flow's original port, which for a raw front is the listener's.
+                let port = local.map(|bound| bound.port()).unwrap_or_default();
+                port_map.get(&port).or(dest.as_ref()).cloned()
+            };
+            let Some(asked) = asked else { return };
+            let (dial, target, tag) = sniff_lane(&out, &asked, &stream, None, None);
+            let dest = dial.as_ref().unwrap_or(&asked);
             serve_connect(stream, &target, dest, Front::Socks, &[], tag.as_deref());
         }
         Role::Proxied(inner) => dispatch(stream, *inner, None),

@@ -6,11 +6,21 @@ use std::time::Duration;
 
 /// The outbound half of xray's `SocketConfig`: the options an ECH DNS query puts on the
 /// socket it dials. Inbound-only fields are read and left alone, as the reference leaves them.
+/// The transparent spelling a socket config names, as xray's `TProxyMode` reads it.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Tproxy {
+    #[default]
+    Off,
+    Redirect,
+    Tproxy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SocketOptions {
     mark: Option<i32>,
     tfo: Option<i32>,
-    tproxy: bool,
+    tproxy: Tproxy,
     domain: DomainStrategy,
     keep_alive: Option<KeepAlive>,
     congestion: Option<String>,
@@ -70,6 +80,14 @@ pub(crate) fn parse_outbound(node: Option<&Json>) -> Result<Option<SocketOptions
     parse_with(node, "the outbound")
 }
 
+/// The transparent mode an inbound's `streamSettings.sockopt` names.
+pub(crate) fn inbound_tproxy(settings: Option<&Json>) -> Result<Tproxy, String> {
+    let node = settings.and_then(|settings| settings.get("sockopt"));
+    Ok(parse_with(node, "the inbound")?
+        .map(|options| options.tproxy)
+        .unwrap_or_default())
+}
+
 fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>, String> {
     let Some(node) = node else {
         return Ok(None);
@@ -92,10 +110,16 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
         },
         Some(_) => return Err("sockopt.tcpFastOpen is neither a boolean nor an integer".to_owned()),
     };
-    let tproxy = matches!(
-        node.get("tproxy").and_then(Json::as_str),
-        Some(text) if text.eq_ignore_ascii_case("tproxy") || text.eq_ignore_ascii_case("redirect")
-    );
+    let tproxy = match node
+        .get("tproxy")
+        .and_then(Json::as_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("tproxy") => Tproxy::Tproxy,
+        Some("redirect") => Tproxy::Redirect,
+        _ => Tproxy::Off,
+    };
     let domain = match node
         .get("domainStrategy")
         .and_then(Json::as_str)
@@ -515,7 +539,7 @@ mod platform {
                     set_int(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, max_seg)?;
                 }
             }
-            if options.tproxy {
+            if options.tproxy != Tproxy::Off {
                 let level = if addr.is_ipv4() {
                     libc::SOL_IP
                 } else {
