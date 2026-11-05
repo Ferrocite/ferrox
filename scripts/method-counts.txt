@@ -596,6 +596,7 @@ security-utls heap-buffers-for-a-warm-relay-write 0 ferrox-core-tls::shaped::cli
 security-utls pulled-record-plaintext-copies-out-of-a-fitting-window 0 ferrox-core-tls::shaped::client::tests::a_tls13_record_is_read_where_it_lands
 security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::tests::a_pulled_record_lands_in_one_vectored_read
 security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
+security-ech heap-buffers-for-a-shaped-sealer 0 ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations
 security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
 
 # --- ECH -------------------------------------------------------------------

@@ -34,6 +34,7 @@ graph TD
 | quic-lanes-that-fall-back-without-an-offer | 1 | ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer |
 | heap-buffers-for-an-ech-cover | 1 | ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer |
 | heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
+| heap-buffers-for-a-shaped-sealer | 0 | ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations |
 | heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
 <!-- counts:end -->
 
@@ -56,6 +57,7 @@ No matrix cell isolates ECH: the bench cells time a relay after the handshake, a
 
 ## What we removed
 
+- **A boxed sealer and its encapsulation buffer.** The shaped offer keeps the 32-byte encapsulation and the sealer's context on the stack, and the cover's zero payload is written in place rather than staged.
 - **A config rebuild for the retry.** The rejected offer clones the parsed `TlsConfig`, replaces its `ech_config_list` `Arc`, and reuses every other field; no text is parsed again and no server name is resolved again.
 - **A second accept loop for QUIC.** The listener's BoringSSL context is built once per identity and shared with quiche; the dial sets the list on the connection it already made.
 
