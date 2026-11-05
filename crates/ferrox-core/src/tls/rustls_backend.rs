@@ -2064,6 +2064,7 @@ mod tests {
 
     #[test]
     fn a_verifier_that_skips_the_chain_still_rejects_a_forged_handshake_signature() {
+        use rustls::client::danger::ServerCertVerifier as _;
         use rustls::internal::msgs::codec::{Codec as _, Reader};
 
         let mut encoded = Vec::with_capacity(68);
