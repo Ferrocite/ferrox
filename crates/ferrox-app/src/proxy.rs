@@ -487,7 +487,10 @@ fn serve_inbounds_counted(
                             if let Some(stop) = &handler_stop {
                                 if !matches!(
                                     inbound_carrier(inbound),
-                                    Carrier::Kcp(_) | Carrier::Xdrive { .. }
+                                    Carrier::Kcp(_)
+                                        | Carrier::Xdrive { .. }
+                                        | Carrier::Quic
+                                        | Carrier::Hysteria(_)
                                 ) {
                                     handler_stops.push((Arc::clone(stop), address.clone()));
                                 }
@@ -1732,7 +1735,7 @@ impl Role {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
                     let reader = crate::xhttp::ChainReader::new(prefix, reader);
-                    serve_session_trojan_xhttp(reader, writer, &settings, keys.as_ref(), freedom);
+                    serve_trojan_xhttp_carrier(reader, writer, &settings, keys.as_ref(), freedom);
                 });
             }
             Carrier::HttpUpgrade { path, host, .. } => {
@@ -3480,6 +3483,9 @@ pub(crate) struct VmessOut {
     heartbeat: u32,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
+    quic_roots: Option<ferrox_core::tls::Anchors>,
+    quic_ech: Option<Arc<[u8]>>,
+    hysteria_roots: Option<ferrox_core::tls::Anchors>,
 }
 
 #[derive(Debug, Clone)]
@@ -4127,14 +4133,19 @@ pub(crate) fn serve_grpc_muxed(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
+            |id, flow, cmd, _, _| {
+                let allowed = vless_user_allows(users, &id, flow, cmd, freedom, false);
+                if allowed {
+                    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                allowed
+            },
             resolve_endpoint,
         )
     }) else {
         reader.abort();
         return;
     };
-    opened.store(true, std::sync::atomic::Ordering::Relaxed);
     let ask = reverse_ask(users, &got, flow, cmd);
     if matches!(&ask, ReverseAsk::Refused) {
         reader.abort();
@@ -4288,6 +4299,10 @@ impl<R: Read> HandshakeRead<R> {
     pub(crate) fn disarm(&mut self) {
         self.until = None;
         self.step = None;
+    }
+
+    pub(crate) fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -4451,6 +4466,11 @@ impl<R: RelayPoll> RelayPoll for ferrox_core::vless_encryption::EncryptedReader<
 
 impl RelayPoll for crate::quic::QuicStream {
     /// The stream read arms its own quantum and reports the idle itself.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl RelayPoll for crate::hysteria::FlowRead {
+    /// One step already hands the wait back, so the lane is never parked inside the flow.
     fn arm_relay_poll(&mut self) {}
 }
 
@@ -9531,9 +9551,24 @@ thread_local! {
     static WAIT_FD: std::cell::Cell<Option<WaitFd>> = const { std::cell::Cell::new(None) };
 }
 
+thread_local! {
+    /// Whether the socket above is waited for a write rather than a read: a full carrier parks on
+    /// its writability while an empty one parks on its readability.
+    static WAIT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn note_wait_fd(fd: WaitFd) {
     if relay_step_owns_poll() {
+        WAIT_WRITE.with(|slot| slot.set(false));
         WAIT_FD.with(|slot| slot.set(Some(fd)));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn note_wait_fd_write(fd: WaitFd) {
+    if relay_step_owns_poll() {
+        WAIT_FD.with(|slot| slot.set(Some(fd)));
+        WAIT_WRITE.with(|slot| slot.set(true));
     }
 }
 
@@ -9541,8 +9576,19 @@ pub(crate) fn take_wait_fd() -> Option<WaitFd> {
     WAIT_FD.with(std::cell::Cell::take)
 }
 
+pub(crate) fn take_wait_write() -> bool {
+    WAIT_WRITE.with(std::cell::Cell::take)
+}
+
+/// Whether the step's last wait is for writability, so a refused offer can park the lane instead of
+/// retaking its turn on the clock.
+pub(crate) fn write_wait_pending() -> bool {
+    WAIT_WRITE.with(std::cell::Cell::get)
+}
+
 pub(crate) fn forget_wait_fd() {
     WAIT_FD.with(|slot| slot.set(None));
+    WAIT_WRITE.with(|slot| slot.set(false));
 }
 
 thread_local! {
@@ -10914,6 +10960,118 @@ fn dial_trojan_kcp(
     kcp_relay(client, conn);
 }
 
+fn dial_vmess_quic(client: &Connection, vmess: &VmessOut, target: &Destination) {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        return;
+    };
+    let Some(pooled) = crate::quic::pumped_stream_within(&vmess_quic_dial(vmess), budgets::dial())
+    else {
+        return;
+    };
+    let mut writer = pooled.stream_handle();
+    if writer.write_all(&request).is_err() {
+        pooled.cancel();
+        return;
+    }
+    let reader = pooled.stream_handle();
+    let close_stream = pooled.stream_handle();
+    let fin_stream = pooled.stream_handle();
+    let graceful = Arc::new(AtomicBool::new(false));
+    let finish: Arc<dyn Fn() + Send + Sync> = {
+        let graceful = Arc::clone(&graceful);
+        Arc::new(move || {
+            if fin_stream.fin() {
+                graceful.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+    let pooled = Mutex::new(Some(pooled));
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if !graceful.load(std::sync::atomic::Ordering::Relaxed) {
+            close_stream.close();
+        }
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    crate::vmess::pump_relay_carried_with_finish(
+        client,
+        reader,
+        writer,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+        Some(finish),
+    );
+}
+
+fn vmess_quic_dial(vmess: &VmessOut) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: [0; 16],
+        host: std::sync::Arc::from(vmess.host.as_str()),
+        address: std::sync::Arc::from(vmess.address.as_str()),
+        port: vmess.port,
+        upstream: None,
+        roots: vmess.quic_roots.clone(),
+        ech_config_list: vmess.quic_ech.clone(),
+    }
+}
+
+fn vmess_hysteria_dial(vmess: &VmessOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &vmess.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: vmess.host.clone(),
+        address: vmess.address.clone(),
+        port: vmess.port,
+        config: config.clone(),
+        roots: vmess.hysteria_roots.clone(),
+    })
+}
+
+fn dial_vmess_hysteria(
+    client: &Connection,
+    dial: &crate::hysteria::Dial,
+    vmess: &VmessOut,
+    target: &Destination,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        return;
+    };
+    let Some(flow) = crate::hysteria::open(dial, &request, 0) else {
+        return;
+    };
+    let reader = crate::hysteria::FlowRead::new(flow.clone());
+    let closer = flow.clone();
+    let finish_flow = flow.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    let finish: Arc<dyn Fn() + Send + Sync> = Arc::new(move || finish_flow.close());
+    crate::vmess::pump_relay_carried_with_finish(
+        client,
+        reader,
+        flow,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+        Some(finish),
+    );
+}
+
 fn dial_vmess_kcp(
     client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
@@ -10955,6 +11113,7 @@ fn dial_vmess_kcp(
     crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
 }
 
+// KCP has no write-side half-close: its only end is the full `close`, which runs once both relay lanes finish.
 fn kcp_close(conn: &Arc<ferrox_core::kcp::Connection>) -> Arc<dyn Fn() + Send + Sync> {
     let conn = Arc::clone(conn);
     Arc::new(move || conn.close())
@@ -11196,7 +11355,16 @@ fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination
         return;
     }
     let close = xdrive_close(&session);
-    crate::vmess::pump_relay_carried(client, reader, session, &close, send, recv, None);
+    crate::vmess::pump_relay_carried_with_finish(
+        client,
+        reader,
+        session,
+        &close,
+        send,
+        recv,
+        None,
+        Some(Arc::clone(&close)),
+    );
 }
 
 fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination) {
@@ -11921,6 +12089,10 @@ fn serve_vmess_inbound_users(
             serve_xdrive_loop(&settings, address, accept);
             true
         }
+        Carrier::Quic => serve_vmess_quic_inbound(address, inbound, users, freedom, address),
+        Carrier::Hysteria(config) => {
+            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom)
+        }
         carrier if sec == "reality" => {
             if !carrier.tcp_stream() {
                 eprintln!("vmess reality on {address}: not carried on that transport");
@@ -11993,10 +12165,169 @@ fn serve_vmess_inbound_users(
     }
 }
 
+fn serve_vmess_hysteria_inbound(
+    address: &str,
+    inbound: &Json,
+    config: &ferrox_core::hysteria::Config,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) -> bool {
+    if config.version != 2 {
+        eprintln!(
+            "hysteria v{} carrier on {address} is not the v2 serve `hysteria` names: serves nothing",
+            config.version
+        );
+        return false;
+    }
+    let Some(settings) = inbound.get("streamSettings") else {
+        eprintln!("unreadable hysteria identity on {address}: serves nothing");
+        return false;
+    };
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+        eprintln!("unreadable hysteria identity on {address}: serves nothing");
+        return false;
+    };
+    let masq = crate::config::masquerade_from_stream(Some(settings));
+    let Some(prepared) = crate::hysteria::prepare(
+        address,
+        &identity,
+        config.cc,
+        &config.obfs_password,
+        config.quic.as_ref(),
+    ) else {
+        eprintln!("cannot listen on {address}: serves nothing");
+        return false;
+    };
+    let config = config.clone();
+    let hysteria_users = std::sync::Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_vmess_hysteria(flow.with_meter(meter.clone()), &hysteria_users, freedom);
+    });
+    thread::spawn(move || {
+        crate::hysteria::serve_prepared(
+            prepared,
+            std::slice::from_ref(&config.auth),
+            &masq,
+            &serve,
+            std::time::Duration::from_secs(config.udp_idle),
+            config.quic.as_ref(),
+        );
+    });
+    true
+}
+
+fn serve_vmess_quic_inbound(
+    address: &str,
+    inbound: &Json,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+    path: &str,
+) -> bool {
+    let Some(identity) = quic_inbound_identity(inbound) else {
+        eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
+        return false;
+    };
+    let Some(config) = crate::quic::serve_config(&identity) else {
+        eprintln!("unreadable quic tls identity in {path}: serves nothing");
+        return false;
+    };
+    let Ok(sock) = crate::quic::bind_datagram(address) else {
+        eprintln!("cannot listen on {address}: serves nothing");
+        return false;
+    };
+    let users = std::sync::Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::quic::Serve = Arc::new(move |stream| {
+        serve_vmess_quic(stream.with_meter(meter.clone()), &users, freedom);
+    });
+    thread::spawn(move || {
+        crate::quic::serve_loop(
+            crate::quic::Datagram::plain(sock),
+            &Arc::new(Mutex::new(config)),
+            &serve,
+            &Arc::new(AtomicBool::new(false)),
+        );
+    });
+    true
+}
+
+fn serve_vmess_quic(
+    mut stream: crate::quic::QuicStream,
+    users: &crate::vmess::Users,
+    freedom: bool,
+) {
+    let decoded = crate::vmess::accept_request_bounded(&mut stream, users);
+    let closer = stream.clone();
+    let finisher = stream.clone();
+    let graceful = Arc::new(AtomicBool::new(false));
+    let close: crate::vmess::Close = {
+        let graceful = Arc::clone(&graceful);
+        Arc::new(move || {
+            if !graceful.load(std::sync::atomic::Ordering::Relaxed) {
+                closer.close();
+            }
+        })
+    };
+    let finish: crate::vmess::Close = Arc::new(move || {
+        if finisher.fin() {
+            graceful.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    crate::vmess::serve_decoded_with_finish(
+        stream.clone(),
+        stream,
+        &close,
+        decoded,
+        freedom,
+        Some(finish),
+    );
+}
+
+fn serve_vmess_hysteria(flow: crate::hysteria::Flow, users: &crate::vmess::Users, freedom: bool) {
+    let mut reader = crate::hysteria::FlowRead::new(flow.clone());
+    let decoded = crate::vmess::accept_request_bounded(&mut reader, users);
+    let closer = flow.clone();
+    let finisher = flow.clone();
+    let close: crate::vmess::Close = Arc::new(move || closer.close());
+    let finish: crate::vmess::Close = Arc::new(move || finisher.close());
+    crate::vmess::serve_decoded_with_finish(reader, flow, &close, decoded, freedom, Some(finish));
+}
+
+/// A TLS xHTTP carrier for vmess: h2 shares the demux with the vless lane, H1 keeps the session
+/// the carrier has always served.
+fn serve_vmess_xhttp_carrier<
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+    close: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return crate::vmess::serve_xhttp_split(chained, write, settings, users, freedom, close);
+    }
+    let users = Arc::clone(users);
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            crate::vmess::serve_xhttp_accepted(reader, writer, &users, freedom, &close);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
 /// The session a `VMess` listener that declares `security: tls` answers, over raw and every carried carrier.
 fn serve_vmess_tls(
     stream: Connection,
-    users: &crate::vmess::Users,
+    users: &crate::vmess::UsersRef,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -12021,7 +12352,7 @@ fn serve_vmess_tls(
             crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+            serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
         }
         Carrier::HttpHeader { path } => {
             crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
@@ -12045,7 +12376,7 @@ fn serve_vmess_tls(
 )]
 fn serve_vmess_reality(
     stream: Connection,
-    users: &crate::vmess::Users,
+    users: &crate::vmess::UsersRef,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
@@ -12104,7 +12435,7 @@ fn serve_vmess_reality(
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                     let _ = raw.shutdown(Shutdown::Both);
                 });
-                crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+                serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
             });
         }
         Carrier::HttpHeader { path } => {
@@ -12854,9 +13185,15 @@ fn dial_vmess_udp_uplink(
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<VmessUdpUplink> {
     let carried = open_vmess_udp_stream(vmess, dest)?;
-    let udp_send = relay.try_clone().ok()?;
+    let Ok(udp_send) = relay.try_clone() else {
+        (carried.close)();
+        return None;
+    };
+    let Some(pad) = crate::vmess::PadSource::fresh() else {
+        (carried.close)();
+        return None;
+    };
     let done = spawn_vmess_udp_reader(carried.reader, udp_send, source, *dest, carried.recv);
-    let pad = crate::vmess::PadSource::fresh()?;
     Some(VmessUdpUplink {
         write: carried.writer,
         close: carried.close,
@@ -12871,17 +13208,100 @@ fn open_vmess_udp_stream(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedV
     if matches!(&vmess.carrier, Carrier::Xdrive { .. }) {
         return open_vmess_udp_xdrive(vmess, dest);
     }
+    if matches!(&vmess.carrier, Carrier::Quic) {
+        return open_vmess_udp_quic(vmess, dest);
+    }
+    if matches!(&vmess.carrier, Carrier::Hysteria(_)) {
+        return open_vmess_udp_hysteria(vmess, dest);
+    }
     let server = resolve_outbound(&vmess.address, vmess.port)?;
     if matches!(&vmess.carrier, Carrier::Kcp(_)) {
         return open_vmess_udp_kcp(vmess, server, dest);
     }
+    let mask = vmess.carrier.tcp_mask();
+    if let Some(cfg) = vmess.reality.as_deref() {
+        let session = dial_reality_session(&server, cfg, mask)?;
+        return open_vmess_udp_session(
+            vmess,
+            &server,
+            session,
+            || dial_reality_session(&server, cfg, mask),
+            dest,
+        );
+    }
     if let Some(cfg) = vmess.tls.as_deref() {
-        let session = dial_tls_session(&server, cfg, vmess.carrier.tcp_mask())?;
-        return open_vmess_udp_tls(vmess, &server, cfg, session, dest);
+        let session = dial_tls_session(&server, cfg, mask)?;
+        return open_vmess_udp_session(
+            vmess,
+            &server,
+            session,
+            || dial_tls_session(&server, cfg, mask),
+            dest,
+        );
     }
     let uplink = dial_or_report(&server)?.with_mask(vmess.carrier.tcp_mask());
     let shutdown = uplink.try_clone().ok()?;
     open_vmess_udp_plain(vmess, uplink, shutdown, dest)
+}
+
+fn open_vmess_udp_quic(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let pooled = crate::quic::pumped_stream_within(&vmess_quic_dial(vmess), budgets::dial())?;
+    let mut writer = pooled.stream_handle();
+    let mut reader = pooled.stream_handle();
+    if writer.write_all(&request).is_err() {
+        pooled.cancel();
+        return None;
+    }
+    {
+        let mut bounded = HandshakeDeadline {
+            inner: &mut reader,
+            until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
+        };
+        if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
+            pooled.cancel();
+            return None;
+        }
+    }
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close: VmessClose = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        close,
+        send,
+        recv,
+    })
+}
+
+fn open_vmess_udp_hysteria(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let dial = vmess_hysteria_dial(vmess)?;
+    let flow = crate::hysteria::open(&dial, &request, 0)?;
+    let mut reader = crate::hysteria::FlowRead::new(flow.clone());
+    {
+        let mut bounded = HandshakeDeadline {
+            inner: &mut reader,
+            until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
+        };
+        if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
+            flow.close();
+            return None;
+        }
+    }
+    let closer = flow.clone();
+    let close: VmessClose = Arc::new(move || closer.close());
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(flow),
+        close,
+        send,
+        recv,
+    })
 }
 
 fn open_vmess_udp_kcp(
@@ -13124,14 +13544,14 @@ fn open_vmess_udp_plain(
 }
 
 #[allow(clippy::too_many_lines)]
-fn open_vmess_udp_tls(
+fn open_vmess_udp_session<S: Dialed>(
     vmess: &VmessOut,
     server: &SocketAddr,
-    cfg: &ferrox_core::tls::TlsConfig,
-    session: ferrox_core::tls::ClientSession<Connection>,
+    session: S,
+    redial: impl FnOnce() -> Option<S>,
     dest: &SocketAddr,
 ) -> Option<CarriedVmess> {
-    let raw = session.get_ref().try_clone().ok()?;
+    let raw = session.raw_clone()?;
     match &vmess.carrier {
         Carrier::Raw(_) => {
             let (request, send, recv, response_key, response_iv, auth) =
@@ -13141,8 +13561,7 @@ fn open_vmess_udp_tls(
             if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
                 return None;
             }
-            let out = raw.try_clone().ok()?;
-            let (reader, writer) = session_halves(session, out);
+            let (reader, writer, _) = session.into_halves()?;
             Some(CarriedVmess {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
@@ -13206,15 +13625,8 @@ fn open_vmess_udp_tls(
             })
         }
         Carrier::Xhttp { settings, .. } => {
-            let mask = vmess.carrier.tcp_mask();
-            let (mut reader, writer) = tls_xhttp(
-                server,
-                session,
-                || dial_tls_session(server, cfg, mask),
-                &vmess.host,
-                settings,
-                false,
-            )?;
+            let (mut reader, writer) =
+                tls_xhttp(server, session, redial, &vmess.host, settings, false)?;
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
@@ -14544,6 +14956,16 @@ fn dial_vmess(
 ) {
     if vmess.reality.is_some() {
         dial_vmess_reality(client, server, vmess, target);
+        return;
+    }
+    if matches!(vmess.carrier, Carrier::Quic) {
+        dial_vmess_quic(client, vmess, target);
+        return;
+    }
+    if matches!(vmess.carrier, Carrier::Hysteria(_)) {
+        if let Some(dial) = vmess_hysteria_dial(vmess) {
+            dial_vmess_hysteria(client, &dial, vmess, target);
+        }
         return;
     }
     if vmess.tls.is_some() {
@@ -18742,16 +19164,53 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    let Some((mut creader, cwriter)) =
-        crate::xhttp::accept_split_with_settings(read, write, settings)
+    let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
     else {
         echo_trace("session xhttp trojan accept refused");
         return;
     };
+    serve_trojan_xhttp_accepted(creader, cwriter, key, freedom);
+}
+
+/// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
+/// session every TLS xhttp client has always reached.
+fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
+    }
+    let keys: Vec<[u8; 56]> = key.to_vec();
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
+fn serve_trojan_xhttp_accepted(
+    creader: Box<dyn crate::proxy::WindowRead + Send>,
+    cwriter: crate::xhttp::XhttpWriter,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
-    let Some((cmd, target)) = decode_trojan_request(&mut creader, key) else {
+    let mut bounded = crate::proxy::HandshakeRead::new(creader, crate::budgets::handshake());
+    let decoded = decode_trojan_request(&mut bounded, key);
+    bounded.disarm();
+    let creader = bounded.into_inner();
+    let Some((cmd, target)) = decoded else {
         echo_trace("session xhttp trojan decode refused");
-        cwriter.finish();
+        cwriter.abort();
         return;
     };
     crate::accesslog::record_current(&target);
@@ -18790,7 +19249,7 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
         return;
     };
     echo_trace("session xhttp relaying");
-    relay_sink_drained(creader, &cwriter, &uplink);
+    relay_sink_xhttp_drained(creader, &cwriter, &uplink);
 }
 
 fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
@@ -20969,11 +21428,7 @@ fn serve_udp_lane_with(
         Outbound::Trojan(trojan) if trojan_udp_carried(&trojan.carrier) => {
             serve_socks_udp_trojan(relay, trojan);
         }
-        Outbound::Vmess(vmess)
-            if matches!(vmess.carrier, Carrier::Raw(_)) && vmess.tls.is_none() =>
-        {
-            serve_socks_udp_vmess(relay, vmess);
-        }
+        Outbound::Vmess(vmess) => serve_socks_udp_vmess(relay, vmess),
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
             serve_socks_udp_shadowsocks(relay, ss);
         }
@@ -24541,6 +24996,8 @@ pub(crate) mod lane_pool {
         id: u64,
         due: std::sync::OnceLock<Option<std::time::Instant>>,
         fd: WaitFd,
+        /// The side of the descriptor the lane waits on: a full carrier wants a write, an empty one a read.
+        write: bool,
         finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
         lane: Mutex<Option<Lane>>,
         pool: std::sync::Weak<Pool>,
@@ -25029,10 +25486,13 @@ pub(crate) mod lane_pool {
             crate::proxy::forget_wait_idle();
             return Err(lane);
         }
+        let write = crate::proxy::write_wait_pending();
         let Some(fd) = crate::proxy::take_wait_fd() else {
             crate::proxy::forget_wait_idle();
+            crate::proxy::take_wait_write();
             return Err(lane);
         };
+        let _ = crate::proxy::take_wait_write();
         if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
             return Err(lane);
         }
@@ -25043,6 +25503,7 @@ pub(crate) mod lane_pool {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             due: std::sync::OnceLock::new(),
             fd,
+            write,
             finish: crate::proxy::take_wait_finish(),
             lane: Mutex::new(None),
             pool: std::sync::Arc::downgrade(pool),
@@ -25050,11 +25511,15 @@ pub(crate) mod lane_pool {
         slot.put_lane(lane);
         // Watch before reading the end, so a racing end either wakes this slot or leaves the grace it arms.
         let ended = slot.finish.as_ref().map(|flow| flow.watch_park(&slot));
-        // A flow with a living sibling arms no clock; no sibling, or one already ended, keeps the check.
-        let due = match ended {
-            None => Some(std::time::Instant::now() + idle),
-            Some(None) => None,
-            Some(Some(at)) => Some(at + idle),
+        // A flow with a living sibling arms no read clock; a write the peer refuses is bounded even then, by the stall its blocking send used to carry.
+        let now = std::time::Instant::now();
+        let stall = now + crate::budgets::relay_stall();
+        let due = match (ended, write) {
+            (Some(Some(at)), true) => Some((at + idle).min(stall)),
+            (Some(Some(at)), false) => Some(at + idle),
+            (_, true) => Some(stall),
+            (None, false) => Some(now + idle),
+            (Some(None), false) => None,
         };
         let _ = slot.due.set(due);
         #[cfg(test)]
@@ -25105,6 +25570,14 @@ pub(crate) mod lane_pool {
         true
     }
 
+    /// The event a descriptor reported: a write-parked lane wakes on writability, a reader on
+    /// readability, and an error wakes both.
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    struct Ready {
+        read: bool,
+        write: bool,
+    }
+
     /// A parked lane's descriptor wait. The epoll/kqueue shape returns only the descriptors that
     /// are ready, so a wake costs the set's ready lines instead of rebuilding a row per parked lane;
     /// `WSAPoll` keeps the rows and reports which of them are ready.
@@ -25145,7 +25618,7 @@ pub(crate) mod lane_pool {
             reactor
                 .events
                 .resize(64, libc::epoll_event { events: 0, u64: 0 });
-            if !reactor.add(wake) {
+            if !reactor.add(wake, true, false) {
                 return None;
             }
             Some(reactor)
@@ -25175,7 +25648,7 @@ pub(crate) mod lane_pool {
                     udata: std::ptr::null_mut(),
                 },
             );
-            if !reactor.add(wake) {
+            if !reactor.add(wake, true, false) {
                 return None;
             }
             Some(reactor)
@@ -25192,9 +25665,16 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "linux")]
-        fn add(&mut self, fd: WaitFd) -> bool {
+        fn add(&mut self, fd: WaitFd, read: bool, write: bool) -> bool {
+            let mut events = 0;
+            if read {
+                events |= libc::EPOLLIN;
+            }
+            if write {
+                events |= libc::EPOLLOUT;
+            }
             let mut row = libc::epoll_event {
-                events: u32::try_from(libc::EPOLLIN).unwrap_or(u32::MAX),
+                events: u32::try_from(events).unwrap_or(u32::MAX),
                 u64: u64::try_from(fd).unwrap_or(u64::MAX),
             };
             let added = unsafe {
@@ -25208,7 +25688,18 @@ pub(crate) mod lane_pool {
             if added == 0 {
                 return true;
             }
-            std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return false;
+            }
+            // A reused number changes its interest, so every park refreshes the row instead of keeping the old one.
+            (unsafe {
+                libc::epoll_ctl(
+                    self.ep,
+                    libc::EPOLL_CTL_MOD,
+                    fd,
+                    std::ptr::from_mut(&mut row),
+                )
+            }) == 0
         }
 
         #[cfg(target_os = "linux")]
@@ -25219,10 +25710,10 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn change(&self, fd: WaitFd, flags: u16) -> bool {
+        fn change_filter(&self, fd: WaitFd, filter: i16, flags: u16) -> bool {
             let change = libc::kevent {
                 ident: usize::try_from(fd).unwrap_or(usize::MAX),
-                filter: libc::EVFILT_READ,
+                filter,
                 flags,
                 fflags: 0,
                 data: 0,
@@ -25241,17 +25732,32 @@ pub(crate) mod lane_pool {
         }
 
         #[cfg(target_os = "macos")]
-        fn add(&mut self, fd: WaitFd) -> bool {
-            self.change(fd, libc::EV_ADD | libc::EV_ENABLE)
+        fn change(&self, fd: WaitFd, flags: u16) -> bool {
+            self.change_filter(fd, libc::EVFILT_READ, flags)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn add(&mut self, fd: WaitFd, read: bool, write: bool) -> bool {
+            let read_ok = read && self.change(fd, libc::EV_ADD | libc::EV_ENABLE);
+            let write_ok = !write
+                || self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ENABLE);
+            if !read {
+                self.change(fd, libc::EV_DELETE);
+            }
+            if !write {
+                self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
+            }
+            read_ok && write_ok
         }
 
         #[cfg(target_os = "macos")]
         fn del(&mut self, fd: WaitFd) {
             self.change(fd, libc::EV_DELETE);
+            self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
         }
 
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        fn add(&mut self, _: WaitFd) -> bool {
+        fn add(&mut self, _: WaitFd, _: bool, _: bool) -> bool {
             true
         }
 
@@ -25259,7 +25765,7 @@ pub(crate) mod lane_pool {
         fn del(&mut self, _: WaitFd) {}
 
         #[cfg(target_os = "linux")]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
             let millis =
                 libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
             let count = unsafe {
@@ -25275,12 +25781,23 @@ pub(crate) mod lane_pool {
             }
             self.events[..usize::try_from(count).unwrap_or(0)]
                 .iter()
-                .map(|event| libc::c_int::try_from(event.u64).unwrap_or(libc::c_int::MAX))
+                .map(|event| {
+                    let bits = event.events;
+                    let error = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0;
+                    (
+                        libc::c_int::try_from(event.u64).unwrap_or(libc::c_int::MAX),
+                        Ready {
+                            read: error
+                                || bits & (libc::EPOLLIN as u32 | libc::EPOLLPRI as u32) != 0,
+                            write: error || bits & libc::EPOLLOUT as u32 != 0,
+                        },
+                    )
+                })
                 .collect()
         }
 
         #[cfg(target_os = "macos")]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
             let seconds = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
             let nanos = i64::from(timeout.subsec_nanos());
             let span = libc::timespec {
@@ -25302,12 +25819,21 @@ pub(crate) mod lane_pool {
             }
             self.events[..usize::try_from(count).unwrap_or(0)]
                 .iter()
-                .map(|event| libc::c_int::try_from(event.ident).unwrap_or(libc::c_int::MAX))
+                .map(|event| {
+                    let error = event.flags & (libc::EV_ERROR | libc::EV_EOF) != 0;
+                    (
+                        libc::c_int::try_from(event.ident).unwrap_or(libc::c_int::MAX),
+                        Ready {
+                            read: error || event.filter == libc::EVFILT_READ,
+                            write: error || event.filter == libc::EVFILT_WRITE,
+                        },
+                    )
+                })
                 .collect()
         }
 
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
             let millis =
                 libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
             let mut rows = Vec::with_capacity(self.fds.len() + 1);
@@ -25316,10 +25842,19 @@ pub(crate) mod lane_pool {
                 events: libc::POLLIN,
                 revents: 0,
             });
-            for fd in self.fds.keys() {
+            let parked: Vec<WaitFd> = self.fds.keys().copied().collect();
+            for fd in parked {
+                let (read, write) = self.interests(fd);
+                let mut events = 0;
+                if read {
+                    events |= libc::POLLIN;
+                }
+                if write {
+                    events |= libc::POLLOUT;
+                }
                 rows.push(libc::pollfd {
-                    fd: *fd,
-                    events: libc::POLLIN,
+                    fd,
+                    events,
                     revents: 0,
                 });
             }
@@ -25335,7 +25870,16 @@ pub(crate) mod lane_pool {
             }
             rows.iter()
                 .filter(|row| row.revents != 0)
-                .map(|row| row.fd)
+                .map(|row| {
+                    let error = row.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0;
+                    (
+                        row.fd,
+                        Ready {
+                            read: error || row.revents & (libc::POLLIN | libc::POLLPRI) != 0,
+                            write: error || row.revents & libc::POLLOUT != 0,
+                        },
+                    )
+                })
                 .collect()
         }
 
@@ -25352,7 +25896,7 @@ pub(crate) mod lane_pool {
 
         // `WSAPoll` takes the whole set per wait, so a socket joins the rows and leaves with its slot.
         #[cfg(windows)]
-        fn add(&mut self, _: WaitFd) -> bool {
+        fn add(&mut self, _: WaitFd, _: bool, _: bool) -> bool {
             true
         }
 
@@ -25360,9 +25904,10 @@ pub(crate) mod lane_pool {
         fn del(&mut self, _: WaitFd) {}
 
         #[cfg(windows)]
-        fn wait(&mut self, timeout: std::time::Duration) -> Vec<WaitFd> {
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
             use windows_sys::Win32::Networking::WinSock::{
-                WSAPoll, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+                WSAPoll, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, POLLWRNORM, SOCKET,
+                WSAPOLLFD,
             };
             let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
             self.rows.clear();
@@ -25371,10 +25916,19 @@ pub(crate) mod lane_pool {
                 events: POLLIN | POLLRDNORM,
                 revents: 0,
             });
-            for fd in self.fds.keys() {
+            let parked: Vec<WaitFd> = self.fds.keys().copied().collect();
+            for fd in parked {
+                let (read, write) = self.interests(fd);
+                let mut events = 0;
+                if read {
+                    events |= POLLIN | POLLRDNORM;
+                }
+                if write {
+                    events |= POLLWRNORM;
+                }
                 self.rows.push(WSAPOLLFD {
-                    fd: *fd as SOCKET,
-                    events: POLLIN | POLLRDNORM,
+                    fd: fd as SOCKET,
+                    events,
                     revents: 0,
                 });
             }
@@ -25396,12 +25950,21 @@ pub(crate) mod lane_pool {
             self.rows
                 .iter()
                 .filter(|row| row.revents != 0)
-                .map(|row| row.fd as WaitFd)
+                .map(|row| {
+                    let error = row.revents & (POLLERR | POLLHUP | POLLNVAL) != 0;
+                    (
+                        row.fd as WaitFd,
+                        Ready {
+                            read: error || row.revents & (POLLIN | POLLRDNORM) != 0,
+                            write: error || row.revents & POLLWRNORM != 0,
+                        },
+                    )
+                })
                 .collect()
         }
 
         /// Registers a fresh slot, or arms its turn a quantum out when its descriptor cannot be
-        /// watched. The first slot on a descriptor adds it; the last one removes it.
+        /// watched. The last slot on a descriptor removes it.
         fn park(&mut self, slot: std::sync::Arc<ReadySlot>) -> Option<std::sync::Arc<ReadySlot>> {
             if slot.is_empty() {
                 return None;
@@ -25410,45 +25973,75 @@ pub(crate) mod lane_pool {
                 self.due.push(std::cmp::Reverse((due, slot.id)));
             }
             let fd = slot.fd;
+            let id = slot.id;
             // A stale id can outlive its closed descriptor, so a reused number is added again.
-            if !self.add(fd) {
+            self.fds.entry(fd).or_default().push(id);
+            self.slots.insert(id, slot);
+            if !self.refresh(fd) {
                 // A descriptor the reactor cannot watch keeps the poll's pace instead of spinning the worker.
                 self.due.push(std::cmp::Reverse((
                     std::time::Instant::now() + crate::budgets::RELAY_POLL,
-                    slot.id,
+                    id,
                 )));
-                self.slots.insert(slot.id, slot);
-                return None;
             }
-            self.fds.entry(fd).or_default().push(slot.id);
-            self.slots.insert(slot.id, slot);
             None
+        }
+
+        /// The interest a descriptor's parked lanes want: a reader watches readability, a writer writability.
+        fn interests(&self, fd: WaitFd) -> (bool, bool) {
+            let mut read = false;
+            let mut write = false;
+            if let Some(ids) = self.fds.get(&fd) {
+                for id in ids {
+                    if let Some(slot) = self.slots.get(id) {
+                        if slot.write {
+                            write = true;
+                        } else {
+                            read = true;
+                        }
+                    }
+                }
+            }
+            (read, write)
+        }
+
+        /// Re-issues a descriptor's registration from the lanes still parked on it, so a slot that
+        /// wanted only writability cannot be woken by the peer's readable byte.
+        fn refresh(&mut self, fd: WaitFd) -> bool {
+            let (read, write) = self.interests(fd);
+            if !read && !write {
+                return true;
+            }
+            self.add(fd, read, write)
         }
 
         fn retire(&mut self, id: u64) {
             let Some(slot) = self.slots.remove(&id) else {
                 return;
             };
-            let fd = slot.fd;
-            let mut last = false;
-            if let Some(ids) = self.fds.get_mut(&fd) {
-                ids.retain(|known| *known != id);
-                last = ids.is_empty();
-            }
-            if last {
-                self.fds.remove(&fd);
-                self.del(fd);
-            }
+            self.settle_fd(slot.fd);
         }
 
-        /// Hands every slot on a ready descriptor back to the queue. Level-triggered, so a lane that
-        /// parks again after leaving a partial frame re-arms and fires at once.
-        fn wake(&mut self, fd: WaitFd, ready: &mut Vec<Lane>) {
-            let Some(ids) = self.fds.remove(&fd) else {
+        /// Hands every slot the ready event matches back to the queue, leaving the others parked.
+        /// Level-triggered, so a lane that parks again after leaving a partial frame re-arms and
+        /// fires at once.
+        fn wake(&mut self, fd: WaitFd, ready: Ready, lanes: &mut Vec<Lane>) {
+            let Some(ids) = self.fds.get(&fd).cloned() else {
                 return;
             };
-            self.del(fd);
+            let mut remaining = Vec::with_capacity(ids.len());
             for id in ids {
+                let wanted = self.slots.get(&id).is_some_and(|slot| {
+                    if slot.write {
+                        ready.write
+                    } else {
+                        ready.read
+                    }
+                });
+                if !wanted {
+                    remaining.push(id);
+                    continue;
+                }
                 let Some(slot) = self.slots.remove(&id) else {
                     continue;
                 };
@@ -25458,7 +26051,14 @@ pub(crate) mod lane_pool {
                 if let Some(flow) = slot.finish.as_ref() {
                     flow.unwatch_park(&slot);
                 }
-                ready.push(lane);
+                lanes.push(lane);
+            }
+            if remaining.is_empty() {
+                self.fds.remove(&fd);
+                self.del(fd);
+            } else {
+                self.fds.insert(fd, remaining);
+                let _ = self.refresh(fd);
             }
         }
 
@@ -25471,7 +26071,7 @@ pub(crate) mod lane_pool {
                 let Some(slot) = self.slots.remove(&id) else {
                     continue;
                 };
-                self.retire_fd(&slot);
+                self.settle_fd(slot.fd);
                 let Some(lane) = slot.take_lane() else {
                     continue;
                 };
@@ -25482,16 +26082,14 @@ pub(crate) mod lane_pool {
             }
         }
 
-        fn retire_fd(&mut self, slot: &ReadySlot) {
-            let fd = slot.fd;
-            let mut empty = false;
-            if let Some(ids) = self.fds.get_mut(&fd) {
-                ids.retain(|known| *known != slot.id);
-                empty = ids.is_empty();
-            }
+        /// Drops a descriptor with no lanes left, or narrows the interest of the ones that remain.
+        fn settle_fd(&mut self, fd: WaitFd) {
+            let empty = self.fds.get(&fd).is_none_or(Vec::is_empty);
             if empty {
                 self.fds.remove(&fd);
                 self.del(fd);
+            } else {
+                let _ = self.refresh(fd);
             }
         }
     }
@@ -25566,11 +26164,11 @@ pub(crate) mod lane_pool {
                 None => std::time::Duration::from_secs(1),
             };
             let ready_fds = reactor.wait(timeout);
-            for fd in ready_fds {
+            for (fd, flags) in ready_fds {
                 if fd == wake.key() {
                     wake.drain();
                 } else {
-                    reactor.wake(fd, &mut ready);
+                    reactor.wake(fd, flags, &mut ready);
                 }
             }
             reactor.wake_due(std::time::Instant::now(), &mut ready);
@@ -26139,6 +26737,35 @@ pub(crate) mod lane_pool {
             );
         }
 
+        /// A parked lane's deadline follows the latest write, not the sibling's older end.
+        #[test]
+        fn a_parked_deadline_follows_the_last_write() {
+            let flow = std::sync::Arc::new(crate::proxy::RelayFinish::new(
+                true,
+                std::sync::Arc::new(|| {}),
+                None,
+            ));
+            flow.mark_ended();
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd: 0,
+                write: false,
+                finish: Some(std::sync::Arc::clone(&flow)),
+                lane: Mutex::new(None),
+                pool: std::sync::Weak::new(),
+            });
+            let at_end = flow.watch_park(&slot).expect("the sibling ended");
+            thread::sleep(Duration::from_millis(20));
+            flow.mark_progress();
+            let at_write = flow.watch_park(&slot).expect("the sibling ended");
+            assert!(
+                at_write > at_end,
+                "the parked deadline stayed at the sibling's end"
+            );
+            flow.unwatch_park(&slot);
+        }
+
         /// A descriptor number the kernel dropped, then reused, is registered again: the stale id
         /// left in the parked set cannot keep the new socket out of the interest set.
         #[cfg(unix)]
@@ -26158,6 +26785,7 @@ pub(crate) mod lane_pool {
                     id,
                     due: std::sync::OnceLock::new(),
                     fd,
+                    write: false,
                     finish: None,
                     lane: Mutex::new(None),
                     pool: std::sync::Arc::downgrade(&pool),
@@ -26187,11 +26815,24 @@ pub(crate) mod lane_pool {
             let ready = reactor.wait(Duration::from_millis(200));
             assert_eq!(
                 ready,
-                vec![fd],
+                vec![(
+                    fd,
+                    Ready {
+                        read: true,
+                        write: false
+                    }
+                )],
                 "the reused descriptor stayed out of the interest set"
             );
             let mut lanes = Vec::new();
-            reactor.wake(fd, &mut lanes);
+            reactor.wake(
+                fd,
+                Ready {
+                    read: true,
+                    write: false,
+                },
+                &mut lanes,
+            );
             assert_eq!(
                 lanes.len(),
                 2,
@@ -26224,6 +26865,7 @@ pub(crate) mod lane_pool {
                 id: 1,
                 due: std::sync::OnceLock::new(),
                 fd,
+                write: false,
                 finish: None,
                 lane: Mutex::new(None),
                 pool: std::sync::Arc::downgrade(&pool),
@@ -26245,6 +26887,92 @@ pub(crate) mod lane_pool {
             reactor.wake_due(park + crate::budgets::RELAY_POLL * 4, &mut lanes);
             assert_eq!(lanes.len(), 1, "the unwatchable descriptor never came back");
             let _ = std::fs::remove_file(&path);
+        }
+
+        /// A lane parked on a full carrier is woken by the socket taking bytes again, not by the clock.
+        #[cfg(unix)]
+        #[test]
+        fn a_write_slot_waits_for_the_socket_to_drain() {
+            use std::io::{Read as _, Write as _};
+            use std::os::fd::AsRawFd;
+
+            let (mut side, mut peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+            side.set_nonblocking(true).expect("non-blocking");
+            while side.write(&[0u8]).is_ok() {}
+            side.set_nonblocking(false).expect("blocking");
+            peer.set_nonblocking(true).expect("non-blocking");
+            let fd = side.as_raw_fd();
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = |id: u64, write: bool| {
+                let slot = std::sync::Arc::new(ReadySlot {
+                    id,
+                    due: std::sync::OnceLock::new(),
+                    fd,
+                    write,
+                    finish: None,
+                    lane: Mutex::new(None),
+                    pool: std::sync::Arc::downgrade(&pool),
+                });
+                slot.put_lane(Lane {
+                    step: Box::new(|| Next::Done),
+                    complete: Some(Box::new(|| {})),
+                    idle: 0,
+                    relay: true,
+                });
+                slot
+            };
+            assert!(
+                reactor.park(slot(1, false)).is_none(),
+                "the reader was refused"
+            );
+            assert!(
+                reactor.park(slot(2, true)).is_none(),
+                "the writer was refused on a socket the reader already holds"
+            );
+            assert!(
+                reactor.wait(Duration::from_millis(50)).is_empty(),
+                "a full socket reported itself writable"
+            );
+            // A byte the peer sends makes the same descriptor readable; only the reader comes back.
+            peer.write_all(b"y").expect("writes");
+            let ready = reactor.wait(Duration::from_secs(2));
+            assert_eq!(
+                ready,
+                vec![(
+                    fd,
+                    Ready {
+                        read: true,
+                        write: false
+                    }
+                )],
+                "a readable socket reported itself writable"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake(fd, ready[0].1, &mut lanes);
+            assert_eq!(
+                lanes.len(),
+                1,
+                "the peer's readable byte woke the write-parked lane"
+            );
+            let mut sink = [0u8; 4096];
+            while peer.read(&mut sink).is_ok() {}
+            let ready = reactor.wait(Duration::from_secs(2));
+            assert_eq!(
+                ready,
+                vec![(
+                    fd,
+                    Ready {
+                        read: false,
+                        write: true
+                    }
+                )],
+                "the drained socket did not wake its writer"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake(fd, ready[0].1, &mut lanes);
+            assert_eq!(lanes.len(), 1, "the drained socket never woke its writer");
         }
 
         /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
@@ -26629,6 +27357,8 @@ pub(crate) struct RelayFinish {
     left: AtomicU32,
     ended: AtomicBool,
     ended_at: Mutex<Option<std::time::Instant>>,
+    /// The latest write either direction finished, so a lane that still moves bytes keeps its grace.
+    progress_at: Mutex<Option<std::time::Instant>>,
     /// Lanes parked on the peer's read, so ending this flow hands its sibling back at once.
     parked: Mutex<Vec<std::sync::Weak<lane_pool::ReadySlot>>>,
     closed: AtomicBool,
@@ -26651,6 +27381,7 @@ impl RelayFinish {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
             ended_at: Mutex::new(None),
+            progress_at: Mutex::new(None),
             parked: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             close_first,
@@ -26697,10 +27428,16 @@ impl RelayFinish {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         parked.push(std::sync::Arc::downgrade(slot));
-        *self
+        let ended = *self
             .ended_at
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ended = ended?;
+        let progress = *self
+            .progress_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(ended.max(progress.unwrap_or(ended)))
     }
 
     pub(crate) fn unwatch_park(&self, slot: &std::sync::Arc<lane_pool::ReadySlot>) {
@@ -26711,12 +27448,28 @@ impl RelayFinish {
             .retain(|parked| !parked.ptr_eq(&weak));
     }
 
+    /// A successful write: bytes still moving restart the reply grace after the sibling's end.
+    pub(crate) fn mark_progress(&self) {
+        *self
+            .progress_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+    }
+
     /// True once the sibling ended and `idle` has run since: a lane waits for the last reply that follows its sibling's end, then hands its thread back.
     pub(crate) fn ended_and_idle(&self, idle: Duration) -> bool {
-        self.ended_at
+        let ended = *self
+            .ended_at
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some_and(|at| at.elapsed() >= idle)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(ended) = ended else {
+            return false;
+        };
+        let progress = *self
+            .progress_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ended.max(progress.unwrap_or(ended)).elapsed() >= idle
     }
 
     fn close_once(&self) {
@@ -27187,6 +27940,11 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
             Push::Lost
         }
     }
+    /// One window offered without waiting on a full socket: a carrier that can report a partial take
+    /// parks the lane on its writability, and the default keeps the blocking send.
+    fn push_ready(&self, bytes: &[u8]) -> Push {
+        self.push(bytes)
+    }
     /// Bytes a parked push accepted but the socket did not take yet: a lane that owes none still
     /// drains them, so a stalled record is not stranded behind an idle read.
     fn settle(&self) -> Settle {
@@ -27225,6 +27983,13 @@ pub(crate) enum Settle {
 pub(crate) trait FrameWrite: Write + Send {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
 
+    /// One framed offer that never waits on a full socket: `Some` is the payload prefix the
+    /// transport took, `None` a transport that cannot report a partial take (a sealed record, a
+    /// masked frame), whose caller keeps the blocking `write_slices`.
+    fn write_ready(&mut self, _parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        None
+    }
+
     /// Every byte is taken, but a transport with a paced tail may not have put it on the wire yet:
     /// it owns the rest, so a lane never waits on a socket the peer has not drained.
     fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
@@ -27256,6 +28021,11 @@ pub(crate) trait FrameWrite: Write + Send {
 impl FrameWrite for Connection {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        Some(Connection::write_ready(self, parts))
     }
 
     fn arm_write(&mut self, timeout: Duration) {
@@ -27566,6 +28336,7 @@ struct Forward {
     sent: usize,
     spins: u32,
     parked: Option<std::time::Instant>,
+    stopped: Option<std::time::Instant>,
 }
 
 impl Forward {
@@ -27576,6 +28347,7 @@ impl Forward {
             sent: 0,
             spins: 0,
             parked: None,
+            stopped: None,
         }
     }
 }
@@ -27620,15 +28392,28 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
     }
 }
 
+/// Stamps the first offer that made no progress and reports whether the stall budget has run out.
+fn write_parked(at: &mut Forward) -> bool {
+    let now = std::time::Instant::now();
+    let since = *at.stopped.get_or_insert(now);
+    now.duration_since(since) >= crate::budgets::relay_stall()
+}
+
 /// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
 fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
     while at.sent < at.pending {
-        match uplink.push(&buffer.prefix(at.pending)[at.sent..]) {
+        match uplink.push_ready(&buffer.prefix(at.pending)[at.sent..]) {
             Push::Took(n) if n > 0 => {
                 at.sent += n;
                 at.spins = 0;
+                at.stopped = None;
             }
-            // A full window is another lane's frame away, so the leg rejoins the queue at once: a quantum spent here is a window the peer cannot grant.
+            // A carrier that takes nothing for the stall budget ends the leg, wherever the lane parks.
+            Push::Took(_) | Push::Parked if write_parked(at) => return Some(Next::Done),
+            // A full socket hands the lane to the reactor, while a full window rejoins the queue at once.
+            Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
+                return Some(Next::Idle);
+            }
             Push::Took(_) | Push::Parked => {
                 at.spins += 1;
                 if at.spins < RELAY_SPINS {
@@ -30875,6 +31660,9 @@ fn loopback_dial(
                 reality: None,
                 headers,
                 heartbeat,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             }))
         }
         "shadowsocks" if matches!(stream_security(inbound), "" | "none") => {
@@ -32493,6 +33281,7 @@ fn vless_loopback_encryption(
     )))
 }
 
+#[allow(clippy::too_many_lines)]
 fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
     if let Some((outbound, server, user)) = vmess_outbounds(root).next() {
         let address = server.get("address").and_then(Json::as_str)?.to_owned();
@@ -32543,30 +33332,72 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 reality: Some(reality),
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             });
         }
-        if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
-            return Some(VmessOut {
-                address,
-                port,
-                id,
-                cipher,
-                auth_len,
-                no_termination,
-                carrier,
-                host,
-                tls: Some(tls),
-                reality: None,
-                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
-                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
-            });
+        let security = stream_security(outbound);
+        let quic_tls = outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            == Some("quic")
+            && security == "tls";
+        let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+        if security == "tls" && !quic_tls && !hysteria_tls {
+            if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
+                return Some(VmessOut {
+                    address,
+                    port,
+                    id,
+                    cipher,
+                    auth_len,
+                    no_termination,
+                    carrier,
+                    host,
+                    tls: Some(tls),
+                    reality: None,
+                    headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                    heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                    quic_roots: None,
+                    quic_ech: None,
+                    hysteria_roots: None,
+                });
+            }
         }
         // A security the tree cannot dial is refused, never silently sent plain.
         let stored = xdrive_carried(outbound, &address);
-        if !matches!(stream_security(outbound), "" | "none") && stored.is_none() {
+        if !matches!(security, "" | "none") && !quic_tls && !hysteria_tls && stored.is_none() {
             return None;
         }
         let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+        if let Carrier::Unknown { network } = &carrier {
+            eprintln!("vmess: network `{network}` is not dialled; outbound refused");
+            return None;
+        }
+        if matches!(&carrier, Carrier::Masque | Carrier::Http) {
+            eprintln!("vmess: the masque and http carriers are not dialled; outbound refused");
+            return None;
+        }
+        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+            Carrier::Quic => {
+                let ech = if quic_tls {
+                    match crate::config::quic_ech_config(outbound, &address) {
+                        Ok(ech) => ech,
+                        Err(why) => {
+                            eprintln!("vmess: {why}; the quic dial will fail");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
+        };
         return Some(VmessOut {
             address,
             port,
@@ -32580,6 +33411,9 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             reality: None,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            quic_roots,
+            quic_ech,
+            hysteria_roots,
         });
     }
     None
@@ -33418,6 +34252,25 @@ mod tests {
             lane_pool::Next::Retry,
             "a yield is progress, not the end of the flow"
         );
+    }
+
+    /// A write after the sibling's end restarts the reply grace: a lane with bytes still moving stays.
+    #[test]
+    fn a_write_after_the_sibling_ends_restarts_the_reply_grace() {
+        let finish = RelayFinish::new(true, Arc::new(|| {}), None);
+        let idle = Duration::from_millis(50);
+        let past = std::time::Instant::now()
+            .checked_sub(idle + Duration::from_millis(1))
+            .expect("a clock past the grace");
+        *finish.ended_at.lock().expect("ended") = Some(past);
+        assert!(
+            finish.ended_and_idle(idle),
+            "the grace ran from the sibling's end"
+        );
+        finish.mark_progress();
+        assert!(!finish.ended_and_idle(idle), "the write restarts the grace");
+        std::thread::sleep(idle + Duration::from_millis(1));
+        assert!(finish.ended_and_idle(idle), "the grace runs from the write");
     }
 
     /// A closed session that still holds plaintext delivers it: a read that filled the caller's
@@ -36703,6 +37556,111 @@ mod tests {
             Some(fd),
             "a socket carrier parks on its descriptor"
         );
+    }
+
+    /// A full carrier parks the lane on the socket's writability instead of spending a worker in the
+    /// send clock: the offer returns at once and names the descriptor the reactor must watch.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_carrier_parks_the_lane_instead_of_the_worker() {
+        use std::time::{Duration, Instant};
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            crate::ws::accept(stream, "/frame").expect("upgrades")
+        });
+        let stream = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (client, _client_writer) =
+            crate::ws::connect(stream, "127.0.0.1", "/frame", 0, b"", &[], 0).expect("upgrades");
+        let (_reader, writer) = server.join().expect("joins");
+
+        let chunk = vec![7u8; 32 * 1024];
+        let mut filled = 0usize;
+        loop {
+            match writer.push_ready(&chunk) {
+                Push::Took(n) if n > 0 => filled += n,
+                Push::Parked => break,
+                _ => panic!("the carrier ended while filling"),
+            }
+            assert!(filled < 256 * 1024 * 1024, "the socket never filled");
+        }
+
+        // The peer drains after the send clock the parked lane must not pay.
+        let drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            std::thread::sleep(Duration::from_millis(250));
+            let mut sink = [0u8; 8192];
+            let mut client = client;
+            let _ = client.read(&mut sink);
+        });
+
+        let mut buffer = RelayBuf::with_len(64 * 1024);
+        buffer.as_mut()[..1024].fill(1);
+        let mut at = Forward::new();
+        at.pending = 1024;
+        let step = crate::proxy::RelayStep::enter();
+        let began = Instant::now();
+        let next = forward_flush(&buffer, &writer, &mut at);
+        let waited = began.elapsed();
+        assert_eq!(next, Some(Next::Idle), "a full socket held the lane");
+        assert!(
+            waited < Duration::from_millis(100),
+            "the lane waited {waited:?} for a socket the reactor will wake it on"
+        );
+        assert!(
+            crate::proxy::write_wait_pending(),
+            "the lane parked without naming the descriptor it waits on"
+        );
+        drop(step);
+        let _ = drain.join();
+    }
+
+    /// A carrier that takes nothing for the stall budget ends the leg where it stands: the parked
+    /// lane must not outlive the write the blocking send used to time out.
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_write_ends_the_leg_at_the_stall_budget() {
+        #[derive(Clone)]
+        struct Stalled;
+        impl CarrierSink for Stalled {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push_ready(&self, _: &[u8]) -> Push {
+                Push::Parked
+            }
+            fn close(&self) {}
+        }
+
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(50)),
+            ..Default::default()
+        });
+        let mut buffer = RelayBuf::with_len(64 * 1024);
+        buffer.as_mut()[..64].fill(1);
+        let mut at = Forward::new();
+        at.pending = 64;
+        let step = crate::proxy::RelayStep::enter();
+        crate::proxy::note_wait_fd_write(1);
+        assert_eq!(
+            forward_flush(&buffer, &Stalled, &mut at),
+            Some(Next::Idle),
+            "a full socket held the lane"
+        );
+        assert!(
+            at.stopped.is_some(),
+            "a parked lane did not stamp the write it waits on"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            forward_flush(&buffer, &Stalled, &mut at),
+            Some(Next::Done),
+            "a write the peer never drained outlived the stall budget"
+        );
+        drop(step);
+        crate::budgets::clear();
     }
 
     #[test]
@@ -41729,7 +42687,22 @@ mod tests {
                     assert!(matches!(out.carrier, Carrier::Kcp(_)));
                     assert!(out.tls.is_some(), "the kcp session carries tls");
                 }
-                _ => assert!(find_vmess_outbound(&root).is_none(), "{network}"),
+                "quic" => {
+                    let out = find_vmess_outbound(&root).expect("quic carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Quic));
+                    assert!(out.quic_roots.is_some(), "the quic dial trusts the ca");
+                    assert!(out.tls.is_none(), "no second handshake above quic");
+                }
+                "hysteria" => {
+                    let out = find_vmess_outbound(&root).expect("hysteria carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+                    assert!(
+                        out.hysteria_roots.is_some(),
+                        "the hysteria dial trusts the ca"
+                    );
+                    assert!(out.tls.is_none(), "no second handshake above hysteria");
+                }
+                _ => unreachable!(),
             }
         }
         let plain = crate::json::parse(
@@ -41775,6 +42748,18 @@ mod tests {
             "security none is the reference's auto when the length is authenticated"
         );
         let _ = std::fs::remove_file(&ca);
+    }
+
+    /// A carrier the dial does not implement must be refused at parse time, not sent as raw TCP to the configured server with its transport ignored.
+    #[test]
+    fn vmess_refuses_carriers_it_does_not_dial() {
+        for network in ["http", "h3", "masque"] {
+            let stream = format!(r#""network": "{network}", "security": "none""#);
+            assert!(
+                find_vmess_outbound(&vnext_tls_root("vmess", &stream)).is_none(),
+                "{network} is not dialled"
+            );
+        }
     }
 
     /// A store's `security: tls` names the handshake its own lanes speak, so the outbound keeps that config on the carrier and adds no second handshake; reality stays refused, as the store refuses it.
@@ -43271,6 +44256,9 @@ mod tests {
                 reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             thread::spawn(move || {
@@ -44494,6 +45482,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         };
         let conn = ferrox_core::kcp::dial(
             format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -44854,6 +45845,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         }
     }
 
@@ -45489,6 +46483,9 @@ mod tests {
                 reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_vmess(
@@ -45708,6 +46705,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         })
     }
 
@@ -46489,6 +47489,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -48125,6 +49128,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -50788,6 +51794,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -50860,6 +51869,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -50931,6 +51943,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -51007,6 +52022,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             for stream in front.incoming().take(SESSIONS) {
@@ -51702,6 +52720,40 @@ mod tests {
         }))
     }
 
+    fn quic_serve_vmess(
+        id: [u8; 16],
+    ) -> (
+        SocketAddr,
+        Vec<Vec<u8>>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        let users = crate::vmess::Users::single(id);
+        quic_serve_with(Arc::new(move |stream| {
+            serve_vmess_quic(stream, &users, true);
+        }))
+    }
+
+    fn quic_vmess_out(port: u16, id: [u8; 16], roots: Vec<Vec<u8>>) -> VmessOut {
+        VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            auth_len: false,
+            no_termination: false,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            tls: None,
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+        }
+    }
+
     fn quic_encryption_pair() -> (
         Arc<ferrox_core::vless_encryption::Client>,
         Arc<ferrox_core::vless_encryption::Server>,
@@ -52078,6 +53130,162 @@ mod tests {
         assert_eq!(&got[..n], payload);
         let _ = conn.close(false, 0, b"done");
         crate::quic::flush_egress(&mut conn, &sock);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn quic_carries_vmess_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = [0x61u8; 16];
+        let (addr, roots, stop, driver) = quic_serve_vmess(id);
+        let out = quic_vmess_out(addr.port(), id, roots);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vmess(
+                &stream,
+                &addr,
+                &out,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let payload = vec![0x5au8; 65536];
+        client.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; payload.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, payload);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn quic_carries_a_markerless_vmess_half_close() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, b"half close");
+            let _ = stream.write_all(b"seen");
+        });
+        let id = [0x61u8; 16];
+        let (addr, roots, stop, driver) = quic_serve_vmess(id);
+        let mut out = quic_vmess_out(addr.port(), id, roots);
+        out.no_termination = true;
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vmess(
+                &stream,
+                &addr,
+                &out,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(b"half close").expect("writes");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("half-closes the request");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("the target saw EOF");
+        assert_eq!(&back, b"seen");
+        let mut eof = [0u8; 1];
+        assert_eq!(client.read(&mut eof).expect("the target's FIN arrives"), 0);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn quic_carries_a_vmess_udp_association_over_the_carrier() {
+        let _serial = quic_serial();
+        let echo_port = udp_echo_loop();
+        let id = [0x61u8; 16];
+        let (addr, roots, stop, driver) = quic_serve_vmess(id);
+        let out = quic_vmess_out(addr.port(), id, roots);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &Outbound::Vmess(out), &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"vmess-quic-association-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = udp.send_to(&datagram, relay);
+            match udp.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"vmess-quic-association-ping");
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
     }
@@ -55125,6 +56333,235 @@ mod tests {
         assert_eq!(payload, b"association-ping");
     }
 
+    fn hysteria_vmess_loop(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {
+        let users = crate::vmess::Users::single(id);
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_vmess_hysteria(flow, &users, true);
+        });
+        hysteria_loop_serve(
+            auth,
+            obfs,
+            ferrox_core::hysteria::Masquerade::NotFound,
+            serve,
+        )
+    }
+
+    fn hysteria_vmess_out(port: u16, id: [u8; 16], auth: &str, roots: Vec<Vec<u8>>) -> VmessOut {
+        VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            auth_len: false,
+            no_termination: false,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            tls: None,
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+        }
+    }
+
+    /// A bind that fails is reported to the caller before the thread exists, so an inbound that
+    /// serves nothing is not counted as listening.
+    #[test]
+    fn a_vmess_hysteria_inbound_that_cannot_bind_is_refused() {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-vmess-hysteria-bind-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let held = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let address = format!("127.0.0.1:{}", held.local_addr().expect("addr").port());
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess", "port": 1, "streamSettings": {{"network": "hysteria", "security": "tls", "hysteriaSettings": {{"version": 2, "auth": "inbound-auth"}}, "tlsSettings": {{"certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
+            cert_path.to_str().expect("ascii").replace('\\', "\\\\"),
+            key_path.to_str().expect("ascii").replace('\\', "\\\\")
+        ))
+        .expect("parses");
+        let config = ferrox_core::hysteria::Config {
+            version: 2,
+            auth: "inbound-auth".to_owned(),
+            ..ferrox_core::hysteria::Config::default()
+        };
+        let users = crate::vmess::Users::single([0x62u8; 16]);
+        assert!(!serve_vmess_hysteria_inbound(
+            &address, &inbound, &config, &users, true
+        ));
+        drop(held);
+    }
+
+    #[test]
+    fn hysteria_carries_vmess_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = [0x61u8; 16];
+        let (port, roots) = hysteria_vmess_loop("vmess-auth", id, "");
+        let out = hysteria_vmess_out(port, id, "vmess-auth", roots);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            dial_vmess(
+                &stream,
+                &server,
+                &out,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let payload = vec![0x5au8; 65536];
+        client.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; payload.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn hysteria_carries_a_markerless_vmess_half_close() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, b"half close");
+            let _ = stream.write_all(b"seen");
+        });
+        let id = [0x61u8; 16];
+        let (port, roots) = hysteria_vmess_loop("vmess-half-close-auth", id, "");
+        let mut out = hysteria_vmess_out(port, id, "vmess-half-close-auth", roots);
+        out.no_termination = true;
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            dial_vmess(
+                &stream,
+                &server,
+                &out,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(b"half close").expect("writes");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("half-closes the request");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("the target saw EOF");
+        assert_eq!(&back, b"seen");
+        let mut eof = [0u8; 1];
+        assert_eq!(client.read(&mut eof).expect("the target's FIN arrives"), 0);
+    }
+
+    #[test]
+    fn hysteria_carries_a_vmess_udp_association_over_the_carrier() {
+        let _serial = quic_serial();
+        let echo_port = udp_echo_loop();
+        let id = [0x61u8; 16];
+        let (port, roots) = hysteria_vmess_loop("vmess-association-auth", id, "");
+        let out = hysteria_vmess_out(port, id, "vmess-association-auth", roots);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &Outbound::Vmess(out), &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"vmess-association-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = udp.send_to(&datagram, relay);
+            match udp.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"vmess-association-ping");
+    }
+
     fn hysteria_tcp_pair(
         port: u16,
         roots: Vec<Vec<u8>>,
@@ -55323,6 +56760,7 @@ mod tests {
                 4,
                 rest,
                 true,
+                false,
             );
             let Some((got, _, cmd, target)) =
                 decode_request_bounded_gated(&mut flow, |_, _, _, _, _| true, resolve_endpoint)
@@ -59699,6 +61137,9 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -65541,6 +66982,74 @@ mod hc_tests {
         assert_eq!(
             exchange(port, b"GET /other HTTP/1.1\r\n\r\n"),
             Vec::<u8>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod h2_carrier_tests {
+    use super::*;
+
+    /// A silent h2 stream that never sends a trojan header ends at the handshake budget: the decode
+    /// claims the poll, so it cannot retry poll timeouts for the relay stall.
+    #[test]
+    fn a_silent_trojan_stream_ends_at_the_handshake_budget() {
+        struct Silent(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    relay_step_owns_poll(),
+                    "a trojan decode read ran outside the poll"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl crate::proxy::WindowRead for Silent {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                unreachable!("the trojan header reads through Read")
+            }
+        }
+
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl FrameWrite for Sink {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                for part in parts {
+                    self.write_all(part).expect("sink");
+                }
+                true
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
+        let began = Instant::now();
+        serve_trojan_xhttp_accepted(
+            Box::new(Silent(Arc::clone(&polled))),
+            crate::xhttp::XhttpWriter::new(Sink(Arc::clone(&out))),
+            &[[0x11u8; 56]],
+            true,
+        );
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(
+            out.lock().expect("lock").ends_with(b"0\r\n\r\n"),
+            "the refusal did not end the carrier"
         );
     }
 }
