@@ -10463,11 +10463,7 @@ fn serve_vless_kcp(
 ) {
     let mut io = KcpIo::with_meter(Arc::clone(conn), meter.clone());
     let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
-        freedom
-            && matches!(cmd, 1 | 3)
-            && users
-                .iter()
-                .any(|user| same_vless_user(&user.id, id) && vless_flow_ok(user, flow, cmd, false))
+        vless_user_allows(users, id, flow, cmd, freedom, false)
     };
     let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
         &mut io,
@@ -30122,14 +30118,13 @@ impl<R: WindowRead> WindowRead for ReplyReader<R> {
 }
 
 pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
-    let mut prefix = [0u8; 2];
-    read_exact(stream, &mut prefix).ok()?;
-    // `decode_response_header` bounds the addons field against the buffer it is handed, so against this prefix only a zero length answers — the accepted set is unchanged — and a rest longer than zero stays as refused as it was. What changes is where its bytes would land: a legal echo is at most 2 + 255, the addons length is one byte, so the buffer is the stack's and the dial never holds a heap trip for the answer.
-    let consumed = ferrox_core::vless::VlessLink::decode_response_header(&prefix).ok()?;
-    if consumed > 2 {
-        let mut rest = [0u8; 255];
-        read_exact(stream, &mut rest[..consumed - 2]).ok()?;
+    let mut header = [0u8; 2 + 255];
+    read_exact(stream, &mut header[..2]).ok()?;
+    let addons = usize::from(header[1]);
+    if addons > 0 {
+        read_exact(stream, &mut header[2..2 + addons]).ok()?;
     }
+    ferrox_core::vless::VlessLink::decode_response_header(&header[..2 + addons]).ok()?;
     if echo_trace_on() {
         echo_trace("response ok");
     }
@@ -39783,26 +39778,27 @@ mod tests {
         }
     }
 
-    /// The dial answers a bare `[0, 0]` and reads no further — the two-byte prefix bounds any nonzero addons as refused — and a wrong version is no answer; the buffer any legal rest would land in is the stack's, so the whole handshake trips no heap.
+    /// The dial reads a response's addons before deciding, and a bare `[0, 0]` leaves the payload on the wire; a wrong version or a short addon is no answer.
     #[test]
-    fn a_flow_echo_refusal_and_a_bare_answer_never_spend_the_payload() {
+    fn a_flow_echo_reads_its_addons_and_a_bare_answer_never_spends_the_payload() {
         let mut wire = vec![0u8, 18];
-        wire.extend_from_slice(b"xtls-rprx-vision\0\0\0");
+        wire.extend_from_slice(b"xtls-rprx-vision\0\0");
         wire.extend_from_slice(b"payload");
         let mut stream = std::io::Cursor::new(wire.clone());
         assert!(
-            read_vless_response(&mut stream).is_none(),
-            "an addons the prefix cannot bound is refused"
+            read_vless_response(&mut stream).is_some(),
+            "a response with addons is an answer"
         );
         assert_eq!(
             stream.position(),
-            2,
-            "a refusal reads no byte past the prefix"
+            20,
+            "the prefix and the addons are consumed"
         );
-        assert_eq!(
-            &wire[2..],
-            b"xtls-rprx-vision\0\0\0payload",
-            "the answer and the payload wait on the wire"
+        assert_eq!(&wire[20..], b"payload", "the payload waits on the wire");
+        let mut short = std::io::Cursor::new(vec![0u8, 3, b'a']);
+        assert!(
+            read_vless_response(&mut short).is_none(),
+            "a truncated addon is no answer"
         );
         let bare = std::io::Cursor::new(vec![0u8, 0, b'p', b'a', b'y']);
         let mut bare = std::io::Read::take(bare, 5);
@@ -64545,9 +64541,10 @@ mod poll_copy {
                 wake,
             });
             let loop_worker = Arc::clone(&worker);
-            let _ = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("ferrox-relay".into())
-                .spawn(move || run(&loop_worker));
+                .spawn(move || run(&loop_worker))
+                .ok()?;
             Some(worker)
         }
 
@@ -64999,9 +64996,16 @@ mod poll_relay {
                 wake,
             });
             let loop_worker = Arc::clone(&worker);
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("ferrox-relay".into())
                 .spawn(move || run(&loop_worker));
+            if spawned.is_err() {
+                unsafe {
+                    libc::close(wake[0]);
+                    libc::close(wake[1]);
+                }
+                return None;
+            }
             Some(worker)
         }
 
@@ -67531,6 +67535,43 @@ mod reverse_tests {
             false
         ));
         assert!(vless_user_allows(&forward, &id, Flow::None, 1, true, false));
+    }
+
+    #[test]
+    fn a_reverse_account_cannot_open_a_kcp_mux() {
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp(&conn, &users, true, crate::stats::Meter::default());
+            let _ = done_tx.send(());
+        });
+        let peer = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        peer.write(&vless_mux_header(&id)).expect("requests");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the handler refuses and returns");
+        peer.set_read_deadline(Instant::now() + Duration::from_secs(1));
+        let mut ack = [0u8; 2];
+        assert!(
+            !matches!(peer.read(&mut ack), Ok(2) if ack == [0, 0]),
+            "a reverse account must not receive the mux acknowledgement"
+        );
+        drop(peer);
+        serving.join().expect("joins");
     }
 
     /// A reverse account's command 4 attaches on a sealed raw session with no Freedom outbound:
