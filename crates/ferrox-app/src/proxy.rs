@@ -4133,14 +4133,19 @@ pub(crate) fn serve_grpc_muxed(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
+            |id, flow, cmd, _, _| {
+                let allowed = vless_user_allows(users, &id, flow, cmd, freedom, false);
+                if allowed {
+                    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                allowed
+            },
             resolve_endpoint,
         )
     }) else {
         reader.abort();
         return;
     };
-    opened.store(true, std::sync::atomic::Ordering::Relaxed);
     let ask = reverse_ask(users, &got, flow, cmd);
     if matches!(&ask, ReverseAsk::Refused) {
         reader.abort();
