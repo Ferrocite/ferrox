@@ -40,6 +40,7 @@ mod hysteria_v1;
 mod json;
 mod limit;
 mod masque;
+mod masque_h1;
 mod masque_h2;
 mod metrics;
 mod observatory;
