@@ -11,6 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
+const LIMITED_PAYLOAD: usize = 4 * 1024;
 const MIN_COOKIE_PADDING: usize = 16;
 const MAX_COOKIE_PADDING: usize = 256;
 const POLL: Duration = Duration::from_millis(100);
@@ -18,6 +19,14 @@ const MAX_POLL: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
+
+fn read_buffer_size(limit: bool) -> usize {
+    if limit {
+        LIMITED_PAYLOAD
+    } else {
+        MAX_PAYLOAD
+    }
+}
 
 /// One server entry's meek front.
 #[derive(Debug, Clone)]
@@ -47,6 +56,7 @@ pub(crate) fn connect(
     meek: &Meek,
     timeout: Duration,
     proxy: Option<&Proxy>,
+    limit_buffer_sizes: bool,
 ) -> Result<TcpStream, String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("psiphon meek listener: {error}"))?;
@@ -66,7 +76,9 @@ pub(crate) fn connect(
         .name("psiphon-meek".to_owned())
         .spawn(move || match listener.accept() {
             Ok((socket, _)) => {
-                if let Err(why) = relay(socket, &config, proxy.as_ref(), timeout) {
+                if let Err(why) =
+                    relay(socket, &config, proxy.as_ref(), timeout, limit_buffer_sizes)
+                {
                     eprintln!("psiphon: fronted-meek relay: {why}");
                 }
             }
@@ -81,6 +93,7 @@ pub(crate) fn connect_inproxy(
     stream: WebRtcStream,
     meek: &Meek,
     timeout: Duration,
+    limit_buffer_sizes: bool,
 ) -> Result<TcpStream, String> {
     let transport = if meek.quic {
         stream.set_timeout(Some(timeout));
@@ -120,7 +133,7 @@ pub(crate) fn connect_inproxy(
     } else {
         MeekStream::WebRtc(stream)
     };
-    start_relay(meek, timeout, transport)
+    start_relay(meek, timeout, transport, limit_buffer_sizes)
 }
 
 /// Send one request over a fresh fronted stream and return its response body.
@@ -136,7 +149,12 @@ pub(crate) fn post(
     http.round_trip(body)
 }
 
-fn start_relay(meek: &Meek, timeout: Duration, transport: MeekStream) -> Result<TcpStream, String> {
+fn start_relay(
+    meek: &Meek,
+    timeout: Duration,
+    transport: MeekStream,
+    limit_buffer_sizes: bool,
+) -> Result<TcpStream, String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("psiphon meek listener: {error}"))?;
     let address = listener
@@ -154,7 +172,9 @@ fn start_relay(meek: &Meek, timeout: Duration, transport: MeekStream) -> Result<
         .name("psiphon-meek".to_owned())
         .spawn(move || match listener.accept() {
             Ok((socket, _)) => {
-                if let Err(why) = relay_stream(socket, &config, timeout, transport) {
+                if let Err(why) =
+                    relay_stream(socket, &config, timeout, transport, limit_buffer_sizes)
+                {
                     eprintln!("psiphon: in-proxy-meek relay: {why}");
                 }
             }
@@ -169,12 +189,13 @@ fn relay(
     meek: &Meek,
     proxy: Option<&Proxy>,
     timeout: Duration,
+    limit_buffer_sizes: bool,
 ) -> Result<(), String> {
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?;
-    let mut buffer = vec![0u8; MAX_PAYLOAD];
+    let mut buffer = vec![0u8; read_buffer_size(limit_buffer_sizes)];
     let mut interval = POLL;
     loop {
         local
@@ -213,12 +234,13 @@ fn relay_stream(
     meek: &Meek,
     timeout: Duration,
     transport: MeekStream,
+    limit_buffer_sizes: bool,
 ) -> Result<(), String> {
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?;
-    let mut buffer = vec![0u8; MAX_PAYLOAD];
+    let mut buffer = vec![0u8; read_buffer_size(limit_buffer_sizes)];
     let mut interval = POLL;
     loop {
         local
@@ -710,6 +732,12 @@ mod tests {
             dns: Vec::new(),
             shape: TlsShape::default(),
         }
+    }
+
+    #[test]
+    fn the_limited_buffer_is_four_kib() {
+        assert_eq!(read_buffer_size(false), MAX_PAYLOAD);
+        assert_eq!(read_buffer_size(true), LIMITED_PAYLOAD);
     }
 
     #[test]
