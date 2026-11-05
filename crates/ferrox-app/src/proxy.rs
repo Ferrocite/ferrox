@@ -3651,6 +3651,14 @@ fn spawn_trojan_mux<R, W>(
     spawn_carried(move || serve_trojan_mux(reader, writer, close, &carried));
 }
 
+fn spawn_vless_mux<R, W>(reader: R, writer: W, close: Arc<dyn Fn() + Send + Sync>)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    spawn_carried(move || serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &[]));
+}
+
 fn serve_shadowsocks(
     stream: Connection,
     accounts: &crate::shadowsocks::SsAccounts,
@@ -3978,6 +3986,14 @@ fn serve_vless_ws(
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
+    if cmd == 3 {
+        let closer = writer.clone();
+        if !writer.send(&[0, 0]) {
+            return;
+        }
+        spawn_vless_mux(reader, writer, Arc::new(move || closer.close()));
+        return;
+    }
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -4033,6 +4049,14 @@ fn serve_vless_httpupgrade(
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
+    if cmd == 3 {
+        let close = connection_closer(&write);
+        if write.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        spawn_vless_mux(reader, write, close);
+        return;
+    }
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -4066,57 +4090,24 @@ fn serve_vless_grpc(
     let Some((reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let mut reader = reader;
-    if let Some(decryption) = decryption {
-        let close = writer.clone();
-        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        return serve_sealed_carried_with(
-            reader,
-            writer,
-            users,
-            freedom,
-            decryption,
-            close,
-            |reader| {
-                reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-                reader.set_poll(Some(RELAY_POLL));
-            },
-            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
-            |reader| reader.set_handshake_budget(None),
-        );
-    }
-    // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
-    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
-        decode_request_gated(
-            read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
-            resolve_endpoint,
-        )
-    }) else {
+    let Some(decryption) = decryption else {
         return;
     };
-    let ask = reverse_ask(users, &got, flow, cmd);
-    if !matches!(ask, ReverseAsk::NotReverse) {
-        let closer_writer = writer.clone();
-        reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
-        return;
-    }
-    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
-        return;
-    }
-    let Some(uplink) = dial_or_report(&target) else {
-        return;
-    };
-    if !writer.send(&[0, 0]) {
-        return;
-    }
-    reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_window_with(
+    let close = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
+    serve_sealed_carried_with(
         reader,
-        &writer,
-        &uplink,
-        crate::grpc::mark_reader_dead,
-        |reader| crate::grpc::request_ended(reader),
+        writer,
+        users,
+        freedom,
+        decryption,
+        close,
+        |reader| {
+            reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+            reader.set_poll(Some(RELAY_POLL));
+        },
+        |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+        |reader| reader.set_handshake_budget(None),
     );
 }
 
@@ -4158,6 +4149,22 @@ pub(crate) fn serve_grpc_muxed(
     }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         reader.abort();
+        return;
+    }
+    if cmd == 3 {
+        let closer = writer.clone();
+        if !writer.send(&[0, 0]) {
+            reader.abort();
+            return;
+        }
+        spawn_carried(move || {
+            serve_mux_tunnel(
+                Box::new(reader),
+                Box::new(writer),
+                Arc::new(move || closer.close()),
+                &[],
+            );
+        });
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -4224,6 +4231,14 @@ fn serve_vless_httpheader(
         return;
     }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
+        return;
+    }
+    if cmd == 3 {
+        let close = connection_closer(&write);
+        if write.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        spawn_vless_mux(reader, write, close);
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -7616,6 +7631,15 @@ fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'stati
         echo_trace("session ws vless id or cmd refused");
         return;
     }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        if !cwriter.send(&[0, 0]) {
+            echo_trace("session ws vless response refused");
+            return;
+        }
+        spawn_vless_mux(creader, cwriter, Arc::new(move || closer.close()));
+        return;
+    }
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session ws uplink refused");
         return;
@@ -7814,6 +7838,20 @@ pub(crate) fn serve_session_xhttp_with<R: crate::proxy::WindowRead + Send + 'sta
         });
         return;
     }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        let writer = cwriter.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+        if !cwriter.send(&[0, 0]) {
+            echo_trace("session xhttp vless response refused");
+            cwriter.finish();
+            return;
+        }
+        spawn_carried(move || {
+            serve_mux_tunnel(Box::new(creader), Box::new(writer), close, &[]);
+        });
+        return;
+    }
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session xhttp uplink refused");
         cwriter.finish();
@@ -7867,6 +7905,16 @@ fn serve_session_httpupgrade<
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session httpupgrade vless id or cmd refused");
         crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    if cmd == 3 {
+        let mut cwriter = cwriter;
+        if cwriter.write_all(&[0, 0]).is_err() {
+            echo_trace("session httpupgrade vless response refused");
+            crate::httpupgrade::quiet(&raw);
+            return;
+        }
+        spawn_vless_mux(creader, cwriter, close);
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -7925,13 +7973,21 @@ fn serve_session_httpheader<
         echo_trace("session httpheader vless id or cmd refused");
         return;
     }
-    let Some(uplink) = dial_or_report(&target) else {
-        echo_trace("session httpheader uplink refused");
-        return;
-    };
     let mut sink = SessionSink {
         half: cwriter,
         raw: Arc::new(raw),
+    };
+    if cmd == 3 {
+        if sink.write_all(&[0, 0]).is_err() {
+            echo_trace("session httpheader vless response refused");
+            return;
+        }
+        spawn_vless_mux(creader, sink, close);
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpheader uplink refused");
+        return;
     };
     if sink.write_all(&[0, 0]).is_err() {
         echo_trace("session httpheader vless response refused");
@@ -7957,53 +8013,21 @@ fn serve_session_grpc<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'sta
         echo_trace("session grpc accept refused");
         return;
     };
-    if let Some(decryption) = decryption {
-        let close = cwriter.clone();
-        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        return serve_sealed_carried_with(
-            creader,
-            cwriter,
-            users,
-            freedom,
-            decryption,
-            close,
-            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
-            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
-            |reader| reader.set_handshake_budget(None),
-        );
-    }
-    let mut creader = creader;
-    // The dispatcher already polls the socket behind a session at the relay's grain, so only the request's own clock is armed here: past it a peer that answered the head and then stopped speaking is a refusal, not a thread pinned in `read_exact`'s retry.
-    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_request_gated(
-        &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
-        resolve_endpoint,
-    );
-    creader.set_handshake_budget(None);
-    let Some((got, flow, cmd, target)) = decoded else {
-        echo_trace("session grpc vless decode refused");
+    let Some(decryption) = decryption else {
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
-        echo_trace("session grpc vless id or cmd refused");
-        return;
-    }
-    let Some(uplink) = dial_or_report(&target) else {
-        echo_trace("session grpc uplink refused");
-        return;
-    };
-    if !cwriter.send(&[0, 0]) {
-        echo_trace("session grpc vless response refused");
-        return;
-    }
-    echo_trace("session grpc relaying");
-    relay_sink_window_with(
+    let close = cwriter.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
+    serve_sealed_carried_with(
         creader,
-        &cwriter,
-        &uplink,
-        crate::grpc::mark_reader_dead,
-        |reader| crate::grpc::request_ended(reader),
+        cwriter,
+        users,
+        freedom,
+        decryption,
+        close,
+        |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+        |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+        |reader| reader.set_handshake_budget(None),
     );
 }
 
@@ -8840,7 +8864,7 @@ fn relay_vless<S>(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn relay_vless_reply<S>(
     mut session: S,
     raw: Option<Connection>,
@@ -8898,6 +8922,44 @@ fn relay_vless_reply<S>(
         ReverseAsk::NotReverse => {}
     }
     if !vless_flow_ok(user, header.1, header.2, vision) {
+        return;
+    }
+    if header.2 == 3 {
+        if !freedom {
+            return;
+        }
+        if session.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let close = raw
+            .as_ref()
+            .map_or_else(|| Arc::new(|| {}), connection_closer);
+        let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+            match driven_halves(session, RELAY_POLL) {
+                Ok(Half::Split { read, write }) => (
+                    Box::new(
+                        read.into_inner()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    ),
+                    Box::new(
+                        write
+                            .into_inner()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    ),
+                ),
+                Ok(_) => return,
+                Err(session) => {
+                    let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> =
+                        Arc::new(Mutex::new(Box::new(session)));
+                    (
+                        Box::new(SharedRead(Arc::clone(&shared))),
+                        Box::new(SharedWrite(shared)),
+                    )
+                }
+            };
+        spawn_carried(move || {
+            serve_mux_tunnel(reader, writer, close, &carried);
+        });
         return;
     }
     let wire_id = header.0;
@@ -10382,7 +10444,7 @@ fn serve_vless_kcp(
     let mut io = KcpIo::with_meter(Arc::clone(conn), meter.clone());
     let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
         freedom
-            && cmd == 1
+            && matches!(cmd, 1 | 3)
             && users
                 .iter()
                 .any(|user| same_vless_user(&user.id, id) && vless_flow_ok(user, flow, cmd, false))
@@ -10405,6 +10467,14 @@ fn serve_vless_kcp(
         return;
     };
     let meter = meter.merged(crate::stats::user(&user.email, user.level));
+    if cmd == 3 {
+        let mut ack = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+        if ack.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        return spawn_vless_mux(reader, writer, close);
+    }
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -11441,6 +11511,9 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
         return;
     };
     // A mux or reverse header names no destination, so the gate above never saw it.
+    if cmd == 3 {
+        return;
+    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
@@ -14348,40 +14421,329 @@ struct MuxUplink {
 }
 
 fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
-    if matches!(vless.carrier, Carrier::Quic) {
-        return open_vless_mux_quic(vless);
+    match &vless.carrier {
+        Carrier::Quic => return open_vless_mux_quic(vless),
+        Carrier::Kcp(_) => return vless_mux_kcp(vless),
+        Carrier::Raw(_)
+        | Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc(_)
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. } => {}
+        _ => return vless_mux_unserved(),
     }
     let server = resolve_outbound(&vless.address, vless.port)?;
-    let uplink = dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask());
+    let mask = vless.carrier.tcp_mask();
+    if let Some(cfg) = vless.reality.as_deref() {
+        let session = dial_reality_session(&server, cfg, mask)?;
+        return vless_mux_session(&server, vless, session, || {
+            dial_reality_session(&server, cfg, mask)
+        });
+    }
+    if let Some(cfg) = vless.tls.as_deref() {
+        let session = dial_tls_session(&server, cfg, mask)?;
+        return vless_mux_session(&server, vless, session, || {
+            dial_tls_session(&server, cfg, mask)
+        });
+    }
+    vless_mux_plain(&server, vless)
+}
+
+fn vless_mux_kcp(vless: &VlessOut) -> Option<MuxUplink> {
+    let conn = kcp_dial_session(&vless.carrier, &vless.address, vless.port)?;
     let header = vless_mux_header(&vless.id);
-    if let Some(encryption) = &vless.encryption {
-        if !matches!(vless.carrier, Carrier::Raw(_)) {
+    if let Some(cfg) = vless.reality.as_deref() {
+        let Some(mut session) = kcp_reality_connect(&conn, cfg) else {
+            kcp_close(&conn)();
+            return None;
+        };
+        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
+            kcp_close(&conn)();
             return None;
         }
-        let close = connection_closer(&uplink);
-        let mut sealed = encryption.handshake(uplink).ok()?;
-        sealed.write_all(&header).ok()?;
-        read_vless_response(&mut sealed)?;
-        let (reader, writer) = sealed.into_split()?;
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        return Some(MuxUplink {
+            read: Box::new(read),
+            write: Box::new(write),
+            close: kcp_close(&conn),
+        });
+    }
+    if let Some(cfg) = vless.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
+            kcp_close(&conn)();
+            return None;
+        };
+        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
+            kcp_close(&conn)();
+            return None;
+        }
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        return Some(MuxUplink {
+            read: Box::new(read),
+            write: Box::new(write),
+            close: kcp_close(&conn),
+        });
+    }
+    let (mut read, mut write, close) = kcp_parts(&conn);
+    if write.write_all(&header).is_err() || read_vless_response(&mut read).is_none() {
+        close();
+        return None;
+    }
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(write),
+        close,
+    })
+}
+
+fn vless_mux_plain(server: &SocketAddr, vless: &VlessOut) -> Option<MuxUplink> {
+    let header = vless_mux_header(&vless.id);
+    let uplink = dial_or_report(server)?.with_mask(vless.carrier.tcp_mask());
+    match &vless.carrier {
+        Carrier::Raw(_) => {
+            if let Some(encryption) = &vless.encryption {
+                let close = connection_closer(&uplink);
+                let mut sealed = encryption.handshake(uplink).ok()?;
+                sealed.write_all(&header).ok()?;
+                read_vless_response(&mut sealed)?;
+                let (reader, writer) = sealed.into_split()?;
+                return Some(MuxUplink {
+                    read: Box::new(reader),
+                    write: Box::new(writer),
+                    close,
+                });
+            }
+            let read = uplink.try_clone().ok()?;
+            let mut write = uplink.try_clone().ok()?;
+            let close = connection_closer(&uplink);
+            write.write_all(&header).ok()?;
+            let mut read = read;
+            read_vless_response(&mut read)?;
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(write),
+                close,
+            })
+        }
+        Carrier::Ws { path, ed } => {
+            let (read, writer) = crate::ws::connect(
+                uplink,
+                &vless.host,
+                path,
+                *ed,
+                &[],
+                &vless.headers,
+                vless.heartbeat,
+            )?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.close()),
+                &header,
+            )
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let close = connection_closer(&uplink);
+            let (read, writer) =
+                crate::httpupgrade::connect(uplink, &vless.host, path, &[], &vless.headers)?;
+            vless_mux_carried(vless, read, writer, close, &header)
+        }
+        Carrier::Grpc(settings) => {
+            let (read, writer) = crate::grpc::connect_with(uplink, &vless.host, settings)?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.close()),
+                &header,
+            )
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (read, writer) = xhttp_pair(uplink, &vless.host, settings)?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.finish()),
+                &header,
+            )
+        }
+        Carrier::HttpHeader { path } => {
+            let close = connection_closer(&uplink);
+            let (read, writer) =
+                crate::httpheader::connect(uplink, &vless.host, path, &vless.headers)?;
+            vless_mux_carried(vless, read, writer, close, &header)
+        }
+        _ => vless_mux_unserved(),
+    }
+}
+
+fn vless_mux_session<S, D>(
+    server: &SocketAddr,
+    vless: &VlessOut,
+    session: S,
+    second: impl FnOnce() -> Option<D>,
+) -> Option<MuxUplink>
+where
+    S: Dialed,
+    D: Dialed,
+{
+    let header = vless_mux_header(&vless.id);
+    let h2 = vless.reality.is_some();
+    match &vless.carrier {
+        Carrier::Raw(_) => {
+            let raw = session.raw_clone()?;
+            let close = connection_closer(&raw);
+            let mut session = session;
+            if let Some(encryption) = &vless.encryption {
+                let mut sealed = match encryption.handshake(session) {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        eprintln!("vless: encryption handshake failed: {error}");
+                        close();
+                        return None;
+                    }
+                };
+                if sealed.write_all(&header).is_err() || read_vless_response(&mut sealed).is_none()
+                {
+                    close();
+                    return None;
+                }
+                let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> =
+                    Arc::new(Mutex::new(Box::new(sealed)));
+                return Some(MuxUplink {
+                    read: Box::new(SharedRead(Arc::clone(&shared))),
+                    write: Box::new(SharedWrite(shared)),
+                    close,
+                });
+            }
+            session.write_all(&header).ok()?;
+            read_vless_response(&mut session)?;
+            let (read, write, _) = session.into_halves()?;
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(write),
+                close,
+            })
+        }
+        Carrier::Ws { path, ed } => {
+            let (read, writer) = tls_ws(
+                server,
+                session,
+                &vless.host,
+                path,
+                *ed,
+                &[],
+                &vless.headers,
+                vless.heartbeat,
+            )?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.close()),
+                &header,
+            )
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let (read, writer) =
+                tls_httpupgrade(server, session, &vless.host, path, &[], &vless.headers)?;
+            let close = connection_closer(&writer.raw);
+            vless_mux_carried(vless, read, writer, close, &header)
+        }
+        Carrier::Grpc(settings) => {
+            let (read, writer) = tls_grpc(server, session, &vless.host, settings)?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.close()),
+                &header,
+            )
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (read, writer) = tls_xhttp(server, session, second, &vless.host, settings, h2)?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.finish()),
+                &header,
+            )
+        }
+        Carrier::HttpHeader { path } => {
+            let (read, writer) =
+                tls_httpheader(server, session, &vless.host, path, &vless.headers)?;
+            let close = connection_closer(&writer.raw);
+            vless_mux_carried(vless, read, writer, close, &header)
+        }
+        _ => vless_mux_unserved(),
+    }
+}
+
+fn vless_mux_carried<R, W>(
+    vless: &VlessOut,
+    read: R,
+    write: W,
+    close: Arc<dyn Fn() + Send + Sync>,
+    header: &[u8],
+) -> Option<MuxUplink>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if let Some(encryption) = &vless.encryption {
+        let mut sealed = match encryption.handshake(CarrierStream {
+            reader: read,
+            writer: write,
+        }) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                eprintln!("vless: encryption handshake failed: {error}");
+                close();
+                return None;
+            }
+        };
+        if sealed.write_all(header).is_err() || read_vless_response(&mut sealed).is_none() {
+            close();
+            return None;
+        }
+        let Some((reader, writer)) = sealed.into_split() else {
+            close();
+            return None;
+        };
         return Some(MuxUplink {
             read: Box::new(reader),
             write: Box::new(writer),
             close,
         });
     }
-    if !matches!(vless.carrier, Carrier::Raw(_)) {
+    let mut read = read;
+    let mut write = write;
+    if write.write_all(header).is_err() || read_vless_response(&mut read).is_none() {
+        close();
         return None;
     }
-    let mut uplink = uplink;
-    uplink.write_all(&header).ok()?;
-    read_vless_response(&mut uplink)?;
-    let read = uplink.try_clone().ok()?;
-    let close = connection_closer(&uplink);
     Some(MuxUplink {
         read: Box::new(read),
-        write: Box::new(uplink),
+        write: Box::new(write),
         close,
     })
+}
+
+fn vless_mux_unserved() -> Option<MuxUplink> {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if SAID.set(()).is_ok() {
+        eprintln!("vless: this carrier does not pair with mux; the flow is not dialed");
+    }
+    None
 }
 
 fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
@@ -21414,6 +21776,9 @@ fn serve_udp_lane_with(
         {
             serve_socks_udp_vless(relay, vless);
         }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Kcp(_)) && vless.mux => {
+            serve_socks_udp_vless(relay, vless);
+        }
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux => {
             // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
             if let Some(dial) = hysteria_dial_session(vless) {
@@ -23791,7 +24156,6 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    #[cfg(not(target_os = "linux"))]
     if !target_write.masked()
         && !client_write.masked()
         && !client_read.metered()
@@ -23801,7 +24165,7 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
         let _ends = poll_handoff(client_read, target_write, target_read, client_write);
         return;
     }
-    // On Linux every accepted flow rides the lane pool; a readiness worker beside it would add a thread per flow.
+    // A masked or metered leg needs the buffered copy, and a host without a descriptor pump keeps the lane pool.
     relay_lanes(client_read, target_write, target_read, client_write);
 }
 
@@ -23977,7 +24341,7 @@ impl TcpCopy {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn poll_available() -> bool {
     poll_relay::available()
 }
@@ -23987,7 +24351,7 @@ fn poll_available() -> bool {
     poll_copy::available()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn poll_handoff(
     client_read: Connection,
     target_write: Connection,
@@ -27605,7 +27969,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -27648,13 +28012,13 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 struct SplicePipe {
     fds: [libc::c_int; 2],
     capacity: libc::size_t,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl SplicePipe {
     fn new() -> Option<Self> {
         let mut fds = [-1; 2];
@@ -27669,20 +28033,21 @@ impl SplicePipe {
             _ => DEFAULT_SPLICE_PIPE_BYTES,
         };
         if capacity != DEFAULT_SPLICE_PIPE_BYTES {
-            eprintln!("ferrox-app: splice pipe {capacity} B");
+            static NOTED: OnceLock<()> = OnceLock::new();
+            NOTED.get_or_init(|| eprintln!("ferrox-app: splice pipe {capacity} B"));
         }
         Some(Self { fds, capacity })
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const SPLICE_PIPE_BYTES: usize = DEFAULT_SPLICE_PIPE_BYTES;
 
-#[cfg(all(test, target_os = "linux"))]
-const DEFAULT_SPLICE_PIPE_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "linux")]
+const DEFAULT_SPLICE_PIPE_BYTES: usize = 1024 * 1024;
 
 /// The pipe's size, asked once: the environment is read at startup, and a relay that read it per pipe paid an environment lookup and a `String` for every connection it carried.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn splice_pipe_bytes() -> libc::c_int {
     static ASKED: OnceLock<libc::c_int> = OnceLock::new();
     *ASKED.get_or_init(|| {
@@ -27695,7 +28060,7 @@ fn splice_pipe_bytes() -> libc::c_int {
     })
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl Drop for SplicePipe {
     fn drop(&mut self) {
         unsafe {
@@ -30571,7 +30936,7 @@ fn vless_user_allows(
         }
     }
     freedom
-        && (cmd == 1 || (udp && cmd == 2))
+        && (matches!(cmd, 1 | 3) || (udp && cmd == 2))
         && users.iter().any(|user| {
             same_vless_user(&user.id, got)
                 && user.reverse.is_none()
@@ -33079,6 +33444,21 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
     vless_outbounds(root).find_map(|(outbound, server)| vless_outbound(outbound, server))
 }
 
+/// The networks whose stream the mux codec rides; a transport outside this set dials one flow per request.
+fn vless_mux_pairs(carrier: &Carrier) -> bool {
+    matches!(
+        carrier,
+        Carrier::Raw(_)
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc(_)
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+            | Carrier::Quic
+            | Carrier::Kcp(_)
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> {
     let encryption = match vless_client_encryption(server.encryption) {
@@ -33105,14 +33485,20 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
     let transport_tls = quic_tls || hysteria_tls;
     let address = server.address.to_owned();
     let (port, id) = (server.port, server.id);
-    let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
+    let requested =
+        outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
+    let rides = vless_mux_pairs(&outbound_carrier(outbound, &address).0);
+    if requested && !rides {
+        eprintln!("vless: mux is not carried over this network; every flow dials directly");
+    }
+    let mux = requested && rides;
     let stored = xdrive_carried(outbound, &address);
     if security == "tls" && !transport_tls && stored.is_none() {
         let out = tls_carried_vless(outbound, address, port, id, &flow, mux, encryption)?;
         return Some(out);
     }
     // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
-    if security == "reality" && !mux {
+    if security == "reality" {
         let (carrier, host) = outbound_carrier(outbound, &address);
         if !matches!(
             carrier,
@@ -33228,7 +33614,7 @@ fn find_bridges(root: &Json) -> Vec<(String, VlessOut)> {
         .collect()
 }
 
-/// The outbound a carried TLS session names: one flow per dial, so a config that also asked for mux is read, warned about, and left without it.
+/// The outbound a carried TLS session names: the carriers whose stream the mux codec rides keep it, and a transport that wraps its own session still dials one flow per request.
 fn tls_carried_vless(
     outbound: &Json,
     address: String,
@@ -33239,16 +33625,13 @@ fn tls_carried_vless(
     encryption: Option<Arc<ferrox_core::vless_encryption::Client>>,
 ) -> Option<VlessOut> {
     let (carrier, host, tls) = tls_carried_parts(outbound, &address)?;
-    if mux {
-        eprintln!("vless: mux is ignored over tls; every flow dials its own session");
-    }
     Some(VlessOut {
         address,
         port,
         id,
         carrier,
         host,
-        mux: false,
+        mux,
         quic_roots: None,
         quic_ech: None,
         hysteria_roots: None,
@@ -42621,7 +43004,16 @@ mod tests {
         .expect("parses");
         let muxed = find_vless_outbound(&muxed).expect("tls carries the muxed outbound");
         assert!(muxed.tls.is_some(), "the session is still tls");
-        assert!(!muxed.mux, "the mux a tls dial cannot carry is ignored");
+        assert!(muxed.mux, "the mux rides the tls carrier");
+        let kcp = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "mux": {"enabled": true},
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+                "streamSettings": {"network": "kcp"}}]}"#,
+        )
+        .expect("parses");
+        let kcp = find_vless_outbound(&kcp).expect("kcp carries the mux");
+        assert!(kcp.mux, "the codec rides the kcp session");
         let _ = std::fs::remove_file(&ca);
     }
 
@@ -44911,6 +45303,254 @@ mod tests {
             find_trojan_outbound(&trojan_reality_outbound(r#""network": "kcp""#, 0))
                 .expect("reality kcp outbound");
         assert_trojan_mux_against_inbound("kcp-reality", &kcp_reality, kcp_reality_out, false);
+    }
+
+    fn assert_vless_mux_tcp_echo(
+        tag: &'static str,
+        serve: impl FnOnce(Connection) + Send + 'static,
+        vless: VlessOut,
+    ) {
+        let echo_port = echo_loop();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve(stream);
+        });
+        let mut vless = vless;
+        vless.port = port;
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let mux = open_vless_mux(&vless).unwrap_or_else(|| panic!("{tag} opens the mux"));
+            dial_mux_stream(&client, mux, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    fn assert_vless_mux_against_inbound(
+        tag: &'static str,
+        inbound: &Json,
+        mut vless: VlessOut,
+        wait_for_tcp: bool,
+    ) {
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(
+            serve_vless_inbound(
+                &address,
+                inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default()
+            ),
+            "{tag}"
+        );
+        if wait_for_tcp {
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let echo_port = echo_loop();
+        vless.port = port;
+        vless.carrier = inbound_carrier(inbound);
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let mux = open_vless_mux(&vless).unwrap_or_else(|| panic!("{tag} opens the mux"));
+            dial_mux_stream(&client, mux, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    /// A muxed VLESS stream rides one session on every carrier xray pairs with mux, plain, under
+    /// TLS, and under REALITY.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn a_vless_mux_carries_a_tcp_stream_over_every_carrier() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let base = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: true,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        };
+        let carrier_of = |stream: &str| {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "vless", "settings": {{}}, "streamSettings": {{{stream}}}}}"#
+            ))
+            .expect("parses");
+            inbound_carrier(&inbound)
+        };
+        for (tag, stream) in carriers {
+            let carrier = carrier_of(stream);
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                carrier: carrier.clone(),
+                ..base.clone()
+            };
+            assert_vless_mux_tcp_echo(
+                tag,
+                move |stream| serve_vless(stream, &users, &carrier, true, None, None),
+                out,
+            );
+        }
+        for (tag, stream) in carriers {
+            let carrier = carrier_of(stream);
+            let (server, client) = carried_tls_configs();
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                carrier: carrier.clone(),
+                tls: Some(Arc::new(client)),
+                ..base.clone()
+            };
+            assert_vless_mux_tcp_echo(
+                tag,
+                move |stream| {
+                    serve_vless_tls(stream, &users, true, &carrier, &server, None, None);
+                },
+                out,
+            );
+        }
+        for (tag, stream) in carriers {
+            let carrier = carrier_of(stream);
+            let server = Arc::new(reality_server_config());
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                carrier: carrier.clone(),
+                reality: Some(trojan_reality_client()),
+                ..base.clone()
+            };
+            assert_vless_mux_tcp_echo(
+                tag,
+                move |stream| {
+                    serve_vless_reality(stream, &users, true, &carrier, &server, None, None);
+                },
+                out,
+            );
+        }
+        let kcp = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let kcp_out = VlessOut {
+            carrier: inbound_carrier(&kcp),
+            ..base.clone()
+        };
+        assert_vless_mux_against_inbound("kcp", &kcp, kcp_out, false);
+        let (cert, cert_key, client) = tls_cert_json();
+        let kcp_tls = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let kcp_tls_out = VlessOut {
+            carrier: inbound_carrier(&kcp_tls),
+            tls: Some(client),
+            ..base.clone()
+        };
+        assert_vless_mux_against_inbound("kcp-tls", &kcp_tls, kcp_tls_out, false);
+        let kcp_reality = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "reality",
+                    "realitySettings": {{"privateKey": "{}",
+                        "shortIds": ["{REALITY_TEST_SHORT}"],
+                        "serverNames": ["{REALITY_TEST_SNI}"]}}}}}}"#,
+            b64url(&REALITY_TEST_PRIVATE),
+        ))
+        .expect("parses");
+        let kcp_reality_out = VlessOut {
+            carrier: inbound_carrier(&kcp_reality),
+            reality: Some(trojan_reality_client()),
+            ..base.clone()
+        };
+        assert_vless_mux_against_inbound("kcp-reality", &kcp_reality, kcp_reality_out, false);
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let carrier = carrier_of(r#""network": "ws", "wsSettings": {"path": "/t"}"#);
+        let users = one_vless_user(&id);
+        let out = VlessOut {
+            carrier: carrier.clone(),
+            encryption: Some(Arc::clone(&client)),
+            ..base.clone()
+        };
+        assert_vless_mux_tcp_echo(
+            "ws-encrypted",
+            move |stream| {
+                serve_vless(stream, &users, &carrier, true, None, Some(&decryption));
+            },
+            out,
+        );
     }
 
     /// A muxed TCP stream rides one session on a raw carrier, plain, under TLS, and under REALITY.
@@ -63539,14 +64179,15 @@ mod poll_copy {
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(test)]
 mod poll_relay {
     use super::{Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::time::Duration;
 
     const SPLICE_F_NONBLOCK: libc::c_uint = 0x002;
+    const MAX_SPLICE_ROUNDS: usize = 16;
 
     fn retryable() -> bool {
         matches!(
@@ -63585,17 +64226,20 @@ mod poll_relay {
     }
 
     impl SpliceGuard {
-        fn arm(socket: &Connection) -> Option<Self> {
-            let held = socket.try_clone().ok()?;
+        fn arm(socket: &Connection) -> std::io::Result<Option<Self>> {
+            let held = socket.try_clone()?;
             let fd = held.as_raw_fd();
             let saved = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if saved < 0 || saved & libc::O_NONBLOCK != 0 {
-                return None;
+            if saved < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if saved & libc::O_NONBLOCK != 0 {
+                return Ok(None);
             }
             if unsafe { libc::fcntl(fd, libc::F_SETFL, saved | libc::O_NONBLOCK) } < 0 {
-                return None;
+                return Err(std::io::Error::last_os_error());
             }
-            Some(Self { held, saved })
+            Ok(Some(Self { held, saved }))
         }
     }
 
@@ -63610,17 +64254,24 @@ mod poll_relay {
     /// Every socket the flow splices, not only the half a wake reported: one wake drives
     /// both legs. Armed while both directions hold a pipe, because a direction without one
     /// hands its sockets to `copy_all_memcpy`, which ends on the first error and would read
-    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once.
-    fn arm_flow(first: &Direction, second: &Direction) -> [Option<SpliceGuard>; 4] {
-        if first.pipe.is_none() || second.pipe.is_none() {
-            return [None, None, None, None];
+    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once. A socket that was
+    /// already nonblocking needs no guard; one whose flags cannot be read or written refuses
+    /// the splice and lets the caller fall back to the buffered relay.
+    fn arm_flow(
+        client_read: &Connection,
+        target_write: &Connection,
+        target_read: &Connection,
+        client_write: &Connection,
+    ) -> Option<[Option<SpliceGuard>; 4]> {
+        let mut guards: [Option<SpliceGuard>; 4] = [None, None, None, None];
+        for (slot, socket) in
+            guards
+                .iter_mut()
+                .zip([client_read, target_write, target_read, client_write])
+        {
+            *slot = SpliceGuard::arm(socket).ok()?;
         }
-        [
-            SpliceGuard::arm(&first.src),
-            SpliceGuard::arm(&first.dst),
-            SpliceGuard::arm(&second.src),
-            SpliceGuard::arm(&second.dst),
-        ]
+        Some(guards)
     }
 
     struct Direction {
@@ -63635,18 +64286,29 @@ mod poll_relay {
         ingest_stalled: bool,
         src_at_eof: bool,
         ended: bool,
+        /// The stall budget this direction was born with, as the copying leg read it once per leg.
+        stall_budget: Duration,
+        /// The first drain that found no room, cleared by the next byte the destination takes.
+        stalled: Option<std::time::Instant>,
     }
 
     impl Direction {
-        fn new(src: Connection, dst: Connection) -> Self {
+        fn new(
+            src: Connection,
+            dst: Connection,
+            pipe: Option<SplicePipe>,
+            stall_budget: Duration,
+        ) -> Self {
             Self {
                 src,
                 dst,
-                pipe: SplicePipe::new(),
+                pipe,
                 pending: 0,
                 ingest_stalled: false,
                 src_at_eof: false,
                 ended: false,
+                stall_budget,
+                stalled: None,
             }
         }
 
@@ -63675,56 +64337,89 @@ mod poll_relay {
                 self.end();
                 return;
             };
-            let room = pipe.capacity - self.pending;
-            if self.can_ingest() {
-                let moved = unsafe {
-                    libc::splice(
-                        self.src.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        pipe.fds[1],
-                        std::ptr::null_mut(),
-                        room,
-                        SPLICE_F_NONBLOCK,
-                    )
-                };
-                if moved > 0 {
-                    self.pending += moved as usize;
-                    self.ingest_stalled = false;
-                } else if moved == 0 {
-                    self.src_at_eof = true;
-                } else if !retryable() {
+            let capacity = pipe.capacity;
+            let pipe_read = pipe.fds[0];
+            let pipe_write = pipe.fds[1];
+            for _ in 0..MAX_SPLICE_ROUNDS {
+                let mut progressed = false;
+                if self.can_ingest() {
+                    let moved = unsafe {
+                        libc::splice(
+                            self.src.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            pipe_write,
+                            std::ptr::null_mut(),
+                            capacity.saturating_sub(self.pending),
+                            SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if moved > 0 {
+                        self.pending += moved as usize;
+                        self.ingest_stalled = false;
+                        progressed = true;
+                    } else if moved == 0 {
+                        self.src_at_eof = true;
+                    } else if !retryable() {
+                        self.end();
+                        return;
+                    } else {
+                        note_idle_ingest(self.pending, capacity);
+                        self.ingest_stalled = true;
+                    }
+                }
+                while self.can_drain() {
+                    let moved = unsafe {
+                        libc::splice(
+                            pipe_read,
+                            std::ptr::null_mut(),
+                            self.dst.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            self.pending,
+                            SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if moved > 0 {
+                        self.pending -= moved as usize;
+                        self.ingest_stalled = false;
+                        self.stalled = None;
+                        progressed = true;
+                        continue;
+                    }
+                    if moved < 0 && !retryable() {
+                        self.end();
+                        return;
+                    }
+                    if moved < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                    {
+                        self.stalled.get_or_insert_with(std::time::Instant::now);
+                    }
+                    break;
+                }
+                if self.pending == 0 {
+                    self.stalled = None;
+                }
+                if self.src_at_eof && self.pending == 0 {
                     self.end();
                     return;
-                } else {
-                    note_idle_ingest(self.pending, pipe.capacity);
-                    self.ingest_stalled = true;
+                }
+                if !progressed {
+                    break;
                 }
             }
-            while self.can_drain() {
-                let moved = unsafe {
-                    libc::splice(
-                        pipe.fds[0],
-                        std::ptr::null_mut(),
-                        self.dst.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        self.pending,
-                        SPLICE_F_NONBLOCK,
-                    )
-                };
-                if moved > 0 {
-                    self.pending -= moved as usize;
-                    self.ingest_stalled = false;
-                    continue;
-                }
-                if moved < 0 && !retryable() {
-                    self.end();
-                    return;
-                }
-                break;
-            }
-            if self.src_at_eof && self.pending == 0 {
-                self.end();
-            }
+        }
+
+        fn stalled_for_budget(&self) -> bool {
+            self.stalled
+                .is_some_and(|since| since.elapsed() >= self.stall_budget)
+        }
+
+        /// The flow has given up: close both halves so neither leg waits on the other.
+        fn abandon(&mut self) {
+            self.ended = true;
+            self.stalled = None;
+            let _ = self.src.shutdown(Shutdown::Both);
+            let _ = self.dst.shutdown(Shutdown::Both);
         }
 
         fn end(&mut self) {
@@ -63732,6 +64427,7 @@ mod poll_relay {
                 return;
             }
             self.ended = true;
+            self.stalled = None;
             let _ = self.dst.shutdown(Shutdown::Write);
         }
     }
@@ -63746,6 +64442,12 @@ mod poll_relay {
     impl Flow {
         fn finished(&self) -> bool {
             self.directions.iter().all(|d| d.ended)
+        }
+
+        fn give_up(&mut self) {
+            for direction in &mut self.directions {
+                direction.abandon();
+            }
         }
     }
 
@@ -63828,6 +64530,13 @@ mod poll_relay {
             if flows.iter().any(Flow::finished) {
                 flows.retain(|flow| !flow.finished());
             }
+            for flow in &mut flows {
+                for direction in &mut flow.directions {
+                    if direction.can_drain() && direction.stalled.is_none() {
+                        direction.stalled = Some(std::time::Instant::now());
+                    }
+                }
+            }
             pfds.clear();
             owners.clear();
             pfds.push(libc::pollfd {
@@ -63859,9 +64568,29 @@ mod poll_relay {
                     }
                 }
             }
-            let answered = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+            let mut timeout = -1;
+            for flow in &flows {
+                for direction in &flow.directions {
+                    if let Some(since) = direction.stalled {
+                        let left = direction.stall_budget.saturating_sub(since.elapsed());
+                        let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+                        timeout = if timeout < 0 {
+                            millis
+                        } else {
+                            timeout.min(millis)
+                        };
+                    }
+                }
+            }
+            let answered =
+                unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
             if answered < 0 {
                 continue;
+            }
+            for flow in &mut flows {
+                if flow.directions.iter().any(Direction::stalled_for_budget) {
+                    flow.give_up();
+                }
             }
             for (index, entry) in pfds.iter().enumerate() {
                 if entry.revents == 0 {
@@ -63915,16 +64644,40 @@ mod poll_relay {
         target_read: Connection,
         client_write: Connection,
     ) -> (super::RelayEnd, super::RelayEnd) {
-        let worker = next();
+        if let (Some(first_pipe), Some(second_pipe)) = (SplicePipe::new(), SplicePipe::new()) {
+            if let Some(guards) = arm_flow(&client_read, &target_write, &target_read, &client_write)
+            {
+                let worker = next();
+                let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+                let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
+                let forward_stall = client_read
+                    .policy()
+                    .or_else(|| target_write.policy())
+                    .and_then(|flow| flow.conn_idle())
+                    .unwrap_or_else(crate::budgets::relay_stall);
+                let reply_stall = target_read
+                    .policy()
+                    .or_else(|| client_write.policy())
+                    .and_then(|flow| flow.conn_idle())
+                    .unwrap_or_else(crate::budgets::relay_stall);
+                let first =
+                    Direction::new(client_read, target_write, Some(first_pipe), forward_stall);
+                let second =
+                    Direction::new(target_read, client_write, Some(second_pipe), reply_stall);
+                worker.push(Flow {
+                    directions: vec![first, second],
+                    guards: Some(guards),
+                    done: vec![first_tx, second_tx],
+                });
+                return (first_rx, second_rx);
+            }
+        }
         let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
         let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
-        let first = Direction::new(client_read, target_write);
-        let second = Direction::new(target_read, client_write);
-        let guards = arm_flow(&first, &second);
-        worker.push(Flow {
-            directions: vec![first, second],
-            guards: Some(guards),
-            done: vec![first_tx, second_tx],
+        std::thread::spawn(move || {
+            super::relay_owned(client_read, target_write, target_read, client_write);
+            let _ = first_tx.send(Ok(()));
+            let _ = second_tx.send(Ok(()));
         });
         (first_rx, second_rx)
     }
@@ -63941,7 +64694,8 @@ mod poll_relay {
         let port = front.local_addr().expect("addr").port();
         let src = Connection::connect(("127.0.0.1", port)).expect("dials");
         let (dst, _) = front.accept().expect("accepts");
-        let mut direction = Direction::new(src, dst);
+        let mut direction =
+            Direction::new(src, dst, SplicePipe::new(), crate::budgets::relay_stall());
         let Some(pipe) = direction.pipe.as_ref() else {
             panic!("a splice pipe is there to size the ring");
         };
