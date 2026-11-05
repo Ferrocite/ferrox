@@ -25063,8 +25063,9 @@ fn relay_owned(
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
     reply.stall = reply_stall;
-    reply.reply_idle = reply_stall;
     if let Some(answer) = answer {
+        // An answer wait owns the configured grace; a plain idle sibling still hands back after one second.
+        reply.reply_idle = reply_stall;
         reply = reply.answering(answer);
     }
     while reply.step(&second) != Next::Done {}
