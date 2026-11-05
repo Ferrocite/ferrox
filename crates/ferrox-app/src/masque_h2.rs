@@ -1948,7 +1948,10 @@ mod tests {
             deadline: Deadline::default(),
         };
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
-        session.run_until(&mut wire, Instant::now() - Duration::from_millis(1));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("a past instant");
+        session.run_until(&mut wire, past);
         assert!(session.end, "the handshake clock ended the session");
         assert_eq!(
             out.lock().expect("a recorder").len(),
