@@ -2740,7 +2740,8 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
     const BEFORE_REFERER: &str = "\r\nReferer: http://";
     const BEFORE_PADDING: &str = "?x_padding=";
-    const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
+    // The reference dialer disables keep-alives (dialer.go:272), and a chunked request whose first chunk waits on the 200 hangs a peer that drains the body before it flushes.
+    const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
     const PADDING_MAX: usize = 1000;
     let mut raw = [0u8; 4];
     getrandom::fill(&mut raw).unwrap_or_default();
@@ -2794,7 +2795,7 @@ pub(crate) fn dial_fields(host: &str, settings: &XhttpSettings) -> Vec<(String, 
         "referer".to_owned(),
         format!(
             "http://{host}{}?x_padding={}",
-            settings.path,
+            normalized_path(settings),
             referer_pad_value(settings)
         ),
     ));
@@ -2877,9 +2878,20 @@ fn combine_target(mut path: String, query: &str) -> String {
     path
 }
 
-/// The request target a dial writes: the configured path and the query that rode in with it (`config.go:20`).
+/// The reference's `GetNormalizedPath` (config.go:20): a path segment needs its trailing slash when the session or seq rides it.
+fn normalized_path(settings: &XhttpSettings) -> String {
+    let mut path = settings.path.clone();
+    if (settings.session_placement == Placement::Path || settings.seq_placement == Placement::Path)
+        && !path.ends_with('/')
+    {
+        path.push('/');
+    }
+    path
+}
+
+/// The request target a dial writes: the normalized path and the query that rode in with it (`config.go:20`).
 pub(crate) fn dial_path(settings: &XhttpSettings) -> String {
-    target_of(&settings.path, &settings.query)
+    target_of(&normalized_path(settings), &settings.query)
 }
 
 /// The packet-up and stream-up dial's POST: one POST, chunked framing, the session under the head's own placement. `Connection: close` is the reference dialer's `DisableKeepAlives` (dialer.go:272).
@@ -2889,7 +2901,7 @@ pub(crate) fn dial_head(
     session: &str,
     seq: Option<u64>,
 ) -> String {
-    let mut target = settings.path.clone();
+    let mut target = normalized_path(settings);
     let mut query = settings.query.clone();
     let mut extra = String::new();
     meta_request(settings, session, seq, &mut target, &mut query, &mut extra);
@@ -2900,18 +2912,18 @@ pub(crate) fn dial_head(
         "application/grpc"
     };
     let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
-    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, settings.path, referer_pad_value(settings))
+    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, normalized_path(settings), referer_pad_value(settings))
 }
 
 /// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
 pub(crate) fn downlink_head(host: &str, settings: &XhttpSettings, session: &str) -> String {
-    let mut target = settings.path.clone();
+    let mut target = normalized_path(settings);
     let mut query = settings.query.clone();
     let mut extra = String::new();
     meta_request(settings, session, None, &mut target, &mut query, &mut extra);
     let target = target_of(&target, &query);
     let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
-    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", settings.path, referer_pad_value(settings))
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", normalized_path(settings), referer_pad_value(settings))
 }
 
 /// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
@@ -2927,7 +2939,7 @@ pub(crate) fn packet_head<'a>(
     seq: u64,
     piece: &'a [u8],
 ) -> (String, Option<&'a [u8]>) {
-    let mut target = settings.path.clone();
+    let mut target = normalized_path(settings);
     let mut query = settings.query.clone();
     let mut extra = String::new();
     meta_request(
@@ -4125,6 +4137,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_one_dial_carries_the_trailing_slash_the_reference_reads() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one"}}}"#,
+        );
+        let path = dial_path(&settings);
+        assert_eq!(path, "/share/");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Sink(Arc::clone(&seen));
+        send_dial_head(&mut sink, "front.example", &path, &settings.headers).expect("head");
+        let head = String::from_utf8(seen.lock().expect("sink").clone()).expect("utf8");
+        assert!(head.starts_with("POST /share/ HTTP/1.1\r\n"), "{head}");
+        assert!(
+            head.contains("Referer: http://front.example/share/?x_padding="),
+            "{head}"
+        );
+        // The reference dialer disables keep-alives (dialer.go:272).
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+        let query = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one", "sessionIDPlacement": "query", "seqPlacement": "query"}}}"#,
+        );
+        assert_eq!(dial_path(&query), "/share");
+    }
+
+    #[test]
     fn a_configured_header_and_the_fetch_defaults_reach_every_dial_head() {
         let settings = settings_from(
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/", "headers": {"X-Fetch": "1"}}}}"#,
@@ -4418,7 +4454,7 @@ mod tests {
         );
         assert!(
             head.ends_with(
-                "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
+                "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
             ),
             "{head}"
         );
