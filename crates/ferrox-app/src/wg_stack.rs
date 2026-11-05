@@ -1472,8 +1472,16 @@ pub(crate) fn resolve_over_tunnel(
             continue;
         };
         for qtype in [1u16, 28] {
+            let family = qtype == 1;
+            if !config
+                .addresses
+                .iter()
+                .any(|address| address.is_ipv4() == family)
+            {
+                continue;
+            }
             if let Some(ip) = query_tunnel(to_tunnel, routes, source, *server, &name, qtype) {
-                if (qtype == 1) == ip.is_ipv4() {
+                if family == ip.is_ipv4() {
                     return Some(SocketAddr::new(ip, port));
                 }
             }
@@ -1525,8 +1533,11 @@ fn query_tunnel(
             let Some(answer) = ferrox_core::dns::parse_answer(datagram.payload) else {
                 continue;
             };
-            if answer.id != id || answer.rcode != 0 {
+            if answer.id != id {
                 continue;
+            }
+            if answer.rcode != 0 {
+                break None;
             }
             break answer.records.iter().find_map(|record| {
                 if record.kind != qtype {

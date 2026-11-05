@@ -77,14 +77,6 @@ struct Inner {
 
 impl MasqueOut {
     pub(crate) fn new(outbound: &Json) -> Result<Self, String> {
-        if outbound
-            .get("streamSettings")
-            .and_then(|settings| settings.get("masqueSettings"))
-            .and_then(|settings| settings.get("warp"))
-            .is_some()
-        {
-            eprintln!("masque: WARP's mutual TLS and static addresses are not carried");
-        }
         let spec = ClientSpec::from(outbound)?;
         let edge = format!("{}:{}", spec.address, spec.port)
             .to_socket_addrs()
@@ -762,17 +754,22 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
 /// config's key and accepts the endpoint's certificate, whose public key
 /// `verify_edge` checks once the handshake finishes.
 fn warp_config(warp: &Warp) -> Result<quiche::Config, String> {
-    static STAGED: AtomicU64 = AtomicU64::new(0);
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|error| format!("masque TLS: {error}"))?;
     config.verify_peer(false);
     if !quic::tune(&mut config, quic::ALPN) {
         return Err("masque cannot name the h3 protocol".to_owned());
     }
-    let sequence = STAGED.fetch_add(1, Ordering::Relaxed);
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|error| format!("masque warp nonce: {error}"))?;
     let base = std::env::temp_dir();
-    let certificate = base.join(format!("ferrox-warp-{}-{sequence}.crt", std::process::id()));
-    let key = base.join(format!("ferrox-warp-{}-{sequence}.key", std::process::id()));
+    let stem = format!(
+        "ferrox-warp-{}-{:032x}",
+        std::process::id(),
+        u128::from_le_bytes(nonce)
+    );
+    let certificate = base.join(format!("{stem}.crt"));
+    let key = base.join(format!("{stem}.key"));
     stage_private(
         &certificate,
         &quic::der_to_pem(&warp.certificate, "CERTIFICATE"),
@@ -803,17 +800,18 @@ fn warp_config(warp: &Warp) -> Result<quiche::Config, String> {
     Ok(config)
 }
 
+/// Write a WARP identity file under a fresh 0600 name and never overwrite it.
 fn stage_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("masque warp staging: {error}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("masque warp staging: {error}"))?;
     std::io::Write::write_all(&mut file, bytes)
         .map_err(|error| format!("masque warp staging: {error}"))
 }
