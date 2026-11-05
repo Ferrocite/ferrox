@@ -1392,6 +1392,7 @@ impl Settings {
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
             shadowsocks_prefix: shadowsocks_prefix(settings),
+            ossh_prefix: ossh_prefix(settings),
         };
         let mut cdn_ips: Vec<String> = string_list(settings, "cdnIps")
             .into_iter()
@@ -1818,50 +1819,74 @@ fn decimal(settings: Option<&Json>, key: &str) -> Option<f64> {
 
 /// The `ShadowsocksPrefixSpecs` transform, its scope map and its probability.
 fn shadowsocks_prefix(settings: Option<&Json>) -> crate::psiphon_ssh::ShadowsocksPrefix {
-    let mut prefix = crate::psiphon_ssh::ShadowsocksPrefix {
+    crate::psiphon_ssh::ShadowsocksPrefix {
         probability: decimal(settings, "ShadowsocksPrefixProbability")
             .unwrap_or(0.0)
             .clamp(0.0, 1.0),
-        ..crate::psiphon_ssh::ShadowsocksPrefix::default()
+        specs: transform_specs(settings, "ShadowsocksPrefixSpecs"),
+        scoped: transform_scopes(settings, "ShadowsocksPrefixScopedSpecNames"),
+    }
+}
+
+/// The `OSSHPrefixSpecs` transform, its scope map, probability and split window.
+fn ossh_prefix(settings: Option<&Json>) -> crate::psiphon_ssh::OsshPrefix {
+    crate::psiphon_ssh::OsshPrefix {
+        probability: decimal(settings, "OSSHPrefixProbability")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        specs: transform_specs(settings, "OSSHPrefixSpecs"),
+        scoped: transform_scopes(settings, "OSSHPrefixScopedSpecNames"),
+        split_min: Duration::from_millis(
+            number(settings, "OSSHPrefixSplitMinDelayMilliseconds").unwrap_or(0),
+        ),
+        split_max: Duration::from_millis(
+            number(settings, "OSSHPrefixSplitMaxDelayMilliseconds").unwrap_or(0),
+        ),
+    }
+}
+
+/// The named byte generators of one prefix transform.
+fn transform_specs(settings: Option<&Json>, field: &str) -> Vec<(String, String)> {
+    let Some(Json::Obj(fields)) = settings.and_then(|settings| settings.get(field)) else {
+        return Vec::new();
     };
-    if let Some(Json::Obj(fields)) =
-        settings.and_then(|settings| settings.get("ShadowsocksPrefixSpecs"))
-    {
-        for (name, spec) in fields {
+    fields
+        .iter()
+        .filter_map(|(name, spec)| {
             let generator = spec
                 .as_arr()
                 .and_then(|transforms| transforms.first())
                 .and_then(Json::as_arr)
                 .and_then(|transform| transform.get(1))
-                .and_then(Json::as_str);
-            if let Some(generator) = generator {
-                prefix.specs.push((name.clone(), generator.to_owned()));
-            }
-        }
-    }
-    if let Some(Json::Obj(scopes)) =
-        settings.and_then(|settings| settings.get("ShadowsocksPrefixScopedSpecNames"))
-    {
-        prefix.scoped = scopes
-            .iter()
-            .map(|(scope, names)| {
-                (
-                    scope.clone(),
-                    names
-                        .as_arr()
-                        .map(|names| {
-                            names
-                                .iter()
-                                .filter_map(Json::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                )
-            })
-            .collect();
-    }
-    prefix
+                .and_then(Json::as_str)?;
+            Some((name.clone(), generator.to_owned()))
+        })
+        .collect()
+}
+
+/// The scope map of one prefix transform.
+fn transform_scopes(settings: Option<&Json>, field: &str) -> Vec<(String, Vec<String>)> {
+    let Some(Json::Obj(scopes)) = settings.and_then(|settings| settings.get(field)) else {
+        return Vec::new();
+    };
+    scopes
+        .iter()
+        .map(|(scope, names)| {
+            (
+                scope.clone(),
+                names
+                    .as_arr()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Json::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 /// The configured `LimitTLSProfiles` parrots, or the scalar `TLSProfile` when one is named.
@@ -2135,6 +2160,11 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ShadowsocksPrefixSpecs",
     "ShadowsocksPrefixScopedSpecNames",
     "ShadowsocksPrefixProbability",
+    "OSSHPrefixSpecs",
+    "OSSHPrefixScopedSpecNames",
+    "OSSHPrefixProbability",
+    "OSSHPrefixSplitMinDelayMilliseconds",
+    "OSSHPrefixSplitMaxDelayMilliseconds",
 ];
 
 /// Report settings fields this lane does not consume.
@@ -6714,6 +6744,75 @@ mod tests {
         assert_eq!(
             settings.tls_shape.shadowsocks_prefix("9000"),
             Some(vec![0x16, 0x03, 0x01])
+        );
+    }
+
+    #[test]
+    fn an_ossh_prefix_spec_generates_and_terminates_its_bytes() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"OSSHPrefixSpecs":{"p":[["","\\x00{24}"]]},"OSSHPrefixScopedSpecNames":{"":["p"]},"OSSHPrefixProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let prefix = settings
+            .tls_shape
+            .ossh_prefix("9000", "keyword")
+            .expect("prefix");
+        assert_eq!(prefix.name, "p");
+        assert_eq!(prefix.prefix_len, 24);
+        assert_eq!(&prefix.bytes[..24], &[0u8; 24][..]);
+        assert_eq!(prefix.bytes.len(), 24 + 16);
+    }
+
+    #[test]
+    fn a_short_ossh_prefix_is_padded_before_its_terminator() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"OSSHPrefixSpecs":{"p":[["","\\x00{4}"]]},"OSSHPrefixScopedSpecNames":{"":["p"]},"OSSHPrefixProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let prefix = settings
+            .tls_shape
+            .ossh_prefix("9000", "keyword")
+            .expect("prefix");
+        assert_eq!(prefix.prefix_len, 4);
+        assert_eq!(prefix.bytes.len(), 24 + 16);
+        assert_eq!(&prefix.bytes[..4], &[0u8; 4][..]);
+    }
+
+    #[test]
+    fn an_ossh_prefix_is_scoped_to_its_dial_port() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"OSSHPrefixSpecs":{"p":[["","\\x00{24}"]]},"OSSHPrefixScopedSpecNames":{"9000":["p"]},"OSSHPrefixProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings.tls_shape.ossh_prefix("9000", "keyword").is_some());
+        assert!(settings.tls_shape.ossh_prefix("443", "keyword").is_none());
+    }
+
+    #[test]
+    fn an_ossh_prefix_split_window_reaches_the_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"OSSHPrefixSplitMinDelayMilliseconds":10,"OSSHPrefixSplitMaxDelayMilliseconds":20}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.tls_shape.ossh_prefix.split_min,
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            settings.tls_shape.ossh_prefix.split_max,
+            Duration::from_millis(20)
         );
     }
 
