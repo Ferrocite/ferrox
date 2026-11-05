@@ -332,6 +332,7 @@ struct Wire {
 }
 
 impl Wire {
+    /// Read the h2c preface inside the handshake clock, refusing a late or malformed one.
     fn preface(&mut self) -> bool {
         let deadline = self
             .deadline
@@ -657,6 +658,7 @@ impl Client {
         )
     }
 
+    /// Ask for both families and wait for the assignment inside the handshake clock.
     fn request_addresses(&mut self) -> Result<(), String> {
         let v4 = [0u8; 4];
         let v6 = [0u8; 16];
@@ -920,6 +922,7 @@ impl Client {
         }
     }
 
+    /// Apply one capsule, holding a pre-stack datagram within the early-buffer caps.
     fn handle(&mut self, capsule: connectip::Capsule<'_>) -> Option<Vec<u8>> {
         match capsule {
             connectip::Capsule::AddressAssign(body) => {
@@ -1052,6 +1055,7 @@ impl Session {
         }
     }
 
+    /// Serve one connection from the handshake clock onward.
     fn run(&mut self, wire: &mut Wire) {
         self.run_until(
             wire,
@@ -1061,6 +1065,7 @@ impl Session {
         );
     }
 
+    /// Serve buffered frames until the wire closes or the deadline passes before a request.
     fn run_until(&mut self, wire: &mut Wire, deadline: Instant) {
         let mut settings = Vec::new();
         settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
@@ -1601,6 +1606,7 @@ mod tests {
         assert_eq!(client.packets.len(), 0);
     }
 
+    /// The count cap ends the session on the datagram after the last one held.
     #[test]
     fn a_pre_stack_datagram_flood_is_bounded() {
         let mut capsule = Vec::new();
@@ -1616,6 +1622,7 @@ mod tests {
         assert_eq!(client.packets.len(), masque::EARLY_PACKETS);
     }
 
+    /// The byte cap ends the session before the count cap is reached.
     #[test]
     fn a_pre_stack_datagram_byte_flood_is_bounded() {
         let packet = vec![0u8; masque::EARLY_BYTES / masque::EARLY_PACKETS + 1];
@@ -1920,6 +1927,7 @@ mod tests {
         }
     }
 
+    /// A cleartext connection starts with the handshake clock already armed.
     #[test]
     fn a_cleartext_wire_arms_the_handshake_clock() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
@@ -1940,12 +1948,14 @@ mod tests {
     }
 
     impl Read for Gate {
+        /// Nothing is ever read from the gate.
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             Ok(0)
         }
     }
 
     impl Write for Gate {
+        /// Wait out the clock before the ping answer, then record every write.
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             if buf.len() == 9 && buf[3] == h2::T_PING && buf[4] == h2::F_ACK {
                 let wait = self.deadline.saturating_duration_since(Instant::now());
@@ -1957,11 +1967,13 @@ mod tests {
             Ok(buf.len())
         }
 
+        /// Flushes are no-ops on the in-memory gate.
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
 
+    /// An already-due clock ends the session before the first buffered frame is answered.
     #[test]
     fn a_due_handshake_clock_ends_before_any_frame() {
         let out = Arc::new(Mutex::new(Vec::new()));
@@ -1989,6 +2001,7 @@ mod tests {
         );
     }
 
+    /// A clock that falls due after the first frame stops the second one from being answered.
     #[test]
     fn a_handshake_clock_that_falls_due_between_frames_stops_the_next() {
         let gate = Instant::now() + Duration::from_secs(2);

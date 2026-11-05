@@ -621,6 +621,7 @@ mod tests {
         assert!(text.contains("authorization: Basic dTpw\r\n"));
     }
 
+    /// A client with no wire or routes, for the capsule paths alone.
     fn bare_client() -> Client {
         Client {
             wire: Wire {
@@ -640,6 +641,7 @@ mod tests {
         }
     }
 
+    /// The count and byte caps both bound datagrams held before the stack attaches.
     #[test]
     fn a_pre_stack_datagram_flood_is_bounded() {
         let mut client = bare_client();
