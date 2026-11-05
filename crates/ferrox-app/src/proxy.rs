@@ -62712,6 +62712,7 @@ mod poll_relay {
     use std::time::Duration;
 
     const SPLICE_F_NONBLOCK: libc::c_uint = 0x002;
+    const MAX_SPLICE_ROUNDS: usize = 16;
 
     fn retryable() -> bool {
         matches!(
@@ -62864,7 +62865,7 @@ mod poll_relay {
             let capacity = pipe.capacity;
             let pipe_read = pipe.fds[0];
             let pipe_write = pipe.fds[1];
-            loop {
+            for _ in 0..MAX_SPLICE_ROUNDS {
                 let mut progressed = false;
                 if self.can_ingest() {
                     let moved = unsafe {
