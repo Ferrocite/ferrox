@@ -5290,6 +5290,7 @@ mod tests {
 
     /// The reference writes its 200 but Go holds it until the handler returns after `httpSC.Wait()`
     /// (hub.go:237); a client that reads it earlier closes the upload body (client.go:90).
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn a_stream_up_post_is_answered_only_after_its_session_ends() {
         let settings = settings_from(
