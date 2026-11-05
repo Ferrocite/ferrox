@@ -1708,7 +1708,8 @@ def main(argv=None):
     priced = sorted(
         s
         for s in bulk
-        if not any(word in s for word in ("idle", "reconnect", "held"))
+        if cells[s].get("workload", {}).get("traffic")
+        in ("upload", "download", "full-duplex")
     )
     families = {}
     for scenario, cell in cells.items():
