@@ -9818,7 +9818,7 @@ fn dial_vless(
     server: &SocketAddr,
     vless: &VlessOut,
     target: Option<&Destination>,
-    ladder: &Ladder,
+    ladder: &'static Ladder,
 ) {
     if let Some(encryption) = &vless.encryption {
         if vless.tls.is_some() {
@@ -10013,7 +10013,7 @@ fn dial_vless_rung(
     vless: &VlessOut,
     header: &[u8],
     attempt: &RungAttempt<'_>,
-    ladder: &Ladder,
+    ladder: &'static Ladder,
 ) -> bool {
     let rung = attempt.rung;
     match rung {
@@ -10169,9 +10169,11 @@ fn dial_vless_rung(
             if uplink.write_all(header).is_err() {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
             }
-            let refused = answer_refused(uplink.peer_addr().ok());
-            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
-            relay_handoff_answering(client, &uplink, refused);
+            let server = uplink.peer_addr().ok();
+            let refused = answer_refused(server);
+            let explicit = attempt.explicit;
+            let success = Box::new(move || note_success(ladder, rung, Stage::FirstByte, explicit));
+            relay_handoff_answering(client, &uplink, success, refused);
             true
         }
     }
@@ -23773,22 +23775,25 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     relay_handoff_with(client, target, None);
 }
 
+/// The success and refusal a lazy VLESS answer reports: the rung counts useful only when the header validates.
+struct AnswerHooks {
+    success: Box<dyn FnOnce() + Send>,
+    refused: Arc<dyn Fn() + Send + Sync>,
+}
+
 /// The same hand-off for a VLESS dial that has not seen the answer: the reply lane strips
 /// `[0, 0]` on the read that first carries it, so an upload-only flow relays at once and a
 /// server that withholds its answer holds no thread or wait of the dial's.
 fn relay_handoff_answering(
     client: &Connection,
     target: &Connection,
+    success: Box<dyn FnOnce() + Send>,
     refused: Arc<dyn Fn() + Send + Sync>,
 ) {
-    relay_handoff_with(client, target, Some(refused));
+    relay_handoff_with(client, target, Some(AnswerHooks { success, refused }));
 }
 
-fn relay_handoff_with(
-    client: &Connection,
-    target: &Connection,
-    refused: Option<Arc<dyn Fn() + Send + Sync>>,
-) {
+fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<AnswerHooks>) {
     let Ok(client_read) = client.try_clone() else {
         return;
     };
@@ -23802,7 +23807,7 @@ fn relay_handoff_with(
         return;
     };
     #[cfg(not(target_os = "linux"))]
-    if refused.is_none()
+    if answer.is_none()
         && !target_write.masked()
         && !client_write.masked()
         && !client_read.metered()
@@ -23813,13 +23818,7 @@ fn relay_handoff_with(
         return;
     }
     // On Linux every accepted flow rides the lane pool; a readiness worker beside it would add a thread per flow.
-    relay_lanes(
-        client_read,
-        target_write,
-        target_read,
-        client_write,
-        refused,
-    );
+    relay_lanes(client_read, target_write, target_read, client_write, answer);
 }
 
 /// One direction of a TCP relay as a lane step: the descriptor pump's buffer and nonblocking
@@ -23829,17 +23828,11 @@ fn relay_lanes(
     target_write: Connection,
     target_read: Connection,
     client_write: Connection,
-    refused: Option<Arc<dyn Fn() + Send + Sync>>,
+    answer: Option<AnswerHooks>,
 ) {
     // A pool with no worker would run forward inline before reply was queued, so use the owned copy.
     if !lane_pool::start() {
-        relay_owned(
-            client_read,
-            target_write,
-            target_read,
-            client_write,
-            refused,
-        );
+        relay_owned(client_read, target_write, target_read, client_write, answer);
         return;
     }
     for connection in [&client_read, &target_read, &target_write, &client_write] {
@@ -23876,8 +23869,8 @@ fn relay_lanes(
     let mut reply = TcpCopy::new(target_read, client_write);
     reply.stall = reply_stall;
     reply.reply_idle = reply_stall;
-    if let Some(refused) = refused {
-        reply = reply.answering(refused);
+    if let Some(answer) = answer {
+        reply = reply.answering(answer);
     }
     lane_pool::submit(
         Box::new(move || reply.step(&second)),
@@ -23905,6 +23898,7 @@ struct TcpCopy {
     /// The VLESS answer this lane strips before its first payload byte: a server may hold
     /// `[0, 0]` until it sees payload, so the strip waits on the read, not before the relay.
     answer: crate::vision::Answer,
+    success: Option<Box<dyn FnOnce() + Send>>,
     refused: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -23922,16 +23916,18 @@ impl TcpCopy {
             stall: crate::budgets::relay_stall(),
             reply_idle: crate::budgets::RELAY_RESPONSE_IDLE,
             answer: crate::vision::Answer::None,
+            success: None,
             refused: None,
         }
     }
 
-    fn answering(mut self, refused: Arc<dyn Fn() + Send + Sync>) -> Self {
+    fn answering(mut self, hooks: AnswerHooks) -> Self {
         self.answer = crate::vision::Answer::Pending {
             head: [0; 2],
             filled: 0,
         };
-        self.refused = Some(refused);
+        self.success = Some(hooks.success);
+        self.refused = Some(hooks.refused);
         self
     }
 
@@ -23983,6 +23979,9 @@ impl TcpCopy {
         }
         self.answer = crate::vision::Answer::None;
         self.refused = None;
+        if let Some(success) = self.success.take() {
+            success();
+        }
         None
     }
 
@@ -24108,7 +24107,7 @@ fn relay_owned(
     target_write: Connection,
     target_read: Connection,
     client_write: Connection,
-    refused: Option<Arc<dyn Fn() + Send + Sync>>,
+    answer: Option<AnswerHooks>,
 ) {
     for connection in [&client_read, &target_read, &target_write, &client_write] {
         let _ = connection.set_read_timeout(Some(RELAY_POLL));
@@ -24137,8 +24136,8 @@ fn relay_owned(
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
     reply.stall = reply_stall;
-    if let Some(refused) = refused {
-        reply = reply.answering(refused);
+    if let Some(answer) = answer {
+        reply = reply.answering(answer);
     }
     while reply.step(&second) != Next::Done {}
     second.mark_ended();
@@ -40858,7 +40857,7 @@ mod tests {
                 &server_addr,
                 &vless,
                 Some(&Destination::from(target)),
-                &Ladder::new(),
+                Ladder::global(),
             );
         });
         let mut peer = Connection::connect(("127.0.0.1", front_port)).expect("connects");
@@ -43928,6 +43927,88 @@ mod tests {
         finished
             .recv_timeout(Duration::from_secs(2))
             .expect("the dial hands the relay back while the server withholds its answer");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_raw_reports_a_bad_answer_as_a_dial_failure() {
+        let id = [0x5Au8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let Some((got, _, _, _)) = decode_request(&mut stream) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            stream.write_all(&[1, 0]).expect("refuses the answer");
+            let mut rest = [0u8; 64];
+            let _ = stream.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: None,
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            sock.read(&mut probe).expect("reads"),
+            0,
+            "a refused answer closes the flow"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some((at, failure)) = last_dial_failure() {
+                if at == server_addr {
+                    assert_eq!(failure.stage, ferrox_core::failure::Stage::RequestSent);
+                    assert_eq!(failure.kind, ferrox_core::failure::Kind::Dropped);
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refused answer was not reported: {:?}",
+                last_dial_failure()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the dial hands the relay back after the refusal");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
@@ -53887,7 +53968,7 @@ mod tests {
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
-        let ladder = Arc::new(Ladder::new());
+        let ladder: &'static Ladder = Box::leak(Box::new(Ladder::new()));
         let vless = VlessOut {
             address: "127.0.0.1".to_owned(),
             port,
@@ -53910,7 +53991,7 @@ mod tests {
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let dial_ladder = Arc::clone(&ladder);
+        let dial_ladder = ladder;
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             dial_vless(
@@ -53918,7 +53999,7 @@ mod tests {
                 &server_addr,
                 &vless,
                 Some(&Destination::from(target)),
-                &dial_ladder,
+                dial_ladder,
             );
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
@@ -64901,6 +64982,125 @@ mod relay_tests {
         for relay_side in relays {
             relay_side.join().expect("joins");
         }
+    }
+    /// A header that lands in two reads is completed, counted useful once, and stripped before the payload.
+    #[test]
+    fn a_split_answer_is_stripped_before_the_payload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let targets = listener();
+        let mut target =
+            Connection::connect(targets.local_addr().expect("addr")).expect("connects");
+        let (src, _) = targets.accept().expect("accepts");
+        src.set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+        let clients = listener();
+        let mut client =
+            Connection::connect(clients.local_addr().expect("addr")).expect("connects");
+        let (dst, _) = clients.accept().expect("accepts");
+        let refused = Arc::new(AtomicUsize::new(0));
+        let success = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (Arc::clone(&refused), Arc::clone(&success));
+        let hooks = AnswerHooks {
+            success: Box::new(move || {
+                s.fetch_add(1, Ordering::Relaxed);
+            }),
+            refused: Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        target.write_all(&[0]).expect("half a header");
+        assert_eq!(
+            copy.step(&flow),
+            Next::Idle,
+            "a half header waits for its other byte"
+        );
+        assert_eq!(success.load(Ordering::Relaxed), 0);
+
+        target
+            .write_all(&[0, b'o', b'k'])
+            .expect("the rest and a payload");
+        assert_eq!(copy.step(&flow), Next::More);
+        assert_eq!(
+            success.load(Ordering::Relaxed),
+            1,
+            "the validated answer counts once"
+        );
+        assert_eq!(copy.step(&flow), Next::Idle);
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).expect("reads");
+        assert_eq!(&got, b"ok");
+        assert_eq!(refused.load(Ordering::Relaxed), 0);
+    }
+
+    /// A bad answer refuses the flow exactly once, however many steps the lane runs afterwards.
+    #[test]
+    fn a_refused_answer_reports_once_and_ends_the_lane() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let targets = listener();
+        let mut target =
+            Connection::connect(targets.local_addr().expect("addr")).expect("connects");
+        let (src, _) = targets.accept().expect("accepts");
+        let clients = listener();
+        let _client = Connection::connect(clients.local_addr().expect("addr")).expect("connects");
+        let (dst, _) = clients.accept().expect("accepts");
+        let refused = Arc::new(AtomicUsize::new(0));
+        let success = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (Arc::clone(&refused), Arc::clone(&success));
+        let hooks = AnswerHooks {
+            success: Box::new(move || {
+                s.fetch_add(1, Ordering::Relaxed);
+            }),
+            refused: Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        target.write_all(&[1, 0]).expect("refuses the answer");
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(refused.load(Ordering::Relaxed), 1);
+        assert_eq!(success.load(Ordering::Relaxed), 0);
+    }
+
+    /// EOF before the header is a refusal, reported once.
+    #[test]
+    fn an_answer_that_ends_before_its_header_is_refused_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let targets = listener();
+        let mut target =
+            Connection::connect(targets.local_addr().expect("addr")).expect("connects");
+        let (src, _) = targets.accept().expect("accepts");
+        let clients = listener();
+        let _client = Connection::connect(clients.local_addr().expect("addr")).expect("connects");
+        let (dst, _) = clients.accept().expect("accepts");
+        let refused = Arc::new(AtomicUsize::new(0));
+        let success = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (Arc::clone(&refused), Arc::clone(&success));
+        let hooks = AnswerHooks {
+            success: Box::new(move || {
+                s.fetch_add(1, Ordering::Relaxed);
+            }),
+            refused: Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        target.write_all(&[0]).expect("half a header");
+        target.shutdown(Shutdown::Write).expect("ends the answer");
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(refused.load(Ordering::Relaxed), 1);
+        assert_eq!(success.load(Ordering::Relaxed), 0);
     }
 }
 
