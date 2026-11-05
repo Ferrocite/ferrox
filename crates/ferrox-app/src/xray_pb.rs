@@ -964,8 +964,8 @@ fn masque_warp(bytes: &[u8]) -> Result<Json, String> {
     let mut address = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => private_key = hex(reader.bytes()?),
-            (2, 2) => public_key = hex(reader.bytes()?),
+            (1, 2) => private_key = ferrox_core::b64::encode(reader.bytes()?),
+            (2, 2) => public_key = ferrox_core::b64::encode(reader.bytes()?),
             (3, 2) => address.push(Json::Str(account_text(&mut reader)?)),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -7183,6 +7183,40 @@ mod tests {
                 ("name", Json::Str("Authorization".to_owned())),
                 ("value", Json::Str("Basic x".to_owned())),
             ])]))
+        );
+    }
+
+    #[test]
+    fn a_masque_warp_block_carries_its_keys_as_base64() {
+        let private = [0x30, 0x82, 0x01, 0x02];
+        let public = [0x30, 0x59, 0x30, 0x13];
+        let warp = message(&[
+            bytes_field(1, &private),
+            bytes_field(2, &public),
+            bytes_field(3, b"172.16.0.2/32"),
+        ]);
+        let settings = message(&[bytes_field(4, &warp)]);
+        let raw = message(&[
+            bytes_field(
+                2,
+                &typed("xray.transport.internet.masque.Config", &settings),
+            ),
+            bytes_field(3, b"masque"),
+        ]);
+        let (json, _) = transport_config(&raw).expect("the transport decodes");
+        let json = json.expect("masque settings");
+        let warp = json.get("warp").expect("warp");
+        assert_eq!(
+            warp.get("privateKey").and_then(Json::as_str),
+            Some(ferrox_core::b64::encode(&private).as_str())
+        );
+        assert_eq!(
+            warp.get("publicKey").and_then(Json::as_str),
+            Some(ferrox_core::b64::encode(&public).as_str())
+        );
+        assert_eq!(
+            warp.get("address"),
+            Some(&Json::Arr(vec![Json::Str("172.16.0.2/32".to_owned())]))
         );
     }
 

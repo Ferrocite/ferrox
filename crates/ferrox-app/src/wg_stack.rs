@@ -52,6 +52,13 @@ const LANE_RACE_AGAIN: Duration = Duration::from_secs(2);
 /// The most names one lane gives their own tunnel source port.
 const LANE_PORTS: usize = 256;
 static NEXT_LANE_PORT: AtomicU16 = AtomicU16::new(0);
+/// How long a name waits for its answer inside the tunnel before the caller
+/// falls back to the host resolver.
+const DNS_TIMEOUT: Duration = Duration::from_secs(2);
+/// The tunnel source ports a DNS query may take, above every lane port.
+const DNS_PORT_BASE: u16 = 60000;
+const DNS_PORT_SPAN: u16 = 5535;
+static NEXT_DNS_PORT: AtomicU16 = AtomicU16::new(0);
 /// One racing candidate's two socket buffers.
 const RACE_BYTES: usize = TCP_RECV_BUFFER + TCP_SEND_BUFFER;
 /// The most memory every flow's extra candidates may reserve together.
@@ -1434,6 +1441,142 @@ fn lane_send(
     udp_datagram(&datagram, &mut packet) && to_tunnel.send(packet).is_ok()
 }
 
+/// Resolve a name through the tunnel against the configured DNS servers: the
+/// query rides the same datagram path as the caller's flows, so a name resolves
+/// where the tunnel can reach, not where the host can. A literal is returned
+/// unchanged, and an answer this lane cannot use is `None` so the caller keeps
+/// its own resolver as the fallback.
+pub(crate) fn resolve_over_tunnel(
+    config: &DeviceConfig,
+    to_tunnel: &ToTunnel,
+    routes: &UdpRoutes,
+    servers: &[IpAddr],
+    host: &str,
+    port: u16,
+) -> Option<SocketAddr> {
+    if host.parse::<IpAddr>().is_ok() {
+        return crate::proxy::resolve_endpoint(host, port);
+    }
+    let mut name = Vec::with_capacity(host.len() + 1);
+    name.extend_from_slice(host.as_bytes());
+    if !host.ends_with('.') {
+        name.push(b'.');
+    }
+    for server in servers {
+        let Some(source) = config
+            .addresses
+            .iter()
+            .find(|address| address.is_ipv4() == server.is_ipv4())
+            .copied()
+        else {
+            continue;
+        };
+        for qtype in [1u16, 28] {
+            let family = qtype == 1;
+            if !config
+                .addresses
+                .iter()
+                .any(|address| address.is_ipv4() == family)
+            {
+                continue;
+            }
+            if let Some(ip) = query_tunnel(to_tunnel, routes, source, *server, &name, qtype) {
+                if family == ip.is_ipv4() {
+                    return Some(SocketAddr::new(ip, port));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One question over the tunnel, answered by the first record of its own type:
+/// the route is owned for the whole exchange and removed whether it answered or
+/// timed out, so a lost query leaves no port behind.
+fn query_tunnel(
+    to_tunnel: &ToTunnel,
+    routes: &UdpRoutes,
+    source: IpAddr,
+    server: IpAddr,
+    name: &[u8],
+    qtype: u16,
+) -> Option<IpAddr> {
+    let id = NEXT_DNS_PORT.fetch_add(1, Ordering::Relaxed);
+    let query = ferrox_core::dns::build_query(id, name, qtype, None)?;
+    let mut source_room = [0u8; 16];
+    let mut destination_room = [0u8; 16];
+    let source = ip_bytes_into(source, &mut source_room);
+    let destination = ip_bytes_into(server, &mut destination_room);
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let source_port = reserve_dns_port(routes, &reply_tx)?;
+    let mut packet = Vec::with_capacity(source.len() + 8 + query.len());
+    let datagram = UdpDatagram {
+        source,
+        destination,
+        source_port,
+        destination_port: 53,
+        payload: &query,
+    };
+    let sent = udp_datagram(&datagram, &mut packet) && to_tunnel.send(packet).is_ok();
+    let answer = if sent {
+        let deadline = StdInstant::now() + DNS_TIMEOUT;
+        loop {
+            let Some(left) = deadline.checked_duration_since(StdInstant::now()) else {
+                break None;
+            };
+            let Ok(reply) = reply_rx.recv_timeout(left) else {
+                break None;
+            };
+            let Some(datagram) = udp_from_packet(&reply) else {
+                continue;
+            };
+            let Some(answer) = ferrox_core::dns::parse_answer(datagram.payload) else {
+                continue;
+            };
+            if answer.id != id {
+                continue;
+            }
+            if answer.rcode != 0 {
+                break None;
+            }
+            break answer.records.iter().find_map(|record| {
+                if record.kind != qtype {
+                    return None;
+                }
+                match record.rdata.len() {
+                    4 => Some(IpAddr::from(
+                        <[u8; 4]>::try_from(record.rdata.as_slice()).ok()?,
+                    )),
+                    16 => Some(IpAddr::from(
+                        <[u8; 16]>::try_from(record.rdata.as_slice()).ok()?,
+                    )),
+                    _ => None,
+                }
+            });
+        }
+    } else {
+        None
+    };
+    if let Ok(mut table) = routes.lock() {
+        table.remove(&source_port);
+    }
+    answer
+}
+
+/// Reserve the port the answer will be addressed to; a lane that already owns it
+/// is skipped so the query never steals a reply from a live call.
+fn reserve_dns_port(routes: &UdpRoutes, sender: &Sender<Vec<u8>>) -> Option<u16> {
+    let mut table = routes.lock().ok()?;
+    for _ in 0..DNS_PORT_SPAN {
+        let port = DNS_PORT_BASE + (NEXT_DNS_PORT.fetch_add(1, Ordering::Relaxed) % DNS_PORT_SPAN);
+        if let std::collections::hash_map::Entry::Vacant(entry) = table.entry(port) {
+            entry.insert(sender.clone());
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// Record the reply's source as this name's winner; false means the name had
 /// already pinned a different target.
 fn lane_reply(
@@ -1860,6 +2003,62 @@ fn icmp_mtu(packet: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_resolves_through_the_tunnel() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().expect("an inner address")],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, queries): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = std::sync::mpsc::channel();
+        let routes: UdpRoutes = Arc::default();
+        let responder_routes = Arc::clone(&routes);
+        let responder = std::thread::spawn(move || {
+            let query = queries.recv().expect("a query");
+            let datagram = udp_from_packet(&query).expect("an inner datagram");
+            assert_eq!(datagram.destination_port, 53);
+            let question = ferrox_core::dns::parse_query(datagram.payload).expect("a question");
+            let answer = ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![192, 0, 2, 7]])
+                .expect("an answer");
+            let reply = UdpDatagram {
+                source: &[1, 1, 1, 1],
+                destination: &[10, 0, 0, 2],
+                source_port: 53,
+                destination_port: datagram.source_port,
+                payload: &answer,
+            };
+            let mut packet = Vec::new();
+            assert!(udp_datagram(&reply, &mut packet), "the reply is built");
+            responder_routes
+                .lock()
+                .expect("routes")
+                .get(&datagram.source_port)
+                .cloned()
+                .expect("the query's route")
+                .send(packet)
+                .expect("the answer reaches the waiter");
+        });
+        let answer = resolve_over_tunnel(
+            &config,
+            &ToTunnel::from(to_tunnel),
+            &routes,
+            &["192.0.2.53".parse().expect("a resolver")],
+            "example.com",
+            443,
+        );
+        responder.join().expect("the responder");
+        assert_eq!(answer, Some("192.0.2.7:443".parse().expect("an answer")));
+        assert!(
+            routes.lock().expect("routes").is_empty(),
+            "the query left its route behind"
+        );
+    }
 
     #[test]
     fn listeners_share_one_total_budget_and_expire() {

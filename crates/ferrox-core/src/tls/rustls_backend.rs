@@ -376,20 +376,30 @@ impl rustls::client::danger::ServerCertVerifier for Unverified {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -2051,6 +2061,26 @@ mod tests {
     const HANDSHAKE: u8 = 22;
     const CCS: u8 = 20;
     const APPLICATION: u8 = 23;
+
+    #[test]
+    fn a_verifier_that_skips_the_chain_still_rejects_a_forged_handshake_signature() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        use rustls::internal::msgs::codec::{Codec as _, Reader};
+
+        let mut encoded = Vec::with_capacity(68);
+        encoded.extend_from_slice(&0x0403u16.to_be_bytes());
+        encoded.extend_from_slice(&64u16.to_be_bytes());
+        encoded.extend_from_slice(&[0u8; 64]);
+        let mut reader = Reader::init(&encoded);
+        let dss = rustls::DigitallySignedStruct::read(&mut reader).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(ANCHOR);
+        assert!(Unverified
+            .verify_tls13_signature(b"message", &cert, &dss)
+            .is_err());
+        assert!(Unverified
+            .verify_tls12_signature(b"message", &cert, &dss)
+            .is_err());
+    }
 
     const ANCHOR: &[u8] = &[
         0x30, 0x82, 0x01, 0x6c, 0x30, 0x82, 0x01, 0x11, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x14,
