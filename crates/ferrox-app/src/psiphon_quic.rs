@@ -767,7 +767,7 @@ impl Engine {
         getrandom::fill(&mut dcid).map_err(|error| format!("psiphon quic dcid: {error}"))?;
         let mut scid = vec![0u8; CID_LEN];
         getrandom::fill(&mut scid).map_err(|error| format!("psiphon quic scid: {error}"))?;
-        let params = transport_params(&scid, randomized);
+        let params = transport_params(&scid, randomized)?;
         let name = quic_server_name();
         let server_name = ServerName::try_from(name.as_str())
             .map_err(|error| format!("psiphon quic server name: {error}"))?
