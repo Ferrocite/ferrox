@@ -25188,9 +25188,15 @@ pub(crate) mod lane_pool {
 
     /// A muxed connection's demux is the lane that turns the peer's window grants into the wake a
     /// parked relay is waiting for, so it runs on its own workers: a full-duplex cell queues two
-    /// relay legs per flow, and a demux behind them delays every grant by a relay turn.
+    /// relay legs per flow, and a demux behind them delays every grant by a relay turn. A demux
+    /// lane parks on its connection's socket between frames, so a server carries every connection
+    /// on two workers; a process dialling a proxy peer keeps one lane per relay lane.
     pub(crate) fn demux_lanes() -> usize {
-        relay_cap()
+        if PROXY_PEER.load(std::sync::atomic::Ordering::Relaxed) {
+            relay_cap()
+        } else {
+            relay_cap().min(2)
+        }
     }
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
