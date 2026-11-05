@@ -1844,6 +1844,8 @@ struct SessionState {
     ended: bool,
     downlink: bool,
     last_seen: std::time::Instant,
+    /// The 200 a plain H1 POST owed, written by whichever half ends the session.
+    response: Option<Box<dyn FnOnce() + Send>>,
 }
 
 type Sessions = Mutex<HashMap<String, Arc<Session>>>;
@@ -1853,7 +1855,7 @@ fn sessions() -> &'static Sessions {
     &CELL
 }
 
-fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
+fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<Session>> {
     let budget = crate::budgets::relay_stall();
     let stale: Vec<String> = map
         .iter()
@@ -1863,44 +1865,54 @@ fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
         })
         .map(|(id, _)| id.clone())
         .collect();
-    for id in stale {
-        if let Some(session) = map.remove(&id) {
-            close_session(&session);
-        }
-    }
+    stale.into_iter().filter_map(|id| map.remove(&id)).collect()
 }
 
 fn get_or_create_session(id: &str) -> Arc<Session> {
     let mut map = sessions().lock().expect("sessions lock");
-    sweep_stalled_sessions(&mut map);
-    if let Some(session) = map.get(id) {
-        return Arc::clone(session);
-    }
-    map.entry(id.to_owned())
-        .or_insert_with(|| {
-            Arc::new(Session {
-                state: Mutex::new(SessionState {
-                    upload: None,
-                    upload_attached: false,
-                    upload_done: false,
-                    upload_fd: None,
-                    packets: BTreeMap::new(),
-                    next_seq: 0,
-                    ended: false,
-                    downlink: false,
-                    last_seen: std::time::Instant::now(),
-                }),
-                cv: Condvar::new(),
-                id: id.to_owned(),
+    let stalled = sweep_stalled_sessions(&mut map);
+    let session = if let Some(session) = map.get(id) {
+        Arc::clone(session)
+    } else {
+        map.entry(id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(Session {
+                    state: Mutex::new(SessionState {
+                        upload: None,
+                        upload_attached: false,
+                        upload_done: false,
+                        upload_fd: None,
+                        packets: BTreeMap::new(),
+                        next_seq: 0,
+                        ended: false,
+                        downlink: false,
+                        last_seen: std::time::Instant::now(),
+                        response: None,
+                    }),
+                    cv: Condvar::new(),
+                    id: id.to_owned(),
+                })
             })
-        })
-        .clone()
+            .clone()
+    };
+    drop(map);
+    // The owed answers run after the map lock, so a peer that stops reading cannot block a session lookup.
+    for session in stalled {
+        close_session(&session);
+    }
+    session
 }
 
 fn close_session(s: &Arc<Session>) {
-    let mut st = s.state.lock().expect("session lock");
-    st.ended = true;
-    s.cv.notify_all();
+    let response = {
+        let mut st = s.state.lock().expect("session lock");
+        st.ended = true;
+        s.cv.notify_all();
+        st.response.take()
+    };
+    if let Some(response) = response {
+        response();
+    }
 }
 
 fn remove_session_if_owned(id: &str, session: &Session) {
@@ -1977,6 +1989,19 @@ impl Session {
         st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
         true
+    }
+    /// The 200 an H1 POST owes: written by whichever half ends the session, so the POST keeps no thread.
+    fn defer_response(&self, response: Box<dyn FnOnce() + Send>) {
+        let mut response = Some(response);
+        {
+            let mut st = self.state.lock().expect("session lock");
+            if !st.ended {
+                st.response = response.take();
+            }
+        }
+        if let Some(response) = response {
+            response();
+        }
     }
     fn wait_ended(&self) {
         self.wait_ended_for(crate::budgets::relay_stall());
@@ -2671,8 +2696,14 @@ pub(crate) fn accept_core<
                 h2.bind_upload(sid);
             }
             // The reference writes the 200 but Go holds it until the handler returns, after the session ends: a client that sees it early closes its upload body.
-            session.wait_ended();
-            plain_ok(&mut write, settings, &padded);
+            if h2.is_some() {
+                session.wait_ended();
+                plain_ok(&mut write, settings, &padded);
+                return Served::Closed;
+            }
+            // A plain H1 POST hands its answer to the session and returns, so no accepted thread waits out the download.
+            let settings = settings.clone();
+            session.defer_response(Box::new(move || plain_ok(&mut write, &settings, &padded)));
             Served::Closed
         }
         (Some(sid), Some(seq)) => {
@@ -5914,6 +5945,7 @@ mod tests {
                 ended: true,
                 downlink: false,
                 last_seen: std::time::Instant::now(),
+                response: None,
             }),
             cv: Condvar::new(),
             id: String::new(),
@@ -5937,6 +5969,7 @@ mod tests {
                 ended: true,
                 downlink: false,
                 last_seen: std::time::Instant::now(),
+                response: None,
             }),
             cv: Condvar::new(),
             id: String::new(),
@@ -5964,6 +5997,7 @@ mod tests {
                 ended: false,
                 downlink: false,
                 last_seen: std::time::Instant::now(),
+                response: None,
             }),
             cv: Condvar::new(),
             id: String::new(),
@@ -5994,6 +6028,7 @@ mod tests {
                 ended: false,
                 downlink: false,
                 last_seen: std::time::Instant::now(),
+                response: None,
             }),
             cv: Condvar::new(),
             id: String::new(),

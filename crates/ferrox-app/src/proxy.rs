@@ -7873,10 +7873,8 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
-        // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane, and a guessed mode takes the same shape.
-        let may_upload = settings.mode == crate::xhttp::XhttpMode::StreamUp
-            || settings.mode_source != crate::xhttp::ModeSource::Stated;
-        if may_upload {
+        // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
+        if settings.mode == crate::xhttp::XhttpMode::StreamUp {
             chained.arm_relay_poll();
             let settings = settings.clone();
             let users: VlessUsers = users.into();
