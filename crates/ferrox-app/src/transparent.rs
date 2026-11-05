@@ -188,8 +188,12 @@ mod linux {
             if read < 0 {
                 return Err(io::Error::last_os_error());
             }
-            let client = storage_address(&source)
-                .ok_or_else(|| io::Error::other("datagram from an unknown family"))?;
+            let client = storage_address(&source).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "datagram from an unknown family",
+                )
+            })?;
             let mut header = libc::CMSG_FIRSTHDR(&message);
             while !header.is_null() {
                 let level = (*header).cmsg_level;
@@ -214,7 +218,10 @@ mod linux {
                 }
                 header = libc::CMSG_NXTHDR(&message, header);
             }
-            Err(io::Error::other("datagram without its destination"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "datagram without its destination",
+            ))
         }
     }
 
@@ -338,6 +345,10 @@ mod darwin {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
+        reply_destination(&look)
+    }
+
+    fn reply_destination(look: &NatLook) -> io::Result<SocketAddr> {
         let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
         match look.family as libc::c_int {
             libc::AF_INET => {
@@ -345,7 +356,7 @@ mod darwin {
                 let address =
                     unsafe { &mut *std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in>() };
                 address.sin_family = libc::AF_INET as _;
-                address.sin_port = u16::from_be_bytes([
+                address.sin_port = u16::from_ne_bytes([
                     look.reply_destination_port[0],
                     look.reply_destination_port[1],
                 ]);
@@ -358,7 +369,7 @@ mod darwin {
                 let address =
                     unsafe { &mut *std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in6>() };
                 address.sin6_family = libc::AF_INET6 as _;
-                address.sin6_port = u16::from_be_bytes([
+                address.sin6_port = u16::from_ne_bytes([
                     look.reply_destination_port[0],
                     look.reply_destination_port[1],
                 ]);
@@ -367,6 +378,23 @@ mod darwin {
             _ => return Err(io::Error::other("unknown address family")),
         }
         storage_address(&storage).ok_or_else(|| io::Error::other("unknown address family"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_nat_look_reply_port_keeps_its_network_order() {
+            let mut look: NatLook = unsafe { zeroed() };
+            look.family = libc::AF_INET as u8;
+            look.reply_destination[..4].copy_from_slice(&[127, 0, 0, 1]);
+            look.reply_destination_port[..2].copy_from_slice(&8080u16.to_be_bytes());
+            assert_eq!(
+                reply_destination(&look).expect("decodes"),
+                "127.0.0.1:8080".parse().expect("literal")
+            );
+        }
     }
 }
 

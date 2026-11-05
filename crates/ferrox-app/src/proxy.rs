@@ -21739,9 +21739,17 @@ fn dokodemo_udp_door(
         if n == 0 {
             continue;
         }
-        legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+        if legs
+            .get(&src)
+            .is_some_and(|(_, _, alive)| !alive.load(Ordering::Relaxed))
+        {
+            legs.remove(&src);
+        }
         if !legs.contains_key(&src) && legs.len() >= MAX_DOKODEMO_LEGS {
-            continue;
+            legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+            if legs.len() >= MAX_DOKODEMO_LEGS {
+                continue;
+            }
         }
         let leg = match legs.entry(src) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -21804,15 +21812,24 @@ fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound) {
                 legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
                 continue;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(_) => return,
         };
         if n == 0 {
             continue;
         }
-        legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
         let key = (client, original);
+        if legs
+            .get(&key)
+            .is_some_and(|(_, _, alive)| !alive.load(Ordering::Relaxed))
+        {
+            legs.remove(&key);
+        }
         if !legs.contains_key(&key) && legs.len() >= MAX_DOKODEMO_LEGS {
-            continue;
+            legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+            if legs.len() >= MAX_DOKODEMO_LEGS {
+                continue;
+            }
         }
         let leg = match legs.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),

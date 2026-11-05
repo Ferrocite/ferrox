@@ -322,7 +322,9 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
                 // A receiver's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
                 stream = Some(stream_settings(reader.bytes()?)?);
             }
-            (4, 0) => return Err(reader.uncarried("receive_original_destination")),
+            (4, 0) => {
+                reader.varint()?;
+            }
             (6, 2) => sniffing = Some(sniffing_settings(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -717,13 +719,28 @@ fn int32(raw: u64) -> i32 {
         .cast_signed()
 }
 
-/// xray's `SocketConfig` as far as a stream's dial reads it: the system dial this tree puts
-/// under `freedom` already resolves a name to an address, which is `USE_IP`; every other
-/// socket option shapes a dial this tree does not carry and is refused by number.
-fn socket_settings(bytes: &[u8]) -> Result<(), String> {
+/// xray's `SocketConfig` as far as a stream reads it: the system dial this tree puts under
+/// `freedom` already resolves a name to an address, which is `USE_IP`; a transparent front's
+/// `tproxy` mode is carried, its original-destination marker is read, and every other socket
+/// option shapes a dial this tree does not carry and is refused by number.
+fn socket_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.SocketConfig");
+    let mut tproxy = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
+            (3, 0) => {
+                tproxy = match reader.varint()? {
+                    0 => None,
+                    1 => Some("tproxy"),
+                    2 => Some("redirect"),
+                    mode => {
+                        return Err(reader.uncarried(&format!("socket tproxy mode {mode}")));
+                    }
+                };
+            }
+            (4, 0) => {
+                reader.varint()?;
+            }
             (8, 0) => {
                 let strategy = reader.varint()?;
                 if strategy > 1 {
@@ -733,7 +750,7 @@ fn socket_settings(bytes: &[u8]) -> Result<(), String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(())
+    Ok(tproxy.map(|tproxy| object(vec![("tproxy", Json::Str(tproxy.to_owned()))])))
 }
 
 /// One stream policy as this tree's JSON dialect spells it: the network, and the security the
@@ -746,6 +763,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut transport_settings: Option<Json> = None;
     let mut security_type = String::new();
     let mut security: Option<(&'static str, Json)> = None;
+    let mut sockopt = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (2, 2) => {
@@ -766,7 +784,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
                 }
             }
             (5, 2) => network = account_text(&mut reader)?,
-            (6, 2) => socket_settings(reader.bytes()?)?,
+            (6, 2) => sockopt = socket_settings(reader.bytes()?)?,
             (8..=12, _) => return Err(reader.uncarried("address, mask or quic policy on a stream")),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -780,6 +798,9 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
         return Err(format!("network `{network}` is not carried"));
     }
     let mut pairs = vec![("network", Json::Str(network.clone()))];
+    if let Some(sockopt) = sockopt {
+        pairs.push(("sockopt", sockopt));
+    }
     if let Some(settings) = transport_settings {
         let key = match network.as_str() {
             "masque" => "masqueSettings",
@@ -4616,6 +4637,16 @@ mod tests {
 
     #[test]
     fn a_dokodemo_follow_redirect_decodes() {
+        let socket = message(&[varint_field(3, 2), varint_field(4, 1)]);
+        let stream = message(&[bytes_field(6, &socket)]);
+        let range = message(&[varint_field(1, 8080), varint_field(2, 8080)]);
+        let list = message(&[bytes_field(1, &range)]);
+        let receiver = message(&[
+            bytes_field(1, &list),
+            bytes_field(2, &bytes_field(1, &[127, 0, 0, 1])),
+            bytes_field(3, &stream),
+            varint_field(4, 1),
+        ]);
         let settings = message(&[
             bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
             varint_field(2, 8080),
@@ -4623,18 +4654,25 @@ mod tests {
             varint_field(7, 2),
         ]);
         let json = to_json(&config(
-            &dokodemo_inbound(&receiver(8080, None), &settings),
+            &dokodemo_inbound(&receiver, &settings),
             &freedom_outbound(),
         ))
         .expect("followRedirect decodes");
-        let follow = json
+        let inbound = &json
             .get("inbounds")
             .and_then(Json::as_arr)
-            .expect("inbounds")[0]
+            .expect("inbounds")[0];
+        let follow = inbound
             .get("settings")
             .and_then(|settings| settings.get("followRedirect"))
             .and_then(Json::as_bool);
         assert_eq!(follow, Some(true));
+        let tproxy = inbound
+            .get("streamSettings")
+            .and_then(|settings| settings.get("sockopt"))
+            .and_then(|sockopt| sockopt.get("tproxy"))
+            .and_then(Json::as_str);
+        assert_eq!(tproxy, Some("redirect"));
     }
 
     #[test]
