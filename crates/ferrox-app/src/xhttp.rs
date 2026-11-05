@@ -1836,6 +1836,7 @@ struct Session {
 struct SessionState {
     upload: Option<Box<dyn Read + Send>>,
     upload_attached: bool,
+    upload_done: bool,
     packets: BTreeMap<u64, Vec<u8>>,
     next_seq: u64,
     ended: bool,
@@ -1879,6 +1880,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
                 state: Mutex::new(SessionState {
                     upload: None,
                     upload_attached: false,
+                    upload_done: false,
                     packets: BTreeMap::new(),
                     next_seq: 0,
                     ended: false,
@@ -2050,6 +2052,13 @@ impl SessionReader {
         st.ended = true;
         self.session.cv.notify_all();
     }
+
+    fn finish_upload(&mut self) {
+        self.upload = None;
+        let mut st = self.session.state.lock().expect("session lock");
+        st.upload_done = true;
+        self.session.cv.notify_all();
+    }
 }
 
 /// A poll grain is the reader's own wake-up, not a socket deadline, so it ends no session.
@@ -2079,7 +2088,7 @@ impl Read for SessionReader {
                 let got = self.upload.as_mut().expect("upload").read(buf);
                 return match got {
                     Ok(0) => {
-                        self.end_upload();
+                        self.finish_upload();
                         Ok(0)
                     }
                     Ok(n) => {
@@ -2109,7 +2118,7 @@ impl Read for SessionReader {
                 buf.copy_from_slice(&self.cur[..buf.len()]);
                 return Ok(buf.len());
             }
-            if st.ended {
+            if st.ended || st.upload_done {
                 return Ok(0);
             }
             let (guard, wait) = self
@@ -2142,7 +2151,7 @@ impl crate::proxy::WindowRead for SessionReader {
                 };
                 return match got {
                     Ok(0) => {
-                        self.end_upload();
+                        self.finish_upload();
                         Ok(crate::proxy::Window::empty())
                     }
                     Ok(n) => Ok(crate::proxy::Window::one(self.scratch.filled(n))),
@@ -2165,7 +2174,7 @@ impl crate::proxy::WindowRead for SessionReader {
                 self.cur_at = self.cur.len();
                 return Ok(crate::proxy::Window::one(&self.cur));
             }
-            if st.ended {
+            if st.ended || st.upload_done {
                 return Ok(crate::proxy::Window::empty());
             }
             let (guard, wait) = self
@@ -2632,8 +2641,9 @@ pub(crate) fn accept_core<
             if let Some(h2) = h2.as_ref() {
                 h2.bind_upload(sid);
             }
-            plain_ok(&mut write, settings, &padded);
+            // The reference writes the 200 but Go holds it until the handler returns, after the session ends: a client that sees it early closes its upload body.
             session.wait_ended();
+            plain_ok(&mut write, settings, &padded);
             Served::Closed
         }
         (Some(sid), Some(seq)) => {
@@ -5278,6 +5288,133 @@ mod tests {
         worker.join().expect("joins");
     }
 
+    /// The reference writes its 200 but Go holds it until the handler returns after `httpSC.Wait()`
+    /// (hub.go:237); a client that reads it earlier closes the upload body (client.go:90).
+    #[test]
+    fn a_stream_up_post_is_answered_only_after_its_session_ends() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-up"}}}"#,
+        );
+        let referer = format!("http://127.0.0.1/share?x_padding={}", "X".repeat(500));
+        let down_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the downlink");
+        let down_port = down_listener.local_addr().expect("addr").port();
+        let up_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the uplink");
+        let up_port = up_listener.local_addr().expect("addr").port();
+
+        let (end_down, hold_down) = std::sync::mpsc::channel::<()>();
+        let down = {
+            let settings = settings.clone();
+            thread::spawn(move || {
+                let (mut stream, _) = down_listener.accept().expect("accepts the downlink");
+                let Ok(read) = stream.try_clone() else {
+                    return;
+                };
+                let (mut head, at) = crate::proxy::read_exact_head(
+                    &mut stream,
+                    HEAD_LIMIT,
+                    crate::budgets::head_arrival(),
+                )
+                .expect("head");
+                let prefix = head.split_off(at);
+                let Served::Session(mut reader, writer) =
+                    accept_core(&head, prefix, read, stream, &settings, None)
+                else {
+                    panic!("the downlink was not a session");
+                };
+                let mut buf = [0u8; 64];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => break,
+                    }
+                }
+                let _ = hold_down.recv_timeout(Duration::from_secs(5));
+                drop(reader);
+                writer.finish();
+            })
+        };
+        let up = {
+            let settings = settings.clone();
+            thread::spawn(move || {
+                let (mut stream, _) = up_listener.accept().expect("accepts the uplink");
+                let Ok(read) = stream.try_clone() else {
+                    return;
+                };
+                let (mut head, at) = crate::proxy::read_exact_head(
+                    &mut stream,
+                    HEAD_LIMIT,
+                    crate::budgets::head_arrival(),
+                )
+                .expect("head");
+                let prefix = head.split_off(at);
+                let _ = accept_core(&head, prefix, read, stream, &settings, None);
+            })
+        };
+
+        let mut get = Connection::connect(("127.0.0.1", down_port)).expect("connects the downlink");
+        get.write_all(
+            format!("GET /share/up-late HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("writes the GET");
+        let answered = head_text(&mut get);
+        assert!(
+            ok_status_text(&answered),
+            "the downlink was not answered, wrote {answered:?}"
+        );
+
+        let mut uplink = Connection::connect(("127.0.0.1", up_port)).expect("connects the uplink");
+        uplink
+            .write_all(
+                format!("POST /share/up-late HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("writes the POST");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !get_or_create_session("up-late")
+            .state
+            .lock()
+            .expect("session lock")
+            .upload_attached
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload was never attached"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        uplink
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("arms the probe");
+        let mut probe = [0u8; 1];
+        match uplink.read(&mut probe) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            other => panic!("the upload was answered before its session ended: {other:?}"),
+        }
+
+        let _ = end_down.send(());
+        uplink
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("rearms the read");
+        let mut answer = Vec::new();
+        uplink.read_to_end(&mut answer).expect("reads the answer");
+        assert!(
+            ok_status_text(&String::from_utf8_lossy(&answer)),
+            "the upload was never answered, wrote {answer:?}"
+        );
+        down.join().expect("joins the downlink");
+        up.join().expect("joins the uplink");
+    }
+
     /// A poll grain from the upload keeps the session open; a socket deadline still ends it.
     #[test]
     fn a_poll_grain_keeps_the_session_and_a_deadline_ends_it() {
@@ -5658,6 +5795,7 @@ mod tests {
             state: Mutex::new(SessionState {
                 upload: Some(Box::new(Blocked)),
                 upload_attached: false,
+                upload_done: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
@@ -5679,6 +5817,7 @@ mod tests {
             state: Mutex::new(SessionState {
                 upload: None,
                 upload_attached: false,
+                upload_done: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
@@ -5704,6 +5843,7 @@ mod tests {
             state: Mutex::new(SessionState {
                 upload: None,
                 upload_attached: false,
+                upload_done: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
@@ -5732,6 +5872,7 @@ mod tests {
             state: Mutex::new(SessionState {
                 upload: None,
                 upload_attached: false,
+                upload_done: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
