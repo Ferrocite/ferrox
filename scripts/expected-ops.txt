@@ -204,4 +204,8 @@ grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 g
 # Re-blessed 1231 by p2-ech: the shaped-ECH sealer and cover changes in
 # ferrox-core move this frame's thin-LTO layout by three instructions;
 # sniff.rs and the warm probe are untouched, and the bytes are unchanged.
-ferrox_app::sniff::Sniffing::inspect 1231 sniff::tests::a_warm_probe_costs_the_documented_instructions
+# Re-blessed 1228 by psiphon-in-place: the in-place QUIC and WebRTC payload
+# handling and its five allocation tests in the same app binary move this
+# frame's thin-LTO layout back by three; sniff.rs, the warm probe and the
+# bytes are unchanged.
+ferrox_app::sniff::Sniffing::inspect 1228 sniff::tests::a_warm_probe_costs_the_documented_instructions
