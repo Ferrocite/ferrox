@@ -4232,7 +4232,20 @@ mod tests {
     /// A downlink that ends before its upload's body still owes the POST a 200: the upload's stream
     /// stays in the table, so the deferred head is not answered by a reset.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_finished_downlink_leaves_its_upload_for_the_response() {
+        struct Discard;
+        impl H2Service for Discard {
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
+        }
         let sid = "h2-deferred-upload-answer";
         crate::xhttp::start_session_for_probe(sid);
         let (conn, written, _slices) = bare_conn();
@@ -4281,20 +4294,8 @@ mod tests {
                 .contains_key(&2),
             "the upload stays for its deferred 200"
         );
-        struct Sink;
-        impl H2Service for Sink {
-            fn open(
-                &self,
-                _conn: &Arc<H2Conn>,
-                _sid: u32,
-                _block: &[u8],
-                _end_stream: bool,
-            ) -> bool {
-                true
-            }
-        }
         assert!(
-            pump_frame(&conn, &Sink, T_DATA, 0, 2, vec![0xa5; 4096], &mut None),
+            pump_frame(&conn, &Discard, T_DATA, 0, 2, vec![0xa5; 4096], &mut None),
             "a late upload frame is discarded instead of ending the connection"
         );
         assert!(
