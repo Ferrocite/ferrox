@@ -1891,7 +1891,7 @@ fn drive(shared: &Arc<Shared>, mut udp: Udp, mut engine: Engine) {
 }
 
 impl Engine {
-    /// Send the CONNECTION_CLOSE frame in the narrowest space this engine has keys for.
+    /// Send the `CONNECTION_CLOSE` frame in the narrowest space this engine has keys for.
     fn send_close(&mut self, udp: &mut Udp, now: Instant) -> Result<(), String> {
         let space = if self.one_rtt.is_some() {
             ONE_RTT
