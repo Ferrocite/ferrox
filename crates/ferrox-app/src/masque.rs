@@ -3884,6 +3884,7 @@ mod tests {
 
     #[test]
     fn early_h3_datagrams_are_bounded_by_count_and_bytes() {
+        assert_eq!((EARLY_PACKETS, EARLY_BYTES), (64, 1 << 20));
         let mut stream = Stream::default();
         for _ in 0..EARLY_PACKETS {
             assert!(stream.stash(vec![0; 32]));

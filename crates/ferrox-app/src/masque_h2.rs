@@ -312,6 +312,7 @@ fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<Server
     }
 }
 
+/// Wrap a cleartext TCP stream in the same clock the TLS carrier uses.
 fn cleartext_wire(stream: TcpStream) -> Wire {
     let (io, deadline) = handshake_stream(stream);
     io.set_read_timeout(Some(READ_WAIT));
@@ -1933,8 +1934,36 @@ mod tests {
         drop(client);
     }
 
+    struct Gate {
+        out: Arc<Mutex<Vec<u8>>>,
+        deadline: Instant,
+    }
+
+    impl Read for Gate {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Gate {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if buf.len() == 9 && buf[3] == h2::T_PING && buf[4] == h2::F_ACK {
+                let wait = self.deadline.saturating_duration_since(Instant::now());
+                if !wait.is_zero() {
+                    std::thread::sleep(wait + Duration::from_millis(1));
+                }
+            }
+            self.out.lock().expect("a gate").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn a_due_handshake_clock_is_checked_between_frames() {
+    fn a_due_handshake_clock_ends_before_any_frame() {
         let out = Arc::new(Mutex::new(Vec::new()));
         let mut pending = Vec::new();
         pending.extend_from_slice(&h2::frame_head(8, h2::T_PING, 0, 0));
@@ -1957,6 +1986,34 @@ mod tests {
             out.lock().expect("a recorder").len(),
             15,
             "the due clock stopped before the ping was answered"
+        );
+    }
+
+    #[test]
+    fn a_handshake_clock_that_falls_due_between_frames_stops_the_next() {
+        let gate = Instant::now() + Duration::from_secs(2);
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            pending.extend_from_slice(&h2::frame_head(8, h2::T_PING, 0, 0));
+            pending.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        }
+        let mut wire = Wire {
+            stream: Box::new(Gate {
+                out: Arc::clone(&out),
+                deadline: gate,
+            }),
+            pending,
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.run_until(&mut wire, gate);
+        assert!(session.end, "the handshake clock ended the session");
+        assert_eq!(
+            out.lock().expect("a gate").len(),
+            32,
+            "the due clock stopped before the second ping was answered"
         );
     }
 
