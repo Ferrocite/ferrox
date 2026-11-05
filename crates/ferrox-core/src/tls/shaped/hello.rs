@@ -1,8 +1,9 @@
 // The shaped ClientHello: a pinned parrot's ciphers, extension order and bodies, with the GREASE, key shares, ECH cover and padding a browser draws.
 use super::keys::{self, Share};
 use super::{Body, Ext, Profile, GREASE};
+use crate::tls::hpke::Sealer;
 use crate::tls::TlsError;
-use rustls::crypto::hpke::{Hpke as _, HpkePublicKey, HpkeSealer};
+use rustls::crypto::hpke::HpkeSealer as _;
 
 /// The version this hello's legacy field names, which a static-RSA premaster repeats.
 pub(super) const TLS12: u16 = 0x0303;
@@ -35,8 +36,8 @@ pub(crate) struct Hello {
 struct EchOffer {
     config_id: u8,
     suite: (u16, u16),
-    enc: Vec<u8>,
-    sealer: Box<dyn HpkeSealer>,
+    enc: [u8; 32],
+    sealer: Sealer,
     inner_random: [u8; 32],
     inner_name: Option<String>,
     public_name: String,
@@ -143,15 +144,20 @@ impl Hello {
         let mut info = Vec::with_capacity(8 + encoded.len());
         info.extend_from_slice(b"tls ech\0");
         info.extend_from_slice(&encoded);
+        let public_key: [u8; 32] = config
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| TlsError::Other("ech: public key is not 32 bytes".to_owned()))?;
         let (enc, sealer) = hpke
-            .setup_sealer(&info, &HpkePublicKey(config.public_key.clone()))
+            .setup_sealer_owned(&info, &public_key)
             .map_err(|e| TlsError::Other(format!("ech: hpke: {e}")))?;
         let mut inner_random = [0u8; 32];
         getrandom::fill(&mut inner_random).map_err(entropy)?;
         let mut offer = EchOffer {
             config_id: config.id,
             suite,
-            enc: enc.0,
+            enc,
             sealer,
             inner_random,
             inner_name: self.sni.clone(),
@@ -178,9 +184,8 @@ impl Hello {
     ) -> Result<Vec<u8>, TlsError> {
         let (encoded, transcript) = self.inner_hello(offer, shares, cookie);
         offer.transcript = handshake(1, &transcript);
-        let placeholder = vec![0u8; encoded.len() + 16];
-        let enc = if retry { &[][..] } else { offer.enc.as_slice() };
-        let cover = ech_cover(offer.suite, offer.config_id, enc, &placeholder);
+        let enc: &[u8] = if retry { &[] } else { &offer.enc };
+        let cover = ech_cover(offer.suite, offer.config_id, enc, encoded.len() + 16);
         let entries =
             self.extension_entries(shares, cookie, self.sni.as_deref(), Some(&cover), true);
         let mut outer = self.encode_body(
@@ -895,16 +900,16 @@ fn handshake(kind: u8, body: &[u8]) -> Vec<u8> {
     msg
 }
 
-fn ech_cover(suite: (u16, u16), config_id: u8, enc: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(12 + enc.len() + payload.len());
+fn ech_cover(suite: (u16, u16), config_id: u8, enc: &[u8], payload_len: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12 + enc.len() + payload_len);
     body.push(0);
     body.extend_from_slice(&suite.0.to_be_bytes());
     body.extend_from_slice(&suite.1.to_be_bytes());
     body.push(config_id);
     body.extend_from_slice(&(enc.len() as u16).to_be_bytes());
     body.extend_from_slice(enc);
-    body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    body.extend_from_slice(payload);
+    body.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    body.resize(body.len() + payload_len, 0);
     body
 }
 
@@ -1022,6 +1027,7 @@ fn entropy(error: getrandom::Error) -> TlsError {
 mod tests {
     use super::*;
     use crate::tls::shaped::Fingerprint;
+    use rustls::crypto::hpke::Hpke as _;
 
     fn hex(bytes: &[u8]) -> String {
         use std::fmt::Write as _;

@@ -45,7 +45,7 @@ impl Aead {
 
     fn seal(
         self,
-        key: &[u8],
+        key: &[u8; 32],
         nonce: &[u8; 12],
         aad: &[u8],
         plaintext: &[u8],
@@ -57,7 +57,7 @@ impl Aead {
         match self {
             Self::Aes128Gcm => {
                 use aes_gcm::{Aes128Gcm, KeyInit as _};
-                let cipher = Aes128Gcm::new_from_slice(key)
+                let cipher = Aes128Gcm::new_from_slice(&key[..16])
                     .map_err(|_| general("hpke: aes-128-gcm key length"))?;
                 cipher
                     .encrypt(
@@ -68,7 +68,7 @@ impl Aead {
             }
             Self::Aes256Gcm => {
                 use aes_gcm::{Aes256Gcm, KeyInit as _};
-                let cipher = Aes256Gcm::new_from_slice(key)
+                let cipher = Aes256Gcm::new_from_slice(&key[..])
                     .map_err(|_| general("hpke: aes-256-gcm key length"))?;
                 cipher
                     .encrypt(
@@ -79,7 +79,7 @@ impl Aead {
             }
             Self::ChaCha20Poly1305 => {
                 use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _};
-                let cipher = ChaCha20Poly1305::new_from_slice(key)
+                let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
                     .map_err(|_| general("hpke: chacha20poly1305 key length"))?;
                 cipher
                     .encrypt(
@@ -93,7 +93,7 @@ impl Aead {
 
     fn open(
         self,
-        key: &[u8],
+        key: &[u8; 32],
         nonce: &[u8; 12],
         aad: &[u8],
         ciphertext: &[u8],
@@ -105,7 +105,7 @@ impl Aead {
         match self {
             Self::Aes128Gcm => {
                 use aes_gcm::{Aes128Gcm, KeyInit as _};
-                let cipher = Aes128Gcm::new_from_slice(key)
+                let cipher = Aes128Gcm::new_from_slice(&key[..16])
                     .map_err(|_| general("hpke: aes-128-gcm key length"))?;
                 cipher
                     .decrypt(
@@ -116,7 +116,7 @@ impl Aead {
             }
             Self::Aes256Gcm => {
                 use aes_gcm::{Aes256Gcm, KeyInit as _};
-                let cipher = Aes256Gcm::new_from_slice(key)
+                let cipher = Aes256Gcm::new_from_slice(&key[..])
                     .map_err(|_| general("hpke: aes-256-gcm key length"))?;
                 cipher
                     .decrypt(
@@ -127,7 +127,7 @@ impl Aead {
             }
             Self::ChaCha20Poly1305 => {
                 use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _};
-                let cipher = ChaCha20Poly1305::new_from_slice(key)
+                let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
                     .map_err(|_| general("hpke: chacha20poly1305 key length"))?;
                 cipher
                     .decrypt(
@@ -233,25 +233,26 @@ impl Context {
     }
 
     fn nonce(&self, sequence: u64) -> [u8; 12] {
-        let mut nonce = self.base_nonce;
-        let mut tail = [0u8; 8];
-        tail.copy_from_slice(&nonce[4..]);
-        nonce[4..].copy_from_slice(&(u64::from_be_bytes(tail) ^ sequence).to_be_bytes());
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.base_nonce[..4]);
+        let tail = u64::from_be_bytes(self.base_nonce[4..].try_into().expect("eight bytes"));
+        nonce[4..].copy_from_slice(&(tail ^ sequence).to_be_bytes());
         nonce
     }
 
+    #[cfg(test)]
     fn key(&self) -> &[u8] {
         &self.key[..self.aead.key_len()]
     }
 
     fn seal(&self, aad: &[u8], plaintext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
-            .seal(self.key(), &self.nonce(sequence), aad, plaintext)
+            .seal(&self.key, &self.nonce(sequence), aad, plaintext)
     }
 
     fn open(&self, aad: &[u8], ciphertext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
-            .open(self.key(), &self.nonce(sequence), aad, ciphertext)
+            .open(&self.key, &self.nonce(sequence), aad, ciphertext)
     }
 }
 
@@ -293,7 +294,7 @@ fn secret_key(bytes: &[u8]) -> Result<[u8; 32], rustls::Error> {
 }
 
 #[derive(Debug)]
-struct Sealer {
+pub(crate) struct Sealer {
     context: Context,
     sequence: u64,
 }
@@ -325,6 +326,24 @@ pub(crate) struct X25519Hpke {
     aead: Aead,
 }
 
+impl X25519Hpke {
+    /// The shaped hello's sealer: the encapsulation and context land on the stack, no boxed trait object.
+    pub(crate) fn setup_sealer_owned(
+        &self,
+        info: &[u8],
+        public_key: &[u8; 32],
+    ) -> Result<([u8; 32], Sealer), rustls::Error> {
+        let (enc, secret) = encapsulate(public_key)?;
+        Ok((
+            enc,
+            Sealer {
+                context: Context::new(&secret, info, self.aead),
+                sequence: 0,
+            },
+        ))
+    }
+}
+
 impl Hpke for X25519Hpke {
     fn seal(
         &self,
@@ -344,14 +363,8 @@ impl Hpke for X25519Hpke {
         info: &[u8],
         pub_key: &HpkePublicKey,
     ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer + 'static>), rustls::Error> {
-        let (enc, secret) = encapsulate(&public_key(pub_key)?)?;
-        Ok((
-            EncapsulatedSecret(enc.to_vec()),
-            Box::new(Sealer {
-                context: Context::new(&secret, info, self.aead),
-                sequence: 0,
-            }),
-        ))
+        let (enc, sealer) = self.setup_sealer_owned(info, &public_key(pub_key)?)?;
+        Ok((EncapsulatedSecret(enc.to_vec()), Box::new(sealer)))
     }
 
     fn open(
@@ -520,6 +533,21 @@ mod tests {
             "the suite ids, labels and keys are all stacks and arrays"
         );
         assert_eq!(context.key().len(), 16);
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_shaped_sealer_costs_no_allocations() {
+        let (sealer, counts) = crate::alloc_count::measure(|| {
+            AES128_GCM.setup_sealer_owned(b"tls ech\0config", &[7u8; 32])
+        });
+        let (enc, _sealer) = sealer.expect("a sealer over a valid public key");
+        assert_eq!(
+            (counts.allocs, counts.bytes),
+            (0, 0),
+            "the encapsulation and context stay on the stack"
+        );
+        assert_eq!(enc.len(), 32);
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
