@@ -12859,6 +12859,14 @@ fn serve_dokodemo(
         .get("receiveOriginalDestination")
         .and_then(Json::as_bool)
         .unwrap_or(follow_redirect);
+    let user_level = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("userLevel"))
+        .and_then(Json::as_u32)
+        .unwrap_or(0);
+    if user_level != 0 {
+        eprintln!("dokodemo-door in {label}: userLevel {user_level} is accepted but not applied");
+    }
     let rewrite = DokodemoRewrite::from_config(inbound);
     let networks = dokodemo_networks(inbound);
     if !dokodemo_has(&networks, "tcp") && !dokodemo_has(&networks, "udp") {
@@ -12941,7 +12949,10 @@ fn serve_dokodemo(
                 socket,
                 transparent.is_some() && follow_redirect && receive_original_destination,
             ),
-            Err(_) if transparent.is_some() && rewrite.configured().is_some() => {
+            Err(_)
+                if transparent.is_some()
+                    && (!follow_redirect || rewrite.configured().is_some()) =>
+            {
                 eprintln!("dokodemo-door udp: a transparent listener is unavailable in {label}; the rewrite target carries the flow");
                 let Ok(socket) = UdpSocket::bind(address) else {
                     eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
@@ -12964,6 +12975,9 @@ fn serve_dokodemo(
                 Some(rewrite.resolved(socket.local_addr().ok(), &port_map))
             };
             let Some(dest) = dest else {
+                eprintln!(
+                    "dokodemo-door udp: followRedirect needs a rewrite address in {label}; no UDP flow is served"
+                );
                 return (armed, dokodemo_has(&networks, "tcp"));
             };
             thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door));
