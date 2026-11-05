@@ -4084,57 +4084,24 @@ fn serve_vless_grpc(
     let Some((reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let mut reader = reader;
-    if let Some(decryption) = decryption {
-        let close = writer.clone();
-        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        return serve_sealed_carried_with(
-            reader,
-            writer,
-            users,
-            freedom,
-            decryption,
-            close,
-            |reader| {
-                reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-                reader.set_poll(Some(RELAY_POLL));
-            },
-            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
-            |reader| reader.set_handshake_budget(None),
-        );
-    }
-    // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
-    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
-        decode_request_gated(
-            read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
-            resolve_endpoint,
-        )
-    }) else {
+    let Some(decryption) = decryption else {
         return;
     };
-    let ask = reverse_ask(users, &got, flow, cmd);
-    if !matches!(ask, ReverseAsk::NotReverse) {
-        let closer_writer = writer.clone();
-        reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
-        return;
-    }
-    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
-        return;
-    }
-    let Some(uplink) = dial_or_report(&target) else {
-        return;
-    };
-    if !writer.send(&[0, 0]) {
-        return;
-    }
-    reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_window_with(
+    let close = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
+    serve_sealed_carried_with(
         reader,
-        &writer,
-        &uplink,
-        crate::grpc::mark_reader_dead,
-        |reader| crate::grpc::request_ended(reader),
+        writer,
+        users,
+        freedom,
+        decryption,
+        close,
+        |reader| {
+            reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+            reader.set_poll(Some(RELAY_POLL));
+        },
+        |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+        |reader| reader.set_handshake_budget(None),
     );
 }
 
@@ -8026,53 +7993,21 @@ fn serve_session_grpc<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'sta
         echo_trace("session grpc accept refused");
         return;
     };
-    if let Some(decryption) = decryption {
-        let close = cwriter.clone();
-        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        return serve_sealed_carried_with(
-            creader,
-            cwriter,
-            users,
-            freedom,
-            decryption,
-            close,
-            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
-            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
-            |reader| reader.set_handshake_budget(None),
-        );
-    }
-    let mut creader = creader;
-    // The dispatcher already polls the socket behind a session at the relay's grain, so only the request's own clock is armed here: past it a peer that answered the head and then stopped speaking is a refusal, not a thread pinned in `read_exact`'s retry.
-    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_request_gated(
-        &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
-        resolve_endpoint,
-    );
-    creader.set_handshake_budget(None);
-    let Some((got, flow, cmd, target)) = decoded else {
-        echo_trace("session grpc vless decode refused");
+    let Some(decryption) = decryption else {
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
-        echo_trace("session grpc vless id or cmd refused");
-        return;
-    }
-    let Some(uplink) = dial_or_report(&target) else {
-        echo_trace("session grpc uplink refused");
-        return;
-    };
-    if !cwriter.send(&[0, 0]) {
-        echo_trace("session grpc vless response refused");
-        return;
-    }
-    echo_trace("session grpc relaying");
-    relay_sink_window_with(
+    let close = cwriter.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
+    serve_sealed_carried_with(
         creader,
-        &cwriter,
-        &uplink,
-        crate::grpc::mark_reader_dead,
-        |reader| crate::grpc::request_ended(reader),
+        cwriter,
+        users,
+        freedom,
+        decryption,
+        close,
+        |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+        |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+        |reader| reader.set_handshake_budget(None),
     );
 }
 
@@ -11408,6 +11343,9 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
         return;
     };
     // A mux or reverse header names no destination, so the gate above never saw it.
+    if cmd == 3 {
+        return;
+    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
@@ -14103,9 +14041,14 @@ fn vless_mux_kcp(vless: &VlessOut) -> Option<MuxUplink> {
     let conn = kcp_dial_session(&vless.carrier, &vless.address, vless.port)?;
     let header = vless_mux_header(&vless.id);
     if let Some(cfg) = vless.reality.as_deref() {
-        let mut session = kcp_reality_connect(&conn, cfg)?;
-        session.write_all(&header).ok()?;
-        read_vless_response(&mut session)?;
+        let Some(mut session) = kcp_reality_connect(&conn, cfg) else {
+            kcp_close(&conn)();
+            return None;
+        };
+        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
+            kcp_close(&conn)();
+            return None;
+        }
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         return Some(MuxUplink {
             read: Box::new(read),
@@ -14114,9 +14057,14 @@ fn vless_mux_kcp(vless: &VlessOut) -> Option<MuxUplink> {
         });
     }
     if let Some(cfg) = vless.tls.as_deref() {
-        let mut session = kcp_tls_connect(&conn, cfg)?;
-        session.write_all(&header).ok()?;
-        read_vless_response(&mut session)?;
+        let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
+            kcp_close(&conn)();
+            return None;
+        };
+        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
+            kcp_close(&conn)();
+            return None;
+        }
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         return Some(MuxUplink {
             read: Box::new(read),
@@ -14125,8 +14073,10 @@ fn vless_mux_kcp(vless: &VlessOut) -> Option<MuxUplink> {
         });
     }
     let (mut read, mut write, close) = kcp_parts(&conn);
-    write.write_all(&header).ok()?;
-    read_vless_response(&mut read)?;
+    if write.write_all(&header).is_err() || read_vless_response(&mut read).is_none() {
+        close();
+        return None;
+    }
     Some(MuxUplink {
         read: Box::new(read),
         write: Box::new(write),
