@@ -4373,7 +4373,7 @@ mod tests {
         );
         assert_eq!(settings.mode_source, ModeSource::Auto);
         let head = format!(
-            "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n",
+            "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
             "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
         );
         assert_eq!(
