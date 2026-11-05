@@ -633,6 +633,7 @@ pub fn decode_ech_keys(text: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+mod legacy;
 mod rustls_backend;
 pub use rustls_backend::{
     quic_server_context_builder, verify_cert_pinned, RustlsProvider, RustlsServerProvider,
@@ -646,6 +647,7 @@ pub use shaped::Fingerprint;
 pub enum ClientSession<S: Stream> {
     Stock(Box<RustlsProvider<S>>),
     Shaped(Box<shaped::Session<S>>),
+    Legacy(Box<legacy::Session<S>>),
 }
 
 impl<S: Stream> std::fmt::Debug for ClientSession<S> {
@@ -653,6 +655,7 @@ impl<S: Stream> std::fmt::Debug for ClientSession<S> {
         match self {
             Self::Stock(session) => std::fmt::Debug::fmt(session, f),
             Self::Shaped(session) => std::fmt::Debug::fmt(session, f),
+            Self::Legacy(session) => std::fmt::Debug::fmt(session, f),
         }
     }
 }
@@ -662,7 +665,14 @@ impl<S: Stream> ClientSession<S> {
         match self {
             Self::Stock(session) => session.get_ref(),
             Self::Shaped(session) => session.get_ref(),
+            Self::Legacy(session) => session.get_ref(),
         }
+    }
+
+    /// Whether a relay may read this session's transport itself and hand it only the ciphertext.
+    /// The `BoringSSL` path owns its transport, so it stays on the shared shape.
+    pub fn separates_ciphertext(&self) -> bool {
+        !matches!(self, Self::Legacy(_))
     }
 }
 
@@ -678,6 +688,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.suites(),
             Self::Shaped(session) => session.suites(),
+            Self::Legacy(session) => session.suites(),
         }
     }
 
@@ -685,6 +696,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.handshake(),
             Self::Shaped(session) => session.handshake(),
+            Self::Legacy(session) => session.handshake(),
         }
     }
 
@@ -692,6 +704,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.alpn(),
             Self::Shaped(session) => session.alpn(),
+            Self::Legacy(session) => session.alpn(),
         }
     }
 
@@ -699,6 +712,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.closed(),
             Self::Shaped(session) => session.closed(),
+            Self::Legacy(session) => session.closed(),
         }
     }
 
@@ -706,6 +720,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.peer_leaf(),
             Self::Shaped(session) => session.peer_leaf(),
+            Self::Legacy(session) => session.peer_leaf(),
         }
     }
 
@@ -713,6 +728,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.open(ciphertext, buf),
             Self::Shaped(session) => session.open(ciphertext, buf),
+            Self::Legacy(session) => session.open(ciphertext, buf),
         }
     }
 
@@ -720,6 +736,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.seal_into(plaintext, out),
             Self::Shaped(session) => session.seal_into(plaintext, out),
+            Self::Legacy(session) => session.seal_into(plaintext, out),
         }
     }
 
@@ -727,6 +744,7 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.seal_slices_into(parts, out),
             Self::Shaped(session) => session.seal_slices_into(parts, out),
+            Self::Legacy(session) => session.seal_slices_into(parts, out),
         }
     }
 }
@@ -736,6 +754,7 @@ impl<S: Stream + RecordAlignment> RecordAlignment for ClientSession<S> {
         match self {
             Self::Stock(session) => session.engage_record_alignment(),
             Self::Shaped(session) => session.engage_record_alignment(),
+            Self::Legacy(session) => session.engage_record_alignment(),
         }
     }
 
@@ -743,6 +762,7 @@ impl<S: Stream + RecordAlignment> RecordAlignment for ClientSession<S> {
         match self {
             Self::Stock(session) => session.disarm_record_alignment(),
             Self::Shaped(session) => session.disarm_record_alignment(),
+            Self::Legacy(session) => session.disarm_record_alignment(),
         }
     }
 
@@ -750,6 +770,7 @@ impl<S: Stream + RecordAlignment> RecordAlignment for ClientSession<S> {
         match self {
             Self::Stock(session) => session.write_all_slices(parts),
             Self::Shaped(session) => session.write_all_slices(parts),
+            Self::Legacy(session) => session.write_all_slices(parts),
         }
     }
 }
@@ -759,6 +780,7 @@ impl<S: Stream> std::io::Read for ClientSession<S> {
         match self {
             Self::Stock(session) => session.read(buf),
             Self::Shaped(session) => session.read(buf),
+            Self::Legacy(session) => session.read(buf),
         }
     }
 }
@@ -768,6 +790,7 @@ impl<S: Stream> std::io::Write for ClientSession<S> {
         match self {
             Self::Stock(session) => session.write(buf),
             Self::Shaped(session) => session.write(buf),
+            Self::Legacy(session) => session.write(buf),
         }
     }
 
@@ -775,6 +798,7 @@ impl<S: Stream> std::io::Write for ClientSession<S> {
         match self {
             Self::Stock(session) => session.flush(),
             Self::Shaped(session) => session.flush(),
+            Self::Legacy(session) => session.flush(),
         }
     }
 }
@@ -793,6 +817,10 @@ pub fn connect<S: Stream + RecordAlignment>(
         Some(_) => Ok(ClientSession::Shaped(Box::new(shaped::Session::connect(
             cfg, io,
         )?))),
+        // ECH is rustls's lane here, so a config naming both keeps ECH and leaves CBC to it.
+        None if cfg.ech_config_list.is_none() && legacy::needed(&cfg.cipher_suites) => Ok(
+            ClientSession::Legacy(Box::new(legacy::Session::connect(cfg, io)?)),
+        ),
         None => Ok(ClientSession::Stock(Box::new(RustlsProvider::connect(
             cfg, io,
         )?))),

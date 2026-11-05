@@ -16637,7 +16637,7 @@ impl Drivable
     for ferrox_core::tls::RustlsServerProvider<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
     fn transport(&self) -> Option<Connection> {
-        if self.is_ech() {
+        if self.is_boring() {
             return None;
         }
         self.get_ref().get_ref().try_clone().ok()
@@ -16666,6 +16666,9 @@ impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
 
 impl Drivable for ferrox_core::tls::ClientSession<Connection> {
     fn transport(&self) -> Option<Connection> {
+        if !self.separates_ciphertext() {
+            return None;
+        }
         self.get_ref().try_clone().ok()
     }
 }

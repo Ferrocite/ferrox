@@ -14,8 +14,11 @@ graph TD
     V --> T["max>=1.3 appends the<br/>TLS 1.3 trio"]
     T --> F["field bytes: 2-byte length<br/>then each id big-endian"]
     F --> E["carry on TlsConfig.cipher_suites"]
-    E --> B["provider.cipher_suites sorted to<br/>the crafted order"]
-    B --> W(("ClientHello on the wire"))
+    E --> S{"an id ring has not?"}
+    S -->|no| B["rustls provider sorted to<br/>the crafted order"]
+    S -->|yes| L["BoringSSL cipher list in<br/>the config's order"]
+    B --> W(("hello on the wire"))
+    L --> W
 ```
 
 ## Measured
@@ -25,8 +28,16 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | oracle-cases-replayed-byte-identical | 10 | ferrox-core-tls::cipher_suites::tests::oracle_replay_matches_go |
-| cipher-suite-ids-reachable-by-the-backend | 3 | ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference |
+| cipher-suite-ids-reachable-by-rustls | 9 | ferrox-core-tls::rustls_backend::tests::the_reachable_set_is_the_tls13_trio_and_ring_s_six_tls12_aead_suites |
+| cipher-suite-ids-reachable-by-boring | 11 | ferrox-core-tls::rustls_backend::tests::the_legacy_lane_covers_the_cbc_and_static_rsa_ids_ring_has_not |
+| cipher-suite-ids-reachable-by-neither | 5 | ferrox-core-tls::rustls_backend::tests::the_legacy_lane_covers_the_cbc_and_static_rsa_ids_ring_has_not |
 | dialer-hello-cipher-field-equals-reference | 1 | ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference |
+| tls12-list-ids-equal-reference-in-order | 1 | ferrox-core-tls::rustls_backend::tests::a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire |
+| tls12-suite-negotiated-by-the-dialer | 1 | ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite |
+| tls12-suite-negotiated-by-the-listener | 1 | ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation |
+| legacy-dial-tls12-ids-equal-reference-in-order | 1 | ferrox-core-tls::rustls_backend::tests::a_legacy_dial_offers_the_reference_cipher_ids_in_order |
+| legacy-cbc-suite-negotiated-by-the-dialer | 1 | ferrox-core-tls::rustls_backend::tests::a_legacy_dial_negotiates_a_cbc_suite |
+| legacy-static-rsa-suite-negotiated-by-the-listener | 1 | ferrox-core-tls::rustls_backend::tests::a_legacy_listener_negotiates_static_rsa |
 | config-key-heap-buffers-per-dial | 0 | ferrox-core-tls::rustls_backend::tests::a_repeat_dial_keys_the_config_without_copying_the_suite_order |
 <!-- counts:end -->
 
@@ -45,14 +56,66 @@ graph TD
 
 ## The reachable-set ceiling, and what was not removed
 
-The derivation is byte-identical to `crypto/tls` for every case the oracle reaches, but what *this* backend can put on its own wire is narrower than the reference, and that is the honest limit rather than a win:
+The derivation is byte-identical to `crypto/tls` for every case the oracle reaches. Two
+backends now carry the result: `rustls` for the suites ring has, and BoringSSL (already linked
+for ECH) when the config names one ring does not. Twenty of the reference's twenty-five ids
+are reachable.
 
-- The dialer's TLS is `rustls` with the `ring` provider, built with `features = ["std", "ring"]` and no `tls12` — `cargo tree -e features -i -p rustls` shows only `ring` and `std` enabled. `rustls::crypto::ring::ALL_CIPHER_SUITES` is therefore the three TLS 1.3 suites `0x1301`/`0x1302`/`0x1303` and nothing else. So every TLS 1.2 id the reference advertises — the CBC, static-RSA and CHACHA suites in the PattNG presets — is parsed and proved here but is **not removed from the wire path because it was never on it**: the backend never offers it, so a real handshake through this tree cannot carry it. Only the TLS 1.3 trio is reachable, and its count (3) is the ceiling, gated by the same capture test.
-- What *is* landed: a `cipherSuites` config re-orders the reachable suites to `crypto/tls`' order, so the dialer's actual ClientHello field equals the reference's. `rustls` writes the hello's `cipher_suites` in provider-config order (`client/hs.rs`, and the provider list this sort re-orders), so sorting `provider.cipher_suites` by the crafted id list moves the bytes. The stock provider offers `0x1302,0x1301,0x1303`; `crypto/tls` emits `0x1301,0x1302,0x1303`; `a_crafted_list_reorders_the_dialer_hello_to_the_reference` captures the real hello over `write_tls` and asserts the field equals the reference bytes. This fires only when the config names a suite — an unset `cipherSuites` leaves the stock ordering untouched.
-- Not done, deliberately: advertising and *negotiating* the TLS 1.2 ids the reference carries. That needs `rustls` built with `tls12` plus a provider that implements CBC and static-RSA — a crypto-subsystem and downgrade-posture change well outside this slice, recorded as an add-on in `prompts.md` rather than folded in here. A change that only reorders bytes to look like the reference is legitimate byte-identity; a change that lowers the floor to reach the reference's CBC suites is not, and it is named rather than half-done.
+- **Nine ids by ring.** `rustls` is built with `tls12`, so the provider is the TLS 1.3 trio
+  `0x1301`/`0x1302`/`0x1303` plus ring's six TLS 1.2 AEAD suites `0xc02b`, `0xc02c`, `0xcca9`,
+  `0xc02f`, `0xc030`, `0xcca8`. `the_reachable_set_is_the_tls13_trio_and_ring_s_six_tls12_aead_suites`
+  reads the provider and asserts both the nine ids and the absence of every CBC and static-RSA
+  one. A dial that names those ids puts them on the wire in `crypto/tls` order
+  (`a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire`), and a handshake negotiates
+  `0xc02b` on either role (`a_tls12_dial_negotiates_the_configured_suite`,
+  `a_tls_floor_and_suite_reach_the_negotiation`); the other five are wired through the same
+  provider and are not each dialled by a test.
+- **Eleven ids by BoringSSL.** ECDHE CBC (`0xc009`, `0xc00a`, `0xc013`, `0xc014`, `0xc023`,
+  `0xc027`), static-RSA AES-CBC and AES-GCM (`0x002f`, `0x0035`, `0x009c`, `0x009d`) and
+  RSA-3DES (`0x000a`). `legacy.rs` is selected only when the list names an id ring has not, and
+  it caches one context per material and host name: the verify callback captures the name, so two
+  hosts cannot share a context that checks the first one's certificate
+  (`a_legacy_context_is_not_shared_across_server_names`). The dial's TLS 1.2 ids
+  keep the config's order (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`), a CBC
+  suite is negotiated by the dial (`a_legacy_dial_negotiates_a_cbc_suite`) and a static-RSA
+  suite by the listener (`a_legacy_listener_negotiates_static_rsa`).
+- **Five ids by neither.** RC4 (`0x0005`, `0xc007`, `0xc011`), ECDHE-3DES (`0xc012`) and
+  static-RSA AES-128-CBC-SHA256 (`0x003c`): BoringSSL 5.4 no longer compiles them, and ring
+  never had them. `set_cipher_list` silently drops such a name, so `needed` refuses to route a
+  list of only those ids and the rustls lane keeps the stock field.
+- **One id rustls adds that `crypto/tls` never sends: `0x00ff`.** rustls appends
+  `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` to every hello that offers TLS 1.2; Go only ever *reads*
+  that id on a server. BoringSSL appends no SCSV, so the legacy lane is free of it.
+  `a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire` asserts the rustls split, so the
+  claim cannot drift into a whole-field one. Nor is the id-for-id claim unconditional: a dial
+  whose config names `maxVersion` 1.2 still offers TLS 1.3 here, because `TlsConfig` carries no
+  version bound, where the reference drops the trio — so a capped list differs by the trio too.
+  Only a list that offers TLS 1.3 on both sides matches id-for-id.
+- **Hello order on the legacy lane.** BoringSSL writes its TLS 1.3 trio before the TLS 1.2 list,
+  where `crypto/tls` appends that trio after the list. The legacy lane therefore matches the
+  reference id-for-id and order-for-order inside the TLS 1.2 ids, and differs in where the trio
+  sits. `a_legacy_dial_offers_the_reference_cipher_ids_in_order` asserts the actual field, not a
+  hoped-for one.
+- **Two named limits on the legacy lane.** An ECH config keeps the rustls lane (ECH is stronger
+  than the suite list), so a config naming both does not advertise its CBC ids; and the lane
+  keeps no session cache, so `enableSessionResumption` does not carry there. Neither is a
+  refusal: the handshake completes, and both are named rather than silent.
+- **Curves carry over.** The three stock groups a `curvePreferences` list can name here map to
+  BoringSSL's `P-256`/`P-384`/`X25519`, so the legacy hello keeps the named group order; the
+  ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
+
+Not done, deliberately and with the cost named: the five ids above, an exact whole-field hello
+on the legacy lane, ECH together with CBC, and resumption on that lane. Each is a ceiling of a
+linked backend rather than a rewrite of this derivation.
 
 ## What we removed
 
+- **The "CBC is unreachable" ceiling, without a new dependency.** The legacy lane adds no
+  crate: `boring` was already linked for ECH, so the eleven CBC/static-RSA ids cost one context
+  cache and one session wrapper rather than a second TLS implementation baked into the binary.
+  The cost that was *not* removed: a config naming one of those ids now runs BoringSSL's
+  handshake instead of rustls's, so that lane has its own read/write path and its own named
+  limits above.
 - **A copy of the suite order on every dial.** The config cache keys on the anchors, pins, `ALPN` and suite order, and building that key cloned the `Vec<u16>` order on every lookup — a heap buffer and a six-byte copy on each repeat handshake for a list the config named once. The order now lives behind one `Arc<[u16]>`, so a repeat dial's key is a reference-count bump. `a_repeat_dial_keys_the_config_without_copying_the_suite_order` measures the cached lookup at 0 allocations (it was 1 allocation / 6 bytes), and `a_crafted_list_reorders_the_dialer_hello_to_the_reference` still holds the field byte-identical.
 - The two-pass shape a naive re-order would use. Rather than copy the config list and then sort it with a comparator that recomputes membership, `hello_ids` walks the fixed `crypto/tls` preference array once and takes the intersection — one `contains` per preference entry, no second pass, and the TLS 1.3 append is a `extend_from_slice`, not a per-element compare. Byte-identity across the whole input the reference sees is the gate.
 
@@ -67,6 +130,10 @@ The derivation is byte-identical to `crypto/tls` for every case the oracle reach
 ## CI scope
 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+The pinned xray-rust conformance suite has no `cipherSuites` row (its TLS cases pin selected
+fingerprints only), so a `conformance.yml` leg cannot observe this field: the checkers above are
+the local capture and handshake tests, and the page names them rather than implying an external
+suite proves them.
 
 <!-- scope:begin -->
 - paths: -
