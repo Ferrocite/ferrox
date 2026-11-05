@@ -1,7 +1,8 @@
 //! The meek relay the native `Psiphon` lane rides for unfronted and CDN-fronted
 //! entries: a loopback TCP stream whose bytes are carried in `POST /` requests.
 
-use crate::psiphon_ssh::{derive_key, random, Proxy, Rc4, MAGIC, SEED_LENGTH};
+use crate::psiphon_ssh::{derive_key, random, Proxy, Rc4, TlsShape, MAGIC, SEED_LENGTH};
+use crate::psiphon_webrtc::WebRtcStream;
 use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use ferrox_core::tls::{ClientSession, RecordAlignment as _, TlsConfig, TlsProvider as _};
@@ -38,6 +39,7 @@ pub(crate) struct Meek {
     pub(crate) protocol: &'static str,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) dns: Vec<SocketAddr>,
+    pub(crate) shape: TlsShape,
 }
 
 /// Start the loopback relay and return the socket the SSH handshake rides.
@@ -74,6 +76,53 @@ pub(crate) fn connect(
     Ok(local)
 }
 
+/// Start the loopback relay over an in-proxy WebRTC stream.
+pub(crate) fn connect_inproxy(
+    stream: WebRtcStream,
+    meek: &Meek,
+    timeout: Duration,
+) -> Result<TcpStream, String> {
+    let transport = if meek.quic {
+        stream.set_timeout(Some(timeout));
+        let server_name = if meek.disable_sni {
+            String::new()
+        } else {
+            meek.sni.clone()
+        };
+        MeekStream::H3(Box::new(crate::psiphon_h3::H3::connect_over(
+            stream,
+            &meek.dial,
+            &server_name,
+            timeout,
+        )?))
+    } else if meek.https {
+        stream.set_timeout(Some(timeout));
+        let server_name = if meek.disable_sni {
+            "0.0.0.0".to_owned()
+        } else {
+            meek.sni.clone()
+        };
+        let config = TlsConfig {
+            server_name,
+            alpn: vec![b"http/1.1".to_vec()].into(),
+            roots: crate::quic::system_roots(),
+            insecure: true,
+            resumption: true,
+            fingerprint: Some(meek.shape.fingerprint()),
+            padding: meek.shape.padding(),
+            ..TlsConfig::default()
+        };
+        let mut tls = ferrox_core::tls::connect(&config, stream)
+            .map_err(|error| format!("psiphon meek tls {}: {error}", meek.sni))?;
+        tls.handshake()
+            .map_err(|error| format!("psiphon meek handshake {}: {error}", meek.sni))?;
+        MeekStream::TlsWebRtc(tls)
+    } else {
+        MeekStream::WebRtc(stream)
+    };
+    start_relay(meek, timeout, transport)
+}
+
 /// Send one request over a fresh fronted stream and return its response body.
 pub(crate) fn post(
     meek: &Meek,
@@ -85,6 +134,34 @@ pub(crate) fn post(
 ) -> Result<Vec<u8>, String> {
     let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, path, endpoint)?;
     http.round_trip(body)
+}
+
+fn start_relay(meek: &Meek, timeout: Duration, transport: MeekStream) -> Result<TcpStream, String> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("psiphon meek listener: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("psiphon meek listener: {error}"))?;
+    let local = TcpStream::connect_timeout(&address, timeout)
+        .map_err(|error| format!("psiphon meek loopback: {error}"))?;
+    local
+        .set_nodelay(true)
+        .and_then(|()| local.set_read_timeout(Some(timeout)))
+        .and_then(|()| local.set_write_timeout(Some(timeout)))
+        .map_err(|error| format!("psiphon meek loopback: {error}"))?;
+    let config = meek.clone();
+    std::thread::Builder::new()
+        .name("psiphon-meek".to_owned())
+        .spawn(move || match listener.accept() {
+            Ok((socket, _)) => {
+                if let Err(why) = relay_stream(socket, &config, timeout, transport) {
+                    eprintln!("psiphon: in-proxy-meek relay: {why}");
+                }
+            }
+            Err(why) => eprintln!("psiphon: in-proxy-meek accept: {why}"),
+        })
+        .map_err(|error| format!("psiphon meek thread: {error}"))?;
+    Ok(local)
 }
 
 fn relay(
@@ -131,10 +208,56 @@ fn relay(
     Ok(())
 }
 
+fn relay_stream(
+    mut local: TcpStream,
+    meek: &Meek,
+    timeout: Duration,
+    transport: MeekStream,
+) -> Result<(), String> {
+    local
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("psiphon meek socket: {error}"))?;
+    let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?;
+    let mut buffer = vec![0u8; MAX_PAYLOAD];
+    let mut interval = POLL;
+    loop {
+        local
+            .set_read_timeout(Some(interval))
+            .map_err(|error| format!("psiphon meek socket: {error}"))?;
+        let body = match local.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => &buffer[..read],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                &[]
+            }
+            Err(error) => return Err(format!("psiphon meek read: {error}")),
+        };
+        let reply = http.round_trip(body)?;
+        if body.is_empty() && reply.is_empty() {
+            interval = interval.mul_f64(POLL_GROWTH).min(MAX_POLL);
+        } else {
+            interval = POLL;
+        }
+        if !reply.is_empty() {
+            local
+                .write_all(&reply)
+                .map_err(|error| format!("psiphon meek write: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// A plain TCP or TLS stream carrying meek HTTP.
 enum MeekStream {
     Plain(TcpStream),
     Tls(ClientSession<TcpStream>),
+    WebRtc(WebRtcStream),
+    TlsWebRtc(ClientSession<WebRtcStream>),
     H3(Box<crate::psiphon_h3::H3>),
 }
 
@@ -144,6 +267,8 @@ impl Read for MeekStream {
         match self {
             Self::Plain(stream) => stream.read(buf),
             Self::Tls(stream) => stream.read(buf),
+            Self::WebRtc(stream) => stream.read(buf),
+            Self::TlsWebRtc(stream) => stream.read(buf),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
         }
     }
@@ -155,6 +280,8 @@ impl Write for MeekStream {
         match self {
             Self::Plain(stream) => stream.write(buf),
             Self::Tls(stream) => stream.write(buf),
+            Self::WebRtc(stream) => stream.write(buf),
+            Self::TlsWebRtc(stream) => stream.write(buf),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
         }
     }
@@ -164,6 +291,8 @@ impl Write for MeekStream {
         match self {
             Self::Plain(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
+            Self::WebRtc(stream) => stream.flush(),
+            Self::TlsWebRtc(stream) => stream.flush(),
             Self::H3(_) => Ok(()),
         }
     }
@@ -176,6 +305,8 @@ impl MeekStream {
         match self {
             Self::Plain(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
             Self::Tls(stream) => stream.write_all_slices(parts),
+            Self::WebRtc(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
+            Self::TlsWebRtc(stream) => stream.write_all_slices(parts),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
         }
     }
@@ -186,6 +317,8 @@ impl MeekStream {
             Self::Plain(stream) => stream,
             Self::Tls(stream) if stream.closed() => return true,
             Self::Tls(stream) => stream.get_ref(),
+            Self::WebRtc(_) => return false,
+            Self::TlsWebRtc(stream) => return stream.closed(),
             Self::H3(h3) => return h3.is_closed(),
         };
         if stream.set_nonblocking(true).is_err() {
@@ -207,6 +340,7 @@ pub(crate) struct MeekHttp {
     cookie: Option<(String, String)>,
     front_index: usize,
     alpn_warned: bool,
+    preconnected: bool,
 }
 
 impl MeekHttp {
@@ -228,6 +362,7 @@ impl MeekHttp {
             cookie,
             front_index: 0,
             alpn_warned: false,
+            preconnected: false,
         })
     }
 
@@ -247,7 +382,29 @@ impl MeekHttp {
             cookie: None,
             front_index: 0,
             alpn_warned: false,
+            preconnected: false,
         }
+    }
+
+    /// Build a client over an already-open in-proxy transport.
+    fn new_over(
+        meek: Meek,
+        timeout: Duration,
+        path: &'static str,
+        stream: MeekStream,
+    ) -> Result<Self, String> {
+        let cookie = Some(make_cookie(&meek, None)?);
+        Ok(Self {
+            meek,
+            proxy: None,
+            timeout,
+            path,
+            stream: Some(stream),
+            cookie,
+            front_index: 0,
+            alpn_warned: false,
+            preconnected: true,
+        })
     }
 
     /// Send one request body and return the response body.
@@ -257,7 +414,7 @@ impl MeekHttp {
         }
         match self.exchange(body) {
             Ok(reply) => Ok(reply),
-            Err(why) if body.is_empty() => {
+            Err(why) if body.is_empty() && !self.preconnected => {
                 self.stream = None;
                 self.open()?;
                 self.exchange(body).map_err(|_| why)
@@ -271,6 +428,9 @@ impl MeekHttp {
 
     /// Dial the next front and start a TLS session when required.
     fn open(&mut self) -> Result<(), String> {
+        if self.preconnected {
+            return Err("psiphon meek connection is gone".to_owned());
+        }
         self.rotate_front();
         if self.meek.quic && self.proxy.is_none() {
             let sni = if self.meek.disable_sni {
@@ -328,6 +488,8 @@ impl MeekHttp {
             roots: crate::quic::system_roots(),
             insecure: true,
             resumption: true,
+            fingerprint: Some(self.meek.shape.fingerprint()),
+            padding: self.meek.shape.padding(),
             ..TlsConfig::default()
         };
         let mut tls = ferrox_core::tls::connect(&config, stream)
@@ -546,6 +708,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            shape: TlsShape::default(),
         }
     }
 

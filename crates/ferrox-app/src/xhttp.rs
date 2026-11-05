@@ -882,6 +882,19 @@ impl XhttpWriter {
         }
         true
     }
+    /// The session refused the request: the response ends and, on h2, the request is reset so its
+    /// unread body is not credited for the connection's life.
+    pub(crate) fn abort(&self) {
+        if let Some(h2) = self.h2.get() {
+            if self.shared.finished.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            h2.reset();
+            return;
+        }
+        self.finish();
+    }
+
     pub(crate) fn finish(&self) {
         if self.shared.finished.swap(true, Ordering::SeqCst) {
             return;

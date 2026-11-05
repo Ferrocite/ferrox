@@ -242,6 +242,8 @@ impl WireGuardOut {
         let socket = bind_socket(&config)?;
         let (packets_tx, packets_rx) = mpsc::channel();
         let (to_tunnel, from_tunnel) = mpsc::channel();
+        let (recycle, recycled) = mpsc::channel();
+        let io_recycle = recycle.clone();
         let (flows, flow_rx) = mpsc::channel();
         let routes: UdpRoutes = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
@@ -257,6 +259,8 @@ impl WireGuardOut {
                 io_packets,
                 Some(io_routes),
                 Some(io_stop),
+                io_recycle,
+                recycled,
             );
         });
         let stack_config = config.clone();
@@ -268,6 +272,7 @@ impl WireGuardOut {
                 packets_rx,
                 flow_rx,
                 WG_HEADER_SIZE,
+                Some(recycle),
             );
         });
         Ok(Self {
@@ -956,9 +961,22 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let _ = socket.set_read_timeout(Some(IO_TICK));
     let (packets_tx, packets_rx) = mpsc::channel();
     let (to_tunnel, from_tunnel) = mpsc::channel();
+    let (recycle, recycled) = mpsc::channel();
+    let io_recycle = recycle.clone();
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
-    std::thread::spawn(move || io(io_config, socket, from_tunnel, io_packets, None, None));
+    std::thread::spawn(move || {
+        io(
+            io_config,
+            socket,
+            from_tunnel,
+            io_packets,
+            None,
+            None,
+            io_recycle,
+            recycled,
+        );
+    });
     let stack_config = config;
     let stack_tunnel = to_tunnel;
     let stack_out = out.clone();
@@ -969,6 +987,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             packets_rx,
             stack_out,
             WG_HEADER_SIZE,
+            Some(recycle),
         );
     });
     Ok(port)
@@ -983,6 +1002,7 @@ struct Peer {
 /// The tunnel reader and writer: inner packets leave, datagrams arrive, and the
 /// timers run on the same clock.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn io(
     config: DeviceConfig,
@@ -991,6 +1011,8 @@ fn io(
     to_stack: Sender<Packet>,
     routes: Option<UdpRoutes>,
     stop: Option<Arc<AtomicBool>>,
+    recycle: Sender<Vec<u8>>,
+    recycled: Receiver<Vec<u8>>,
 ) {
     let _ = socket.set_read_timeout(Some(IO_TICK));
     widen(&socket);
@@ -999,6 +1021,11 @@ fn io(
     let mut peers = peers(&config, epoch);
     let mut cookies = CookieGuard::default();
     let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut receive_batch = ReceiveBatch::new(config.mtu, recycled);
+    #[cfg(not(target_os = "linux"))]
+    let _ = recycled;
+    #[cfg(not(target_os = "linux"))]
     let mut buf = vec![0u8; 65_535];
     let mut incoming = Vec::new();
     let mut events = Vec::new();
@@ -1027,6 +1054,7 @@ fn io(
                             Some(index),
                             ipv6_socket,
                             &mut sends,
+                            Some(&recycle),
                         );
                     }
                     return;
@@ -1053,6 +1081,7 @@ fn io(
                         Some(previous),
                         ipv6_socket,
                         &mut sends,
+                        Some(&recycle),
                     );
                 }
                 pending = Some(index);
@@ -1071,6 +1100,7 @@ fn io(
                 Some(index),
                 ipv6_socket,
                 &mut sends,
+                Some(&recycle),
             );
         }
         for index in 0..peers.len() {
@@ -1084,66 +1114,144 @@ fn io(
                 Some(index),
                 ipv6_socket,
                 &mut sends,
+                Some(&recycle),
             );
         }
 
-        let mut received = 0;
-        let mut nonblocking = false;
-        loop {
-            match socket.recv_from(&mut buf) {
-                Ok((n, source)) if n >= 4 => {
-                    let source = recv_endpoint(source, ipv6_socket);
-                    receive_datagram(
-                        &mut peers,
-                        &mut cookies,
-                        now,
-                        source,
-                        &mut buf[..n],
-                        &socket,
-                        &to_stack,
-                        &mut incoming,
-                        routes.as_ref(),
-                        ipv6_socket,
-                        &mut sends,
-                    );
-                    received += 1;
-                    if received >= RX_BURST {
-                        break;
-                    }
-                    if !nonblocking {
-                        if socket.set_nonblocking(true).is_err() {
+        #[cfg(target_os = "linux")]
+        {
+            let mut first = true;
+            let mut received = 0;
+            loop {
+                match receive_batch.recv(&socket, first) {
+                    Ok(0) => break,
+                    Ok(got) => {
+                        first = false;
+                        for at in 0..got {
+                            if receive_batch.truncated(at) {
+                                continue;
+                            }
+                            if let Some(source) = receive_batch.source(at) {
+                                let source = recv_endpoint(source, ipv6_socket);
+                                let Some(packet) = receive_batch.take(at) else {
+                                    let packet = receive_batch.packet(at);
+                                    if packet.len() >= 4 {
+                                        receive_datagram(
+                                            &mut peers,
+                                            &mut cookies,
+                                            now,
+                                            source,
+                                            packet,
+                                            &socket,
+                                            &to_stack,
+                                            &mut incoming,
+                                            routes.as_ref(),
+                                            ipv6_socket,
+                                            &mut sends,
+                                        );
+                                    }
+                                    continue;
+                                };
+                                if let Some(back) = receive_datagram_owned(
+                                    &mut peers,
+                                    &mut cookies,
+                                    now,
+                                    source,
+                                    packet,
+                                    &socket,
+                                    &to_stack,
+                                    &mut incoming,
+                                    routes.as_ref(),
+                                    ipv6_socket,
+                                    &mut sends,
+                                    Some(&recycle),
+                                ) {
+                                    receive_batch.put_back(back);
+                                }
+                            }
+                        }
+                        received += got;
+                        if got < RX_BATCH || received >= RX_BURST {
                             break;
                         }
-                        nonblocking = true;
                     }
-                }
-                Ok(_) => break,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    break;
-                }
-                Err(_) => {
-                    if nonblocking {
-                        let _ = socket.set_nonblocking(false);
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        break;
                     }
-                    return;
+                    Err(_) => return,
                 }
             }
         }
-        if nonblocking {
-            let _ = socket.set_nonblocking(false);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut received = 0;
+            let mut nonblocking = false;
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, source)) if n >= 4 => {
+                        let source = recv_endpoint(source, ipv6_socket);
+                        receive_datagram(
+                            &mut peers,
+                            &mut cookies,
+                            now,
+                            source,
+                            &mut buf[..n],
+                            &socket,
+                            &to_stack,
+                            &mut incoming,
+                            routes.as_ref(),
+                            ipv6_socket,
+                            &mut sends,
+                        );
+                        received += 1;
+                        if received >= RX_BURST {
+                            break;
+                        }
+                        if !nonblocking {
+                            if socket.set_nonblocking(true).is_err() {
+                                break;
+                            }
+                            nonblocking = true;
+                        }
+                    }
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(_) => {
+                        if nonblocking {
+                            let _ = socket.set_nonblocking(false);
+                        }
+                        return;
+                    }
+                }
+            }
+            if nonblocking {
+                let _ = socket.set_nonblocking(false);
+            }
         }
     }
 }
 
+/// Read one datagram's message kind without slicing past a short packet.
 #[allow(clippy::too_many_arguments)]
 fn receive_datagram(
     peers: &mut [Peer],
@@ -1158,8 +1266,14 @@ fn receive_datagram(
     ipv6_socket: bool,
     sends: &mut Vec<Vec<u8>>,
 ) {
-    let kind = u32::from(packet[0]);
-    if kind == TYPE_INITIATION && packet.len() == INITIATION_SIZE {
+    let Some(&first) = packet.first() else {
+        return;
+    };
+    let kind = u32::from(first);
+    if kind == TYPE_INITIATION {
+        if packet.len() != INITIATION_SIZE {
+            return;
+        }
         let under_load = cookies.observe(now);
         clear_reserved(packet);
         handle_initiation(
@@ -1168,7 +1282,13 @@ fn receive_datagram(
         return;
     }
     let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
-    let receiver = u32::from_le_bytes(packet[at..at + 4].try_into().unwrap_or([0; 4]));
+    let Some(receiver) = packet
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return;
+    };
     let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
         return;
     };
@@ -1182,7 +1302,70 @@ fn receive_datagram(
         Some(index),
         ipv6_socket,
         sends,
+        None,
     );
+}
+
+/// The owned counterpart of [`receive_datagram`]: a transport record keeps the
+/// buffer it was read into, and anything that does not authenticate comes back
+/// for the batch to reuse.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn receive_datagram_owned(
+    peers: &mut [Peer],
+    cookies: &mut CookieGuard,
+    now: u64,
+    source: SocketAddr,
+    mut packet: Vec<u8>,
+    socket: &UdpSocket,
+    to_stack: &Sender<Packet>,
+    incoming: &mut Vec<Event>,
+    routes: Option<&UdpRoutes>,
+    ipv6_socket: bool,
+    sends: &mut Vec<Vec<u8>>,
+    recycle: Option<&Sender<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    let Some(&first) = packet.first() else {
+        return Some(packet);
+    };
+    let kind = u32::from(first);
+    if kind == TYPE_INITIATION {
+        if packet.len() != INITIATION_SIZE {
+            return Some(packet);
+        }
+        let under_load = cookies.observe(now);
+        clear_reserved(&mut packet);
+        handle_initiation(
+            peers, now, source, &packet, socket, to_stack, cookies, under_load, sends,
+        );
+        return Some(packet);
+    }
+    let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
+    let Some(receiver) = packet
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return Some(packet);
+    };
+    let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
+        return Some(packet);
+    };
+    let packet = peers[index]
+        .tunnel
+        .receive_owned(now, source, packet, incoming);
+    flush(
+        incoming,
+        socket,
+        to_stack,
+        routes,
+        peers,
+        Some(index),
+        ipv6_socket,
+        sends,
+        recycle,
+    );
+    packet
 }
 
 /// The most tunnel packets one socket turn forwards before it reads again, so
@@ -1191,6 +1374,166 @@ fn receive_datagram(
 const RX_BURST: usize = 256;
 const TX_DRAIN: usize = 128;
 
+#[cfg(target_os = "linux")]
+const RX_BATCH: usize = 64;
+
+/// Read a batch of tunnel datagrams in one `recvmmsg`, so a fast lane is paced
+/// by the wire rather than by one syscall for every record.
+#[cfg(target_os = "linux")]
+struct ReceiveBatch {
+    slots: Vec<Vec<u8>>,
+    iovecs: Vec<libc::iovec>,
+    headers: Vec<libc::mmsghdr>,
+    names: Vec<libc::sockaddr_storage>,
+    slot: usize,
+    extra: usize,
+    spare: Vec<Vec<u8>>,
+    recycled: Receiver<Vec<u8>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveBatch {
+    /// Size one slot for this MTU and one receive queue for the stack.
+    fn new(mtu: usize, recycled: Receiver<Vec<u8>>) -> Self {
+        let slot = mtu
+            .saturating_add(WG_HEADER_SIZE + WG_TAG_SIZE)
+            .max(INITIATION_SIZE);
+        Self {
+            slots: (0..RX_BATCH).map(|_| vec![0u8; slot]).collect(),
+            iovecs: (0..RX_BATCH)
+                .map(|_| libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                })
+                .collect(),
+            headers: (0..RX_BATCH)
+                .map(|_| libc::mmsghdr {
+                    msg_hdr: libc::msghdr {
+                        msg_name: std::ptr::null_mut(),
+                        msg_namelen: 0,
+                        msg_iov: std::ptr::null_mut(),
+                        msg_iovlen: 0,
+                        msg_control: std::ptr::null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    },
+                    msg_len: 0,
+                })
+                .collect(),
+            names: (0..RX_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+            slot,
+            extra: 0,
+            spare: Vec::new(),
+            recycled,
+        }
+    }
+
+    /// Fill every free slot from the socket in one `recvmmsg`.
+    fn recv(&mut self, socket: &UdpSocket, first: bool) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+
+        let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        for at in 0..RX_BATCH {
+            let slot = &mut self.slots[at];
+            if slot.capacity() < self.slot {
+                *slot = vec![0u8; self.slot];
+            }
+            self.iovecs[at] = libc::iovec {
+                iov_base: slot.as_mut_ptr().cast(),
+                iov_len: self.slot,
+            };
+            self.headers[at].msg_hdr = libc::msghdr {
+                msg_name: (&raw mut self.names[at]).cast(),
+                msg_namelen: room,
+                msg_iov: (&raw mut self.iovecs[at]).cast(),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+            self.headers[at].msg_len = 0;
+        }
+        let mut flags = libc::MSG_WAITFORONE as libc::c_int;
+        if !first {
+            flags |= libc::MSG_DONTWAIT;
+        }
+        // SAFETY: every header names a slot, an iovec and a name in `self`, all of which outlive the call, and the kernel writes each slot only as far as the datagram it read.
+        let got = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                self.headers.as_mut_ptr(),
+                RX_BATCH as libc::c_uint,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if got < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        usize::try_from(got).map_err(|_| std::io::Error::other("recvmmsg count"))
+    }
+
+    /// Whether the kernel cut this datagram at the slot boundary.
+    fn truncated(&self, at: usize) -> bool {
+        self.headers[at].msg_hdr.msg_flags & libc::MSG_TRUNC != 0
+    }
+
+    /// The bytes a slot received, bounded by what the kernel wrote.
+    fn packet(&mut self, at: usize) -> &mut [u8] {
+        let len = usize::try_from(self.headers[at].msg_len)
+            .unwrap_or(0)
+            .min(self.slots[at].len());
+        &mut self.slots[at][..len]
+    }
+
+    /// Hand out one received slot and leave a replacement for the next read.
+    fn take(&mut self, at: usize) -> Option<Vec<u8>> {
+        self.drain_recycled();
+        let replacement = if let Some(buffer) = self.spare.pop() {
+            buffer
+        } else if self.extra < RX_BATCH {
+            self.extra += 1;
+            vec![0u8; self.slot]
+        } else {
+            return None;
+        };
+        let len = usize::try_from(self.headers[at].msg_len)
+            .unwrap_or(0)
+            .min(self.slot);
+        let mut packet = std::mem::replace(&mut self.slots[at], replacement);
+        packet.truncate(len);
+        Some(packet)
+    }
+
+    /// Keep a returned slot only when it still fits the configured MTU.
+    fn put_back(&mut self, mut buffer: Vec<u8>) {
+        if buffer.capacity() < self.slot || self.spare.len() >= RX_BATCH {
+            return;
+        }
+        if buffer.len() < self.slot {
+            buffer.resize(self.slot, 0);
+        } else if buffer.len() > self.slot {
+            buffer.truncate(self.slot);
+        }
+        self.spare.push(buffer);
+    }
+
+    /// Move slots the stack returned into the batch spare list.
+    fn drain_recycled(&mut self) {
+        while let Ok(buffer) = self.recycled.try_recv() {
+            self.put_back(buffer);
+        }
+    }
+
+    /// The sender address the kernel wrote for this slot.
+    fn source(&self, at: usize) -> Option<SocketAddr> {
+        crate::proxy::socket_addr_of(&self.names[at], self.headers[at].msg_hdr.msg_namelen)
+    }
+}
+
+/// Validate an initiation, apply the cookie gate, and answer with a response.
 #[allow(clippy::too_many_arguments)]
 fn handle_initiation(
     peers: &mut [Peer],
@@ -1247,6 +1590,7 @@ fn handle_initiation(
         Some(index),
         ipv6,
         sends,
+        None,
     );
 }
 
@@ -1263,6 +1607,7 @@ fn flush(
     peer: Option<usize>,
     ipv6_socket: bool,
     sends: &mut Vec<Vec<u8>>,
+    recycle: Option<&Sender<Vec<u8>>>,
 ) {
     let candidates = peer.map(|index| peers[index].config.endpoints.as_slice());
     let mut endpoint = None;
@@ -1290,36 +1635,85 @@ fn flush(
             Event::Data(inner) => {
                 flush_sends(socket, ipv6_socket, endpoint, sends);
                 endpoint = None;
-                let Some(index) = peer else {
-                    continue;
-                };
-                let Some((source, _)) = wg_stack::inner_addresses(&inner) else {
-                    continue;
-                };
-                if peer_for(peers, source) != Some(index) {
-                    continue;
-                }
-                if let Some(routes) = routes {
-                    if let Some(datagram) = ferrox_core::foxy::connectip::udp_from_packet(&inner) {
-                        if let Ok(table) = routes.lock() {
-                            if let Some(lane) = table.get(&datagram.destination_port) {
-                                let _ = lane.send(inner);
-                            }
-                        }
-                        continue;
-                    }
-                }
-                let _ = to_stack.send(Packet {
-                    peer: peers[index].config.public,
-                    bytes: inner,
-                });
+                deliver_data(inner, 0, peers, peer, routes, to_stack, recycle);
+            }
+            Event::DataPrefixed(inner) => {
+                flush_sends(socket, ipv6_socket, endpoint, sends);
+                endpoint = None;
+                deliver_data(
+                    inner,
+                    WG_HEADER_SIZE,
+                    peers,
+                    peer,
+                    routes,
+                    to_stack,
+                    recycle,
+                );
             }
         }
     }
     flush_sends(socket, ipv6_socket, endpoint, sends);
 }
 
-/// The most transport packets one `sendmmsg` carries. A batch that cannot be
+/// Hand one decrypted packet to its UDP lane or the stack, with `at` naming the
+/// first payload byte when the receive buffer kept its transport header.
+fn deliver_data(
+    inner: Vec<u8>,
+    at: usize,
+    peers: &[Peer],
+    peer: Option<usize>,
+    routes: Option<&UdpRoutes>,
+    to_stack: &Sender<Packet>,
+    recycle: Option<&Sender<Vec<u8>>>,
+) {
+    let Some(index) = peer else {
+        recycle_slot(inner, at, recycle);
+        return;
+    };
+    let Some(source) = wg_stack::inner_addresses(&inner[at..]).map(|(source, _)| source) else {
+        recycle_slot(inner, at, recycle);
+        return;
+    };
+    if peer_for(peers, source) != Some(index) {
+        recycle_slot(inner, at, recycle);
+        return;
+    }
+    if let Some(routes) = routes {
+        if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
+            .map(|datagram| datagram.destination_port)
+        {
+            if let Ok(table) = routes.lock() {
+                if let Some(lane) = table.get(&port) {
+                    let payload = if at == 0 {
+                        inner
+                    } else {
+                        let payload = inner[at..].to_vec();
+                        recycle_slot(inner, at, recycle);
+                        payload
+                    };
+                    let _ = lane.send(payload);
+                    return;
+                }
+            }
+            recycle_slot(inner, at, recycle);
+            return;
+        }
+    }
+    let _ = to_stack.send(Packet {
+        peer: peers[index].config.public,
+        bytes: inner,
+        at,
+    });
+}
+
+/// Return a prefixed receive buffer after a copy, or drop a payload-only one.
+fn recycle_slot(inner: Vec<u8>, at: usize, recycle: Option<&Sender<Vec<u8>>>) {
+    if let Some(recycle) = recycle.filter(|_| at != 0) {
+        let _ = recycle.send(inner);
+    }
+}
+
+/// The most transport packets one socket batch carries. A batch that cannot be
 /// taken whole falls back to the socket for the rest, so a full queue still
 /// names every packet.
 const SEND_BATCH: usize = 64;
@@ -1344,12 +1738,19 @@ fn flush_sends(
 }
 
 #[cfg(target_os = "linux")]
-fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
-    use std::os::fd::AsRawFd as _;
+/// `UDP_SEGMENT` coalescing, off on aarch64: the arm pool's reference client
+/// collapses to 72 MiB/s on the coalesced super-packet (0.40 leg, 41894636989)
+/// where the `sendmmsg` path holds 189 (1.10, 41899990310).
+static GSO_SUPPORTED: AtomicBool = AtomicBool::new(!cfg!(target_arch = "aarch64"));
 
+/// Send one endpoint's transport records, coalescing equal-sized runs where the
+/// kernel accepts `UDP_SEGMENT` and batching the rest with `sendmmsg`.
+#[cfg(target_os = "linux")]
+fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[Vec<u8>]) {
     debug_assert!(packets.len() <= SEND_BATCH);
     let to = send_endpoint(endpoint, ipv6);
     let (storage, name_len) = crate::proxy::sockaddr_of(to);
+    let max_payload = if ipv6 { 65_527 } else { 65_507 };
     let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
@@ -1357,11 +1758,88 @@ fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[V
     // SAFETY: a zeroed `mmsghdr` is the empty header the loop fills below.
     let mut headers: [libc::mmsghdr; SEND_BATCH] =
         std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let mut start = 0;
+    while start < packets.len() {
+        let gso = packets[start].len();
+        let mut end = start + 1;
+        let mut total = gso;
+        let mut shorter = false;
+        while end < packets.len() && !shorter {
+            let len = packets[end].len();
+            if len > gso || total + len > max_payload {
+                break;
+            }
+            total += len;
+            end += 1;
+            shorter = len < gso;
+        }
+        if end - start > 1 && gso <= 65_535 && GSO_SUPPORTED.load(Ordering::Relaxed) {
+            for (at, packet) in packets[start..end].iter().enumerate() {
+                iovecs[at] = libc::iovec {
+                    iov_base: packet.as_ptr().cast_mut().cast(),
+                    iov_len: packet.len(),
+                };
+            }
+            match send_segments(
+                socket,
+                &storage,
+                name_len,
+                &mut iovecs[..end - start],
+                gso as u16,
+            ) {
+                Ok(sent) if sent >= total => {
+                    start = end;
+                    continue;
+                }
+                Ok(sent) if sent >= gso => {
+                    start += sent / gso;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL | libc::EIO | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+                    ) {
+                        GSO_SUPPORTED.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        send_messages(
+            socket,
+            &storage,
+            name_len,
+            to,
+            &packets[start..end],
+            &mut iovecs,
+            &mut headers,
+        );
+        start = end;
+    }
+}
+
+/// Hand every record to one endpoint with `sendmmsg`, then `send_to` for what
+/// the call could not take.
+#[cfg(target_os = "linux")]
+fn send_messages(
+    socket: &UdpSocket,
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+    to: SocketAddr,
+    packets: &[Vec<u8>],
+    iovecs: &mut [libc::iovec; SEND_BATCH],
+    headers: &mut [libc::mmsghdr; SEND_BATCH],
+) {
+    use std::os::fd::AsRawFd as _;
+
     for (at, packet) in packets.iter().enumerate() {
-        iovecs[at].iov_base = packet.as_ptr().cast_mut().cast();
-        iovecs[at].iov_len = packet.len();
+        iovecs[at] = libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        };
         headers[at].msg_hdr = libc::msghdr {
-            msg_name: (&raw const storage).cast_mut().cast(),
+            msg_name: (&raw const *storage).cast_mut().cast(),
             msg_namelen: name_len,
             msg_iov: (&raw mut iovecs[at]).cast(),
             msg_iovlen: 1,
@@ -1389,6 +1867,51 @@ fn send_batch(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packets: &[V
     for packet in &packets[done..] {
         let _ = socket.send_to(packet, to);
     }
+}
+
+/// Send concatenated records as one `UDP_SEGMENT` payload, so the kernel splits
+/// them into the datagrams the peer expects.
+#[cfg(target_os = "linux")]
+fn send_segments(
+    socket: &UdpSocket,
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+    iovecs: &mut [libc::iovec],
+    gso: u16,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd as _;
+
+    const UDP_SEGMENT: libc::c_int = 103;
+    #[repr(align(8))]
+    struct Control([u8; 32]);
+    let space = unsafe { libc::CMSG_SPACE(2) } as usize;
+    let mut control = Control([0u8; 32]);
+    if space > control.0.len() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    // SAFETY: `control` is aligned and large enough for one two-byte control message, which the calls below fill before the header names it.
+    unsafe {
+        let header = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
+        (*header).cmsg_level = libc::IPPROTO_UDP;
+        (*header).cmsg_type = UDP_SEGMENT;
+        (*header).cmsg_len = libc::CMSG_LEN(2) as _;
+        std::ptr::copy_nonoverlapping(gso.to_ne_bytes().as_ptr(), libc::CMSG_DATA(header), 2);
+    }
+    let message = libc::msghdr {
+        msg_name: (&raw const *storage).cast_mut().cast(),
+        msg_namelen: name_len,
+        msg_iov: iovecs.as_mut_ptr(),
+        msg_iovlen: iovecs.len(),
+        msg_control: control.0.as_mut_ptr().cast(),
+        msg_controllen: space as _,
+        msg_flags: 0,
+    };
+    // SAFETY: the name, iovecs and control all outlive the call, and the kernel only reads them.
+    let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, 0) };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(sent as usize)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1550,6 +2073,7 @@ fn send_endpoint(endpoint: SocketAddr, ipv6: bool) -> SocketAddr {
     }
 }
 
+/// Normalize a received endpoint to the tunnel's address family.
 fn recv_endpoint(socket: SocketAddr, ipv6: bool) -> SocketAddr {
     match socket {
         SocketAddr::V6(address) if ipv6 => match address.ip().to_ipv4_mapped() {
@@ -1566,16 +2090,18 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    /// The first packet a handshake or data path queued for sending.
     fn sent(events: &[Event]) -> Vec<u8> {
         events
             .iter()
             .find_map(|event| match event {
                 Event::Send { packet, .. } => Some(packet.clone()),
-                Event::Data(_) => None,
+                Event::Data(_) | Event::DataPrefixed(_) => None,
             })
             .expect("an outbound packet")
     }
 
+    /// A peer cannot claim another peer's source address as its own.
     #[test]
     fn a_peer_may_not_originate_another_peers_source() {
         let config = DeviceConfig {
@@ -1621,6 +2147,7 @@ mod tests {
             Some(1),
             false,
             &mut Vec::new(),
+            None,
         );
         assert!(packets.try_recv().is_err(), "the owner is peer zero");
         let mut packet = vec![0u8; 20];
@@ -1636,8 +2163,75 @@ mod tests {
             Some(1),
             false,
             &mut Vec::new(),
+            None,
         );
         assert!(packets.try_recv().is_ok(), "the peer owns its own source");
+    }
+
+    /// One `recvmmsg` returns every queued datagram to the batch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_receives_every_datagram() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let address = receiver.local_addr().expect("address");
+        for packet in &packets {
+            sender.send_to(packet, address).expect("datagram");
+        }
+        let (_recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        let got = batch.recv(&receiver, true).expect("batch");
+        assert_eq!(got, packets.len(), "the batch reads all four");
+        for (at, packet) in packets.iter().enumerate().take(got) {
+            assert_eq!(batch.packet(at), packet.as_slice());
+            assert_eq!(batch.source(at), Some(sender.local_addr().unwrap()));
+        }
+    }
+
+    /// A record the kernel truncated is dropped, not authenticated as a short packet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_truncated_record_is_not_handed_out() {
+        let (_recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        batch.headers[0].msg_hdr.msg_flags = libc::MSG_TRUNC;
+        assert!(batch.truncated(0));
+        batch.headers[0].msg_hdr.msg_flags = 0;
+        assert!(!batch.truncated(0));
+    }
+
+    /// A slot consumed through the recycle channel keeps its allocation and capacity.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_taken_slot_returns_to_the_batch() {
+        let (recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        let first = batch.take(0).expect("a slot");
+        let base = first.as_ptr();
+        let capacity = first.capacity();
+        recycle.send(first).expect("the slot comes back");
+        let _ = batch.take(0).expect("a replacement");
+        assert_eq!(batch.slots[0].as_ptr(), base);
+        assert_eq!(batch.slots[0].capacity(), capacity);
+    }
+
+    /// A batch hands out only its base slots and one extra slot per base slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_stops_taking_after_its_extra_budget() {
+        let (_recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        for _ in 0..RX_BATCH {
+            assert!(
+                batch.take(0).is_some(),
+                "the base and extra slots are handed out"
+            );
+        }
+        assert!(batch.take(0).is_none(), "the extra budget is bounded");
     }
 
     #[cfg(target_os = "linux")]
@@ -1662,6 +2256,107 @@ mod tests {
             got.push(buf[..n].to_vec());
         }
         assert_eq!(got, packets);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_keeps_each_packet_size_after_segmentation() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let packets: Vec<Vec<u8>> = [128usize, 128, 64, 256, 256, 32]
+            .into_iter()
+            .map(|len| vec![len as u8; len])
+            .collect();
+        send_batch(
+            &sender,
+            false,
+            receiver.local_addr().expect("address"),
+            &packets,
+        );
+        let mut got = Vec::new();
+        for _ in 0..packets.len() {
+            let mut buf = [0u8; 256];
+            let (n, _) = receiver.recv_from(&mut buf).expect("datagram");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, packets);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sendmsg_fallback_keeps_every_transport_packet_in_order() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let to = receiver.local_addr().expect("address");
+        let (storage, name_len) = crate::proxy::sockaddr_of(to);
+        let packets: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 32]).collect();
+        let mut iovecs: [libc::iovec; SEND_BATCH] = std::array::from_fn(|_| libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        // SAFETY: a zeroed `mmsghdr` is the empty header `send_messages` fills.
+        let mut headers: [libc::mmsghdr; SEND_BATCH] =
+            std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+        send_messages(
+            &sender,
+            &storage,
+            name_len,
+            to,
+            &packets,
+            &mut iovecs,
+            &mut headers,
+        );
+        let mut got = Vec::new();
+        for _ in 0..packets.len() {
+            let mut buf = [0u8; 64];
+            let (n, _) = receiver.recv_from(&mut buf).expect("datagram");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, packets);
+    }
+
+    #[test]
+    fn a_short_datagram_is_refused_before_any_slice() {
+        let Ok(socket) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let (to_stack, _stack) = mpsc::channel();
+        let mut peers = Vec::new();
+        let mut cookies = CookieGuard::default();
+        let mut incoming = Vec::new();
+        let mut sends = Vec::new();
+        let source = socket.local_addr().expect("address");
+        for (kind, len) in [
+            (TYPE_RESPONSE, 4),
+            (TYPE_RESPONSE, 7),
+            (TYPE_RESPONSE, 11),
+            (TYPE_INITIATION, 4),
+            (TYPE_INITIATION, INITIATION_SIZE - 1),
+        ] {
+            let mut packet = vec![0u8; len];
+            let bytes = kind.to_le_bytes();
+            let copied = len.min(bytes.len());
+            packet[..copied].copy_from_slice(&bytes[..copied]);
+            receive_datagram(
+                &mut peers,
+                &mut cookies,
+                0,
+                source,
+                &mut packet,
+                &socket,
+                &to_stack,
+                &mut incoming,
+                None,
+                false,
+                &mut sends,
+            );
+        }
     }
 
     #[test]
@@ -2121,6 +2816,7 @@ mod tests {
                 Some(0),
                 false,
                 &mut sends,
+                None,
             );
             assert_eq!(sends.len(), 0, "the batch is drained by the flush");
             if capacity == 0 {

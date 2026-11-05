@@ -114,6 +114,7 @@ impl Destination {
 }
 
 /// The in-proxy destination a signed server entry names for the requested TLS shape.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn destination(
     entry: &Json,
     host: &str,
@@ -133,8 +134,8 @@ pub(crate) fn destination(
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(protocol))
     };
-    let candidates = if tls {
-        [
+    let candidates: Vec<(bool, Option<u16>, NetworkProtocol, &'static str)> = if tls {
+        vec![
             (
                 has("INPROXY-WEBRTC-TLS-OSSH"),
                 entry
@@ -149,7 +150,7 @@ pub(crate) fn destination(
             (false, None, NetworkProtocol::Tcp, ""),
         ]
     } else {
-        [
+        vec![
             (
                 has("INPROXY-WEBRTC-OSSH"),
                 entry.get("inproxyOSSHPort").and_then(Json::as_port),
@@ -168,7 +169,49 @@ pub(crate) fn destination(
                 NetworkProtocol::Tcp,
                 "INPROXY-WEBRTC-SHADOWSOCKS-OSSH",
             ),
-            (false, None, NetworkProtocol::Tcp, ""),
+            (
+                has("INPROXY-WEBRTC-QUIC-OSSH"),
+                entry.get("inproxyQUICPort").and_then(Json::as_port),
+                NetworkProtocol::Udp,
+                "INPROXY-WEBRTC-QUIC-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-UNFRONTED-MEEK-OSSH"),
+                entry.get("inproxyMeekPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-UNFRONTED-MEEK-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-UNFRONTED-MEEK-HTTPS-OSSH"),
+                entry.get("inproxyMeekPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-UNFRONTED-MEEK-HTTPS-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-UNFRONTED-MEEK-SESSION-TICKET-OSSH"),
+                entry.get("inproxyMeekPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-FRONTED-MEEK-QUIC-OSSH")
+                    && crate::psiphon::fronted_quic_supported(entry),
+                entry.get("inproxyMeekPort").and_then(Json::as_port),
+                NetworkProtocol::Udp,
+                "INPROXY-WEBRTC-FRONTED-MEEK-QUIC-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-FRONTED-MEEK-OSSH"),
+                entry.get("inproxyMeekPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-FRONTED-MEEK-OSSH",
+            ),
+            (
+                has("INPROXY-WEBRTC-FRONTED-MEEK-HTTP-OSSH"),
+                entry.get("inproxyMeekPort").and_then(Json::as_port),
+                NetworkProtocol::Tcp,
+                "INPROXY-WEBRTC-FRONTED-MEEK-HTTP-OSSH",
+            ),
         ]
     };
     let (_, port, network_protocol, protocol) =
@@ -194,6 +237,7 @@ pub(crate) fn destination(
 #[derive(Clone, Copy)]
 enum NetworkProtocol {
     Tcp = 0,
+    Udp = 1,
 }
 
 fn pack_server_entry(entry: &Json) -> Option<Vec<u8>> {
@@ -356,6 +400,7 @@ impl Client {
             protocol: "INPROXY-BROKER",
             headers: headers.to_vec(),
             dns: dns.to_vec(),
+            shape: crate::psiphon_ssh::TlsShape::default(),
         };
         let http = psiphon_meek::MeekHttp::new_plain(meek, proxy.cloned(), timeout, BROKER_PATH);
         let transport = Box::new(MeekTransport { http });

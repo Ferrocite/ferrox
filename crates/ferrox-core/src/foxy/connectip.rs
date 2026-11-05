@@ -211,9 +211,22 @@ pub fn connect_ip_qpack_named(
     headers: &[(String, String)],
     out: &mut Vec<u8>,
 ) {
+    connect_ip_qpack_named_protocol(authority, path, b"connect-ip", headers, out);
+}
+
+/// The same named request under the extended-CONNECT protocol a transport
+/// asks for: Cloudflare's WARP endpoint answers `cf-connect-ip`, and the rest
+/// of the block is unchanged.
+pub fn connect_ip_qpack_named_protocol(
+    authority: &str,
+    path: &str,
+    protocol: &[u8],
+    headers: &[(String, String)],
+    out: &mut Vec<u8>,
+) {
     out.extend_from_slice(&[0x00, 0x00]);
     qpack_field(out, b":method", b"CONNECT");
-    qpack_field(out, b":protocol", b"connect-ip");
+    qpack_field(out, b":protocol", protocol);
     qpack_field(out, b":scheme", b"https");
     qpack_field(out, b":authority", authority.as_bytes());
     qpack_field(out, b":path", path.as_bytes());
@@ -275,6 +288,14 @@ pub fn packet_encode(packet: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(packet);
 }
 
+/// The same capsule without a context: the shape Cloudflare's WARP carries
+/// over HTTP/2, where the request stream is the only context there is.
+pub fn packet_encode_bare(packet: &[u8], out: &mut Vec<u8>) {
+    out.push(0x00);
+    quic_varint(out, packet.len() as u64);
+    out.extend_from_slice(packet);
+}
+
 /// What one capsule was, as far as this lane reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capsule<'a> {
@@ -312,6 +333,31 @@ pub fn capsule_split(buf: &[u8]) -> Option<(usize, Capsule<'_>)> {
                     Capsule::Other(0)
                 }
             }
+            ADDRESS_ASSIGN => Capsule::AddressAssign(value),
+            ADDRESS_REQUEST => Capsule::AddressRequest(value),
+            ROUTE_ADVERTISEMENT => Capsule::RouteAdvert(value),
+            other => Capsule::Other(other),
+        },
+    ))
+}
+
+/// The first complete capsule in a WARP HTTP/2 body: a type-zero capsule is a
+/// bare packet with no context byte, and every other type reads as it does on
+/// the RFC 9484 stream.
+#[must_use]
+pub fn capsule_split_bare(buf: &[u8]) -> Option<(usize, Capsule<'_>)> {
+    let mut at = 0usize;
+    if at >= buf.len() {
+        return None;
+    }
+    let kind = quic_read(buf, &mut at)?;
+    let length = quic_read(buf, &mut at)? as usize;
+    let end = at.checked_add(length)?;
+    let value = buf.get(at..end)?;
+    Some((
+        end,
+        match kind {
+            0 => Capsule::Datagram(value),
             ADDRESS_ASSIGN => Capsule::AddressAssign(value),
             ADDRESS_REQUEST => Capsule::AddressRequest(value),
             ROUTE_ADVERTISEMENT => Capsule::RouteAdvert(value),
@@ -1238,6 +1284,18 @@ mod tests {
         assert_eq!(used, buf.len() - 5);
         assert_eq!(capsule_split(&buf[..2]), None, "half a capsule");
         assert_eq!(capsule_split(b""), None);
+    }
+
+    /// WARP's HTTP/2 carrier drops the context byte, so a bare capsule is the
+    /// packet behind a type and length and nothing else.
+    #[test]
+    fn a_bare_datagram_has_no_context() {
+        let mut buf = Vec::new();
+        packet_encode_bare(b"\x45\x00\x00\x14", &mut buf);
+        assert_eq!(buf, [0x00, 0x04, 0x45, 0x00, 0x00, 0x14]);
+        let (used, capsule) = capsule_split_bare(&buf).expect("a capsule");
+        assert_eq!(used, buf.len());
+        assert_eq!(capsule, Capsule::Datagram(b"\x45\x00\x00\x14"));
     }
 
     /// The IP/UDP header walk reads a datagram this lane builds without a copy, at both versions, and verifies what it read.

@@ -186,6 +186,12 @@ impl H2StreamOut {
         }
         self.conn.end_session_of(self.stream);
     }
+
+    /// The request is refused with its body unread: an `RST_STREAM` frees the stream and the credit
+    /// it would otherwise keep granting a body nobody drains.
+    pub(crate) fn reset(&self) {
+        self.conn.reset(self.stream);
+    }
 }
 
 pub(crate) struct H2Stream {
@@ -2068,7 +2074,8 @@ fn block_from_head(head: &str, host: &str, scheme: &str) -> Vec<u8> {
 /// What a connection does with a request stream: xHTTP synthesises its H1 head and reuses the H1
 /// dispatch, gRPC opens the message reader and writer over the same demux.
 pub(crate) trait H2Service: Send + Sync {
-    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool);
+    /// True when the frame opened a request; a rejected head resets its stream and answers false.
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool;
 }
 
 impl H2Conn {
@@ -2166,23 +2173,55 @@ impl H2Conn {
     }
 }
 
+/// What a served h2 stream hands the protocol above the carrier once `accept_core` split it.
+pub(crate) type SessionServe = dyn Fn(
+        Box<dyn crate::proxy::WindowRead + Send>,
+        crate::xhttp::XhttpWriter,
+        Option<Arc<ferrox_core::vless_encryption::Server>>,
+    ) + Send
+    + Sync;
+
 struct XhttpService {
     settings: XhttpSettings,
-    users: VlessUsers,
-    freedom: bool,
+    serve: Arc<SessionServe>,
 }
 
 impl H2Service for XhttpService {
-    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool {
         open_stream(
             conn,
             &self.settings,
-            &self.users,
-            self.freedom,
+            Arc::clone(&self.serve),
             sid,
             block,
             end_stream,
-        );
+        )
+    }
+}
+
+/// The same demux for a carrier whose protocol above xHTTP is not VLESS: the accept still splits the
+/// stream into the carrier reader and writer, and the caller's closure runs the protocol handler.
+pub(crate) struct XhttpSessionService {
+    settings: XhttpSettings,
+    serve: Arc<SessionServe>,
+}
+
+impl XhttpSessionService {
+    pub(crate) fn new(settings: XhttpSettings, serve: Arc<SessionServe>) -> Self {
+        Self { settings, serve }
+    }
+}
+
+impl H2Service for XhttpSessionService {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool {
+        open_stream(
+            conn,
+            &self.settings,
+            Arc::clone(&self.serve),
+            sid,
+            block,
+            end_stream,
+        )
     }
 }
 
@@ -2235,12 +2274,11 @@ fn serve_stream(
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
-    users: &VlessUsers,
-    freedom: bool,
+    serve: Arc<SessionServe>,
     sid: u32,
     block: &[u8],
     end_stream: bool,
-) {
+) -> bool {
     let (method, target, lines) = {
         let mut decoder = conn.decoder.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut method, mut target, mut lines) = (Vec::new(), Vec::new(), Vec::new());
@@ -2266,17 +2304,17 @@ fn open_stream(
         drop(decoder);
         if !ok || !have_method || !have_target {
             conn.reset_stream(sid);
-            return;
+            return false;
         }
         (method, target, lines)
     };
     if conn.goaway.load(Ordering::SeqCst) {
         conn.reset_stream(sid);
-        return;
+        return false;
     }
     let Some(state) = conn.attach_stream(sid, end_stream) else {
         conn.reset_stream(sid);
-        return;
+        return false;
     };
     let head = synth_head(&method, &target, &lines, end_stream);
     let reader = H2StreamReader {
@@ -2300,7 +2338,6 @@ fn open_stream(
         headed: false,
     };
     let settings = settings.clone();
-    let users = Arc::clone(users);
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
@@ -2312,11 +2349,12 @@ fn open_stream(
             Some(h2out.clone()),
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
-                serve_stream(ureader, xwriter, &users, freedom, decryption);
+                serve(ureader, xwriter, decryption);
             }
             _ => h2out.end(),
         }
     });
+    true
 }
 
 pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + Send + 'static>(
@@ -2327,10 +2365,12 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     freedom: bool,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
+    let users: VlessUsers = Arc::from(users);
     let service = XhttpService {
         settings: settings.clone(),
-        users: Arc::from(users),
-        freedom,
+        serve: Arc::new(move |reader, writer, decryption| {
+            serve_stream(reader, writer, &users, freedom, decryption);
+        }),
     };
     serve_h2_service(read, write, &service, decryption);
 }
@@ -2348,10 +2388,12 @@ pub(crate) fn h2_xhttp_lane<
     freedom: bool,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) -> impl FnMut() -> crate::proxy::lane_pool::Next + Send + 'static {
+    let users: VlessUsers = Arc::from(users);
     let service = XhttpService {
         settings: settings.clone(),
-        users: Arc::from(users),
-        freedom,
+        serve: Arc::new(move |reader, writer, decryption| {
+            serve_stream(reader, writer, &users, freedom, decryption);
+        }),
     };
     h2_lane(read, write, service, decryption, None)
 }
@@ -2366,7 +2408,10 @@ pub(crate) fn serve_h2_service<
     service: &S,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
-    serve_h2_service_until(read, write, service, decryption, None);
+    // A peer that offers the preface and no request ends at the handshake clock; the first HEADERS puts it away.
+    let until = std::time::Instant::now() + crate::budgets::handshake();
+    let opened = Arc::new(AtomicBool::new(false));
+    serve_h2_service_until(read, write, service, decryption, Some((until, opened)));
 }
 
 /// What one call of `Frames::step` settled on: another frame is ready, the socket is quiet until the
@@ -2488,13 +2533,13 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     if !block {
                         return Filled::Idle;
                     }
-                    if let Some(until) = *until {
-                        std::thread::sleep(
-                            until
-                                .saturating_duration_since(std::time::Instant::now())
-                                .min(crate::budgets::RELAY_POLL),
-                        );
-                    }
+                    // No deadline means an established connection: poll in a quantum instead of spinning a worker.
+                    let wait = until.map_or(crate::budgets::RELAY_POLL, |until| {
+                        until
+                            .saturating_duration_since(std::time::Instant::now())
+                            .min(crate::budgets::RELAY_POLL)
+                    });
+                    std::thread::sleep(wait);
                 }
                 Err(_) => return Filled::End,
             }
@@ -2612,7 +2657,16 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     return self.end();
                 };
                 let body = std::mem::take(&mut self.body);
-                if !pump_frame(conn, service, kind, flags, sid, body, &mut self.frag) {
+                if !pump_frame(
+                    conn,
+                    service,
+                    kind,
+                    flags,
+                    sid,
+                    body,
+                    &mut self.frag,
+                    self.opened.as_ref(),
+                ) {
                     return self.end();
                 }
                 self.head_have = 0;
@@ -2798,6 +2852,7 @@ fn pump_frame(
     sid: u32,
     mut body: Vec<u8>,
     frag: &mut Option<(u32, Vec<u8>, bool)>,
+    opened: Option<&Arc<AtomicBool>>,
 ) -> bool {
     if let Some(alive) = control_frame(conn, kind, flags, sid, &body) {
         return alive;
@@ -2838,7 +2893,11 @@ fn pump_frame(
                 {
                     return true;
                 }
-                service.open(conn, sid, &block, end_stream);
+                if service.open(conn, sid, &block, end_stream) {
+                    if let Some(opened) = opened {
+                        opened.store(true, Ordering::Relaxed);
+                    }
+                }
             } else {
                 *frag = Some((sid, block, end_stream));
             }
@@ -2857,7 +2916,11 @@ fn pump_frame(
                 }
                 gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
-                    service.open(conn, sid, &gathered, end_stream);
+                    if service.open(conn, sid, &gathered, end_stream) {
+                        if let Some(opened) = opened {
+                            opened.store(true, Ordering::Relaxed);
+                        }
+                    }
                 } else {
                     *frag = Some((sid, gathered, end_stream));
                 }
@@ -2924,17 +2987,32 @@ fn pump_frame(
 mod tests {
     use super::*;
     use crate::conn::{test_bind, Connection};
-    use crate::h2::{read_head, MAGIC};
+    use crate::h2::{read_head, read_head_bounded, MAGIC};
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
 
+    /// The production pump with no demux clock: a unit test drives frames, not a connection's handshake.
+    fn pump_frame(
+        conn: &Arc<H2Conn>,
+        service: &dyn H2Service,
+        kind: u8,
+        flags: u8,
+        sid: u32,
+        body: Vec<u8>,
+        frag: &mut Option<(u32, Vec<u8>, bool)>,
+    ) -> bool {
+        super::pump_frame(conn, service, kind, flags, sid, body, frag, None)
+    }
+
     fn test_service(settings: &XhttpSettings) -> XhttpService {
+        let users = crate::proxy::one_user([0u8; 16]);
         XhttpService {
             settings: settings.clone(),
-            users: crate::proxy::one_user([0u8; 16]),
-            freedom: true,
+            serve: Arc::new(move |reader, writer, decryption| {
+                serve_stream(reader, writer, &users, true, decryption);
+            }),
         }
     }
 
@@ -2946,6 +3024,8 @@ mod tests {
     }
 
     impl H2Client {
+        /// Opens the test peer and reads the server's opening frames under the socket deadline, so a
+        /// demux that never answers fails the test instead of parking it.
         fn connect(addr: SocketAddr) -> Self {
             let mut stream = Connection::connect(addr).expect("connects");
             stream
@@ -2963,9 +3043,9 @@ mod tests {
                 held: VecDeque::new(),
             };
             for _ in 0..3 {
-                let (len, kind, flags, _) = read_head(&mut conn.stream).expect("frame");
+                let (len, kind, flags, _) = read_head_bounded(&mut conn.stream).expect("frame");
                 let mut body = crate::proxy::unfilled(len);
-                crate::proxy::read_exact(&mut conn.stream, &mut body).expect("body");
+                conn.stream.read_exact(&mut body).expect("body");
                 if kind == T_SETTINGS && flags & F_ACK == 0 {
                     write_frame(&mut conn.stream, T_SETTINGS, F_ACK, 0, &[]);
                 }
@@ -3056,9 +3136,9 @@ mod tests {
                 if let Some(at) = self.held.iter().position(|f| f.2 == id && want(f.0)) {
                     return self.held.remove(at).expect("the position just found");
                 }
-                let (len, kind, flags, got) = read_head(&mut self.stream).expect("frame");
+                let (len, kind, flags, got) = read_head_bounded(&mut self.stream).expect("frame");
                 let mut body = crate::proxy::unfilled(len);
-                crate::proxy::read_exact(&mut self.stream, &mut body).expect("body");
+                self.stream.read_exact(&mut body).expect("body");
                 if kind == T_PING && flags & F_ACK == 0 && body.len() == 8 {
                     write_frame(&mut self.stream, T_PING, F_ACK, 0, &body);
                     continue;
@@ -3601,6 +3681,62 @@ mod tests {
         assert_eq!(client.response_data(down, payload.len()), payload);
         drop(client);
         echo.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// A carrier whose protocol above xHTTP is not VLESS hands the demux a closure instead of the engine session: the split request reaches it with the upload body as its first bytes and its reply lands on the downlink stream.
+    #[test]
+    fn a_carried_session_runs_above_the_demux() {
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let ran = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ran);
+        let server = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            let service = XhttpSessionService::new(
+                test_settings("stream-up"),
+                Arc::new(move |mut reader, mut writer, _decryption| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let mut body = Vec::new();
+                    let mut chunk = [0u8; 8];
+                    while body.len() < 8 {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if crate::proxy::is_timeout(&e) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = writer.write_all(&body);
+                    writer.finish();
+                }),
+            );
+            serve_h2_service(read, stream, &service, None);
+        });
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers("GET", "/up/carried-1", &[("referer", pad.as_str())], true);
+        assert_eq!(client.response_head(down), 200);
+        let up = client.headers(
+            "POST",
+            "/up/carried-1",
+            &[
+                ("referer", pad.as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        client.data(up, b"carried!", true);
+        assert_eq!(client.response_head(up), 200);
+        assert_eq!(client.response_data(down, 8), b"carried!");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the carried session ran once"
+        );
+        drop(client);
         server.join().expect("joins");
     }
 
@@ -4553,6 +4689,167 @@ mod tests {
         let _ = handle;
     }
 
+    /// A peer that offers the h2 preface and no request is ended at the handshake clock: the demux
+    /// does not hold its worker for a connection that never opened a stream.
+    #[test]
+    fn a_preface_without_a_request_ends_at_the_handshake_budget() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let opened = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&opened);
+        let server = thread::spawn(crate::budgets::carrying(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
+                .expect("arms the poll");
+            let service = XhttpSessionService::new(
+                test_settings("stream-up"),
+                Arc::new(move |_, _, _| {
+                    seen.store(true, Ordering::SeqCst);
+                }),
+            );
+            let began = std::time::Instant::now();
+            serve_h2_service(read, stream, &service, None);
+            began.elapsed()
+        }));
+        let mut client = Connection::connect(addr).expect("connects");
+        client.write_all(MAGIC).expect("writes the preface");
+        let took = server.join().expect("joins");
+        crate::budgets::clear();
+        assert!(!opened.load(Ordering::SeqCst), "no stream opened");
+        assert!(
+            took < Duration::from_secs(2),
+            "the demux did not end at its clock: {took:?}"
+        );
+        drop(client);
+    }
+
+    /// A gRPC head is not a request either: the VLESS body decodes later, so the connection clock
+    /// stays until then and a head-only peer cannot hold the demux.
+    #[test]
+    fn a_grpc_head_does_not_clear_the_connection_clock() {
+        let (conn, _, _) = bare_conn();
+        let settings = crate::config::GrpcSettings::path("/p");
+        let service =
+            crate::grpc::GrpcService::new(&settings, &[], true, Arc::new(AtomicBool::new(false)));
+        let block = block_encode(&[
+            (":path", "/p"),
+            (":method", "POST"),
+            ("content-type", "application/grpc"),
+        ]);
+        let opened = Arc::new(AtomicBool::new(false));
+        let mut frag = None;
+        assert!(super::pump_frame(
+            &conn,
+            &service,
+            T_HEADERS,
+            F_END_HEADERS,
+            3,
+            block,
+            &mut frag,
+            Some(&opened),
+        ));
+        assert!(!opened.load(Ordering::SeqCst), "a gRPC head opened");
+    }
+
+    /// A refused request must not clear the clock: the reply is the last thing the peer sends, then
+    /// it goes silent, and the stream never opened.
+    #[test]
+    fn a_refused_head_does_not_open_the_connection() {
+        struct Reject;
+        impl H2Service for Reject {
+            fn open(&self, _: &Arc<H2Conn>, _: u32, _: &[u8], _: bool) -> bool {
+                false
+            }
+        }
+        let (conn, _, _) = bare_conn();
+        let opened = Arc::new(AtomicBool::new(false));
+        let mut frag = None;
+        assert!(super::pump_frame(
+            &conn,
+            &Reject,
+            T_HEADERS,
+            F_END_HEADERS,
+            3,
+            vec![0x82],
+            &mut frag,
+            Some(&opened),
+        ));
+        assert!(!opened.load(Ordering::SeqCst), "a refused head opened");
+    }
+
+    /// A refused session frees its request stream with an `RST_STREAM`: leaving it open would credit
+    /// a body nobody reads for the connection's life.
+    #[test]
+    fn an_aborted_writer_resets_its_stream() {
+        let (conn, written, _) = bare_conn();
+        let Some((_reader, _writer, out)) = conn.open(3, false) else {
+            panic!("the stream opens");
+        };
+        let writer = crate::xhttp::XhttpWriter::new(Vec::<u8>::new());
+        writer.set_h2(out);
+        writer.abort();
+        let bytes = written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(
+            bytes
+                .as_chunks::<9>()
+                .0
+                .iter()
+                .any(|f| { f[3] == T_RST && u32::from_be_bytes([f[5], f[6], f[7], f[8]]) == 3 }),
+            "no RST_STREAM went out"
+        );
+    }
+
+    /// A HEADERS on stream 0 is not a request: it must not clear the clock, or a silent peer keeps
+    /// the demux worker without ever opening a stream.
+    #[test]
+    fn a_headers_on_stream_zero_keeps_the_handshake_clock() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let opened = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&opened);
+        let server = thread::spawn(crate::budgets::carrying(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
+                .expect("arms the poll");
+            let service = XhttpSessionService::new(
+                test_settings("stream-up"),
+                Arc::new(move |_, _, _| {
+                    seen.store(true, Ordering::SeqCst);
+                }),
+            );
+            let began = std::time::Instant::now();
+            serve_h2_service(read, stream, &service, None);
+            began.elapsed()
+        }));
+        let mut client = Connection::connect(addr).expect("connects");
+        client.write_all(MAGIC).expect("writes the preface");
+        // HEADERS, END_STREAM|END_HEADERS, stream 0: ignored by the demux.
+        client
+            .write_all(&[0, 0, 1, T_HEADERS, F_END | F_END_HEADERS, 0, 0, 0, 0, 0x82])
+            .expect("writes the ignored head");
+        let took = server.join().expect("joins");
+        crate::budgets::clear();
+        assert!(!opened.load(Ordering::SeqCst), "no stream opened");
+        assert!(
+            took < Duration::from_secs(2),
+            "the ignored head cleared the clock: {took:?}"
+        );
+        drop(client);
+    }
+
     /// The writer a credit is read by: it answers with the bytes it was handed, so the number of writes it took is exact — over a loopback socket the same shape moves with the scheduler.
     struct Counted {
         written: Arc<Mutex<Vec<u8>>>,
@@ -4631,7 +4928,15 @@ mod tests {
     fn a_settings_length_outside_sixes_is_refused_as_a_frame_size_error() {
         struct Silent;
         impl H2Service for Silent {
-            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
         }
         let (conn, written, _slices) = bare_conn();
         let mut frag = None;
@@ -4704,11 +5009,12 @@ mod tests {
     fn an_end_stream_header_block_keeps_its_flag_across_a_continuation() {
         struct Record(Arc<Mutex<Vec<(u32, bool)>>>);
         impl H2Service for Record {
-            fn open(&self, _conn: &Arc<H2Conn>, sid: u32, _block: &[u8], end_stream: bool) {
+            fn open(&self, _conn: &Arc<H2Conn>, sid: u32, _block: &[u8], end_stream: bool) -> bool {
                 self.0
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push((sid, end_stream));
+                true
             }
         }
         let (conn, _, _) = bare_conn();
@@ -5169,7 +5475,15 @@ mod tests {
     fn a_failed_control_send_ends_the_read_loop() {
         struct Silent;
         impl H2Service for Silent {
-            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
         }
         let conn = conn_with(Box::new(NullWrite), true);
         conn.dead.store(true, Ordering::SeqCst);

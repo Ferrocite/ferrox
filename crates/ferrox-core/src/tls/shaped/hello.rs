@@ -24,6 +24,9 @@ pub(crate) struct Hello {
     alpn: Option<&'static [&'static [u8]]>,
     sni: Option<String>,
     ech: Option<Vec<u8>>,
+    /// A config-named padding extension body length, placed first as Psiphon does; `None`
+    /// keeps the preset's own `BoringSSL` padding rule.
+    padding: Option<usize>,
     offer: Option<EchOffer>,
     /// A fixture build: fixed entropy, table order, and a fixed ECH payload length.
     canonical: bool,
@@ -88,11 +91,19 @@ impl Hello {
             alpn: alpn_override(alpn, websocket),
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, false),
+            padding: None,
             offer: None,
             canonical: false,
         };
         hello.msg = hello.encode(None);
         Ok(hello)
+    }
+
+    /// Move or add the RFC 7685 padding extension at the front of the extension list with
+    /// an exact body length, capped so the hello stays in one 2^14-byte record.
+    pub(crate) fn set_padding(&mut self, padding: usize) {
+        self.padding = Some(padding.min(0x3000));
+        self.msg = self.encode(None);
     }
 
     /// Replaces the GREASE cover with a real ECH offer sealed to the named config.
@@ -222,7 +233,7 @@ impl Hello {
             ));
         }
         let ciphers = self.cipher_values(true);
-        let message_len = Self::pad_prepared(&mut entries, ciphers.len(), 0);
+        let message_len = Self::pad_prepared(&mut entries, ciphers.len(), 0, None);
         let head = Prepared {
             version: TLS12,
             random: &offer.inner_random,
@@ -281,6 +292,7 @@ impl Hello {
             alpn: self.alpn,
             sni: self.sni.clone(),
             ech: self.ech.clone(),
+            padding: self.padding,
             offer,
             canonical: self.canonical,
         })
@@ -459,7 +471,9 @@ impl Hello {
         shares: &[Share],
     ) -> Vec<u8> {
         let ciphers = self.cipher_values(tls13_only);
-        let message_len = Self::pad_prepared(&mut entries, ciphers.len(), session_id.len());
+        // The outer hello is the visible one, so the configured padding goes there once.
+        let message_len =
+            Self::pad_prepared(&mut entries, ciphers.len(), session_id.len(), self.padding);
         let head = Prepared {
             version,
             random,
@@ -614,28 +628,43 @@ impl Hello {
     }
 
     fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) -> usize {
-        Self::pad_prepared(entries, self.profile.ciphers.len(), self.session_id.len())
+        Self::pad_prepared(
+            entries,
+            self.profile.ciphers.len(),
+            self.session_id.len(),
+            self.padding,
+        )
     }
 
-    fn pad_prepared(entries: &mut Vec<Entry<'_>>, ciphers: usize, session: usize) -> usize {
+    fn pad_prepared(
+        entries: &mut Vec<Entry<'_>>,
+        ciphers: usize,
+        session: usize,
+        padding: Option<usize>,
+    ) -> usize {
         let header = 2 + 32 + 1 + session + 2 + 2 * ciphers + 1 + 1;
-        let unpadded = header
-            + 4
-            + entries
-                .iter()
-                .filter(|entry| entry.kind != PAD)
-                .map(|entry| 4 + entry.len)
-                .sum::<usize>()
-            + 2;
-        let pad = boring_padding(unpadded);
-        entries.retain(|entry| entry.kind != PAD || pad.is_some());
-        if let Some(len) = pad {
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.kind == PAD) {
-                entry.source = Source::Zeros(len);
-                entry.len = len;
+        if let Some(len) = padding {
+            entries.retain(|entry| entry.kind != PAD);
+            entries.insert(0, Entry::new(PAD, len, true, Source::Zeros(len)));
+        } else {
+            let unpadded = header
+                + 4
+                + entries
+                    .iter()
+                    .filter(|entry| entry.kind != PAD)
+                    .map(|entry| 4 + entry.len)
+                    .sum::<usize>()
+                + 2;
+            let pad = boring_padding(unpadded);
+            entries.retain(|entry| entry.kind != PAD || pad.is_some());
+            if let Some(len) = pad {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.kind == PAD) {
+                    entry.source = Source::Zeros(len);
+                    entry.len = len;
+                }
             }
         }
-        unpadded
+        header + 4 + entries.iter().map(|entry| 4 + entry.len).sum::<usize>() + 2
     }
 
     /// The table order as a canonical hello: zero random, session id, GREASE
@@ -654,6 +683,7 @@ impl Hello {
             alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, true),
+            padding: None,
             offer: None,
             canonical: true,
         };
@@ -1014,6 +1044,57 @@ mod tests {
             .expect("a shaped dial hello");
         assert_eq!(hello.random, random);
         assert_eq!(&hello.msg[6..38], &random);
+    }
+
+    #[test]
+    fn a_configured_padding_is_first_and_exact() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello.set_padding(77);
+        let entries = extensions(&hello.msg[4..]);
+        assert_eq!(kind(entries[0]), 0x0015);
+        assert_eq!(entries[0].len(), 4 + 77);
+        assert!(entries[0][4..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            entries.iter().filter(|entry| kind(entry) == 0x0015).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_padding_over_one_record_is_capped() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello.set_padding(0xffff);
+        let entries = extensions(&hello.msg[4..]);
+        assert_eq!(kind(entries[0]), 0x0015);
+        assert_eq!(entries[0].len(), 4 + 0x3000);
+        assert!(hello.msg.len() < 0x4000);
+    }
+
+    #[test]
+    fn a_configured_padding_is_not_repeated_on_the_ech_outer_hello() {
+        let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello.set_padding(0x3000);
+        hello.enable_ech(&list).expect("ech");
+        let entries = extensions(&hello.msg[4..]);
+        assert_eq!(kind(entries[0]), 0x0015);
+        assert_eq!(entries[0].len(), 4 + 0x3000);
+        assert!(hello.msg.len() < 0x4000);
     }
 
     fn extensions(body: &[u8]) -> Vec<&[u8]> {

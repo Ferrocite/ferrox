@@ -189,6 +189,7 @@ fn open_flow(session: &Session, stream: u64, host: &str, port: u16) -> Option<Fl
         stream,
         Vec::new(),
         drive,
+        false,
     )
     .with_wake(wake)
     .with_session(session);
@@ -463,6 +464,7 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<Flow> {
         FIRST_FLOW_STREAM,
         Vec::new(),
         true,
+        false,
     ))
 }
 
@@ -1053,6 +1055,7 @@ fn serve_tcp_or_udp(
         local,
         stream,
         Vec::new(),
+        false,
         false,
     )
     .with_wake(Some(Arc::clone(wake)))

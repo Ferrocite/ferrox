@@ -610,7 +610,7 @@ security-ech quic-lanes-that-fall-back-without-an-offer 1 ferrox-app-quic::tests
 security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
 
 # --- engine sniffing --------------------------------------------------------
-engine-sniffing-http-tls-quic-fakedns ops-retired-instructions 1220 scripts/count-ops.sh
+engine-sniffing-http-tls-quic-fakedns ops-retired-instructions 1228 scripts/count-ops.sh
 engine-sniffing-http-tls-quic-fakedns http-host-and-tls-sni-recognized 2 ferrox-app-sniff::tests::reads_http_host_and_tls_sni
 engine-sniffing-http-tls-quic-fakedns quic-initial-sni-recognized 1 ferrox-app-sniff::tests::reads_a_quic_initial_sni
 engine-sniffing-http-tls-quic-fakedns bittorrent-and-utp-recognized 2 ferrox-app-sniff::tests::reads_bittorrent_and_utp
@@ -812,6 +812,7 @@ wireguard echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_th
 wireguard echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
 wireguard prefixed-record-allocations 0 ferrox-core-wireguard::tests::a_prefixed_record_reuses_the_stack_headroom
 wireguard prefixed-record-zeroed-bytes 0 ferrox-core-wireguard::tests::a_prefixed_record_reuses_the_stack_headroom
+wireguard received-record-copies 0 ferrox-core-wireguard::tests::an_owned_transport_record_keeps_the_received_allocation
 wireguard kernel-rule-priority 32765 ferrox-app-wg-kernel::tests::the_rule_marks_the_table
 wireguard kernel-iif-priority 32764 ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel
 carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh

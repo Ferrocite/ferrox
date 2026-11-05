@@ -24,6 +24,9 @@ const OPT_MASK: u8 = 0x04;
 const OPT_PAD: u8 = 0x08;
 const OPT_AUTH_LEN: u8 = 0x10;
 
+/// The grace after a peer half-close, long enough for a target that answers late.
+const REPLY_IDLE: Duration = Duration::from_secs(30);
+
 /// A sealed size field: the two plain octets and their tag, what `AEADChunkSizeParser`
 /// reads when the request asks for an authenticated length.
 const SIZE_FIELD: usize = HEADER_LEN + TAG_LEN;
@@ -1067,6 +1070,8 @@ pub(crate) struct Wire<R> {
     last: bool,
     /// The last frame opened was the zero-length marker, not a carrier end.
     marker: bool,
+    /// A frame could not be authenticated, or the carrier ended inside one.
+    failed: bool,
 }
 
 impl<R: Read> Wire<R> {
@@ -1081,6 +1086,7 @@ impl<R: Read> Wire<R> {
             waiting: None,
             last: false,
             marker: false,
+            failed: false,
         }
     }
 
@@ -1088,6 +1094,11 @@ impl<R: Read> Wire<R> {
     /// carrier ending under it.
     fn ended_by_marker(&self) -> bool {
         self.marker
+    }
+
+    /// Whether the end was a frame that would not open, rather than the carrier's own FIN.
+    fn corrupt(&self) -> bool {
+        self.failed
     }
 
     /// One step of the relay: open up to `FRAMES_PER_WRITE` frames, waiting only for the first,
@@ -1184,12 +1195,16 @@ impl<R: Read> Wire<R> {
                 }
                 Ok(read) => self.end += read,
                 // A lane's read polls the carrier, and hands the wait back rather than spinning on it.
-                Err(ref error) if crate::proxy::is_timeout(error) => {
+                Err(ref error)
+                    if crate::proxy::is_timeout(error)
+                        || error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
                     if crate::proxy::relay_step_owns_poll() {
                         return false;
                     }
                 }
                 Err(_) => {
+                    self.failed = true;
                     self.last = true;
                     return false;
                 }
@@ -1204,6 +1219,9 @@ impl<R: Read> Wire<R> {
             sizes
         } else {
             if self.buffered() < width && !self.fill(width, block) {
+                if self.last && self.buffered() > 0 {
+                    self.failed = true;
+                }
                 return if self.last { Frame::Last } else { Frame::Idle };
             }
             let sizes = if width == SIZE_FIELD {
@@ -1218,17 +1236,22 @@ impl<R: Read> Wire<R> {
                 Some(masked_len(recv, u16::from_be_bytes(prefix)))
             };
             let Some(sizes) = sizes else {
+                self.failed = true;
                 return Frame::Last;
             };
             self.waiting = Some(sizes);
             sizes
         };
         if self.buffered() < width + total && !self.fill(width + total, block) {
+            if self.last {
+                self.failed = true;
+            }
             return if self.last { Frame::Last } else { Frame::Idle };
         }
         self.waiting = None;
         let body = self.start + width;
         let Some(len) = open_body(recv, &mut self.held[body..body + total], padding) else {
+            self.failed = true;
             return Frame::Last;
         };
         self.start = body + total;
@@ -1421,7 +1444,10 @@ impl Answer {
             match stream.read(&mut self.sealed[self.got..self.need]) {
                 Ok(0) => return AnswerStep::Failed,
                 Ok(read) => self.got += read,
-                Err(ref error) if crate::proxy::is_timeout(error) => {
+                Err(ref error)
+                    if crate::proxy::is_timeout(error)
+                        || error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
                     return if crate::proxy::relay_step_owns_poll() {
                         AnswerStep::Idle
                     } else {
@@ -1614,10 +1640,29 @@ pub(crate) fn pump_relay_carried<R, W>(
     plain: &Connection,
     reader: R,
     writer: W,
-    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    close: &Close,
     send: Flow,
     recv: Flow,
     pending: Option<PendingResponse>,
+) -> Option<std::sync::Arc<crate::proxy::RelayFinish>>
+where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    pump_relay_carried_with_finish(plain, reader, writer, close, send, recv, pending, None)
+}
+
+/// The carried pump with the carrier's own write-side finish: a clean target EOF ends the request, and a markerless one under `NoTerminationSignal` leaves the carrier FIN as the only end the peer sees.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pump_relay_carried_with_finish<R, W>(
+    plain: &Connection,
+    reader: R,
+    writer: W,
+    close: &Close,
+    send: Flow,
+    recv: Flow,
+    pending: Option<PendingResponse>,
+    finish: Option<Close>,
 ) -> Option<std::sync::Arc<crate::proxy::RelayFinish>>
 where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
@@ -1651,10 +1696,14 @@ where
                 &forward_flow,
             );
             if next == Next::Idle {
+                crate::proxy::note_wait_idle(REPLY_IDLE);
                 crate::proxy::note_wait_finish(&forward_flow);
             }
             if next == Next::Done {
                 if clean {
+                    if let Some(finish) = finish.as_ref() {
+                        finish();
+                    }
                     // A clean target EOF leaves the upload direction writing to this socket.
                     let _ = plain_read.shutdown(Shutdown::Read);
                 } else {
@@ -1687,6 +1736,7 @@ where
                 &mut first,
             );
             if next == Next::Idle {
+                crate::proxy::note_wait_idle(REPLY_IDLE);
                 crate::proxy::note_wait_finish(&backward_flow);
             }
             next
@@ -1741,6 +1791,7 @@ fn forward_step(
                 });
             }
             if ok {
+                flow.mark_progress();
                 (Next::More, false)
             } else {
                 close();
@@ -1748,7 +1799,7 @@ fn forward_step(
             }
         }
         Err(ref error) if crate::proxy::is_timeout(error) => {
-            if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+            if flow.ended_and_idle(REPLY_IDLE) {
                 (Next::Done, false)
             } else {
                 (Next::Idle, false)
@@ -1777,7 +1828,7 @@ fn backward_step<R: Read>(
             AnswerStep::Done => *answer = None,
             AnswerStep::Idle => {
                 // Parks past the grace are due at once, so a pending answer spends the grace here.
-                if !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                if !flow.ended_and_idle(REPLY_IDLE) {
                     return Next::Idle;
                 }
                 close();
@@ -1793,19 +1844,20 @@ fn backward_step<R: Read>(
     }
     match reader.step(recv) {
         Opened::Idle => {
-            if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+            if flow.ended_and_idle(REPLY_IDLE) {
                 Next::Done
             } else {
                 Next::Idle
             }
         }
         Opened::End => {
-            // The marker ends this direction only: half-close its peer and keep the other direction.
-            if reader.ended_by_marker() {
-                let _ = out.shutdown(Shutdown::Write);
-            } else {
+            if reader.corrupt() {
+                // A frame that will not open ends both directions.
                 close();
                 let _ = out.shutdown(Shutdown::Both);
+            } else {
+                // A marker or a clean carrier FIN ends this direction only.
+                let _ = out.shutdown(Shutdown::Write);
             }
             Next::Done
         }
@@ -1815,6 +1867,9 @@ fn backward_step<R: Read>(
                 *first = false;
             }
             if out.write_all(&reader.held[at..at + len]).is_ok() {
+                if len > 0 {
+                    flow.mark_progress();
+                }
                 Next::More
             } else {
                 close();
@@ -1833,9 +1888,9 @@ pub(crate) struct Accepted {
     pub(crate) cmd: u8,
     pub(crate) user: crate::stats::Meter,
 }
-type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
+pub(crate) type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
 
-fn accept_request_bounded(reader: &mut dyn Read, users: &Users) -> Option<Accepted> {
+pub(crate) fn accept_request_bounded(reader: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut bounded = crate::proxy::HandshakeDeadline {
         inner: reader,
         until: std::time::Instant::now() + crate::budgets::handshake(),
@@ -1843,12 +1898,27 @@ fn accept_request_bounded(reader: &mut dyn Read, users: &Users) -> Option<Accept
     accept_request(&mut bounded, users)
 }
 
-fn serve_decoded<R, W>(
+pub(crate) fn serve_decoded<R, W>(
+    reader: R,
+    writer: W,
+    close: &Close,
+    decoded: Option<Accepted>,
+    freedom: bool,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    serve_decoded_with_finish(reader, writer, close, decoded, freedom, None);
+}
+
+/// [`serve_decoded`] with the carrier's write-side finish for the clean EOF `NoTerminationSignal` leaves markerless.
+pub(crate) fn serve_decoded_with_finish<R, W>(
     reader: R,
     mut writer: W,
     close: &Close,
     decoded: Option<Accepted>,
     freedom: bool,
+    finish: Option<Close>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
@@ -1881,7 +1951,9 @@ fn serve_decoded<R, W>(
                 close();
                 return;
             }
-            pump_relay_carried(&uplink, reader, writer, close, send, recv, None);
+            pump_relay_carried_with_finish(
+                &uplink, reader, writer, close, send, recv, None, finish,
+            );
         }
         2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv, &user),
         _ => {}
@@ -2031,12 +2103,31 @@ pub(crate) fn serve_xhttp_split<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((mut reader, writer)) =
-        crate::xhttp::accept_split_with_settings(reader, writer, settings)
+    let Some((reader, writer)) = crate::xhttp::accept_split_with_settings(reader, writer, settings)
     else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, users);
+    serve_xhttp_accepted(reader, writer, users, freedom, close);
+}
+
+/// The session above an xHTTP carrier an accept already split: an h2 stream and an H1 request both
+/// leave the same pair, so the request decode and relay are shared.
+pub(crate) fn serve_xhttp_accepted(
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
+    writer: crate::xhttp::XhttpWriter,
+    users: &Users,
+    freedom: bool,
+    close: &Close,
+) {
+    // The h2 reader sleeps through poll timeouts, so the handshake claims the poll and a silent stream ends at its budget.
+    let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
+    let decoded = accept_request(&mut reader, users);
+    reader.disarm();
+    if decoded.is_none() {
+        writer.abort();
+        close();
+        return;
+    }
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -2132,13 +2223,8 @@ pub(crate) fn serve_raw_split<R, W>(
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
-pub(crate) fn serve_kcp<R, W>(
-    mut reader: R,
-    writer: W,
-    users: &Users,
-    freedom: bool,
-    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
-) where
+pub(crate) fn serve_kcp<R, W>(mut reader: R, writer: W, users: &Users, freedom: bool, close: &Close)
+where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
@@ -2320,6 +2406,7 @@ pub(crate) fn pump_relay(
         let _ = plain_write.shutdown(Shutdown::Write);
         let _ = done.join();
     } else {
+        // Carrier EOF or a frame that will not open ends both directions; releasing the target's read unblocks the forward thread before the join.
         let _ = sealed.shutdown(Shutdown::Both);
         let _ = plain_write.shutdown(Shutdown::Both);
         let _ = done.join();
@@ -2333,6 +2420,7 @@ pub(crate) fn pump_relay(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Arc;
 
     #[test]
     fn a_frame_coalesced_behind_its_header_still_arrives() {
@@ -4568,6 +4656,35 @@ mod tests {
         }
     }
 
+    /// A not-ready answer read is a wait, not a failed handshake: the same step resumes it.
+    #[test]
+    fn a_not_ready_answer_read_resumes_instead_of_failing() {
+        struct Late(Vec<u8>, bool);
+
+        impl Read for Late {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.1 {
+                    self.1 = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                let read = buffer.len().min(self.0.len());
+                buffer[..read].copy_from_slice(&self.0[..read]);
+                self.0.drain(..read);
+                Ok(read)
+            }
+        }
+
+        let key = [0x31u8; 16];
+        let iv = [0x32u8; 16];
+        let auth = 5;
+        let prefix = response_prefix(&key, &iv, auth).expect("seals the answer");
+        let mut answer = Answer::new((key, iv, auth));
+        assert!(
+            matches!(answer.step(&mut Late(prefix, false)), AnswerStep::Done),
+            "a WouldBlock read failed the answer instead of resuming it"
+        );
+    }
+
     #[test]
     fn a_peer_that_ends_its_upload_with_the_marker_still_gets_the_download() {
         let key = [0x55u8; 16];
@@ -4913,5 +5030,66 @@ mod tests {
 
         client.shutdown(Shutdown::Write).expect("ends the upload");
         relay.join().expect("joins");
+    }
+
+    /// A silent h2 stream authenticates under the handshake clock: its reader polls, and the handler
+    /// ends at the budget instead of waiting the relay stall for a body that never comes.
+    #[test]
+    fn a_silent_h2_request_ends_at_the_handshake_budget() {
+        struct Silent(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    crate::proxy::relay_step_owns_poll(),
+                    "an h2 authentication read ran outside the poll"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl crate::proxy::WindowRead for Silent {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                unreachable!("authentication reads through Read")
+            }
+        }
+
+        struct Sink;
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for Sink {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                true
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close: Close = Arc::new({
+            let closed = Arc::clone(&closed);
+            move || closed.store(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
+        let began = std::time::Instant::now();
+        serve_xhttp_accepted(
+            Box::new(Silent(Arc::clone(&polled))),
+            crate::xhttp::XhttpWriter::new(Sink),
+            &Users::single([0x55u8; 16]),
+            true,
+            &close,
+        );
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 }

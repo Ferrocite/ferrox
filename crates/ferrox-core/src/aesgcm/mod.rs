@@ -13,6 +13,7 @@ mod x86v;
 pub(crate) trait Lanes: Copy {
     fn load(b: &[u8; 16]) -> Self;
     fn store(self, b: &mut [u8; 16]);
+    unsafe fn store_ptr(self, dst: *mut u8);
     fn xor(self, o: Self) -> Self;
     fn bswap(self) -> Self;
     fn swap_halves(self) -> Self;
@@ -712,6 +713,156 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
     state
 }
 
+/// CTR and GHASH reading `src` and writing `dst`, so a caller that holds plaintext in one buffer and the wire in another never copies between them. `src` and `dst` must not overlap; their lengths are equal.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cipher state, both directions and the deferred tail are the pass, not a bundle"
+)]
+pub(crate) fn ctr_ghash_from_256<V: Lanes>(
+    rk: &[V; 15],
+    hp: &[(V, V); 4],
+    template: V,
+    mut state: V,
+    src: &[u8],
+    dst: &mut [u8],
+    tailq: &mut Tail<V>,
+    mut ctr: u32,
+) -> V {
+    debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+    let (sblocks, stail) = src.as_chunks::<16>();
+    let (dblocks, dtail) = dst.as_chunks_mut::<16>();
+    let (sgroups, srest) = sblocks.as_chunks::<4>();
+    let (dgroups, drest) = dblocks.as_chunks_mut::<4>();
+    debug_assert_eq!(sgroups.len(), dgroups.len(), "equal lengths group alike");
+    for (sq, dq) in sgroups.iter().zip(dgroups.iter_mut()) {
+        let mut ksv = ctr4v(template, ctr);
+        V::encrypt4_256(rk, &mut ksv);
+        let ct4 = [
+            ksv[0].xor(V::load(&sq[0])),
+            ksv[1].xor(V::load(&sq[1])),
+            ksv[2].xor(V::load(&sq[2])),
+            ksv[3].xor(V::load(&sq[3])),
+        ];
+        ct4[0].store(&mut dq[0]);
+        ct4[1].store(&mut dq[1]);
+        ct4[2].store(&mut dq[2]);
+        ct4[3].store(&mut dq[3]);
+        state = ghash_group(
+            hp,
+            [
+                state.xor(ct4[0].bswap()),
+                ct4[1].bswap(),
+                ct4[2].bswap(),
+                ct4[3].bswap(),
+            ],
+        );
+        ctr += 4;
+    }
+    for (sb, db) in srest.iter().zip(drest.iter_mut()) {
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
+        let ct1 = ks1.xor(V::load(sb));
+        ct1.store(db);
+        tailq.push(ct1.bswap());
+        ctr += 1;
+    }
+    if !stail.is_empty() {
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
+        let mut ksb = [0u8; 16];
+        ks1.store(&mut ksb);
+        let mut padded = [0u8; 16];
+        for (((xb, kb), pb), db) in stail
+            .iter()
+            .zip(ksb.iter())
+            .zip(padded.iter_mut())
+            .zip(dtail.iter_mut())
+        {
+            let v = *xb ^ kb;
+            *pb = v;
+            *db = v;
+        }
+        tailq.push(V::load(&padded).bswap());
+    }
+    state
+}
+
+/// CTR and GHASH reading `src` and writing `len` bytes to `dst`, which may be uninitialized. Every byte is written before this returns.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cipher state, both directions and the deferred tail are the pass, not a bundle"
+)]
+pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
+    rk: &[V; 15],
+    hp: &[(V, V); 4],
+    template: V,
+    mut state: V,
+    src: &[u8],
+    dst: *mut u8,
+    tailq: &mut Tail<V>,
+    mut ctr: u32,
+) -> V {
+    let (sblocks, stail) = src.as_chunks::<16>();
+    let (sgroups, srest) = sblocks.as_chunks::<4>();
+    for (group, sq) in sgroups.iter().enumerate() {
+        let mut ksv = ctr4v(template, ctr);
+        V::encrypt4_256(rk, &mut ksv);
+        let ct4 = [
+            ksv[0].xor(V::load(&sq[0])),
+            ksv[1].xor(V::load(&sq[1])),
+            ksv[2].xor(V::load(&sq[2])),
+            ksv[3].xor(V::load(&sq[3])),
+        ];
+        let at = group * 64;
+        // SAFETY: the caller guarantees `dst` has room for every byte stored here.
+        unsafe {
+            V::store_ptr(ct4[0], dst.add(at));
+            V::store_ptr(ct4[1], dst.add(at + 16));
+            V::store_ptr(ct4[2], dst.add(at + 32));
+            V::store_ptr(ct4[3], dst.add(at + 48));
+        }
+        state = ghash_group(
+            hp,
+            [
+                state.xor(ct4[0].bswap()),
+                ct4[1].bswap(),
+                ct4[2].bswap(),
+                ct4[3].bswap(),
+            ],
+        );
+        ctr += 4;
+    }
+    let mut at = sgroups.len() * 64;
+    for sb in srest {
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
+        let ct1 = ks1.xor(V::load(sb));
+        // SAFETY: `at` is inside the `src.len()`-byte destination.
+        unsafe { V::store_ptr(ct1, dst.add(at)) };
+        tailq.push(ct1.bswap());
+        ctr += 1;
+        at += 16;
+    }
+    if !stail.is_empty() {
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
+        let mut ksb = [0u8; 16];
+        ks1.store(&mut ksb);
+        let mut padded = [0u8; 16];
+        for (i, ((xb, kb), pb)) in stail
+            .iter()
+            .zip(ksb.iter())
+            .zip(padded.iter_mut())
+            .enumerate()
+        {
+            let v = *xb ^ kb;
+            *pb = v;
+            // SAFETY: the tail starts at `at` and has fewer than 16 bytes left.
+            unsafe { std::ptr::write(dst.add(at + i), v) };
+        }
+        tailq.push(V::load(&padded).bswap());
+    }
+    state
+}
+
 #[inline(always)]
 pub(crate) fn ctr_only_256<V: Lanes>(rk: &[V; 15], template: V, buf: &mut [u8], mut ctr: u32) {
     let (blocks, tail) = buf.as_chunks_mut::<16>();
@@ -761,6 +912,63 @@ pub(crate) fn seal_impl_256<V: Lanes>(
         &mut tailq,
         aad.len() as u64,
         buf.len() as u64,
+        mask,
+    )
+}
+
+/// Seal `src` into `dst` with the fused CTR/GHASH pass, returning the authentication tag.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn seal_impl_from_256<V: Lanes>(
+    rk: &[V; 15],
+    h: &[(V, V); 4],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: &mut [u8],
+) -> [u8; 16] {
+    debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+    let template = counter_template::<V>(nonce);
+    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
+    let mut tailq = Tail::new();
+    let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
+    let state = flush(h, state, &mut tailq);
+    let state = ctr_ghash_from_256(rk, h, template, state, src, dst, &mut tailq, 2);
+    finish(
+        h,
+        state,
+        &mut tailq,
+        aad.len() as u64,
+        dst.len() as u64,
+        mask,
+    )
+}
+
+/// Seal `src` into initialization-free `dst` with the fused pass, returning the tag.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn seal_impl_from_256_uninit<V: Lanes>(
+    rk: &[V; 15],
+    h: &[(V, V); 4],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: *mut u8,
+) -> [u8; 16] {
+    let template = counter_template::<V>(nonce);
+    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
+    let mut tailq = Tail::new();
+    let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
+    let state = flush(h, state, &mut tailq);
+    // SAFETY: the caller guarantees `dst` has room for every plaintext byte.
+    let state =
+        unsafe { ctr_ghash_from_256_uninit(rk, h, template, state, src, dst, &mut tailq, 2) };
+    finish(
+        h,
+        state,
+        &mut tailq,
+        aad.len() as u64,
+        src.len() as u64,
         mask,
     )
 }
@@ -916,6 +1124,76 @@ impl Aes256Gcm {
                 )
                 .expect("the length limits above are the crate's own refusal conditions")
                 .into()
+            }
+        }
+    }
+
+    /// Seal `src` into `dst` without a staging copy: the CTR pass reads plaintext and writes ciphertext where the caller wants it, and GHASH authenticates the bytes it just wrote. `src` and `dst` must be equal-length and must not overlap.
+    #[must_use]
+    pub fn seal_from(&self, nonce: &[u8; 12], aad: &[u8], src: &[u8], dst: &mut [u8]) -> [u8; 16] {
+        assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        assert!(
+            (dst.len() as u64) <= (u64::from(u32::MAX) - 1) * 16,
+            "GCM plaintext is at most 2^32 - 2 blocks"
+        );
+        assert!(
+            (aad.len() as u64) < (1u64 << 61),
+            "GCM associated data is at most 2^61 - 1 bytes"
+        );
+        match &self.inner {
+            #[cfg(target_arch = "x86_64")]
+            Inner256::X86V(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Inner256::X86(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
+            #[cfg(target_arch = "aarch64")]
+            Inner256::Arm(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
+            Inner256::Crate(_) => {
+                dst.copy_from_slice(src);
+                self.seal_in_place(nonce, aad, dst)
+            }
+        }
+    }
+
+    /// Seal `src` into `dst`, which may be uninitialized, returning the tag. Every byte of `dst` is written before this returns.
+    #[must_use]
+    pub fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: &mut [std::mem::MaybeUninit<u8>],
+    ) -> [u8; 16] {
+        assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        assert!(
+            (dst.len() as u64) <= (u64::from(u32::MAX) - 1) * 16,
+            "GCM plaintext is at most 2^32 - 2 blocks"
+        );
+        assert!(
+            (aad.len() as u64) < (1u64 << 61),
+            "GCM associated data is at most 2^61 - 1 bytes"
+        );
+        match &self.inner {
+            #[cfg(target_arch = "x86_64")]
+            Inner256::X86V(e) => unsafe {
+                e.seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+            },
+            #[cfg(target_arch = "x86_64")]
+            Inner256::X86(e) => unsafe {
+                e.seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+            },
+            #[cfg(target_arch = "aarch64")]
+            Inner256::Arm(e) => unsafe {
+                e.seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+            },
+            Inner256::Crate(_) => {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    d.write(*s);
+                }
+                // SAFETY: every byte was initialized by writing the plaintext above.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len())
+                };
+                self.seal_in_place(nonce, aad, dst)
             }
         }
     }
@@ -1282,6 +1560,56 @@ mod tests_aes256 {
             )
             .expect("seals")
             .into()
+    }
+
+    /// The source seal writes the same bytes as the in-place seal and leaves its input alone.
+    #[test]
+    fn sealing_256_from_a_source_writes_the_same_bytes_and_leaves_the_source_alone() {
+        let keys: [[u8; 32]; 2] = [
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+            std::array::from_fn(|i| (i as u8).wrapping_mul(97).wrapping_add(29)),
+        ];
+        let nonce = [0x5au8; 12];
+        let mut checked = 0usize;
+        for key in &keys {
+            let engine = Aes256Gcm::new(key);
+            for aad_len in [0usize, 16] {
+                let aad: Vec<u8> = (0..aad_len).map(|i| i as u8).collect();
+                for len in sweep_lengths() {
+                    let plain: Vec<u8> = (0..len)
+                        .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+                        .collect();
+                    let mut in_place = plain.clone();
+                    let want = engine.seal_in_place(&nonce, &aad, &mut in_place);
+                    let mut dst = vec![0xa5u8; len];
+                    let tag = engine.seal_from(&nonce, &aad, &plain, &mut dst);
+                    assert_eq!(tag, want, "tag: aad {aad_len} len {len}");
+                    assert_eq!(dst, in_place, "ciphertext: aad {aad_len} len {len}");
+                    let mut uninit = vec![std::mem::MaybeUninit::new(0xa5u8); len];
+                    let tag = engine.seal_from_uninit(&nonce, &aad, &plain, &mut uninit);
+                    assert_eq!(tag, want, "uninit tag: aad {aad_len} len {len}");
+                    // SAFETY: seal_from_uninit wrote every byte of the destination.
+                    let uninit = unsafe {
+                        std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len())
+                    };
+                    assert_eq!(
+                        uninit, in_place,
+                        "uninit ciphertext: aad {aad_len} len {len}"
+                    );
+                    assert_eq!(
+                        plain,
+                        (0..len)
+                            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+                            .collect::<Vec<u8>>(),
+                        "seal_from must not touch the plaintext: aad {aad_len} len {len}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        if cfg!(not(miri)) {
+            assert!(checked > 900, "the native sweep is dense, not a sample");
+        }
     }
 
     #[test]

@@ -42,10 +42,10 @@ snow = "0.10"
 curve25519-dalek = "4"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 maxminddb = { version = "0.32.0", default-features = false }
+rcgen = "0.14"
 
 [dev-dependencies]
 chacha20poly1305 = "0.11"
-rcgen = "0.14"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 sha2 = { version = "0.11" }
