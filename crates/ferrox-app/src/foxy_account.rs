@@ -421,6 +421,7 @@ pub(crate) fn read_reply<S: Read>(io: &mut S, chunk: usize) -> Result<Reply, Fai
     })
 }
 
+/// Read the declared body shape in bounded pieces.
 fn read_body<S: BufRead>(
     io: &mut S,
     headers: &[(String, String)],

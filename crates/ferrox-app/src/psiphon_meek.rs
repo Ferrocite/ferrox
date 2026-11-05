@@ -204,8 +204,8 @@ fn relay(
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
-    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?;
-    http.limit_buffer_sizes = limit_buffer_sizes;
+    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?
+        .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
@@ -250,8 +250,8 @@ fn relay_stream(
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
-    let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?;
-    http.limit_buffer_sizes = limit_buffer_sizes;
+    let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?
+        .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
@@ -443,6 +443,24 @@ impl MeekHttp {
             preconnected: true,
             limit_buffer_sizes: false,
         })
+    }
+
+    /// Apply `LimitMeekBufferSizes` to both response readers.
+    fn with_limit_buffer_sizes(mut self, limit: bool) -> Self {
+        self.limit_buffer_sizes = limit;
+        self
+    }
+
+    /// The HTTP/1 response chunk this client will pass to `read_reply`.
+    #[cfg(test)]
+    fn response_chunk(&self) -> usize {
+        response_read_chunk(self.limit_buffer_sizes)
+    }
+
+    /// The HTTP/3 response chunk this client will pass to `H3::round_trip`.
+    #[cfg(test)]
+    fn h3_response_chunk(&self) -> usize {
+        h3_read_chunk(self.limit_buffer_sizes)
     }
 
     /// Send one request body and return the response body.
@@ -767,6 +785,20 @@ mod tests {
         assert_eq!(response_read_chunk(true), LIMITED_READ_CHUNK);
         assert_eq!(h3_read_chunk(false), 16 * 1024);
         assert_eq!(h3_read_chunk(true), LIMITED_READ_CHUNK);
+    }
+
+    #[test]
+    fn both_relay_paths_carry_the_limit_into_each_response_reader() {
+        for (limit, http1, h3) in [
+            (false, crate::foxy_account::DEFAULT_READ_CHUNK, 16 * 1024),
+            (true, LIMITED_READ_CHUNK, LIMITED_READ_CHUNK),
+        ] {
+            let http = MeekHttp::new(entry(), None, Duration::from_secs(1), "/", None)
+                .expect("http")
+                .with_limit_buffer_sizes(limit);
+            assert_eq!(http.response_chunk(), http1);
+            assert_eq!(http.h3_response_chunk(), h3);
+        }
     }
 
     #[test]
