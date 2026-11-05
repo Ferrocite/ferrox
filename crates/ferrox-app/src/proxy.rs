@@ -23701,7 +23701,6 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    #[cfg(not(target_os = "linux"))]
     if !target_write.masked()
         && !client_write.masked()
         && !client_read.metered()
@@ -23711,7 +23710,7 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
         let _ends = poll_handoff(client_read, target_write, target_read, client_write);
         return;
     }
-    // On Linux every accepted flow rides the lane pool; a readiness worker beside it would add a thread per flow.
+    // A masked or metered leg needs the buffered copy, and a host without a descriptor pump keeps the lane pool.
     relay_lanes(client_read, target_write, target_read, client_write);
 }
 
@@ -23887,7 +23886,7 @@ impl TcpCopy {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn poll_available() -> bool {
     poll_relay::available()
 }
@@ -23897,7 +23896,7 @@ fn poll_available() -> bool {
     poll_copy::available()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn poll_handoff(
     client_read: Connection,
     target_write: Connection,
@@ -27211,7 +27210,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -27254,13 +27253,13 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 struct SplicePipe {
     fds: [libc::c_int; 2],
     capacity: libc::size_t,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl SplicePipe {
     fn new() -> Option<Self> {
         let mut fds = [-1; 2];
@@ -27275,20 +27274,21 @@ impl SplicePipe {
             _ => DEFAULT_SPLICE_PIPE_BYTES,
         };
         if capacity != DEFAULT_SPLICE_PIPE_BYTES {
-            eprintln!("ferrox-app: splice pipe {capacity} B");
+            static NOTED: OnceLock<()> = OnceLock::new();
+            NOTED.get_or_init(|| eprintln!("ferrox-app: splice pipe {capacity} B"));
         }
         Some(Self { fds, capacity })
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const SPLICE_PIPE_BYTES: usize = DEFAULT_SPLICE_PIPE_BYTES;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const DEFAULT_SPLICE_PIPE_BYTES: usize = 256 * 1024;
 
 /// The pipe's size, asked once: the environment is read at startup, and a relay that read it per pipe paid an environment lookup and a `String` for every connection it carried.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn splice_pipe_bytes() -> libc::c_int {
     static ASKED: OnceLock<libc::c_int> = OnceLock::new();
     *ASKED.get_or_init(|| {
@@ -27301,7 +27301,7 @@ fn splice_pipe_bytes() -> libc::c_int {
     })
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl Drop for SplicePipe {
     fn drop(&mut self) {
         unsafe {
@@ -62704,12 +62704,13 @@ mod poll_copy {
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(test)]
 mod poll_relay {
     use super::{Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;
+    #[cfg(test)]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::time::Duration;
 
     const SPLICE_F_NONBLOCK: libc::c_uint = 0x002;
 
@@ -62750,17 +62751,20 @@ mod poll_relay {
     }
 
     impl SpliceGuard {
-        fn arm(socket: &Connection) -> Option<Self> {
-            let held = socket.try_clone().ok()?;
+        fn arm(socket: &Connection) -> std::io::Result<Option<Self>> {
+            let held = socket.try_clone()?;
             let fd = held.as_raw_fd();
             let saved = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if saved < 0 || saved & libc::O_NONBLOCK != 0 {
-                return None;
+            if saved < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if saved & libc::O_NONBLOCK != 0 {
+                return Ok(None);
             }
             if unsafe { libc::fcntl(fd, libc::F_SETFL, saved | libc::O_NONBLOCK) } < 0 {
-                return None;
+                return Err(std::io::Error::last_os_error());
             }
-            Some(Self { held, saved })
+            Ok(Some(Self { held, saved }))
         }
     }
 
@@ -62775,17 +62779,24 @@ mod poll_relay {
     /// Every socket the flow splices, not only the half a wake reported: one wake drives
     /// both legs. Armed while both directions hold a pipe, because a direction without one
     /// hands its sockets to `copy_all_memcpy`, which ends on the first error and would read
-    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once.
-    fn arm_flow(first: &Direction, second: &Direction) -> [Option<SpliceGuard>; 4] {
-        if first.pipe.is_none() || second.pipe.is_none() {
-            return [None, None, None, None];
+    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once. A socket that was
+    /// already nonblocking needs no guard; one whose flags cannot be read or written refuses
+    /// the splice and lets the caller fall back to the buffered relay.
+    fn arm_flow(
+        client_read: &Connection,
+        target_write: &Connection,
+        target_read: &Connection,
+        client_write: &Connection,
+    ) -> Option<[Option<SpliceGuard>; 4]> {
+        let mut guards: [Option<SpliceGuard>; 4] = [None, None, None, None];
+        for (slot, socket) in
+            guards
+                .iter_mut()
+                .zip([client_read, target_write, target_read, client_write])
+        {
+            *slot = SpliceGuard::arm(socket).ok()?;
         }
-        [
-            SpliceGuard::arm(&first.src),
-            SpliceGuard::arm(&first.dst),
-            SpliceGuard::arm(&second.src),
-            SpliceGuard::arm(&second.dst),
-        ]
+        Some(guards)
     }
 
     struct Direction {
@@ -62800,18 +62811,29 @@ mod poll_relay {
         ingest_stalled: bool,
         src_at_eof: bool,
         ended: bool,
+        /// The stall budget this direction was born with, as the copying leg read it once per leg.
+        stall_budget: Duration,
+        /// The first drain that found no room, cleared by the next byte the destination takes.
+        stalled: Option<std::time::Instant>,
     }
 
     impl Direction {
-        fn new(src: Connection, dst: Connection) -> Self {
+        fn new(
+            src: Connection,
+            dst: Connection,
+            pipe: Option<SplicePipe>,
+            stall_budget: Duration,
+        ) -> Self {
             Self {
                 src,
                 dst,
-                pipe: SplicePipe::new(),
+                pipe,
                 pending: 0,
                 ingest_stalled: false,
                 src_at_eof: false,
                 ended: false,
+                stall_budget,
+                stalled: None,
             }
         }
 
@@ -62879,17 +62901,38 @@ mod poll_relay {
                 if moved > 0 {
                     self.pending -= moved as usize;
                     self.ingest_stalled = false;
+                    self.stalled = None;
                     continue;
                 }
                 if moved < 0 && !retryable() {
                     self.end();
                     return;
                 }
+                if moved < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                {
+                    self.stalled.get_or_insert_with(std::time::Instant::now);
+                }
                 break;
+            }
+            if self.pending == 0 {
+                self.stalled = None;
             }
             if self.src_at_eof && self.pending == 0 {
                 self.end();
             }
+        }
+
+        fn stalled_for_budget(&self) -> bool {
+            self.stalled
+                .is_some_and(|since| since.elapsed() >= self.stall_budget)
+        }
+
+        /// The flow has given up: close both halves so neither leg waits on the other.
+        fn abandon(&mut self) {
+            self.ended = true;
+            self.stalled = None;
+            let _ = self.src.shutdown(Shutdown::Both);
+            let _ = self.dst.shutdown(Shutdown::Both);
         }
 
         fn end(&mut self) {
@@ -62897,6 +62940,7 @@ mod poll_relay {
                 return;
             }
             self.ended = true;
+            self.stalled = None;
             let _ = self.dst.shutdown(Shutdown::Write);
         }
     }
@@ -62911,6 +62955,12 @@ mod poll_relay {
     impl Flow {
         fn finished(&self) -> bool {
             self.directions.iter().all(|d| d.ended)
+        }
+
+        fn give_up(&mut self) {
+            for direction in &mut self.directions {
+                direction.abandon();
+            }
         }
     }
 
@@ -62993,6 +63043,13 @@ mod poll_relay {
             if flows.iter().any(Flow::finished) {
                 flows.retain(|flow| !flow.finished());
             }
+            for flow in &mut flows {
+                for direction in &mut flow.directions {
+                    if direction.can_drain() && direction.stalled.is_none() {
+                        direction.stalled = Some(std::time::Instant::now());
+                    }
+                }
+            }
             pfds.clear();
             owners.clear();
             pfds.push(libc::pollfd {
@@ -63024,9 +63081,29 @@ mod poll_relay {
                     }
                 }
             }
-            let answered = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+            let mut timeout = -1;
+            for flow in &flows {
+                for direction in &flow.directions {
+                    if let Some(since) = direction.stalled {
+                        let left = direction.stall_budget.saturating_sub(since.elapsed());
+                        let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+                        timeout = if timeout < 0 {
+                            millis
+                        } else {
+                            timeout.min(millis)
+                        };
+                    }
+                }
+            }
+            let answered =
+                unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
             if answered < 0 {
                 continue;
+            }
+            for flow in &mut flows {
+                if flow.directions.iter().any(Direction::stalled_for_budget) {
+                    flow.give_up();
+                }
             }
             for (index, entry) in pfds.iter().enumerate() {
                 if entry.revents == 0 {
@@ -63080,16 +63157,40 @@ mod poll_relay {
         target_read: Connection,
         client_write: Connection,
     ) -> (super::RelayEnd, super::RelayEnd) {
-        let worker = next();
+        if let (Some(first_pipe), Some(second_pipe)) = (SplicePipe::new(), SplicePipe::new()) {
+            if let Some(guards) = arm_flow(&client_read, &target_write, &target_read, &client_write)
+            {
+                let worker = next();
+                let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+                let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
+                let forward_stall = client_read
+                    .policy()
+                    .or_else(|| target_write.policy())
+                    .and_then(|flow| flow.conn_idle())
+                    .unwrap_or_else(crate::budgets::relay_stall);
+                let reply_stall = target_read
+                    .policy()
+                    .or_else(|| client_write.policy())
+                    .and_then(|flow| flow.conn_idle())
+                    .unwrap_or_else(crate::budgets::relay_stall);
+                let first =
+                    Direction::new(client_read, target_write, Some(first_pipe), forward_stall);
+                let second =
+                    Direction::new(target_read, client_write, Some(second_pipe), reply_stall);
+                worker.push(Flow {
+                    directions: vec![first, second],
+                    guards: Some(guards),
+                    done: vec![first_tx, second_tx],
+                });
+                return (first_rx, second_rx);
+            }
+        }
         let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
         let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
-        let first = Direction::new(client_read, target_write);
-        let second = Direction::new(target_read, client_write);
-        let guards = arm_flow(&first, &second);
-        worker.push(Flow {
-            directions: vec![first, second],
-            guards: Some(guards),
-            done: vec![first_tx, second_tx],
+        std::thread::spawn(move || {
+            super::relay_owned(client_read, target_write, target_read, client_write);
+            let _ = first_tx.send(Ok(()));
+            let _ = second_tx.send(Ok(()));
         });
         (first_rx, second_rx)
     }
@@ -63106,7 +63207,8 @@ mod poll_relay {
         let port = front.local_addr().expect("addr").port();
         let src = Connection::connect(("127.0.0.1", port)).expect("dials");
         let (dst, _) = front.accept().expect("accepts");
-        let mut direction = Direction::new(src, dst);
+        let mut direction =
+            Direction::new(src, dst, SplicePipe::new(), crate::budgets::relay_stall());
         let Some(pipe) = direction.pipe.as_ref() else {
             panic!("a splice pipe is there to size the ring");
         };
