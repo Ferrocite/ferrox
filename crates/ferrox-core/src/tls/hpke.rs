@@ -234,7 +234,7 @@ impl Context {
         }
     }
 
-    /// Builds the per-message nonce by XORing `sequence` into the fixed base nonce's tail.
+    /// Builds the per-message nonce by `XORing` `sequence` into the fixed base nonce's tail.
     fn nonce(&self, sequence: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.base_nonce[..4]);
