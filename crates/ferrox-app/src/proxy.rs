@@ -10454,7 +10454,11 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let pump = Pump::to_sink(client, &writer);
-            let answered = read_vless_response(&mut reader).is_some();
+            let answered = {
+                reader.set_poll(Some(RELAY_POLL));
+                let _step = RelayStep::enter();
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some()
+            };
             let sent = pump.end();
             if !answered {
                 // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
@@ -10494,7 +10498,11 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let pump = Pump::to_sink(client, &writer);
-            let answered = read_vless_response(&mut reader).is_some();
+            let answered = {
+                reader.set_poll(Some(RELAY_POLL));
+                let _step = RelayStep::enter();
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some()
+            };
             let sent = pump.end();
             if !answered {
                 // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
@@ -11653,7 +11661,7 @@ fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination
     }
     let mut up = session.clone();
     let pump = Pump::over(client, move |bytes| up.write_all(bytes).is_ok());
-    let answered = read_vless_response(&mut session).is_some();
+    let answered = read_vless_response_deferred(&mut session, pump.progress_flag()).is_some();
     pump.end();
     if !answered {
         return;
@@ -12944,11 +12952,13 @@ fn serve_dokodemo(
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
+        let mut listen = None;
         let socket = if transparent.is_some() {
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
                 return (armed, dokodemo_has(&networks, "tcp"));
             };
+            listen = Some(bound);
             crate::transparent::bind_udp(bound)
         } else {
             UdpSocket::bind(address)
@@ -12976,7 +12986,11 @@ fn serve_dokodemo(
         };
         let door = out.clone();
         if transparent_udp {
-            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door));
+            let Some(listen) = socket.local_addr().ok().or(listen) else {
+                eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
+                return (armed, dokodemo_has(&networks, "tcp"));
+            };
+            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door, listen));
         } else {
             let dest = if follow_redirect {
                 rewrite.configured()
@@ -18069,7 +18083,8 @@ fn dial_vless_reality(
                 },
                 vless.is_vision(),
             );
-            let answered = read_vless_response(&mut reader).is_some();
+            let answered =
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some();
             pump.end();
             if !answered {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -22115,7 +22130,7 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
 
 /// The transparent dokodemo UDP door: every datagram carries its own original destination,
 /// and the answer must leave from that destination or the client drops it.
-fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound) {
+fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound, listen: SocketAddr) {
     type Flow = (SocketAddr, SocketAddr);
     let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
@@ -22137,6 +22152,9 @@ fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound) {
             Err(_) => return,
         };
         if n == 0 {
+            continue;
+        }
+        if dokodemo_loopback(&Destination::Address(original), listen) {
             continue;
         }
         let key = (client, original);
@@ -24868,6 +24886,7 @@ impl TcpCopy {
                         filled: filled as u8,
                     };
                     if flow.ended() && flow.ended_and_idle(self.reply_idle) {
+                        self.refuse();
                         self.end();
                         return Some(Next::Done);
                     }
@@ -25044,6 +25063,7 @@ fn relay_owned(
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
     reply.stall = reply_stall;
+    reply.reply_idle = reply_stall;
     if let Some(answer) = answer {
         reply = reply.answering(answer);
     }

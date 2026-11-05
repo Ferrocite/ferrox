@@ -1533,7 +1533,7 @@ impl Settings {
             .as_deref()
         {
             Some("public") => ConduitMode::Public,
-            Some("shirokhorshid") => ConduitMode::Shirokhorshid,
+            Some("private" | "shirokhorshid") => ConduitMode::Shirokhorshid,
             Some("auto") | None => ConduitMode::Auto,
             Some(other) => {
                 eprintln!("psiphon: conduitMode {other:?} is not a known mode");
@@ -6460,6 +6460,17 @@ mod tests {
     fn a_compartment_defaults_to_the_public_id() {
         let settings = Settings::from_json(None).expect("settings");
         assert_eq!(settings.compartment, PRIVATE_COMPARTMENT_ID);
+    }
+
+    #[test]
+    fn a_private_conduit_mode_uses_the_personal_compartment() {
+        let settings = json::parse(r#"{"conduitMode":"private"}"#).expect("settings");
+        assert!(matches!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .conduit_mode,
+            ConduitMode::Shirokhorshid
+        ));
     }
 
     #[test]
