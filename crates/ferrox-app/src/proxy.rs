@@ -27285,7 +27285,7 @@ impl SplicePipe {
 const SPLICE_PIPE_BYTES: usize = DEFAULT_SPLICE_PIPE_BYTES;
 
 #[cfg(target_os = "linux")]
-const DEFAULT_SPLICE_PIPE_BYTES: usize = 256 * 1024;
+const DEFAULT_SPLICE_PIPE_BYTES: usize = 1024 * 1024;
 
 /// The pipe's size, asked once: the environment is read at startup, and a relay that read it per pipe paid an environment lookup and a `String` for every connection it carried.
 #[cfg(target_os = "linux")]
@@ -62861,63 +62861,75 @@ mod poll_relay {
                 self.end();
                 return;
             };
-            let room = pipe.capacity - self.pending;
-            if self.can_ingest() {
-                let moved = unsafe {
-                    libc::splice(
-                        self.src.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        pipe.fds[1],
-                        std::ptr::null_mut(),
-                        room,
-                        SPLICE_F_NONBLOCK,
-                    )
-                };
-                if moved > 0 {
-                    self.pending += moved as usize;
-                    self.ingest_stalled = false;
-                } else if moved == 0 {
-                    self.src_at_eof = true;
-                } else if !retryable() {
-                    self.end();
-                    return;
-                } else {
-                    note_idle_ingest(self.pending, pipe.capacity);
-                    self.ingest_stalled = true;
+            let capacity = pipe.capacity;
+            let pipe_read = pipe.fds[0];
+            let pipe_write = pipe.fds[1];
+            loop {
+                let mut progressed = false;
+                if self.can_ingest() {
+                    let moved = unsafe {
+                        libc::splice(
+                            self.src.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            pipe_write,
+                            std::ptr::null_mut(),
+                            capacity.saturating_sub(self.pending),
+                            SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if moved > 0 {
+                        self.pending += moved as usize;
+                        self.ingest_stalled = false;
+                        progressed = true;
+                    } else if moved == 0 {
+                        self.src_at_eof = true;
+                    } else if !retryable() {
+                        self.end();
+                        return;
+                    } else {
+                        note_idle_ingest(self.pending, capacity);
+                        self.ingest_stalled = true;
+                    }
                 }
-            }
-            while self.can_drain() {
-                let moved = unsafe {
-                    libc::splice(
-                        pipe.fds[0],
-                        std::ptr::null_mut(),
-                        self.dst.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        self.pending,
-                        SPLICE_F_NONBLOCK,
-                    )
-                };
-                if moved > 0 {
-                    self.pending -= moved as usize;
-                    self.ingest_stalled = false;
+                while self.can_drain() {
+                    let moved = unsafe {
+                        libc::splice(
+                            pipe_read,
+                            std::ptr::null_mut(),
+                            self.dst.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            self.pending,
+                            SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if moved > 0 {
+                        self.pending -= moved as usize;
+                        self.ingest_stalled = false;
+                        self.stalled = None;
+                        progressed = true;
+                        continue;
+                    }
+                    if moved < 0 && !retryable() {
+                        self.end();
+                        return;
+                    }
+                    if moved < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                    {
+                        self.stalled.get_or_insert_with(std::time::Instant::now);
+                    }
+                    break;
+                }
+                if self.pending == 0 {
                     self.stalled = None;
-                    continue;
                 }
-                if moved < 0 && !retryable() {
+                if self.src_at_eof && self.pending == 0 {
                     self.end();
                     return;
                 }
-                if moved < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
-                {
-                    self.stalled.get_or_insert_with(std::time::Instant::now);
+                if !progressed {
+                    break;
                 }
-                break;
-            }
-            if self.pending == 0 {
-                self.stalled = None;
-            }
-            if self.src_at_eof && self.pending == 0 {
-                self.end();
             }
         }
 
