@@ -2348,6 +2348,7 @@ fn open_stream(
             writer,
             &settings,
             Some(h2out.clone()),
+            None,
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
                 serve(ureader, xwriter, decryption);

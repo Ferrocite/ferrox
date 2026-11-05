@@ -3853,7 +3853,7 @@ fn serve_shadowsocks_tls(
             };
             let (reader, writer) = session_halves(session, out);
             let Some((reader, writer)) =
-                crate::xhttp::accept_split_with_settings(reader, writer, settings)
+                crate::xhttp::accept_split_with_settings(reader, writer, settings, None)
             else {
                 return;
             };
@@ -7747,8 +7747,10 @@ fn serve_session_xhttp<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'st
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
+    fd: Option<WaitFd>,
 ) {
-    let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
+    let Some((creader, cwriter)) =
+        crate::xhttp::accept_split_with_settings(read, write, settings, fd)
     else {
         echo_trace("session xhttp accept refused");
         return;
@@ -7844,6 +7846,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static + RelayPoll, W: FrameWrite + Send
         users,
         freedom,
         decryption.cloned().as_deref(),
+        None,
     );
 }
 
@@ -7859,16 +7862,28 @@ fn serve_vless_xhttp(
     let Ok(read) = stream.try_clone() else {
         return;
     };
+    // The upload reads through the clone, and a duplicated socket inherits no timeout on Windows.
+    let fd = Some(wait_key(&read));
     let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
     // A sealed session's demux reads through a decryption the pool cannot poll, so it keeps the worker.
     if decryption.is_some() {
         return serve_xhttp_stream(read, stream, settings, users, freedom, decryption, arm);
     }
-    let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
+    let Some((mut chained, h2)) = sniff_xhttp(read, false, arm) else {
         return;
     };
     if !h2 {
-        return serve_session_xhttp(chained, stream, settings, users, freedom, None);
+        // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
+        if settings.mode == crate::xhttp::XhttpMode::StreamUp {
+            chained.arm_relay_poll();
+            let settings = settings.clone();
+            let users: VlessUsers = users.into();
+            spawn_carried(move || {
+                serve_session_xhttp(chained, stream, &settings, &users, freedom, None, fd);
+            });
+            return;
+        }
+        return serve_session_xhttp(chained, stream, settings, users, freedom, None, None);
     }
     #[cfg(test)]
     if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
@@ -19807,7 +19822,8 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
+    let Some((creader, cwriter)) =
+        crate::xhttp::accept_split_with_settings(read, write, settings, None)
     else {
         echo_trace("session xhttp trojan accept refused");
         return;
@@ -41470,7 +41486,7 @@ mod tests {
                 let Ok(read) = stream.try_clone() else {
                     return;
                 };
-                let _ = crate::xhttp::accept_split_with_settings(read, stream, &settings);
+                let _ = crate::xhttp::accept_split_with_settings(read, stream, &settings, None);
             });
             let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
             stream
@@ -48063,7 +48079,7 @@ mod tests {
         write: ServerHalf,
     ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         let (reader, writer) =
-            crate::xhttp::accept_split_with_settings(read, write, &xhttp_settings("/share"))?;
+            crate::xhttp::accept_split_with_settings(read, write, &xhttp_settings("/share"), None)?;
         Some((Box::new(reader), Box::new(writer)))
     }
 
