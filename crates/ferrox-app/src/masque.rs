@@ -45,6 +45,9 @@ const DEFAULT_REMOTE_DNS: [IpAddr; 4] = [
 ];
 pub(crate) const DEFAULT_MTU: usize = 1280;
 pub(crate) const QUEUE: usize = 512;
+/// Datagrams a client may hold before its stack attaches, and their total bytes.
+pub(crate) const EARLY_PACKETS: usize = 64;
+pub(crate) const EARLY_BYTES: usize = 1 << 20;
 /// Frames the connection may hold before `dgram_send` refuses more: the
 /// reference queues 32, and a peer that drains slower drops what the wire
 /// delivers above its own receive queue, which the inner TCP then backs off
@@ -1256,9 +1259,22 @@ struct Stream {
     pending: Vec<Owned>,
     done: bool,
     packets: Vec<Vec<u8>>,
+    early_bytes: usize,
 }
 
 impl Stream {
+    /// Hold a datagram until the stack attaches, within the early-buffer caps.
+    fn stash(&mut self, datagram: Vec<u8>) -> bool {
+        if self.packets.len() >= EARLY_PACKETS
+            || self.early_bytes.saturating_add(datagram.len()) > EARLY_BYTES
+        {
+            return false;
+        }
+        self.early_bytes += datagram.len();
+        self.packets.push(datagram);
+        true
+    }
+
     fn wait_head(
         &mut self,
         conn: &mut quiche::Connection,
@@ -1280,6 +1296,7 @@ impl Stream {
         std::mem::take(&mut self.pending)
     }
 
+    /// Deliver one pump into the request stream and hold every matching datagram, refusing a flood.
     fn poll(
         &mut self,
         conn: &mut quiche::Connection,
@@ -1301,7 +1318,12 @@ impl Stream {
             if stream == self.id {
                 let offset = datagram.len() - packet.len();
                 datagram.drain(..offset);
-                self.packets.push(datagram);
+                if !self.stash(datagram) {
+                    return Err(
+                        "masque: the edge sent too many datagrams before assigning an address"
+                            .to_owned(),
+                    );
+                }
             }
         }
         Ok(())
@@ -3859,5 +3881,146 @@ mod tests {
             Some(Duration::ZERO),
             "a due QUIC deadline was left for the next receive timeout"
         );
+    }
+
+    /// The count and byte caps both bound datagrams held before the stack attaches.
+    #[test]
+    fn early_h3_datagrams_are_bounded_by_count_and_bytes() {
+        assert_eq!((EARLY_PACKETS, EARLY_BYTES), (64, 1 << 20));
+        let mut stream = Stream::default();
+        for _ in 0..EARLY_PACKETS {
+            assert!(stream.stash(vec![0; 32]));
+        }
+        assert!(!stream.stash(vec![0; 32]), "the count cap holds");
+        assert_eq!(stream.packets.len(), EARLY_PACKETS);
+
+        let mut stream = Stream::default();
+        let packet = vec![0u8; EARLY_BYTES / EARLY_PACKETS + 1];
+        let mut accepted = 0;
+        while stream.stash(packet.clone()) {
+            accepted += 1;
+        }
+        assert!(accepted < EARLY_PACKETS, "the byte cap holds");
+        assert!(stream.early_bytes <= EARLY_BYTES);
+    }
+
+    /// The poll path, not just the stash helper, ends the session on a pre-address flood.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn poll_refuses_a_pre_stack_datagram_flood() {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let leaf = minted.cert.der().to_vec();
+        let identity = ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: vec![leaf.clone()],
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            send_tickets: true,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        };
+        let mut server_config = quic::serve_config(&identity).expect("serves");
+        server_config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+        let spec = ClientSpec {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            tls: Some(Arc::new(TlsConfig {
+                server_name: "localhost".to_owned(),
+                roots: vec![leaf].into(),
+                ..TlsConfig::default()
+            })),
+            path: DEFAULT_PATH.to_owned(),
+            host: None,
+            headers: Vec::new(),
+            remote_dns: Vec::new(),
+            warp: None,
+        };
+        let mut client_config = client_config(&spec).expect("client config");
+        let server_lane = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let server_addr = server_lane.local_addr().expect("server address");
+        let client_lane = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let client_addr = client_lane.local_addr().expect("client address");
+        let mut server_id = [0u8; 16];
+        getrandom::fill(&mut server_id).expect("random");
+        let server_id = quiche::ConnectionId::from_ref(&server_id);
+        let mut server = quiche::accept(
+            &server_id,
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
+        let mut client_id = [0u8; 16];
+        getrandom::fill(&mut client_id).expect("random");
+        let client_id = quiche::ConnectionId::from_ref(&client_id);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &client_id,
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(client.is_established() && server.is_established()) {
+            assert!(Instant::now() < deadline, "the handshake did not finish");
+            quic::pump_once(&mut client, &client_lane, client_addr, TICK);
+            quic::pump_once(&mut server, &server_lane, server_addr, TICK);
+        }
+        open_h3(&mut client, &spec).expect("opens the request");
+        quic::flush_egress(&mut client, &client_lane);
+        quic::pump_once(&mut server, &server_lane, server_addr, TICK);
+        send_server_settings(&mut server, 3, 7, 11, false).expect("settings");
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[(":status", "200"), ("capsule-protocol", "?1")],
+            &mut block,
+        );
+        let mut head = Vec::new();
+        frames::quic_varint(&mut head, frames::H3_HEADERS);
+        frames::quic_varint(&mut head, block.len() as u64);
+        head.extend_from_slice(&block);
+        send_stream(&mut server, 0, &head, false).expect("head");
+        quic::flush_egress(&mut server, &server_lane);
+        let mut stream = Stream::default();
+        assert_eq!(
+            stream
+                .wait_head(&mut client, &client_lane, client_addr, HEAD_TIMEOUT)
+                .expect("head"),
+            200
+        );
+        for _ in 0..=EARLY_PACKETS {
+            let mut datagram = Vec::with_capacity(3 + 32);
+            connectip::datagram_prefix(stream.id, &mut datagram);
+            datagram.extend_from_slice(&[0u8; 32]);
+            server.dgram_send_buf(datagram).expect("queues a datagram");
+            quic::flush_egress(&mut server, &server_lane);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            match stream.poll(&mut client, &client_lane, client_addr, TICK) {
+                Ok(()) => {}
+                Err(reason) => break Err(reason),
+            }
+            if Instant::now() >= deadline {
+                break Ok(());
+            }
+            quic::pump_once(&mut server, &server_lane, server_addr, TICK);
+        };
+        assert_eq!(
+            result.expect_err("the poll path refuses the flood"),
+            "masque: the edge sent too many datagrams before assigning an address"
+        );
+        assert_eq!(stream.packets.len(), EARLY_PACKETS);
     }
 }
