@@ -1484,6 +1484,11 @@ def matrix_markdown(results, image_prefix):
     """The complete bundle document: tables, one multi-metric image per test, coverage."""
     scenarios = results.get("scenarios", [])
     bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
+    priced = any(
+        "setup" not in scenario.get("id", "")
+        and not any(word in scenario.get("id", "") for word in ("idle", "reconnect", "held"))
+        for scenario in scenarios
+    )
     setup = any("setup" in scenario.get("id", "") for scenario in scenarios)
     lines = [
         f"# ferrox benchmark matrix \u2014 {results.get('date', '?')} on {results.get('runner', '?')}",
@@ -1560,9 +1565,12 @@ def matrix_markdown(results, image_prefix):
         "",
     ]
     if bulk:
+        if priced:
+            lines += [
+                f"![CPU per GiB]({image_prefix}/cpu-per-gib.png)",
+                "",
+            ]
         lines += [
-            f"![CPU per GiB]({image_prefix}/cpu-per-gib.png)",
-            "",
             f"![peak RSS]({image_prefix}/memory-rss.png)",
             "",
             f"![peak threads]({image_prefix}/threads.png)",
@@ -1572,7 +1580,7 @@ def matrix_markdown(results, image_prefix):
         f"![cold start]({image_prefix}/startup.png)",
         "",
     ]
-    if bulk:
+    if priced:
         lines += [
             f"![cells at harness ceiling]({image_prefix}/ceiling.png)",
             "",
