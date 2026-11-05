@@ -1833,6 +1833,7 @@ struct Session {
     id: String,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct SessionState {
     upload: Option<Box<dyn Read + Send>>,
     upload_attached: bool,
@@ -5092,6 +5093,7 @@ mod tests {
 
     /// A session takes one stream-up body, as the reference's upload queue does: a second POST is
     /// answered 409 instead of 200, because a 200 promises bytes the reader never takes.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn a_second_stream_up_upload_is_refused_before_it_is_acknowledged() {
         let settings = settings_from(
@@ -5117,14 +5119,33 @@ mod tests {
                 if let Served::Session(mut reader, writer) =
                     accept_core(&head, prefix, read, stream, &settings, None)
                 {
-                    let mut drained = Vec::new();
-                    let _ = reader.read_to_end(&mut drained);
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => break,
+                        }
+                    }
                     writer.finish();
                 }
             })
         };
 
         let referer = format!("http://127.0.0.1/share?x_padding={}", "X".repeat(500));
+        let declared = serve();
+        let mut down = Connection::connect(("127.0.0.1", port)).expect("connects the downlink");
+        down.write_all(
+            format!("GET /share/twouploads HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("writes the GET");
+        assert!(
+            ok_status_text(&head_text(&mut down)),
+            "the downlink was not answered"
+        );
+
         let first = serve();
         let mut uplink =
             Connection::connect(("127.0.0.1", port)).expect("connects the first uplink");
@@ -5136,11 +5157,19 @@ mod tests {
                 .as_bytes(),
             )
             .expect("writes the first POST");
-        let answered = head_text(&mut uplink);
-        assert!(
-            ok_status_text(&answered),
-            "the first upload was refused, wrote {answered:?}"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !get_or_create_session("twouploads")
+            .state
+            .lock()
+            .expect("session lock")
+            .upload_attached
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload was never attached"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
 
         let second = serve();
         let mut refused = Connection::connect(("127.0.0.1", port)).expect("connects the second");
@@ -5161,9 +5190,14 @@ mod tests {
         uplink
             .write_all(b"0\r\n\r\n")
             .expect("ends the first upload");
-        end_session("twouploads");
+        let answered = head_text(&mut uplink);
+        assert!(
+            ok_status_text(&answered),
+            "the first upload was never acknowledged, wrote {answered:?}"
+        );
         first.join().expect("joins the first service");
         second.join().expect("joins the second service");
+        declared.join().expect("joins the downlink service");
     }
 
     /// A packet-up session whose downlink never arrives holds its packets forever; a later bind must start fresh rather than read a sequence from a flow that already stalled.
