@@ -12914,11 +12914,11 @@ fn serve_dokodemo(
     let mut armed = 0;
     if dokodemo_has(&networks, "tcp")
         && follow_redirect
-        && transparent.is_none()
         && rewrite.configured().is_none()
+        && (!receive_original_destination || transparent.is_none())
     {
         eprintln!(
-            "dokodemo-door in {label}: followRedirect needs a rewrite address with no transparent lookup; each tcp flow closes without a destination"
+            "dokodemo-door in {label}: followRedirect has no rewrite address and no original-destination lookup; each tcp flow closes without a destination"
         );
     }
     if dokodemo_has(&networks, "tcp") {
