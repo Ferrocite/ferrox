@@ -38,6 +38,10 @@ const UDPGW_MAX_MESSAGE: usize = 32_768 + 23;
 const MAX_LIST_BYTES: u64 = 16 * 1024 * 1024;
 const RELAY_BUFFER: usize = 256 * 1024;
 const RELAY_BATCH: usize = 64;
+/// How long one server classification keeps a destination on the direct path.
+const SPLIT_TUNNEL_CLASSIFICATION_TTL: Duration = Duration::from_hours(24);
+/// The reference's cap on cached split-tunnel classifications.
+const SPLIT_TUNNEL_CLASSIFICATION_MAX: usize = 65_536;
 const FRONTED_VARIANTS: usize = 256;
 const FRONTED_SERVERS: usize = 512;
 const BUILTIN_CDN_EDGES: &[[u8; 4]] = &[
@@ -93,6 +97,7 @@ struct Inner {
     http_endpoint: Option<SocketAddr>,
     udpgw: Mutex<Option<Arc<UdpGateway>>>,
     conduit: Mutex<Option<Arc<crate::psiphon_webrtc::Conduit>>>,
+    split_untunneled: Mutex<HashMap<String, Instant>>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -127,6 +132,8 @@ struct Settings {
     device_region: Option<String>,
     device_location: Option<String>,
     client_features: Vec<String>,
+    split_tunnel_own_region: bool,
+    split_tunnel_regions: Vec<String>,
     compartment: String,
     conduit: bool,
     conduit_mode: ConduitMode,
@@ -255,6 +262,7 @@ impl PsiphonOut {
             http_endpoint,
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
+            split_untunneled: Mutex::new(HashMap::new()),
         });
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
         let weak = Arc::downgrade(&inner);
@@ -494,6 +502,8 @@ impl Inner {
             let device_region = self.settings.device_region.clone();
             let device_location = self.settings.device_location.clone();
             let client_features = self.settings.client_features.clone();
+            let split_tunnel = self.settings.split_tunnel_own_region;
+            let split_tunnel_regions = self.settings.split_tunnel_regions.clone();
             let proxy = self.settings.proxy.clone();
             let keepalive = self.settings.keepalive;
             let limit_meek_buffers = self.settings.limit_meek_buffers;
@@ -526,6 +536,8 @@ impl Inner {
                     device_region: device_region.as_deref(),
                     device_location: device_location.as_deref(),
                     client_features: &client_features,
+                    split_tunnel,
+                    split_tunnel_regions: &split_tunnel_regions,
                 };
                 Session::connect(
                     server,
@@ -634,7 +646,7 @@ impl Inner {
                 return Ok(Arc::clone(gateway));
             }
         }
-        let channel = self.dial(UDPGW_HOST, UDPGW_PORT)?;
+        let channel = self.dial_tunnel(UDPGW_HOST, UDPGW_PORT, self.split_tunnel_enabled())?;
         let mut slot = lock(&self.udpgw);
         if let Some(gateway) = slot.as_ref() {
             if !gateway.is_closed() {
@@ -647,23 +659,127 @@ impl Inner {
         Ok(gateway)
     }
 
-    fn dial(&self, host: &str, port: u16) -> Result<Channel, String> {
+    fn dial(&self, host: &str, port: u16) -> Result<Flow, String> {
+        if !self.split_tunnel_enabled() {
+            return self.dial_tunnel(host, port, false).map(Flow::Tunnel);
+        }
+        let key = format!("{host}:{port}");
+        if self.split_is_untunneled(&key) {
+            return self.direct(host, port).map(Flow::Direct);
+        }
+        self.dial_split(host, port, &key)
+    }
+
+    /// A server-tunneled dial: UDP gateways and plain lanes never take the direct path.
+    fn dial_tunnel(&self, host: &str, port: u16, always_tunneled: bool) -> Result<Channel, String> {
         if self.stopping.load(Ordering::Acquire) {
             return Err("psiphon: the lane is stopping".to_owned());
         }
         for _ in 0..2 {
             let session = self.ensure()?;
-            match session.open(host, port) {
+            let opened = if always_tunneled {
+                session.open_tunneled(host, port)
+            } else {
+                session.open(host, port)
+            };
+            match opened {
                 Ok(channel) => return Ok(channel),
                 // A refused target says nothing about the tunnel; a dead one is replaced and retried.
                 Err(why) if !session.is_closed() => return Err(why),
-                Err(_) => {
-                    session.close();
-                    lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, &session));
-                }
+                Err(_) => self.retire(&session),
             }
         }
         Err(format!("psiphon: {host}:{port} was not reachable"))
+    }
+
+    /// Ask the server to classify a target, then tunnel it or dial it direct.
+    fn dial_split(&self, host: &str, port: u16, key: &str) -> Result<Flow, String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("psiphon: the lane is stopping".to_owned());
+        }
+        for _ in 0..2 {
+            let session = self.ensure()?;
+            match session.open_split(host, port) {
+                Ok(Some(channel)) => {
+                    self.split_forget(key);
+                    return Ok(Flow::Tunnel(channel));
+                }
+                Ok(None) => {
+                    self.split_remember(key);
+                    return self.direct(host, port).map(Flow::Direct);
+                }
+                // A refused target says nothing about the tunnel; a dead one is replaced and retried.
+                Err(why) if !session.is_closed() => return Err(why),
+                Err(_) => self.retire(&session),
+            }
+        }
+        Err(format!("psiphon: {host}:{port} was not reachable"))
+    }
+
+    fn retire(&self, session: &Arc<Session>) {
+        session.close();
+        lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, session));
+    }
+
+    fn split_tunnel_enabled(&self) -> bool {
+        self.settings.split_tunnel_own_region || !self.settings.split_tunnel_regions.is_empty()
+    }
+
+    fn split_is_untunneled(&self, key: &str) -> bool {
+        let mut cache = lock(&self.split_untunneled);
+        match cache.get(key).copied() {
+            Some(at) if at.elapsed() < SPLIT_TUNNEL_CLASSIFICATION_TTL => true,
+            Some(_) => {
+                cache.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn split_remember(&self, key: &str) {
+        let mut cache = lock(&self.split_untunneled);
+        if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX {
+            cache.retain(|_, at| at.elapsed() < SPLIT_TUNNEL_CLASSIFICATION_TTL);
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(key.to_owned(), Instant::now());
+    }
+
+    fn split_forget(&self, key: &str) {
+        lock(&self.split_untunneled).remove(key);
+    }
+
+    /// The direct half of split tunnel: the reference's untunneled dial, proxy included.
+    fn direct(&self, host: &str, port: u16) -> Result<TcpStream, String> {
+        if let Some(proxy) = self.settings.proxy.as_ref() {
+            let stream = proxy.connect_host(host, port, self.settings.dial_timeout())?;
+            let _ = stream.set_read_timeout(None);
+            let _ = stream.set_write_timeout(None);
+            return Ok(stream);
+        }
+        let timeout = self.settings.dial_timeout();
+        let addresses = crate::psiphon_dns::resolve(host, port, &self.settings.dns_servers)
+            .map_err(|error| format!("psiphon: split tunnel could not resolve {host}: {error}"))?;
+        let mut last = format!("no address for {host}");
+        for address in addresses {
+            match TcpStream::connect_timeout(&address, timeout) {
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    return Ok(stream);
+                }
+                Err(error) => last = format!("{address}: {error}"),
+            }
+        }
+        Err(format!(
+            "psiphon: split tunnel could not dial {host}:{port}: {last}"
+        ))
     }
 
     /// A live tunnel, dialing at most one beside any other caller.
@@ -799,15 +915,15 @@ fn serve(mut client: TcpStream, inner: &Arc<Inner>) {
     };
     match ask {
         Ask::Connect(host, port) => match inner.dial(&host, port) {
-            Ok(channel) => {
-                trace_flow(&channel);
+            Ok(flow) => {
+                trace_flow(&flow);
                 if !ask_reply(&mut client, version, Ok(())) {
-                    channel.close();
+                    flow.close();
                     return;
                 }
                 let _ = client.set_read_timeout(None);
                 let _ = client.set_write_timeout(None);
-                relay(client, channel, inner.settings.relay_buffer);
+                relay_flow(client, flow, inner.settings.relay_buffer);
             }
             Err(why) => {
                 eprintln!("psiphon: {why}");
@@ -821,6 +937,39 @@ fn serve(mut client: TcpStream, inner: &Arc<Inner>) {
 enum Ask {
     Connect(String, u16),
     Udp,
+}
+
+/// One accepted flow: inside the SSH tunnel or directly out when split tunnel says so.
+enum Flow {
+    Tunnel(Channel),
+    Direct(TcpStream),
+}
+
+impl Flow {
+    fn close(&self) {
+        match self {
+            Self::Tunnel(channel) => channel.close(),
+            Self::Direct(stream) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+impl Write for Flow {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tunnel(channel) => channel.write(buffer),
+            Self::Direct(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tunnel(channel) => channel.flush(),
+            Self::Direct(stream) => stream.flush(),
+        }
+    }
 }
 
 fn read_request(client: &mut TcpStream, inner: &Inner) -> Option<(Version, Ask)> {
@@ -983,6 +1132,53 @@ fn ask_reply(client: &mut TcpStream, version: Version, result: Result<(), u8>) -
     }
 }
 
+fn relay_flow(client: TcpStream, flow: Flow, buffer: usize) {
+    match flow {
+        Flow::Tunnel(channel) => relay(client, channel, buffer),
+        Flow::Direct(remote) => relay_direct(client, remote, buffer),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn relay_direct(mut client: TcpStream, mut remote: TcpStream, buffer: usize) {
+    let Ok(mut client_read) = client.try_clone() else {
+        return;
+    };
+    let Ok(mut remote_write) = remote.try_clone() else {
+        return;
+    };
+    let forward = thread::Builder::new()
+        .name("psiphon-direct-forward".to_owned())
+        .stack_size(FLOW_STACK)
+        .spawn(move || {
+            pump_copy(&mut client_read, &mut remote_write, buffer);
+            let _ = remote_write.shutdown(Shutdown::Write);
+        })
+        .ok();
+    pump_copy(&mut remote, &mut client, buffer);
+    let _ = client.shutdown(Shutdown::Write);
+    if let Some(forward) = forward {
+        let _ = forward.join();
+    }
+    let _ = remote.shutdown(Shutdown::Both);
+}
+
+fn pump_copy(source: &mut impl Read, sink: &mut impl Write, buffer: usize) {
+    let mut bytes = vec![0u8; buffer];
+    loop {
+        match source.read(&mut bytes) {
+            Ok(0) => return,
+            Ok(read) => {
+                if sink.write_all(&bytes[..read]).is_err() {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn relay(mut client: TcpStream, channel: Channel, buffer: usize) {
     let Ok(mut client_read) = client.try_clone() else {
@@ -1007,13 +1203,16 @@ fn relay(mut client: TcpStream, channel: Channel, buffer: usize) {
     channel.close();
 }
 
-fn trace_flow(channel: &Channel) {
+fn trace_flow(flow: &Flow) {
     if std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some() {
-        eprintln!(
-            "psiphon: flow via session {} {}",
-            channel.session_id(),
-            channel.server()
-        );
+        match flow {
+            Flow::Tunnel(channel) => eprintln!(
+                "psiphon: flow via session {} {}",
+                channel.session_id(),
+                channel.server()
+            ),
+            Flow::Direct(_) => eprintln!("psiphon: flow split-tunneled directly"),
+        }
     }
 }
 
@@ -1164,19 +1363,19 @@ fn serve_http(mut client: TcpStream, inner: &Arc<Inner>) {
         return;
     };
     match inner.dial(host, port) {
-        Ok(mut channel) => {
-            trace_flow(&channel);
+        Ok(mut flow) => {
+            trace_flow(&flow);
             if client
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .is_err()
-                || (!early.is_empty() && channel.write_all(early).is_err())
+                || (!early.is_empty() && flow.write_all(early).is_err())
             {
-                channel.close();
+                flow.close();
                 return;
             }
             let _ = client.set_read_timeout(None);
             let _ = client.set_write_timeout(None);
-            relay(client, channel, inner.settings.relay_buffer);
+            relay_flow(client, flow, inner.settings.relay_buffer);
         }
         Err(why) => {
             eprintln!("psiphon: {why}");
@@ -1666,6 +1865,12 @@ impl Settings {
             .or_else(|| env("AETHER_PSIPHON_DEVICE_LOCATION"))
             .filter(|location| !location.is_empty());
         let client_features = string_list(settings, "ClientFeatures");
+        let split_tunnel_own_region = flag(
+            settings,
+            "SplitTunnelOwnRegion",
+            "AETHER_PSIPHON_SPLIT_TUNNEL_OWN_REGION",
+        );
+        let split_tunnel_regions = split_tunnel_regions(settings);
         let compartment = text(settings, "InproxyClientPersonalCompartmentID")
             .or_else(|| text(settings, "inproxyClientPersonalCompartmentID"))
             .or_else(|| text(settings, "inproxyCompartment"))
@@ -1730,6 +1935,8 @@ impl Settings {
             device_region,
             device_location,
             client_features,
+            split_tunnel_own_region,
+            split_tunnel_regions,
             compartment,
             conduit,
             conduit_mode,
@@ -2114,6 +2321,20 @@ fn string_list(settings: Option<&Json>, key: &str) -> Vec<String> {
         return split_list(text);
     }
     Vec::new()
+}
+
+/// Split-tunnel regions are ISO 3166-1 alpha-2 codes; accept either case and drop duplicates.
+fn split_tunnel_regions(settings: Option<&Json>) -> Vec<String> {
+    let mut regions = Vec::new();
+    for region in string_list(settings, "SplitTunnelRegions") {
+        let region = region.trim().to_ascii_uppercase();
+        if region.len() == 2 && region.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            push_unique(&mut regions, region);
+        } else {
+            eprintln!("psiphon: SplitTunnelRegions ignores {region:?}, not an ISO alpha-2 code");
+        }
+    }
+    regions
 }
 
 fn custom_headers(settings: Option<&Json>) -> Vec<(String, String)> {
@@ -2674,6 +2895,8 @@ pub(crate) fn broker_offer(
         device_region: settings.device_region.as_deref(),
         device_location: settings.device_location.as_deref(),
         client_features: &settings.client_features,
+        split_tunnel: settings.split_tunnel_own_region,
+        split_tunnel_regions: &settings.split_tunnel_regions,
     };
     let fronts = broker_fronts(broker);
     if fronts.is_empty() {
@@ -2763,6 +2986,8 @@ fn fetch_tactics_from(
         device_region: settings.device_region.as_deref(),
         device_location: settings.device_location.as_deref(),
         client_features: &settings.client_features,
+        split_tunnel: settings.split_tunnel_own_region,
+        split_tunnel_regions: &settings.split_tunnel_regions,
     };
     crate::psiphon_tactics::Tactics::fetch(
         server,
@@ -7224,6 +7449,20 @@ mod tests {
     }
 
     #[test]
+    fn split_tunnel_settings_normalize_regions() {
+        let settings = json::parse(
+            r#"{"SplitTunnelOwnRegion":true,"SplitTunnelRegions":["us","DE","usa","de"]}"#,
+        )
+        .expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert!(settings.split_tunnel_own_region);
+        assert_eq!(
+            settings.split_tunnel_regions,
+            vec!["US".to_owned(), "DE".to_owned()]
+        );
+    }
+
+    #[test]
     fn queued_packets_leave_in_one_vectored_write() {
         struct Sink {
             calls: usize,
@@ -7625,6 +7864,7 @@ mod tests {
             http_endpoint: None,
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
+            split_untunneled: Mutex::new(HashMap::new()),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -7670,6 +7910,7 @@ mod tests {
             http_endpoint: None,
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
+            split_untunneled: Mutex::new(HashMap::new()),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
