@@ -30123,13 +30123,13 @@ impl<R: WindowRead> WindowRead for ReplyReader<R> {
 
 pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
     let mut header = [0u8; 2 + 255];
-    read_exact(stream, &mut header[..2]).ok()?;
+    let mut bounded = HandshakeDeadline {
+        inner: stream,
+        until: Instant::now() + crate::budgets::handshake(),
+    };
+    read_exact(&mut bounded, &mut header[..2]).ok()?;
     let addons = usize::from(header[1]);
     if addons > 0 {
-        let mut bounded = HandshakeDeadline {
-            inner: stream,
-            until: Instant::now() + crate::budgets::handshake(),
-        };
         read_exact(&mut bounded, &mut header[2..2 + addons]).ok()?;
     }
     ferrox_core::vless::VlessLink::decode_response_header(&header[..2 + addons]).ok()?;
