@@ -2,7 +2,9 @@
 //! [`crate::psiphon_ssh`], and the loopback SOCKS edge the proxy dials.
 
 use crate::json::{self, Json};
-use crate::psiphon_ssh::{Channel, ChannelChunk, Identity, Proxy, Server, Session, TlsShape};
+use crate::psiphon_ssh::{
+    Channel, ChannelChunk, Identity, Proxy, Server, Session, TlsShape, MAX_PADDING, MIN_PADDING,
+};
 use crate::socks::{Credential, Destination, Version};
 use ferrox_core::tls::Fingerprint;
 use flate2::read::ZlibDecoder;
@@ -34,8 +36,8 @@ const UDPGW_FLAG_IPV6: u8 = 8;
 const UDPGW_MAX_PAYLOAD: usize = 32_768;
 const UDPGW_MAX_MESSAGE: usize = 32_768 + 23;
 const MAX_LIST_BYTES: u64 = 16 * 1024 * 1024;
-const RELAY_BUFFER: usize = 64 * 1024;
-const RELAY_BATCH: usize = 32;
+const RELAY_BUFFER: usize = 256 * 1024;
+const RELAY_BATCH: usize = 64;
 const FRONTED_VARIANTS: usize = 256;
 const FRONTED_SERVERS: usize = 512;
 const BUILTIN_CDN_EDGES: &[[u8; 4]] = &[
@@ -138,6 +140,13 @@ struct Settings {
     tls_shape: TlsShape,
     meek_padding: (u16, u16),
     relay_buffer: usize,
+    dial_ports: Vec<(String, PortList)>,
+    dial_ports_probability: f64,
+    prioritize_protocols: Vec<String>,
+    prioritize_count: usize,
+    prioritize_probability: f64,
+    limit_protocols_probability: f64,
+    initial_limit_probability: f64,
     disable_tactics: bool,
     meek_headers: Vec<(String, String)>,
     ssh_channel_window: u32,
@@ -158,6 +167,20 @@ enum ConduitMode {
     Auto,
     Public,
     Shirokhorshid,
+}
+
+/// One `LimitTunnelDialPortNumbers` entry: the port numbers, as single ports or closed ranges.
+#[derive(Clone, Debug, Default)]
+struct PortList {
+    ranges: Vec<(u16, u16)>,
+}
+
+impl PortList {
+    fn contains(&self, port: u16) -> bool {
+        self.ranges
+            .iter()
+            .any(|(low, high)| port >= *low && port <= *high)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1342,6 +1365,15 @@ impl Settings {
         let geoip_path = text(settings, "GeoIPDatabasePath");
         let reject_cidrs = string_list(settings, "InproxyRejectProxyCIDRs");
         let limit_quic_versions = string_list(settings, "LimitQUICVersions");
+        let dial_ports = port_lists(settings);
+        let dial_ports_probability = probability(settings, "LimitTunnelDialPortNumbersProbability");
+        let prioritize_protocols = protocol_list_named(settings, "PrioritizeTunnelProtocols");
+        let prioritize_count =
+            number(settings, "PrioritizeTunnelProtocolsCandidateCount").unwrap_or(10) as usize;
+        let prioritize_probability = probability(settings, "PrioritizeTunnelProtocolsProbability");
+        let limit_protocols_probability = probability(settings, "LimitTunnelProtocolsProbability");
+        let initial_limit_probability =
+            probability(settings, "InitialLimitTunnelProtocolsProbability");
         let quic_noise = text(settings, "QUICNoiseProfile").filter(|profile| !profile.is_empty());
         let mut sni_names = string_list(settings, "TLSOSSHSNIServerNames");
         if sni_names.is_empty() {
@@ -1370,6 +1402,18 @@ impl Settings {
             )
             .unwrap_or(0),
         );
+        let obfuscated_min_padding = ssh_padding(
+            settings,
+            "ObfuscatedSSHMinPadding",
+            MIN_PADDING,
+            MIN_PADDING,
+        );
+        let obfuscated_max_padding = ssh_padding(
+            settings,
+            "ObfuscatedSSHMaxPadding",
+            MAX_PADDING,
+            obfuscated_min_padding,
+        );
         let tls_shape = TlsShape {
             min_padding: u16::try_from(
                 number(settings, "TLSTunnelMinTLSPadding")
@@ -1393,6 +1437,8 @@ impl Settings {
                 .clamp(0.0, 1.0),
             shadowsocks_prefix: shadowsocks_prefix(settings),
             ossh_prefix: ossh_prefix(settings),
+            obfuscated_min_padding,
+            obfuscated_max_padding,
         };
         let mut cdn_ips: Vec<String> = string_list(settings, "cdnIps")
             .into_iter()
@@ -1677,9 +1723,16 @@ impl Settings {
             tls_shape,
             meek_padding,
             relay_buffer,
+            dial_ports,
+            dial_ports_probability,
+            prioritize_protocols,
+            prioritize_count,
+            prioritize_probability,
+            limit_protocols_probability,
+            initial_limit_probability,
             keepalive,
             disable_tactics: flag(settings, "DisableTactics", "AETHER_PSIPHON_DISABLE_TACTICS"),
-            meek_headers: header_map(settings, "MeekAdditionalHeaders"),
+            meek_headers: dial_headers(settings),
             ssh_channel_window: number(settings, "SSHChannelWindowSize")
                 .map_or(crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW, |window| {
                     window.clamp(64 * 1024, u64::from(u32::MAX)) as u32
@@ -1817,6 +1870,77 @@ fn decimal(settings: Option<&Json>, key: &str) -> Option<f64> {
     }
 }
 
+/// A probability field, clamped to the reference's `[0, 1]`; absent means its default coin lands.
+fn probability(settings: Option<&Json>, key: &str) -> f64 {
+    decimal(settings, key).unwrap_or(1.0).clamp(0.0, 1.0)
+}
+
+fn coin(probability: f64) -> bool {
+    if probability >= 1.0 {
+        return true;
+    }
+    if probability <= 0.0 {
+        return false;
+    }
+    f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0 < probability
+}
+
+/// The reference's `LimitTunnelDialPortNumbers`: protocol names (or `All`) to port ranges.
+fn port_lists(settings: Option<&Json>) -> Vec<(String, PortList)> {
+    let Some(Json::Obj(fields)) = settings.and_then(|settings| {
+        settings
+            .get("LimitTunnelDialPortNumbers")
+            .or_else(|| settings.get("limitTunnelDialPortNumbers"))
+    }) else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter_map(|(name, value)| {
+            let ranges = port_ranges(value)?;
+            Some((name.to_ascii_uppercase(), PortList { ranges }))
+        })
+        .collect()
+}
+
+/// A `PortList` value: scalars, closed ranges, or a mix of both, exactly as the reference unmarshals.
+fn port_ranges(value: &Json) -> Option<Vec<(u16, u16)>> {
+    if let Some(port) = value.as_port() {
+        return Some(vec![(port, port)]);
+    }
+    if let Some(text) = value.as_str() {
+        let (low, high) = text.split_once('-').unwrap_or((text, text));
+        let low = low.trim().parse::<u16>().ok()?;
+        let high = high.trim().parse::<u16>().ok()?;
+        return Some(vec![(low.min(high), low.max(high))]);
+    }
+    let items = value.as_arr()?;
+    let mut ranges = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Json::Arr(pair) => {
+                let low = pair.first()?.as_port()?;
+                let high = pair.get(1)?.as_port()?;
+                ranges.push((low.min(high), low.max(high)));
+            }
+            Json::Num(_) => {
+                let port = item.as_port()?;
+                ranges.push((port, port));
+            }
+            Json::Str(text) => {
+                let (low, high) = text
+                    .split_once('-')
+                    .unwrap_or((text.as_str(), text.as_str()));
+                let low = low.trim().parse::<u16>().ok()?;
+                let high = high.trim().parse::<u16>().ok()?;
+                ranges.push((low.min(high), low.max(high)));
+            }
+            _ => return None,
+        }
+    }
+    Some(ranges)
+}
+
 /// The `ShadowsocksPrefixSpecs` transform, its scope map and its probability.
 fn shadowsocks_prefix(settings: Option<&Json>) -> crate::psiphon_ssh::ShadowsocksPrefix {
     crate::psiphon_ssh::ShadowsocksPrefix {
@@ -1836,17 +1960,35 @@ fn ossh_prefix(settings: Option<&Json>) -> crate::psiphon_ssh::OsshPrefix {
             .clamp(0.0, 1.0),
         specs: transform_specs(settings, "OSSHPrefixSpecs"),
         scoped: transform_scopes(settings, "OSSHPrefixScopedSpecNames"),
-        split_min: Duration::from_millis(
-            number(settings, "OSSHPrefixSplitMinDelayMilliseconds")
-                .unwrap_or(0)
-                .min(60_000),
-        ),
-        split_max: Duration::from_millis(
-            number(settings, "OSSHPrefixSplitMaxDelayMilliseconds")
-                .unwrap_or(0)
-                .min(60_000),
-        ),
+        split_min: Duration::from_nanos(duration_nanos(
+            settings,
+            "OSSHPrefixSplitMinDelayMilliseconds",
+            "OSSHPrefixSplitMinDelay",
+        )),
+        split_max: Duration::from_nanos(duration_nanos(
+            settings,
+            "OSSHPrefixSplitMaxDelayMilliseconds",
+            "OSSHPrefixSplitMaxDelay",
+        )),
     }
+}
+
+/// One obfuscated-SSH padding bound: the reference only accepts a value in
+/// `[prng.SEED_LENGTH, OBFUSCATE_MAX_PADDING]`; anything else leaves the default.
+fn ssh_padding(settings: Option<&Json>, key: &str, default: usize, floor: usize) -> usize {
+    number(settings, key)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (MIN_PADDING..=MAX_PADDING).contains(value) && *value >= floor)
+        .unwrap_or(default)
+}
+
+/// A duration in nanoseconds: the `...Milliseconds` spelling is milliseconds, while the
+/// reference's `time.Duration` spelling is already nanoseconds.
+fn duration_nanos(settings: Option<&Json>, millis: &str, duration: &str) -> u64 {
+    if let Some(value) = number(settings, millis) {
+        return value.saturating_mul(1_000_000).min(60_000_000_000);
+    }
+    number(settings, duration).map_or(0, |nanos| nanos.min(60_000_000_000))
 }
 
 /// The named byte generators of one prefix transform.
@@ -1953,25 +2095,35 @@ fn string_list(settings: Option<&Json>, key: &str) -> Vec<String> {
 }
 
 fn custom_headers(settings: Option<&Json>) -> Vec<(String, String)> {
-    let Some(Json::Obj(fields)) = settings.and_then(|settings| {
-        settings
-            .get("CustomHeaders")
-            .or_else(|| settings.get("customHeaders"))
-    }) else {
-        return Vec::new();
-    };
-    fields
-        .iter()
-        .flat_map(|(name, value)| match value {
-            Json::Str(text) => vec![(name.clone(), text.clone())],
-            Json::Arr(items) => items
-                .iter()
-                .filter_map(Json::as_str)
-                .map(|text| (name.clone(), text.to_owned()))
-                .collect(),
-            _ => Vec::new(),
-        })
-        .collect()
+    let mut headers = header_map(settings, "CustomHeaders");
+    if headers.is_empty() {
+        headers = header_map(settings, "customHeaders");
+    }
+    merge_headers(headers, header_map(settings, "AdditionalCustomHeaders"))
+}
+
+/// The dial headers: `MeekAdditionalHeaders` with `AdditionalCustomHeaders` replacing a same name.
+fn dial_headers(settings: Option<&Json>) -> Vec<(String, String)> {
+    merge_headers(
+        header_map(settings, "MeekAdditionalHeaders"),
+        header_map(settings, "AdditionalCustomHeaders"),
+    )
+}
+
+fn merge_headers(
+    mut headers: Vec<(String, String)>,
+    additional: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    if additional.is_empty() {
+        return headers;
+    }
+    headers.retain(|(name, _)| {
+        !additional
+            .iter()
+            .any(|(added, _)| added.eq_ignore_ascii_case(name))
+    });
+    headers.extend(additional);
+    headers
 }
 
 fn header_map(settings: Option<&Json>, key: &str) -> Vec<(String, String)> {
@@ -2132,7 +2284,15 @@ const KNOWN_SETTINGS: &[&str] = &[
     "NetworkLatencyMultiplierLambda",
     "InitialLimitTunnelProtocols",
     "InitialLimitTunnelProtocolsCandidateCount",
+    "InitialLimitTunnelProtocolsProbability",
     "LimitTunnelProtocols",
+    "LimitTunnelProtocolsProbability",
+    "LimitTunnelDialPortNumbers",
+    "limitTunnelDialPortNumbers",
+    "LimitTunnelDialPortNumbersProbability",
+    "PrioritizeTunnelProtocols",
+    "PrioritizeTunnelProtocolsCandidateCount",
+    "PrioritizeTunnelProtocolsProbability",
     "limitTunnelProtocols",
     "TunnelProtocol",
     "tunnelProtocol",
@@ -2140,6 +2300,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "TargetServerEntry",
     "CustomHeaders",
     "customHeaders",
+    "AdditionalCustomHeaders",
     "AdditionalParameters",
     "additionalParameters",
     "DisableTactics",
@@ -2169,6 +2330,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "OSSHPrefixProbability",
     "OSSHPrefixSplitMinDelayMilliseconds",
     "OSSHPrefixSplitMaxDelayMilliseconds",
+    "OSSHPrefixSplitMinDelay",
+    "OSSHPrefixSplitMaxDelay",
+    "ObfuscatedSSHMinPadding",
+    "ObfuscatedSSHMaxPadding",
 ];
 
 /// Report settings fields this lane does not consume.
@@ -2719,14 +2884,43 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     let mut servers = if settings.target.is_some() {
         servers
     } else {
-        select_protocols_with(
+        let protocols: &[String] = if coin(settings.limit_protocols_probability) {
+            &settings.protocols
+        } else {
+            &[]
+        };
+        let initial: &[String] = if coin(settings.initial_limit_probability) {
+            &settings.initial_protocols
+        } else {
+            &[]
+        };
+        let initial_count = if initial.is_empty() {
+            0
+        } else {
+            settings.initial_count
+        };
+        let dial_ports = if coin(settings.dial_ports_probability) {
+            Some(settings.dial_ports.as_slice())
+        } else {
+            None
+        };
+        let mut selected = select_protocols_with(
             servers,
-            &settings.protocols,
-            &settings.initial_protocols,
-            settings.initial_count,
+            protocols,
+            initial,
+            initial_count,
             settings.fronted,
             settings.fronted_fallback,
-        )
+            dial_ports,
+        );
+        if coin(settings.prioritize_probability) {
+            prioritize_servers(
+                &mut selected,
+                &settings.prioritize_protocols,
+                settings.prioritize_count,
+            );
+        }
+        selected
     };
     apply_fronting_overrides(&mut servers, settings);
     apply_session_settings(&mut servers, settings);
@@ -2754,8 +2948,8 @@ fn load_target_entry(
         })?;
     if target_limits {
         let (limits, label, filter) = target_protocol_filter(settings);
+        let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
         if let Some(shape) = filter {
-            let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
             let shadowsocks_takes_over = shape.shadowsocks && server.shadowsocks.is_some();
             if shape.tls
                 && !shape.plain
@@ -2805,6 +2999,13 @@ fn load_target_entry(
                     limits.join(",")
                 ));
             }
+        }
+        if coin(settings.dial_ports_probability) {
+            server = allowed_dial_variant(server, &settings.dial_ports, filter, named_meek, limits)
+                .ok_or_else(|| {
+                    "psiphon: TargetServerEntry has no dial port allowed by LimitTunnelDialPortNumbers"
+                        .to_owned()
+                })?;
         }
     }
     Ok(server)
@@ -3423,6 +3624,7 @@ fn select_protocols(
         initial_count,
         fronted,
         false,
+        None,
     )
 }
 
@@ -3434,6 +3636,7 @@ fn select_protocols_with(
     initial_count: usize,
     fronted: bool,
     fronted_fallback: bool,
+    dial_ports: Option<&[(String, PortList)]>,
 ) -> Vec<Server> {
     let mut servers = servers;
     let normal = shape_filter(protocols, "LimitTunnelProtocols");
@@ -3489,7 +3692,7 @@ fn select_protocols_with(
         let variants: Vec<Server> = servers.iter().filter_map(Server::quic_variant).collect();
         servers.extend(variants);
     }
-    if normal.is_none() && !initial_active {
+    if normal.is_none() && !initial_active && dial_ports.is_none() {
         return servers;
     }
     let tls_named = normal.is_some_and(|shape| shape.tls)
@@ -3530,40 +3733,218 @@ fn select_protocols_with(
             return Vec::new();
         }
         eprintln!("psiphon: initial protocol limit matched nothing; using the whole list");
-        return servers;
+        selected = (0..servers.len()).collect();
     }
-    selected
+    let selected: Vec<Server> = selected
         .into_iter()
         .map(|index| servers[index].clone())
-        .collect()
+        .collect();
+    match dial_ports {
+        Some(limits) => apply_dial_port_limits(selected, limits, normal, normal_meek, protocols),
+        None => selected,
+    }
+}
+
+fn fronted_meek_dial_port(protocol: &str) -> Option<u16> {
+    match protocol {
+        "FRONTED-MEEK-HTTP-OSSH" | "FRONTED-MEEK-CDN-HTTP-OSSH" => Some(80),
+        "FRONTED-MEEK-OSSH"
+        | "FRONTED-MEEK-CDN-OSSH"
+        | "FRONTED-MEEK-QUIC-OSSH"
+        | "FRONTED-MEEK-CDN-QUIC-OSSH" => Some(443),
+        _ => None,
+    }
+}
+
+/// The protocol name and dial port a server currently presents.
+fn server_dial_port(server: &Server) -> Option<(&str, u16)> {
+    if let Some(meek) = server.meek.as_ref() {
+        let port = fronted_meek_dial_port(meek.protocol)
+            .filter(|_| meek.fronted)
+            .unwrap_or(meek.port);
+        return Some((meek.protocol, port));
+    }
+    if let Some(meek) = server.unfronted_meek.as_ref() {
+        return Some((meek.protocol, meek.port));
+    }
+    if server.inproxy.is_some() || server.tls_inproxy.is_some() {
+        return None;
+    }
+    if server.quic {
+        return Some(("QUIC-OSSH", server.port));
+    }
+    if server.ss {
+        return Some(("SHADOWSOCKS-OSSH", server.port));
+    }
+    if server.tls {
+        return Some(("TLS-OSSH", server.port));
+    }
+    if server.obfuscated() {
+        return Some(("OSSH", server.port));
+    }
+    Some(("SSH", server.port))
+}
+
+fn allowed_dial_port(limits: &[(String, PortList)], protocol: &str, port: u16) -> bool {
+    limits
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(protocol))
+        .or_else(|| {
+            limits
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("ALL"))
+        })
+        .is_none_or(|(_, list)| list.contains(port))
+}
+
+/// The `LimitTunnelDialPortNumbers` filter: the current protocol or a sibling whose own port is allowed.
+fn allowed_dial_variant(
+    server: Server,
+    limits: &[(String, PortList)],
+    filter: Option<Shape>,
+    meek_named: bool,
+    protocols: &[String],
+) -> Option<Server> {
+    if let Some((protocol, port)) = server_dial_port(&server) {
+        if allowed_dial_port(limits, protocol, port) {
+            return Some(server);
+        }
+    } else {
+        return Some(server);
+    }
+    let allowed = |variant: &Server, protocol: &str, port: u16| {
+        allowed_dial_port(limits, protocol, port)
+            && filter.is_none_or(|shape| matches_limit(variant, shape, meek_named, protocols))
+    };
+    if let Some(variant) = server.shadowsocks_variant() {
+        if allowed(&variant, "SHADOWSOCKS-OSSH", variant.port) {
+            return Some(variant);
+        }
+    }
+    if let Some(variant) = server.quic_variant() {
+        if allowed(&variant, "QUIC-OSSH", variant.port) {
+            return Some(variant);
+        }
+    }
+    if let Some(variant) = tls_variant(&server) {
+        if allowed(&variant, "TLS-OSSH", variant.port) {
+            return Some(variant);
+        }
+    }
+    if let Some(variant) = ssh_variant(&server) {
+        if allowed(&variant, "SSH", variant.port) {
+            return Some(variant);
+        }
+    }
+    if let Some(unfronted) = server.unfronted_meek.clone() {
+        let mut variant = server.clone();
+        variant.meek = Some(unfronted.clone());
+        variant.unfronted_meek = None;
+        if allowed(&variant, unfronted.protocol, unfronted.port) {
+            return Some(variant);
+        }
+    }
+    None
+}
+
+fn apply_dial_port_limits(
+    servers: Vec<Server>,
+    limits: &[(String, PortList)],
+    filter: Option<Shape>,
+    meek_named: bool,
+    protocols: &[String],
+) -> Vec<Server> {
+    if limits.is_empty() {
+        return servers;
+    }
+    let kept: Vec<Server> = servers
+        .iter()
+        .cloned()
+        .filter_map(|server| allowed_dial_variant(server, limits, filter, meek_named, protocols))
+        .collect();
+    if kept.is_empty() {
+        eprintln!("psiphon: LimitTunnelDialPortNumbers matched no server");
+    }
+    kept
+}
+
+/// The `PrioritizeTunnelProtocols` order: matching servers with an allowed port lead the list.
+fn prioritize_servers(servers: &mut Vec<Server>, protocols: &[String], count: usize) {
+    if protocols.is_empty() || count == 0 {
+        return;
+    }
+    let mut priority = Vec::with_capacity(count.min(servers.len()));
+    let mut rest = Vec::with_capacity(servers.len());
+    for server in servers.drain(..) {
+        let matches = server_dial_port(&server).is_some_and(|(protocol, _)| {
+            protocols
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(protocol))
+        });
+        if matches && priority.len() < count {
+            priority.push(server);
+        } else {
+            rest.push(server);
+        }
+    }
+    priority.extend(rest);
+    *servers = priority;
+}
+
+fn ssh_variant(server: &Server) -> Option<Server> {
+    let port = server.ssh_port?;
+    if !server.obfuscated() && !server.ss && !server.quic && !server.tls && server.port == port {
+        return None;
+    }
+    let mut variant = server.clone();
+    variant.port = port;
+    variant.ssh_port = Some(port);
+    variant.direct = true;
+    variant.obfuscation_key = None;
+    variant.tls_obfuscation_key = None;
+    variant.meek_obfuscated_key = None;
+    variant.tls = false;
+    variant.tls_port = None;
+    variant.quic = false;
+    variant.quic_port = None;
+    variant.ss = false;
+    variant.shadowsocks = None;
+    variant.meek = None;
+    variant.unfronted_meek = None;
+    variant.inproxy = None;
+    variant.tls_inproxy = None;
+    variant.inproxy_meek = None;
+    variant.inproxy_shadowsocks_key = None;
+    variant.tactics = None;
+    Some(variant)
+}
+
+fn tls_variant(server: &Server) -> Option<Server> {
+    if server.tls
+        || server.quic
+        || !server.direct
+        || server.tls_port.is_none()
+        || (server.obfuscation_key.is_none() && server.tls_obfuscation_key.is_none())
+    {
+        return None;
+    }
+    let mut variant = server.clone();
+    if variant.obfuscation_key.is_none() {
+        variant.obfuscation_key = variant.tls_obfuscation_key.clone();
+    }
+    variant.tls_obfuscation_key = None;
+    variant.tls = true;
+    variant.port = variant.tls_port.unwrap_or(variant.port);
+    variant.meek = None;
+    variant.unfronted_meek = None;
+    variant.inproxy = variant.tls_inproxy.take();
+    variant.tactics = None;
+    Some(variant)
 }
 
 /// Add a TLS variant for each direct entry that names a TLS port.
 fn add_tls_variants(servers: &mut Vec<Server>) {
-    let variants: Vec<Server> = servers
-        .iter()
-        .filter(|server| {
-            !server.tls
-                && !server.quic
-                && server.direct
-                && server.tls_port.is_some()
-                && (server.obfuscation_key.is_some() || server.tls_obfuscation_key.is_some())
-        })
-        .map(|server| {
-            let mut variant = server.clone();
-            if variant.obfuscation_key.is_none() {
-                variant.obfuscation_key = variant.tls_obfuscation_key.clone();
-            }
-            variant.tls_obfuscation_key = None;
-            variant.tls = true;
-            variant.port = variant.tls_port.unwrap_or(variant.port);
-            variant.meek = None;
-            variant.unfronted_meek = None;
-            variant.inproxy = variant.tls_inproxy.take();
-            variant.tactics = None;
-            variant
-        })
-        .collect();
+    let variants: Vec<Server> = servers.iter().filter_map(tls_variant).collect();
     servers.extend(variants);
 }
 
@@ -3846,6 +4227,7 @@ fn decode_entry_with(
         host,
         address,
         port,
+        ssh_port,
         user,
         password,
         host_key,
@@ -5221,7 +5603,7 @@ mod tests {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
         let server = decode_entry(&encoded).expect("entry");
-        let selected = select_protocols_with(vec![server], &[], &[], 0, false, true);
+        let selected = select_protocols_with(vec![server], &[], &[], 0, false, true, None);
         assert_eq!(selected.len(), 1);
         let meek = selected[0].meek.as_ref().expect("unfronted");
         assert!(!meek.fronted);
@@ -5728,6 +6110,7 @@ mod tests {
             0,
             false,
             true,
+            None,
         );
         assert_eq!(selected.len(), 2);
         assert!(selected[1].meek.is_some());
@@ -5809,6 +6192,178 @@ mod tests {
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
         assert_eq!(got, [("X-One", "a"), ("X-Two", "b"), ("X-Two", "c")]);
+    }
+
+    #[test]
+    fn additional_custom_headers_follow_the_base_map() {
+        let settings = json::parse(
+            r#"{"CustomHeaders":{"X-One":"a","X-Two":"old"},"AdditionalCustomHeaders":{"X-Two":["b","c"]}}"#,
+        )
+        .expect("settings");
+        let headers = custom_headers(Some(&settings));
+        let got: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(got, [("X-One", "a"), ("X-Two", "b"), ("X-Two", "c")]);
+    }
+
+    #[test]
+    fn additional_custom_headers_reach_dial_headers() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"MeekAdditionalHeaders":{"X-One":"a"},"AdditionalCustomHeaders":{"X-Two":"b"}}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.meek_headers,
+            vec![
+                ("X-One".to_owned(), "a".to_owned()),
+                ("X-Two".to_owned(), "b".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_obfuscated_ssh_padding_window_is_read() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"ObfuscatedSSHMinPadding":100,"ObfuscatedSSHMaxPadding":200,"OSSHPrefixSplitMinDelay":5000000}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.obfuscated_min_padding, 100);
+        assert_eq!(settings.tls_shape.obfuscated_max_padding, 200);
+        assert_eq!(
+            settings.tls_shape.ossh_prefix.split_min,
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn a_dial_port_list_reads_scalars_ranges_and_the_all_key() {
+        let settings = json::parse(
+            r#"{"LimitTunnelDialPortNumbers":{"SSH":[[10,11]],"QUIC-OSSH":[30,31,[40,41]],"All":"80-81"}}"#,
+        )
+        .expect("settings");
+        let lists = port_lists(Some(&settings));
+        let ssh = lists.iter().find(|(name, _)| name == "SSH").expect("ssh");
+        assert!(ssh.1.contains(10));
+        assert!(ssh.1.contains(11));
+        assert!(!ssh.1.contains(12));
+        let quic = lists
+            .iter()
+            .find(|(name, _)| name == "QUIC-OSSH")
+            .expect("quic");
+        assert!(quic.1.contains(31));
+        assert!(quic.1.contains(41));
+        let all = lists.iter().find(|(name, _)| name == "ALL").expect("all");
+        assert!(all.1.contains(81));
+    }
+
+    #[test]
+    fn a_dial_port_limit_selects_an_allowed_sibling() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedKey":"o","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["SSH","SHADOWSOCKS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        let limits = vec![(
+            "ALL".to_owned(),
+            PortList {
+                ranges: vec![(9000, 9000)],
+            },
+        )];
+        let selected = apply_dial_port_limits(vec![server.clone()], &limits, None, false, &[]);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].ss);
+        assert_eq!(selected[0].port, 9000);
+        let refused = vec![(
+            "All".to_owned(),
+            PortList {
+                ranges: vec![(443, 443), (8443, 8443)],
+            },
+        )];
+        assert!(apply_dial_port_limits(vec![server], &refused, None, false, &[]).is_empty());
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA"}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        let plain = vec![(
+            "All".to_owned(),
+            PortList {
+                ranges: vec![(22, 22)],
+            },
+        )];
+        let selected = apply_dial_port_limits(vec![server.clone()], &plain, None, false, &[]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].port, 22);
+        assert!(!selected[0].obfuscated());
+        let obfuscated_only = vec!["OSSH".to_owned()];
+        let filter = shape_filter(&obfuscated_only, "test");
+        assert!(apply_dial_port_limits(
+            vec![server.clone()],
+            &plain,
+            filter,
+            false,
+            &obfuscated_only
+        )
+        .is_empty());
+        let selected =
+            select_protocols_with(vec![server.clone()], &[], &[], 0, false, true, Some(&plain));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].port, 22);
+        assert!(!selected[0].obfuscated());
+        let named = vec![(
+            "SSH".to_owned(),
+            PortList {
+                ranges: vec![(22, 22)],
+            },
+        )];
+        let selected = apply_dial_port_limits(vec![server], &named, None, false, &[]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].port, 443);
+        let mut fronted = test_server(true);
+        fronted.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 8443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 8443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let https = vec![(
+            "All".to_owned(),
+            PortList {
+                ranges: vec![(443, 443)],
+            },
+        )];
+        let selected = apply_dial_port_limits(vec![fronted], &https, None, false, &[]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].meek.as_ref().expect("fronted").port, 8443);
+    }
+
+    #[test]
+    fn a_prioritized_protocol_moves_to_the_front() {
+        let plain = test_server(true);
+        let mut quic = test_server(true);
+        quic.quic = true;
+        quic.port = 4443;
+        quic.quic_versions = vec!["QUICv1".to_owned()];
+        let mut servers = vec![plain, quic];
+        prioritize_servers(&mut servers, &["QUIC-OSSH".to_owned()], 1);
+        assert!(servers[0].quic);
     }
 
     #[test]
@@ -5961,6 +6516,20 @@ mod tests {
     }
 
     #[test]
+    fn a_target_honors_the_dial_port_limit() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA"}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let text = format!(
+            r#"{{"TargetServerEntry":"{encoded}","LimitTunnelDialPortNumbers":{{"All":[22]}}}}"#
+        );
+        let settings =
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
+        let error = load_target_entry(&settings, &encoded, true, false)
+            .expect_err("the target has no permitted dial port");
+        assert!(error.contains("no dial port allowed"));
+    }
+
+    #[test]
     fn a_client_quic_limit_demotes_a_fronted_h3_entry() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","FRONTED-MEEK-QUIC"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -6052,6 +6621,7 @@ mod tests {
             host: "192.0.2.1".to_owned(),
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 22,
+            ssh_port: Some(22),
             user: String::new(),
             password: String::new(),
             host_key: Vec::new(),
@@ -6821,6 +7391,23 @@ mod tests {
     }
 
     #[test]
+    fn an_ossh_prefix_nanosecond_window_keeps_sub_millisecond_values() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"OSSHPrefixSplitMinDelay":1000,"OSSHPrefixSplitMaxDelay":2000}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.tls_shape.ossh_prefix.split_min,
+            Duration::from_nanos(1_000)
+        );
+        assert_eq!(
+            settings.tls_shape.ossh_prefix.split_max,
+            Duration::from_nanos(2_000)
+        );
+    }
+
+    #[test]
     fn a_limited_tls_profile_reaches_every_tls_shape() {
         let settings = Settings::from_json(Some(
             &json::parse(
@@ -7028,6 +7615,7 @@ mod tests {
                 host: name.to_owned(),
                 address: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port: 22,
+                ssh_port: Some(22),
                 user: String::new(),
                 password: String::new(),
                 host_key: Vec::new(),
@@ -7081,6 +7669,7 @@ mod tests {
                 host: format!("stalled-{index}"),
                 address: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port: 22,
+                ssh_port: Some(22),
                 user: String::new(),
                 password: String::new(),
                 host_key: Vec::new(),
