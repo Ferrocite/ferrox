@@ -609,8 +609,8 @@ security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_en
 security-ech heap-buffers-for-a-real-ech-offer 17 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
 
 # --- ECH -------------------------------------------------------------------
-security-ech aes256-gcm-seal-retired-instructions 29612 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 29749 scripts/count-ops.sh
+security-ech aes256-gcm-seal-retired-instructions 15414 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15348 scripts/count-ops.sh
 security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
 security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
 security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)
