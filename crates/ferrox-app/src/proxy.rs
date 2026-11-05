@@ -65189,7 +65189,7 @@ mod poll_relay {
         let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
         let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
         std::thread::spawn(move || {
-            super::relay_owned(client_read, target_write, target_read, client_write);
+            super::relay_owned(client_read, target_write, target_read, client_write, None);
             let _ = first_tx.send(Ok(()));
             let _ = second_tx.send(Ok(()));
         });
