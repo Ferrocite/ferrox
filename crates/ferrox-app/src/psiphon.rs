@@ -1837,10 +1837,14 @@ fn ossh_prefix(settings: Option<&Json>) -> crate::psiphon_ssh::OsshPrefix {
         specs: transform_specs(settings, "OSSHPrefixSpecs"),
         scoped: transform_scopes(settings, "OSSHPrefixScopedSpecNames"),
         split_min: Duration::from_millis(
-            number(settings, "OSSHPrefixSplitMinDelayMilliseconds").unwrap_or(0),
+            number(settings, "OSSHPrefixSplitMinDelayMilliseconds")
+                .unwrap_or(0)
+                .min(60_000),
         ),
         split_max: Duration::from_millis(
-            number(settings, "OSSHPrefixSplitMaxDelayMilliseconds").unwrap_or(0),
+            number(settings, "OSSHPrefixSplitMaxDelayMilliseconds")
+                .unwrap_or(0)
+                .min(60_000),
         ),
     }
 }
