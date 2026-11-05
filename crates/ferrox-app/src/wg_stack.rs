@@ -91,6 +91,7 @@ const UDP_FLOWS: usize = 4096;
 pub(crate) struct Packet {
     pub(crate) peer: [u8; 32],
     pub(crate) bytes: Vec<u8>,
+    pub(crate) at: usize,
 }
 
 /// One local stream the client asks the stack to connect.
@@ -108,10 +109,11 @@ pub(crate) type UdpRoutes = Arc<Mutex<HashMap<u16, Sender<Vec<u8>>>>>;
 /// An in-memory IP device: the reader pushes inner packets into `rx`, and every
 /// packet `smoltcp` emits is left in `tx` for the tunnel writer.
 struct QueueDevice {
-    rx: VecDeque<Vec<u8>>,
+    rx: VecDeque<(Vec<u8>, usize)>,
     tx: VecDeque<Vec<u8>>,
     mtu: usize,
     headroom: usize,
+    recycle: Option<Sender<Vec<u8>>>,
 }
 
 impl QueueDevice {
@@ -122,14 +124,28 @@ impl QueueDevice {
             tx: VecDeque::new(),
             mtu,
             headroom,
+            recycle: None,
         }
     }
 
-    fn push(&mut self, packet: Vec<u8>) {
+    /// Queue an inner packet, recycling the oldest slot when the queue is full.
+    fn push(&mut self, packet: Vec<u8>, at: usize) {
         if self.rx.len() >= RX_PACKETS {
-            self.rx.pop_front();
+            if let Some((buffer, at)) = self.rx.pop_front() {
+                self.recycle(buffer, at);
+            }
         }
-        self.rx.push_back(packet);
+        self.rx.push_back((packet, at));
+    }
+
+    /// Return a receive slot to the batch, leaving copied payloads alone.
+    fn recycle(&self, buffer: Vec<u8>, at: usize) {
+        if at != self.headroom {
+            return;
+        }
+        if let Some(recycle) = &self.recycle {
+            let _ = recycle.send(buffer);
+        }
     }
 
     /// A path MTU an ICMP Packet Too Big names narrows every later segment; a packet that names no usable MTU leaves it alone.
@@ -145,25 +161,42 @@ impl QueueDevice {
     }
 }
 
+/// The receive token that reads past a transport header and returns the slot.
 struct QueueRx {
     buffer: Vec<u8>,
+    at: usize,
+    recycle: Option<Sender<Vec<u8>>>,
 }
 
 impl RxToken for QueueRx {
+    /// Read the packet after its transport header.
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer)
+        f(&self.buffer[self.at..])
     }
 }
 
+/// Return the consumed slot after smoltcp has read its bytes.
+impl Drop for QueueRx {
+    /// Return the slot to the batch once smoltcp has consumed it.
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            let _ = recycle.send(std::mem::take(&mut self.buffer));
+        }
+    }
+}
+
+/// The transmit token that prepends tunnel headroom and a tag to one segment.
 struct QueueTx<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
     headroom: usize,
 }
 
+/// Build an outgoing segment in one buffer with its tunnel headroom reserved.
 impl TxToken for QueueTx<'_> {
+    /// Reserve headroom, build the segment, and queue it for the tunnel.
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -186,10 +219,19 @@ impl Device for QueueDevice {
     where
         Self: 'a;
 
+    /// Pop one queued packet and offer its slot to smoltcp.
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let buffer = self.rx.pop_front()?;
+        let (buffer, at) = self.rx.pop_front()?;
         Some((
-            QueueRx { buffer },
+            QueueRx {
+                buffer,
+                at,
+                recycle: if at == self.headroom {
+                    self.recycle.clone()
+                } else {
+                    None
+                },
+            },
             QueueTx {
                 tx: &mut self.tx,
                 headroom: self.headroom,
@@ -197,6 +239,7 @@ impl Device for QueueDevice {
         ))
     }
 
+    /// Offer a token that appends one segment to the transmit queue.
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(QueueTx {
             tx: &mut self.tx,
@@ -204,6 +247,7 @@ impl Device for QueueDevice {
         })
     }
 
+    /// Report the current path MTU and an IP medium to smoltcp.
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
@@ -452,11 +496,15 @@ type Packets = Receiver<Packet>;
 
 /// One packet the reader decrypted into the client stack.
 fn receive_client(stack: &mut ClientStack, packet: Packet) {
-    if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
-        stack.device.push(packet.bytes);
-    } else if !stack.answer_echo(&packet.bytes) {
+    let at = packet.at;
+    if inner_protocol(&packet.bytes[at..]) == Some(PROTOCOL_TCP) {
+        stack.device.push(packet.bytes, at);
+        return;
+    }
+    if !stack.answer_echo(&packet.bytes[at..]) {
         stack.absorb(&packet);
     }
+    stack.device.recycle(packet.bytes, at);
 }
 
 /// Run the client stack until the outbound is dropped.
@@ -467,8 +515,10 @@ pub(crate) fn client(
     packets: Packets,
     flows: Receiver<ClientFlow>,
     headroom: usize,
+    recycle: Option<Sender<Vec<u8>>>,
 ) {
     let mut stack = ClientStack::new(&config, to_tunnel, headroom);
+    stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         while let Ok(flow) = flows.try_recv() {
@@ -538,8 +588,10 @@ pub(crate) fn server(
     packets: Packets,
     out: Outbound,
     headroom: usize,
+    recycle: Option<Sender<Vec<u8>>>,
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
+    stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if server_turn(&mut stack, &packets, &mut buf) {
@@ -633,7 +685,7 @@ impl ClientStack {
         if self.peers.len() > 1 {
             return;
         }
-        let Some((source, destination)) = icmp_quoted(&packet.bytes) else {
+        let Some((source, destination)) = icmp_quoted(&packet.bytes[packet.at..]) else {
             return;
         };
         if !self.addresses.contains(&source)
@@ -644,7 +696,7 @@ impl ClientStack {
         {
             return;
         }
-        if self.device.absorb(&packet.bytes) {
+        if self.device.absorb(&packet.bytes[packet.at..]) {
             self.reset_iface();
         }
     }
@@ -657,6 +709,7 @@ impl ClientStack {
         add_default_routes(&mut self.iface, &self.addresses);
     }
 
+    /// Race a client flow's destinations and keep the first connected socket.
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
         flow.client.set_nonblocking(true)?;
         let mut candidates = Vec::new();
@@ -718,6 +771,7 @@ impl ClientStack {
         Ok(())
     }
 
+    /// Find the next unused local port for a datagram lane.
     fn free_port(&mut self) -> Option<u16> {
         let span = usize::from(u16::MAX) - 49_152 + 1;
         for _ in 0..span {
@@ -730,6 +784,7 @@ impl ClientStack {
         None
     }
 
+    /// Drive the interface, every flow, and the queued transmits one turn.
     fn poll(&mut self, buf: &mut [u8]) -> bool {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -864,13 +919,20 @@ impl ServerStack {
         }
     }
 
+    /// Route one packet to TCP, a UDP lane, or the server echo path.
     fn receive(&mut self, packet: Packet) {
-        match inner_protocol(&packet.bytes) {
-            Some(PROTOCOL_TCP) => self.device.push(packet.bytes),
-            Some(PROTOCOL_UDP) => self.datagram(packet.peer, &packet.bytes),
+        let at = packet.at;
+        let protocol = inner_protocol(&packet.bytes[at..]);
+        match protocol {
+            Some(PROTOCOL_TCP) => self.device.push(packet.bytes, at),
+            Some(PROTOCOL_UDP) => {
+                self.datagram(packet.peer, &packet.bytes[at..]);
+                self.device.recycle(packet.bytes, at);
+            }
             _ => {
                 // A client's ICMP must not narrow the MTU every tunnel shares.
-                self.answer_echo(&packet.bytes);
+                self.answer_echo(&packet.bytes[at..]);
+                self.device.recycle(packet.bytes, at);
             }
         }
     }
@@ -932,10 +994,11 @@ impl ServerStack {
         let _ = crate::proxy::send_two(&lane.uplink, head, payload);
     }
 
+    /// Drive the server interface and hand off every completed flow.
     fn poll(&mut self, buf: &mut [u8]) -> bool {
         self.syn_ports.clear();
-        for packet in &self.device.rx {
-            if let Some(port) = tcp_syn_port(packet) {
+        for (packet, at) in &self.device.rx {
+            if let Some(port) = tcp_syn_port(&packet[*at..]) {
                 self.syn_ports.push(port);
             }
         }
@@ -1988,7 +2051,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
         assert_eq!(syn[9], 6, "the inner packet is TCP");
-        stack.device.push(syn_ack(&syn));
+        stack.device.push(syn_ack(&syn), 0);
         stack.poll(&mut buf);
         assert_eq!(
             stack
@@ -2147,7 +2210,7 @@ mod tests {
         let syn = tunnel
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
-        stack.device.push(syn_ack(&syn));
+        stack.device.push(syn_ack(&syn), 0);
         stack.poll(&mut buf);
         assert_eq!(
             stack
@@ -2164,6 +2227,7 @@ mod tests {
             .send(Packet {
                 peer: [0u8; 32],
                 bytes: echo_v4([10, 0, 0, 1], [10, 0, 0, 2], b"ping"),
+                at: 0,
             })
             .expect("a queued echo");
         stack.flows[0].stage_up(&[b'u'; 512]);
@@ -2256,6 +2320,7 @@ mod tests {
         assert_eq!(packet, reference, "the stack room writes the same packet");
     }
 
+    /// A server datagram lane carries its payload through the freedom outbound.
     #[test]
     fn a_server_datagram_lane_echoes_through_freedom() {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("echo");
@@ -2298,6 +2363,7 @@ mod tests {
         assert_eq!(datagram.destination_port, source.port());
     }
 
+    /// A server datagram reuses the per-lane frame head across a drain.
     #[test]
     fn a_server_stack_datagram_reuses_its_frame_head() {
         crate::budgets::clear();
@@ -2344,6 +2410,7 @@ mod tests {
             stack.receive(Packet {
                 peer: [0x11; 32],
                 bytes: inner,
+                at: 0,
             });
             let (head, sent) = LAST_SERVER_DATAGRAM
                 .with(std::cell::Cell::get)
@@ -2471,6 +2538,7 @@ mod tests {
         }
     }
 
+    /// An echo to the client's own address is answered on the tunnel.
     #[test]
     fn an_echo_to_the_devices_own_address_is_answered_on_the_tunnel() {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
@@ -2519,6 +2587,7 @@ mod tests {
         assert!(replies.try_recv().is_err(), "and no reply was sent");
     }
 
+    /// An echo to the server's own tunnel address is answered locally.
     #[test]
     fn a_server_answers_an_echo_to_its_own_address() {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
@@ -2533,6 +2602,7 @@ mod tests {
         stack.receive(Packet {
             peer: [0u8; 32],
             bytes: echo_v4([10, 13, 0, 2], [10, 13, 0, 1], b"ping"),
+            at: 0,
         });
         let reply = replies.try_recv().expect("a reply");
         assert!(reply[..WG_HEADER_SIZE].iter().all(|&byte| byte == 0));
@@ -2551,10 +2621,12 @@ mod tests {
         stack.receive(Packet {
             peer: [0u8; 32],
             bytes: echo_v4([10, 13, 0, 2], [10, 13, 0, 9], b"ping"),
+            at: 0,
         });
         assert!(replies.try_recv().is_err(), "an address it does not own");
     }
 
+    /// A handed-off flow carries the device peer in its PROXY header.
     #[test]
     fn the_handoff_names_the_device_peer_in_the_proxy_header() {
         let sink = std::net::TcpListener::bind("127.0.0.1:0").expect("sink");
@@ -2588,6 +2660,7 @@ mod tests {
         stack.receive(Packet {
             peer: [0u8; 32],
             bytes: tcp_segment(source, 1234, destination, 80, 1000, 0, 0x02),
+            at: 0,
         });
         let mut buf = [0u8; 2048];
         stack.poll(&mut buf);
@@ -2611,6 +2684,7 @@ mod tests {
                 server_sequence + 1,
                 0x10,
             ),
+            at: 0,
         });
         stack.poll(&mut buf);
 
@@ -2624,6 +2698,7 @@ mod tests {
         assert_eq!(fields.get(4), Some(&b"1234".as_slice()), "{line:?}");
     }
 
+    /// A client packet cannot lower the server's MTU.
     #[test]
     fn a_client_cannot_narrow_the_server_mtu() {
         let (to_tunnel, _) = std::sync::mpsc::channel();
@@ -2642,6 +2717,7 @@ mod tests {
         stack.receive(Packet {
             peer: [0u8; 32],
             bytes: too_big,
+            at: 0,
         });
         assert_eq!(
             stack.device.capabilities().max_transmission_unit,
@@ -2811,6 +2887,7 @@ mod client_tests {
         assert_eq!(payload, b"answer");
     }
 
+    /// A client datagram name races every answer it was given.
     #[test]
     fn a_client_datagram_name_races_every_supplied_answer() {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
@@ -2879,6 +2956,7 @@ mod client_tests {
         assert_eq!(sent, expected);
     }
 
+    /// A replied datagram lane sends the next datagram only to the winner.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn a_replied_client_datagram_lane_sends_the_next_datagram_only_to_the_winner() {
@@ -3054,6 +3132,25 @@ mod client_tests {
         crate::budgets::clear();
     }
 
+    /// A consumed device token returns its slot with the same allocation and capacity.
+    #[test]
+    fn a_queue_token_returns_the_received_buffer() {
+        let (recycle, recycled) = mpsc::channel();
+        let mut device = QueueDevice::new(1500, 16);
+        device.recycle = Some(recycle);
+        let mut buffer = vec![0u8; 1500];
+        buffer[16..19].copy_from_slice(b"tcp");
+        let base = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        device.push(buffer, 16);
+        let (token, _) = device.receive(Instant::from_millis(0)).expect("a token");
+        token.consume(|bytes| assert_eq!(&bytes[..3], b"tcp"));
+        let back = recycled.try_recv().expect("the slot comes back");
+        assert_eq!(back.as_ptr(), base);
+        assert_eq!(back.capacity(), capacity);
+    }
+
+    /// A Packet Too Big lowers the device MTU once and never widens it.
     #[test]
     fn a_packet_too_big_narrows_the_device_mtu() {
         let mut inner = vec![0u8; 28];
@@ -3087,6 +3184,7 @@ mod client_tests {
         forged[40] = 3;
         assert!(!device.absorb(&forged), "not a packet too big");
     }
+    /// A learned MTU reaches the SYN's advertised segment size.
     #[test]
     fn a_learned_mtu_reaches_the_client_segment_size() {
         let config = DeviceConfig {
@@ -3122,6 +3220,7 @@ mod client_tests {
             Packet {
                 peer: [0u8; 32],
                 bytes: too_big,
+                at: 0,
             },
         );
 
@@ -3160,6 +3259,7 @@ mod client_tests {
         drop(app);
     }
 
+    /// One peer's Packet Too Big does not narrow another peer's path.
     #[test]
     fn a_peer_cannot_narrow_another_peers_path() {
         let config = DeviceConfig {
@@ -3205,6 +3305,7 @@ mod client_tests {
             Packet {
                 peer: [0x11; 32],
                 bytes: too_big,
+                at: 0,
             },
         );
         assert_eq!(
@@ -3214,6 +3315,7 @@ mod client_tests {
         );
     }
 
+    /// One peer's Packet Too Big does not narrow the MTU another peer uses.
     #[test]
     fn a_peer_cannot_narrow_the_mtu_another_peer_uses() {
         let config = DeviceConfig {
@@ -3259,6 +3361,7 @@ mod client_tests {
             Packet {
                 peer: [0x11; 32],
                 bytes: too_big,
+                at: 0,
             },
         );
         assert_eq!(

@@ -242,6 +242,8 @@ impl WireGuardOut {
         let socket = bind_socket(&config)?;
         let (packets_tx, packets_rx) = mpsc::channel();
         let (to_tunnel, from_tunnel) = mpsc::channel();
+        let (recycle, recycled) = mpsc::channel();
+        let io_recycle = recycle.clone();
         let (flows, flow_rx) = mpsc::channel();
         let routes: UdpRoutes = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
@@ -257,6 +259,8 @@ impl WireGuardOut {
                 io_packets,
                 Some(io_routes),
                 Some(io_stop),
+                io_recycle,
+                recycled,
             );
         });
         let stack_config = config.clone();
@@ -268,6 +272,7 @@ impl WireGuardOut {
                 packets_rx,
                 flow_rx,
                 WG_HEADER_SIZE,
+                Some(recycle),
             );
         });
         Ok(Self {
@@ -956,9 +961,22 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let _ = socket.set_read_timeout(Some(IO_TICK));
     let (packets_tx, packets_rx) = mpsc::channel();
     let (to_tunnel, from_tunnel) = mpsc::channel();
+    let (recycle, recycled) = mpsc::channel();
+    let io_recycle = recycle.clone();
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
-    std::thread::spawn(move || io(io_config, socket, from_tunnel, io_packets, None, None));
+    std::thread::spawn(move || {
+        io(
+            io_config,
+            socket,
+            from_tunnel,
+            io_packets,
+            None,
+            None,
+            io_recycle,
+            recycled,
+        );
+    });
     let stack_config = config;
     let stack_tunnel = to_tunnel;
     let stack_out = out.clone();
@@ -969,6 +987,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             packets_rx,
             stack_out,
             WG_HEADER_SIZE,
+            Some(recycle),
         );
     });
     Ok(port)
@@ -983,6 +1002,7 @@ struct Peer {
 /// The tunnel reader and writer: inner packets leave, datagrams arrive, and the
 /// timers run on the same clock.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn io(
     config: DeviceConfig,
@@ -991,6 +1011,8 @@ fn io(
     to_stack: Sender<Packet>,
     routes: Option<UdpRoutes>,
     stop: Option<Arc<AtomicBool>>,
+    recycle: Sender<Vec<u8>>,
+    recycled: Receiver<Vec<u8>>,
 ) {
     let _ = socket.set_read_timeout(Some(IO_TICK));
     widen(&socket);
@@ -1000,7 +1022,9 @@ fn io(
     let mut cookies = CookieGuard::default();
     let started = Instant::now();
     #[cfg(target_os = "linux")]
-    let mut receive_batch = ReceiveBatch::new();
+    let mut receive_batch = ReceiveBatch::new(config.mtu, recycled);
+    #[cfg(not(target_os = "linux"))]
+    let _ = recycled;
     #[cfg(not(target_os = "linux"))]
     let mut buf = vec![0u8; 65_535];
     let mut incoming = Vec::new();
@@ -1030,6 +1054,7 @@ fn io(
                             Some(index),
                             ipv6_socket,
                             &mut sends,
+                            Some(&recycle),
                         );
                     }
                     return;
@@ -1056,6 +1081,7 @@ fn io(
                         Some(previous),
                         ipv6_socket,
                         &mut sends,
+                        Some(&recycle),
                     );
                 }
                 pending = Some(index);
@@ -1074,6 +1100,7 @@ fn io(
                 Some(index),
                 ipv6_socket,
                 &mut sends,
+                Some(&recycle),
             );
         }
         for index in 0..peers.len() {
@@ -1087,6 +1114,7 @@ fn io(
                 Some(index),
                 ipv6_socket,
                 &mut sends,
+                Some(&recycle),
             );
         }
 
@@ -1100,23 +1128,45 @@ fn io(
                     Ok(got) => {
                         first = false;
                         for at in 0..got {
+                            if receive_batch.truncated(at) {
+                                continue;
+                            }
                             if let Some(source) = receive_batch.source(at) {
                                 let source = recv_endpoint(source, ipv6_socket);
-                                let packet = receive_batch.packet(at);
-                                if packet.len() >= 4 {
-                                    receive_datagram(
-                                        &mut peers,
-                                        &mut cookies,
-                                        now,
-                                        source,
-                                        packet,
-                                        &socket,
-                                        &to_stack,
-                                        &mut incoming,
-                                        routes.as_ref(),
-                                        ipv6_socket,
-                                        &mut sends,
-                                    );
+                                let Some(packet) = receive_batch.take(at) else {
+                                    let packet = receive_batch.packet(at);
+                                    if packet.len() >= 4 {
+                                        receive_datagram(
+                                            &mut peers,
+                                            &mut cookies,
+                                            now,
+                                            source,
+                                            packet,
+                                            &socket,
+                                            &to_stack,
+                                            &mut incoming,
+                                            routes.as_ref(),
+                                            ipv6_socket,
+                                            &mut sends,
+                                        );
+                                    }
+                                    continue;
+                                };
+                                if let Some(back) = receive_datagram_owned(
+                                    &mut peers,
+                                    &mut cookies,
+                                    now,
+                                    source,
+                                    packet,
+                                    &socket,
+                                    &to_stack,
+                                    &mut incoming,
+                                    routes.as_ref(),
+                                    ipv6_socket,
+                                    &mut sends,
+                                    Some(&recycle),
+                                ) {
+                                    receive_batch.put_back(back);
                                 }
                             }
                         }
@@ -1252,7 +1302,70 @@ fn receive_datagram(
         Some(index),
         ipv6_socket,
         sends,
+        None,
     );
+}
+
+/// The owned counterpart of [`receive_datagram`]: a transport record keeps the
+/// buffer it was read into, and anything that does not authenticate comes back
+/// for the batch to reuse.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn receive_datagram_owned(
+    peers: &mut [Peer],
+    cookies: &mut CookieGuard,
+    now: u64,
+    source: SocketAddr,
+    mut packet: Vec<u8>,
+    socket: &UdpSocket,
+    to_stack: &Sender<Packet>,
+    incoming: &mut Vec<Event>,
+    routes: Option<&UdpRoutes>,
+    ipv6_socket: bool,
+    sends: &mut Vec<Vec<u8>>,
+    recycle: Option<&Sender<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    let Some(&first) = packet.first() else {
+        return Some(packet);
+    };
+    let kind = u32::from(first);
+    if kind == TYPE_INITIATION {
+        if packet.len() != INITIATION_SIZE {
+            return Some(packet);
+        }
+        let under_load = cookies.observe(now);
+        clear_reserved(&mut packet);
+        handle_initiation(
+            peers, now, source, &packet, socket, to_stack, cookies, under_load, sends,
+        );
+        return Some(packet);
+    }
+    let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
+    let Some(receiver) = packet
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return Some(packet);
+    };
+    let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
+        return Some(packet);
+    };
+    let packet = peers[index]
+        .tunnel
+        .receive_owned(now, source, packet, incoming);
+    flush(
+        incoming,
+        socket,
+        to_stack,
+        routes,
+        peers,
+        Some(index),
+        ipv6_socket,
+        sends,
+        recycle,
+    );
+    packet
 }
 
 /// The most tunnel packets one socket turn forwards before it reads again, so
@@ -1272,13 +1385,21 @@ struct ReceiveBatch {
     iovecs: Vec<libc::iovec>,
     headers: Vec<libc::mmsghdr>,
     names: Vec<libc::sockaddr_storage>,
+    slot: usize,
+    extra: usize,
+    spare: Vec<Vec<u8>>,
+    recycled: Receiver<Vec<u8>>,
 }
 
 #[cfg(target_os = "linux")]
 impl ReceiveBatch {
-    fn new() -> Self {
+    /// Size one slot for this MTU and one receive queue for the stack.
+    fn new(mtu: usize, recycled: Receiver<Vec<u8>>) -> Self {
+        let slot = mtu
+            .saturating_add(WG_HEADER_SIZE + WG_TAG_SIZE)
+            .max(INITIATION_SIZE);
         Self {
-            slots: (0..RX_BATCH).map(|_| vec![0u8; 65_535]).collect(),
+            slots: (0..RX_BATCH).map(|_| vec![0u8; slot]).collect(),
             iovecs: (0..RX_BATCH)
                 .map(|_| libc::iovec {
                     iov_base: std::ptr::null_mut(),
@@ -1302,17 +1423,26 @@ impl ReceiveBatch {
             names: (0..RX_BATCH)
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect(),
+            slot,
+            extra: 0,
+            spare: Vec::new(),
+            recycled,
         }
     }
 
+    /// Fill every free slot from the socket in one `recvmmsg`.
     fn recv(&mut self, socket: &UdpSocket, first: bool) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd as _;
 
         let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         for at in 0..RX_BATCH {
+            let slot = &mut self.slots[at];
+            if slot.capacity() < self.slot {
+                *slot = vec![0u8; self.slot];
+            }
             self.iovecs[at] = libc::iovec {
-                iov_base: self.slots[at].as_mut_ptr().cast(),
-                iov_len: self.slots[at].len(),
+                iov_base: slot.as_mut_ptr().cast(),
+                iov_len: self.slot,
             };
             self.headers[at].msg_hdr = libc::msghdr {
                 msg_name: (&raw mut self.names[at]).cast(),
@@ -1345,6 +1475,12 @@ impl ReceiveBatch {
         usize::try_from(got).map_err(|_| std::io::Error::other("recvmmsg count"))
     }
 
+    /// Whether the kernel cut this datagram at the slot boundary.
+    fn truncated(&self, at: usize) -> bool {
+        self.headers[at].msg_hdr.msg_flags & libc::MSG_TRUNC != 0
+    }
+
+    /// The bytes a slot received, bounded by what the kernel wrote.
     fn packet(&mut self, at: usize) -> &mut [u8] {
         let len = usize::try_from(self.headers[at].msg_len)
             .unwrap_or(0)
@@ -1352,11 +1488,52 @@ impl ReceiveBatch {
         &mut self.slots[at][..len]
     }
 
+    /// Hand out one received slot and leave a replacement for the next read.
+    fn take(&mut self, at: usize) -> Option<Vec<u8>> {
+        self.drain_recycled();
+        let replacement = if let Some(buffer) = self.spare.pop() {
+            buffer
+        } else if self.extra < RX_BATCH {
+            self.extra += 1;
+            vec![0u8; self.slot]
+        } else {
+            return None;
+        };
+        let len = usize::try_from(self.headers[at].msg_len)
+            .unwrap_or(0)
+            .min(self.slot);
+        let mut packet = std::mem::replace(&mut self.slots[at], replacement);
+        packet.truncate(len);
+        Some(packet)
+    }
+
+    /// Keep a returned slot only when it still fits the configured MTU.
+    fn put_back(&mut self, mut buffer: Vec<u8>) {
+        if buffer.capacity() < self.slot || self.spare.len() >= RX_BATCH {
+            return;
+        }
+        if buffer.len() < self.slot {
+            buffer.resize(self.slot, 0);
+        } else if buffer.len() > self.slot {
+            buffer.truncate(self.slot);
+        }
+        self.spare.push(buffer);
+    }
+
+    /// Move slots the stack returned into the batch spare list.
+    fn drain_recycled(&mut self) {
+        while let Ok(buffer) = self.recycled.try_recv() {
+            self.put_back(buffer);
+        }
+    }
+
+    /// The sender address the kernel wrote for this slot.
     fn source(&self, at: usize) -> Option<SocketAddr> {
         crate::proxy::socket_addr_of(&self.names[at], self.headers[at].msg_hdr.msg_namelen)
     }
 }
 
+/// Validate an initiation, apply the cookie gate, and answer with a response.
 #[allow(clippy::too_many_arguments)]
 fn handle_initiation(
     peers: &mut [Peer],
@@ -1413,6 +1590,7 @@ fn handle_initiation(
         Some(index),
         ipv6,
         sends,
+        None,
     );
 }
 
@@ -1429,6 +1607,7 @@ fn flush(
     peer: Option<usize>,
     ipv6_socket: bool,
     sends: &mut Vec<Vec<u8>>,
+    recycle: Option<&Sender<Vec<u8>>>,
 ) {
     let candidates = peer.map(|index| peers[index].config.endpoints.as_slice());
     let mut endpoint = None;
@@ -1456,33 +1635,82 @@ fn flush(
             Event::Data(inner) => {
                 flush_sends(socket, ipv6_socket, endpoint, sends);
                 endpoint = None;
-                let Some(index) = peer else {
-                    continue;
-                };
-                let Some((source, _)) = wg_stack::inner_addresses(&inner) else {
-                    continue;
-                };
-                if peer_for(peers, source) != Some(index) {
-                    continue;
-                }
-                if let Some(routes) = routes {
-                    if let Some(datagram) = ferrox_core::foxy::connectip::udp_from_packet(&inner) {
-                        if let Ok(table) = routes.lock() {
-                            if let Some(lane) = table.get(&datagram.destination_port) {
-                                let _ = lane.send(inner);
-                            }
-                        }
-                        continue;
-                    }
-                }
-                let _ = to_stack.send(Packet {
-                    peer: peers[index].config.public,
-                    bytes: inner,
-                });
+                deliver_data(inner, 0, peers, peer, routes, to_stack, recycle);
+            }
+            Event::DataPrefixed(inner) => {
+                flush_sends(socket, ipv6_socket, endpoint, sends);
+                endpoint = None;
+                deliver_data(
+                    inner,
+                    WG_HEADER_SIZE,
+                    peers,
+                    peer,
+                    routes,
+                    to_stack,
+                    recycle,
+                );
             }
         }
     }
     flush_sends(socket, ipv6_socket, endpoint, sends);
+}
+
+/// Hand one decrypted packet to its UDP lane or the stack, with `at` naming the
+/// first payload byte when the receive buffer kept its transport header.
+fn deliver_data(
+    inner: Vec<u8>,
+    at: usize,
+    peers: &[Peer],
+    peer: Option<usize>,
+    routes: Option<&UdpRoutes>,
+    to_stack: &Sender<Packet>,
+    recycle: Option<&Sender<Vec<u8>>>,
+) {
+    let Some(index) = peer else {
+        recycle_slot(inner, at, recycle);
+        return;
+    };
+    let Some(source) = wg_stack::inner_addresses(&inner[at..]).map(|(source, _)| source) else {
+        recycle_slot(inner, at, recycle);
+        return;
+    };
+    if peer_for(peers, source) != Some(index) {
+        recycle_slot(inner, at, recycle);
+        return;
+    }
+    if let Some(routes) = routes {
+        if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
+            .map(|datagram| datagram.destination_port)
+        {
+            if let Ok(table) = routes.lock() {
+                if let Some(lane) = table.get(&port) {
+                    let payload = if at == 0 {
+                        inner
+                    } else {
+                        let payload = inner[at..].to_vec();
+                        recycle_slot(inner, at, recycle);
+                        payload
+                    };
+                    let _ = lane.send(payload);
+                    return;
+                }
+            }
+            recycle_slot(inner, at, recycle);
+            return;
+        }
+    }
+    let _ = to_stack.send(Packet {
+        peer: peers[index].config.public,
+        bytes: inner,
+        at,
+    });
+}
+
+/// Return a prefixed receive buffer after a copy, or drop a payload-only one.
+fn recycle_slot(inner: Vec<u8>, at: usize, recycle: Option<&Sender<Vec<u8>>>) {
+    if let Some(recycle) = recycle.filter(|_| at != 0) {
+        let _ = recycle.send(inner);
+    }
 }
 
 /// The most transport packets one socket batch carries. A batch that cannot be
@@ -1845,6 +2073,7 @@ fn send_endpoint(endpoint: SocketAddr, ipv6: bool) -> SocketAddr {
     }
 }
 
+/// Normalize a received endpoint to the tunnel's address family.
 fn recv_endpoint(socket: SocketAddr, ipv6: bool) -> SocketAddr {
     match socket {
         SocketAddr::V6(address) if ipv6 => match address.ip().to_ipv4_mapped() {
@@ -1861,16 +2090,18 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    /// The first packet a handshake or data path queued for sending.
     fn sent(events: &[Event]) -> Vec<u8> {
         events
             .iter()
             .find_map(|event| match event {
                 Event::Send { packet, .. } => Some(packet.clone()),
-                Event::Data(_) => None,
+                Event::Data(_) | Event::DataPrefixed(_) => None,
             })
             .expect("an outbound packet")
     }
 
+    /// A peer cannot claim another peer's source address as its own.
     #[test]
     fn a_peer_may_not_originate_another_peers_source() {
         let config = DeviceConfig {
@@ -1916,6 +2147,7 @@ mod tests {
             Some(1),
             false,
             &mut Vec::new(),
+            None,
         );
         assert!(packets.try_recv().is_err(), "the owner is peer zero");
         let mut packet = vec![0u8; 20];
@@ -1931,10 +2163,12 @@ mod tests {
             Some(1),
             false,
             &mut Vec::new(),
+            None,
         );
         assert!(packets.try_recv().is_ok(), "the peer owns its own source");
     }
 
+    /// One `recvmmsg` returns every queued datagram to the batch.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_batch_receives_every_datagram() {
@@ -1948,13 +2182,56 @@ mod tests {
         for packet in &packets {
             sender.send_to(packet, address).expect("datagram");
         }
-        let mut batch = ReceiveBatch::new();
+        let (_recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
         let got = batch.recv(&receiver, true).expect("batch");
         assert_eq!(got, packets.len(), "the batch reads all four");
         for (at, packet) in packets.iter().enumerate().take(got) {
             assert_eq!(batch.packet(at), packet.as_slice());
             assert_eq!(batch.source(at), Some(sender.local_addr().unwrap()));
         }
+    }
+
+    /// A record the kernel truncated is dropped, not authenticated as a short packet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_truncated_record_is_not_handed_out() {
+        let (_recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        batch.headers[0].msg_hdr.msg_flags = libc::MSG_TRUNC;
+        assert!(batch.truncated(0));
+        batch.headers[0].msg_hdr.msg_flags = 0;
+        assert!(!batch.truncated(0));
+    }
+
+    /// A slot consumed through the recycle channel keeps its allocation and capacity.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_taken_slot_returns_to_the_batch() {
+        let (recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        let first = batch.take(0).expect("a slot");
+        let base = first.as_ptr();
+        let capacity = first.capacity();
+        recycle.send(first).expect("the slot comes back");
+        let _ = batch.take(0).expect("a replacement");
+        assert_eq!(batch.slots[0].as_ptr(), base);
+        assert_eq!(batch.slots[0].capacity(), capacity);
+    }
+
+    /// A batch hands out only its base slots and one extra slot per base slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_batch_stops_taking_after_its_extra_budget() {
+        let (_recycle, recycled) = mpsc::channel();
+        let mut batch = ReceiveBatch::new(1500, recycled);
+        for _ in 0..RX_BATCH {
+            assert!(
+                batch.take(0).is_some(),
+                "the base and extra slots are handed out"
+            );
+        }
+        assert!(batch.take(0).is_none(), "the extra budget is bounded");
     }
 
     #[cfg(target_os = "linux")]
@@ -2539,6 +2816,7 @@ mod tests {
                 Some(0),
                 false,
                 &mut sends,
+                None,
             );
             assert_eq!(sends.len(), 0, "the batch is drained by the flush");
             if capacity == 0 {

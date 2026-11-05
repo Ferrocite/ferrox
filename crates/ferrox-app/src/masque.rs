@@ -260,6 +260,7 @@ fn assemble(
             packets_rx,
             flow_rx,
             0,
+            None,
         );
     });
     let io_routes = Arc::clone(&routes);
@@ -864,6 +865,7 @@ fn io(
                     let _ = to_stack.send(Packet {
                         peer: [0u8; 32],
                         bytes: icmp,
+                        at: 0,
                     });
                 }
             }
@@ -930,6 +932,7 @@ pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u
             let _ = to_stack.send(Packet {
                 peer: [0u8; 32],
                 bytes: packet.to_vec(),
+                at: 0,
             });
         }
         None => {}
@@ -954,6 +957,7 @@ fn deliver_owned(
             let _ = to_stack.send(Packet {
                 peer: [0u8; 32],
                 bytes: datagram,
+                at: 0,
             });
         }
     }
@@ -1095,7 +1099,9 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         dns: Vec::new(),
     };
     let stack_out = out.clone();
-    std::thread::spawn(move || wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0));
+    std::thread::spawn(move || {
+        wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0, None);
+    });
     let demux_config = Arc::new(Mutex::new(config));
     let demux_sock = Arc::clone(&sock);
     let demux_shared = Arc::clone(&shared);
@@ -1684,6 +1690,7 @@ fn worker(
                     let _ = shared.packets.send(Packet {
                         peer: [0u8; 32],
                         bytes: icmp,
+                        at: 0,
                     });
                 }
             }
@@ -2084,6 +2091,7 @@ pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr],
             let _ = shared.packets.send(Packet {
                 peer: peer_key(addrs),
                 bytes: packet.to_vec(),
+                at: 0,
             });
         }
         None => {}
@@ -2109,6 +2117,7 @@ fn forward_owned(
             let _ = shared.packets.send(Packet {
                 peer: peer_key(addrs),
                 bytes: datagram,
+                at: 0,
             });
         }
     }

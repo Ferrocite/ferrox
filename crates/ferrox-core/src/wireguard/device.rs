@@ -56,6 +56,9 @@ pub enum Event {
         packet: Vec<u8>,
     },
     Data(Vec<u8>),
+    /// A decrypted payload whose bytes start at `HEADER_SIZE`, for a caller
+    /// that handed over the received buffer instead of copying the payload out.
+    DataPrefixed(Vec<u8>),
 }
 
 /// The `TAI64N` timestamp a handshake carries: seconds since the epoch with the
@@ -323,7 +326,8 @@ impl Tunnel {
 
     /// Feed one datagram from `src`. Handshake responses, cookie replies and
     /// transport records are accepted; anything else is ignored. A transport
-    /// record's payload becomes [`Event::Data`].
+    /// record's payload becomes [`Event::Data`], or [`Event::DataPrefixed`] when
+    /// the caller hands over the buffer in [`Self::receive_owned`].
     pub fn receive(&mut self, now: u64, src: SocketAddr, packet: &mut [u8], out: &mut Vec<Event>) {
         if packet.len() < 4 {
             return;
@@ -342,6 +346,36 @@ impl Tunnel {
         }
     }
 
+    /// Feed one datagram whose buffer the caller can hand over. A transport
+    /// payload is returned in the same allocation, with its header still in
+    /// front, as [`Event::DataPrefixed`]; every non-transport datagram and every
+    /// record that does not authenticate is returned for the caller to reuse.
+    pub fn receive_owned(
+        &mut self,
+        now: u64,
+        src: SocketAddr,
+        mut packet: Vec<u8>,
+        out: &mut Vec<Event>,
+    ) -> Option<Vec<u8>> {
+        if packet.len() < 4 {
+            return Some(packet);
+        }
+        if u32::from(packet[0]) != transport::TYPE_TRANSPORT {
+            self.receive(now, src, &mut packet, out);
+            return Some(packet);
+        }
+        let Some(len) = self.transport_open(now, src, &mut packet) else {
+            return Some(packet);
+        };
+        if len == 0 {
+            return Some(packet);
+        }
+        packet.truncate(HEADER_SIZE + len);
+        out.push(Event::DataPrefixed(packet));
+        None
+    }
+
+    /// Consume a valid response and install the transport key.
     fn response(&mut self, now: u64, src: SocketAddr, packet: &mut [u8], out: &mut Vec<Event>) {
         let local_index = self.local_index();
         let Some(state) = self.handshake.as_mut() else {
@@ -387,6 +421,7 @@ impl Tunnel {
         }
     }
 
+    /// Consume a valid cookie reply and retry the pending initiation.
     fn cookie_reply(&mut self, now: u64, packet: &mut [u8], out: &mut Vec<Event>) {
         if packet.len() != COOKIE_REPLY_SIZE || packet[0] != transport::TYPE_COOKIE_REPLY as u8 {
             return;
@@ -411,9 +446,19 @@ impl Tunnel {
         }
     }
 
+    /// Open a transport record and copy its payload into a new event.
     fn transport(&mut self, now: u64, src: SocketAddr, packet: &mut [u8], out: &mut Vec<Event>) {
+        if let Some(len) = self.transport_open(now, src, packet) {
+            if len > 0 {
+                out.push(Event::Data(packet[HEADER_SIZE..HEADER_SIZE + len].to_vec()));
+            }
+        }
+    }
+
+    /// Authenticate and decrypt a transport record in place, returning its payload length.
+    fn transport_open(&mut self, now: u64, src: SocketAddr, packet: &mut [u8]) -> Option<usize> {
         if packet.len() < transport::MIN_SIZE {
-            return;
+            return None;
         }
         if self
             .session
@@ -458,17 +503,13 @@ impl Tunnel {
         } else {
             (None, false)
         };
-        let Some(session) = session else {
-            return;
-        };
+        let session = session?;
         let counter = u64::from_le_bytes(packet[8..16].try_into().unwrap_or([0; 8]));
         let action = session.replay.check(counter);
         if action == Action::Reject {
-            return;
+            return None;
         }
-        let Some((_, _, len)) = transport::open(&session.recv, packet, packet.len()) else {
-            return;
-        };
+        let (_, _, len) = transport::open(&session.recv, packet, packet.len())?;
         session.replay.commit(counter, action);
         if promote {
             self.previous = self
@@ -479,9 +520,7 @@ impl Tunnel {
         }
         self.endpoint = src;
         self.last_recv = now;
-        if len > 0 {
-            out.push(Event::Data(packet[HEADER_SIZE..HEADER_SIZE + len].to_vec()));
-        }
+        Some(len)
     }
 
     /// Consume an initiation with this device's static key, recovering the
@@ -724,16 +763,18 @@ mod tests {
         )
     }
 
+    /// Two established tunnels with no extra keepalive.
     fn pair() -> (Tunnel, Tunnel) {
         pair_with_keepalive(0)
     }
 
+    /// The first packet a handshake or data path queued for sending.
     fn packet(events: &[Event]) -> Vec<u8> {
         events
             .iter()
             .find_map(|event| match event {
                 Event::Send { packet, .. } => Some(packet.clone()),
-                Event::Data(_) => None,
+                Event::Data(_) | Event::DataPrefixed(_) => None,
             })
             .expect("an outbound packet")
     }
@@ -797,6 +838,7 @@ mod tests {
         assert_eq!(payload, b"first packet");
     }
 
+    /// The message sizes match the `WireGuard` reference constants.
     #[test]
     fn the_reference_message_sizes() {
         assert_eq!(transport::HEADER_SIZE, 16);
@@ -804,6 +846,7 @@ mod tests {
         assert_eq!(handshake::RESPONSE_SIZE, 92);
     }
 
+    /// A transport counter cannot be accepted twice.
     #[test]
     fn a_replayed_transport_counter_is_refused() {
         let (mut alice, mut bob) = establish(0);
@@ -816,6 +859,59 @@ mod tests {
         let mut again = Vec::new();
         bob.receive(NOW + 5, ALICE.parse().unwrap(), &mut record, &mut again);
         assert!(again.is_empty(), "the same counter is a replay");
+    }
+
+    /// An owned transport record hands off the exact receive buffer with its payload offset.
+    #[test]
+    fn an_owned_transport_record_keeps_the_received_allocation() {
+        let (mut alice, mut bob) = establish(0);
+        let mut out = Vec::new();
+        alice.send(NOW + 3, b"payload", &mut out);
+        let record = packet(&out);
+        let base = record.as_ptr();
+        let capacity = record.capacity();
+        let mut received = Vec::new();
+        assert!(bob
+            .receive_owned(NOW + 4, ALICE.parse().unwrap(), record, &mut received)
+            .is_none());
+        let Event::DataPrefixed(payload) = &received[0] else {
+            panic!("a prefixed data event");
+        };
+        assert_eq!(payload.as_ptr(), base);
+        assert_eq!(payload.capacity(), capacity);
+        assert_eq!(&payload[HEADER_SIZE..], b"payload");
+    }
+
+    /// The owned receive path costs one fewer allocation than the borrowed path.
+    #[test]
+    fn an_owned_transport_record_allocates_nothing() {
+        let (mut alice, mut bob) = establish(0);
+        let mut out = Vec::new();
+        alice.send(NOW + 3, b"payload", &mut out);
+        let mut record = packet(&out);
+        let source = ALICE.parse().unwrap();
+        let mut received = Vec::with_capacity(1);
+        let ((), copied) = crate::alloc_count::measure(|| {
+            bob.receive(NOW + 4, source, &mut record, &mut received);
+        });
+        assert_eq!(
+            copied.allocs, 1,
+            "the copy path owns one payload: {copied:?}"
+        );
+
+        let (mut alice, mut bob) = establish(0);
+        let mut out = Vec::new();
+        alice.send(NOW + 3, b"payload", &mut out);
+        let record = packet(&out);
+        let mut received = Vec::with_capacity(1);
+        let (back, moved) = crate::alloc_count::measure(|| {
+            bob.receive_owned(NOW + 4, source, record, &mut received)
+        });
+        assert!(back.is_none());
+        assert_eq!(
+            moved.allocs, 0,
+            "the owned path keeps the received allocation: {moved:?}"
+        );
     }
 
     #[test]
