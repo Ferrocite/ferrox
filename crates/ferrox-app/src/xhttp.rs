@@ -174,6 +174,7 @@ pub(crate) struct Reader<R> {
     ended: bool,
     reads: usize,
     pending_head: bool,
+    head_progress: Option<Arc<AtomicU64>>,
     /// Where the chunked framing stands: a body's bytes are being delivered, its closing CRLF is still unread, or the zero-size chunk ran and only trailer lines are left until an empty one ends the body.
     chunk: Chunk,
 }
@@ -234,6 +235,13 @@ impl Reader<Connection> {
     }
 }
 
+impl<R> Reader<R> {
+    /// Tie the first answer head to the upload pump, so a server that waits for payload cannot end the head at a fixed clock.
+    pub(crate) fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        self.head_progress = Some(progress);
+    }
+}
+
 impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for Reader<R> {
     fn arm_relay_poll(&mut self) {
         self.read.arm_relay_poll();
@@ -278,11 +286,21 @@ impl<R: Read> Reader<R> {
             return Ok(());
         }
         self.pending_head = false;
-        let Some((head, at)) = crate::proxy::read_exact_head(
-            &mut self.read,
-            HEAD_LIMIT,
-            crate::budgets::head_arrival(),
-        ) else {
+        let progress = self.head_progress.take();
+        let head = match progress.as_deref() {
+            Some(progress) => crate::proxy::read_exact_head_deferred(
+                &mut self.read,
+                HEAD_LIMIT,
+                crate::budgets::head_arrival(),
+                progress,
+            ),
+            None => crate::proxy::read_exact_head(
+                &mut self.read,
+                HEAD_LIMIT,
+                crate::budgets::head_arrival(),
+            ),
+        };
+        let Some((head, at)) = head else {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         };
         if check_response(&head[..at]).is_none() {
@@ -724,6 +742,14 @@ impl<R: Read> Read for Reader<R> {
 }
 
 impl<R: Read> crate::proxy::WindowRead for Reader<R> {
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        Reader::set_head_progress(self, progress);
+    }
+
+    fn awaits_head(&self) -> bool {
+        self.pending_head
+    }
+
     /// Every body the prefix already holds, as spans of it: the relay writes them in one gather without moving them again.
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         self.open()?;
@@ -953,6 +979,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         ended: false,
         reads: 0,
         pending_head: false,
+        head_progress: None,
         chunk: Chunk::Body,
     };
     let writer = XhttpWriter {
@@ -2640,6 +2667,7 @@ pub(crate) fn accept_core<
                         ended: false,
                         reads: 0,
                         pending_head: false,
+                        head_progress: None,
                         chunk: Chunk::Body,
                     })
                 };
@@ -2685,6 +2713,7 @@ pub(crate) fn accept_core<
                     ended: false,
                     reads: 0,
                     pending_head: false,
+                    head_progress: None,
                     chunk: Chunk::Body,
                 })
             };
@@ -2746,6 +2775,7 @@ pub(crate) fn accept_core<
                         ended: false,
                         reads: 0,
                         pending_head: false,
+                        head_progress: None,
                         chunk: Chunk::Body,
                     };
                     drain_body(&mut framed, settings.sc_max_each_post)
@@ -3165,6 +3195,7 @@ pub(crate) fn connect_dual_split<
         ended: false,
         reads: 0,
         pending_head: true,
+        head_progress: None,
         chunk: Chunk::Body,
     };
     Some((reader, writer))
@@ -3551,6 +3582,7 @@ mod tests {
                 ended: false,
                 reads: 0,
                 pending_head: false,
+                head_progress: None,
                 chunk: Chunk::Body,
             };
             let mut got = Vec::new();
@@ -3587,6 +3619,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut got = Vec::new();
@@ -3628,6 +3661,7 @@ mod tests {
                 ended: false,
                 reads: 0,
                 pending_head: false,
+                head_progress: None,
                 chunk: Chunk::Body,
             };
             let mut got = Vec::new();
@@ -3770,6 +3804,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut want = Vec::new();
@@ -3789,6 +3824,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut got = Vec::new();
@@ -3829,6 +3865,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut got = Vec::new();
@@ -3862,6 +3899,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut got = Vec::new();
@@ -3907,6 +3945,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut got = Vec::new();
@@ -3946,6 +3985,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            head_progress: None,
             chunk: Chunk::Body,
         };
         let mut got = Vec::new();

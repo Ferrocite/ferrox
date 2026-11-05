@@ -26,6 +26,9 @@ graph TD
 | --- | --- | --- |
 | aes256-gcm-seal-retired-instructions | 29612 | scripts/count-ops.sh |
 | aes256-gcm-open-retired-instructions | 29749 | scripts/count-ops.sh |
+| syscalls-per-ech-handshake | UNBLESSED | scripts/count-ops.sh |
+| user-space-copies-per-ech-handshake | UNBLESSED | no copy checker yet |
+| seconds-per-ech-handshake | UNBLESSED | CI bench.yml (no cell yet) |
 | ech-offers-accepted-by-the-stock-lane | 1 | ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo |
 | rejected-ech-offers-retried-once | 1 | ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list |
 | ech-offers-built-by-the-shaped-lane | 1 | ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one |

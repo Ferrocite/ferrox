@@ -234,10 +234,8 @@ def check_charts(charts_dir, results):
         scenario
         for scenario in scenarios
         if "setup" not in scenario.get("id", "")
-        and not any(
-            word in scenario.get("id", "")
-            for word in ("idle", "reconnect", "held")
-        )
+        and scenario.get("workload", {}).get("traffic")
+        in ("upload", "download", "full-duplex")
     ]
     if "cpu-per-gib.png" in wanted and not priced:
         wanted.remove("cpu-per-gib.png")

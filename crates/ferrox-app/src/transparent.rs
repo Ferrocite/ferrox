@@ -156,7 +156,7 @@ mod linux {
         let _ = enable(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT);
         if v6 {
             enable(socket.as_raw_fd(), libc::SOL_IPV6, IPV6_RECVORIGDSTADDR)?;
-            let _ = enable(socket.as_raw_fd(), libc::SOL_IP, IP_RECVORIGDSTADDR);
+            enable(socket.as_raw_fd(), libc::SOL_IP, IP_RECVORIGDSTADDR)?;
         } else {
             enable(socket.as_raw_fd(), libc::SOL_IP, IP_RECVORIGDSTADDR)?;
         }

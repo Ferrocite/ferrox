@@ -10454,7 +10454,11 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let pump = Pump::to_sink(client, &writer);
-            let answered = read_vless_response(&mut reader).is_some();
+            let answered = {
+                reader.set_poll(Some(RELAY_POLL));
+                let _step = RelayStep::enter();
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some()
+            };
             let sent = pump.end();
             if !answered {
                 // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
@@ -10494,7 +10498,12 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let pump = Pump::to_sink(client, &writer);
-            let answered = read_vless_response(&mut reader).is_some();
+            reader.set_head_progress(pump.progress_handle());
+            let answered = {
+                reader.set_poll(Some(RELAY_POLL));
+                let _step = RelayStep::enter();
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some()
+            };
             let sent = pump.end();
             if !answered {
                 // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
@@ -11653,7 +11662,7 @@ fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination
     }
     let mut up = session.clone();
     let pump = Pump::over(client, move |bytes| up.write_all(bytes).is_ok());
-    let answered = read_vless_response(&mut session).is_some();
+    let answered = read_vless_response_deferred(&mut session, pump.progress_flag()).is_some();
     pump.end();
     if !answered {
         return;
@@ -12944,11 +12953,13 @@ fn serve_dokodemo(
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
+        let mut listen = None;
         let socket = if transparent.is_some() {
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
                 return (armed, dokodemo_has(&networks, "tcp"));
             };
+            listen = Some(bound);
             crate::transparent::bind_udp(bound)
         } else {
             UdpSocket::bind(address)
@@ -12976,7 +12987,11 @@ fn serve_dokodemo(
         };
         let door = out.clone();
         if transparent_udp {
-            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door));
+            let Some(listen) = socket.local_addr().ok().or(listen) else {
+                eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
+                return (armed, dokodemo_has(&networks, "tcp"));
+            };
+            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door, listen));
         } else {
             let dest = if follow_redirect {
                 rewrite.configured()
@@ -17534,6 +17549,24 @@ fn relay_vless_xhttp_session<R: WindowRead + Send + 'static>(
     if !writer.send(header) {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
+    let mut reader = reader;
+    if reader.awaits_head() {
+        let pump = Pump::to_sink(client, &writer);
+        reader.set_head_progress(pump.progress_handle());
+        let answered = {
+            let _step = RelayStep::enter();
+            read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some()
+        };
+        let sent = pump.end();
+        if !answered {
+            if !sent {
+                note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            return;
+        }
+        relay_sink_xhttp_drained(reader, &writer, client);
+        return;
+    }
     relay_sink_xhttp_drained(ReplyReader::new(reader), &writer, client);
 }
 
@@ -18069,7 +18102,8 @@ fn dial_vless_reality(
                 },
                 vless.is_vision(),
             );
-            let answered = read_vless_response(&mut reader).is_some();
+            let answered =
+                read_vless_response_deferred(&mut reader, pump.progress_flag()).is_some();
             pump.end();
             if !answered {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -22115,7 +22149,7 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
 
 /// The transparent dokodemo UDP door: every datagram carries its own original destination,
 /// and the answer must leave from that destination or the client drops it.
-fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound) {
+fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound, listen: SocketAddr) {
     type Flow = (SocketAddr, SocketAddr);
     let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
@@ -22137,6 +22171,9 @@ fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound) {
             Err(_) => return,
         };
         if n == 0 {
+            continue;
+        }
+        if dokodemo_loopback(&Destination::Address(original), listen) {
             continue;
         }
         let key = (client, original);
@@ -24868,6 +24905,7 @@ impl TcpCopy {
                         filled: filled as u8,
                     };
                     if flow.ended() && flow.ended_and_idle(self.reply_idle) {
+                        self.refuse();
                         self.end();
                         return Some(Next::Done);
                     }
@@ -24887,6 +24925,8 @@ impl TcpCopy {
         }
         self.answer = crate::vision::Answer::None;
         self.refused = None;
+        flow.mark_progress();
+        self.reply_idle = crate::budgets::RELAY_RESPONSE_IDLE;
         if let Some(success) = self.success.take() {
             success();
         }
@@ -25045,6 +25085,8 @@ fn relay_owned(
     let mut reply = TcpCopy::new(target_read, client_write);
     reply.stall = reply_stall;
     if let Some(answer) = answer {
+        // An answer wait owns the configured grace; a plain idle sibling still hands back after one second.
+        reply.reply_idle = reply_stall;
         reply = reply.answering(answer);
     }
     while reply.step(&second) != Next::Done {}
@@ -28821,7 +28863,22 @@ fn kept_head_rounds(
     limit: usize,
     budget: Duration,
 ) -> Option<(Vec<u8>, usize)> {
-    kept_head_into(stream, limit, budget, Vec::with_capacity(HEAD_ROUND))
+    kept_head_into(stream, limit, budget, Vec::with_capacity(HEAD_ROUND), None)
+}
+
+fn kept_head_rounds_deferred(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    progress: &AtomicU64,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_into(
+        stream,
+        limit,
+        budget,
+        Vec::with_capacity(HEAD_ROUND),
+        Some(progress),
+    )
 }
 
 #[allow(
@@ -28833,9 +28890,11 @@ fn kept_head_into(
     limit: usize,
     budget: Duration,
     mut head: Vec<u8>,
+    progress: Option<&AtomicU64>,
 ) -> Option<(Vec<u8>, usize)> {
     head.clear();
-    let until = Instant::now() + budget;
+    let mut until = Instant::now() + budget;
+    let mut seen = progress.map(|progress| progress.load(Ordering::Relaxed));
     loop {
         if head.len() >= limit {
             return None;
@@ -28853,6 +28912,13 @@ fn kept_head_into(
             Ok(n) => n,
             Err(error) if is_timeout(&error) => {
                 head.truncate(base);
+                if let (Some(progress), Some(seen)) = (progress, seen.as_mut()) {
+                    let advanced = progress.load(Ordering::Relaxed);
+                    if advanced != *seen {
+                        *seen = advanced;
+                        until = Instant::now() + budget;
+                    }
+                }
                 if Instant::now() >= until {
                     return None;
                 }
@@ -28927,6 +28993,17 @@ pub(crate) fn read_exact_head(
     kept_head_rounds(stream, limit, budget)
 }
 
+/// The same reader, whose clock moves with the upload pump: a server may hold its answer behind the
+/// payload, so progress buys another head budget and silence after the last step still ends the read.
+pub(crate) fn read_exact_head_deferred(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    progress: &AtomicU64,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_rounds_deferred(stream, limit, budget, progress)
+}
+
 /// The same reader over a buffer the caller keeps: a lane that reads an answer per frame hands its own window back instead of paying a fresh allocation for every read.
 pub(crate) fn read_exact_head_into(
     stream: &mut dyn Read,
@@ -28934,7 +29011,7 @@ pub(crate) fn read_exact_head_into(
     budget: Duration,
     head: Vec<u8>,
 ) -> Option<(Vec<u8>, usize)> {
-    kept_head_into(stream, limit, budget, head)
+    kept_head_into(stream, limit, budget, head, None)
 }
 
 /// What a carrier did with a relay window: took a prefix, had no room and asked for the same bytes again, or ended the flow.
@@ -29218,6 +29295,13 @@ pub(crate) trait WindowRead: Read {
     fn parks_on_timeout(&self) -> bool {
         false
     }
+
+    /// A carrier whose first answer head may wait on the upload ties that read to the pump's progress.
+    fn set_head_progress(&mut self, _progress: Arc<AtomicU64>) {}
+
+    fn awaits_head(&self) -> bool {
+        false
+    }
 }
 
 impl<T: WindowRead + ?Sized> WindowRead for Box<T> {
@@ -29227,6 +29311,14 @@ impl<T: WindowRead + ?Sized> WindowRead for Box<T> {
 
     fn parks_on_timeout(&self) -> bool {
         (**self).parks_on_timeout()
+    }
+
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        (**self).set_head_progress(progress);
+    }
+
+    fn awaits_head(&self) -> bool {
+        (**self).awaits_head()
     }
 }
 
@@ -30376,6 +30468,10 @@ impl Pump {
     /// The leg's pumped steps, read while an answer wait decides how long silence may hold it.
     fn progress_flag(&self) -> &AtomicU64 {
         &self.progress
+    }
+
+    fn progress_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.progress)
     }
 
     /// Stops the leg and waits for it, so the session's own upload leg is the only reader afterwards, and reports whether it spent any of the app's bytes.
@@ -38103,6 +38199,58 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(5),
             "the read ran on the named 150ms, not the 20s constant, and took {elapsed:?}"
+        );
+    }
+
+    /// A server holding its answer behind the upload must not lose the head to the fixed arrival clock:
+    /// the pump's progress buys another budget, and silence after the last step still ends the read.
+    #[test]
+    fn an_upload_extends_the_head_wait() {
+        struct UploadingHead {
+            head: &'static [u8],
+            at: usize,
+            reads: usize,
+            progress: Arc<AtomicU64>,
+        }
+
+        impl Read for UploadingHead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads < 4 {
+                    if self.reads == 2 {
+                        self.progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    thread::sleep(Duration::from_millis(60));
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                let n = (self.head.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.head[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        let head = b"HTTP/1.1 200 OK\r\n\r\n";
+        let progress = Arc::new(AtomicU64::new(0));
+        let mut source = UploadingHead {
+            head,
+            at: 0,
+            reads: 0,
+            progress: Arc::clone(&progress),
+        };
+        let started = Instant::now();
+        let (got, at) = read_exact_head_deferred(
+            &mut source,
+            HEAD_LIMIT_TEST,
+            Duration::from_millis(150),
+            &progress,
+        )
+        .expect("upload progress extends the head budget");
+        assert_eq!(&got[..at], head);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "the head outlived its first budget: {:?}",
+            started.elapsed()
         );
     }
 
@@ -66490,6 +66638,7 @@ mod relay_tests {
             }),
         };
         let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        copy.reply_idle = Duration::from_secs(120);
         let flow = RelayFinish::new(false, Arc::new(|| {}), None);
 
         target.write_all(&[0]).expect("half a header");
@@ -66508,6 +66657,11 @@ mod relay_tests {
             success.load(Ordering::Relaxed),
             1,
             "the validated answer counts once"
+        );
+        assert_eq!(
+            copy.reply_idle,
+            crate::budgets::RELAY_RESPONSE_IDLE,
+            "the answer wait's grace ends with the answer"
         );
         assert_eq!(copy.step(&flow), Next::Idle);
         let mut got = [0u8; 2];

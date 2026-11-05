@@ -1486,7 +1486,8 @@ def matrix_markdown(results, image_prefix):
     bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
     priced = any(
         "setup" not in scenario.get("id", "")
-        and not any(word in scenario.get("id", "") for word in ("idle", "reconnect", "held"))
+        and scenario.get("workload", {}).get("traffic")
+        in ("upload", "download", "full-duplex")
         for scenario in scenarios
     )
     setup = any("setup" in scenario.get("id", "") for scenario in scenarios)
@@ -1707,7 +1708,8 @@ def main(argv=None):
     priced = sorted(
         s
         for s in bulk
-        if not any(word in s for word in ("idle", "reconnect", "held"))
+        if cells[s].get("workload", {}).get("traffic")
+        in ("upload", "download", "full-duplex")
     )
     families = {}
     for scenario, cell in cells.items():
