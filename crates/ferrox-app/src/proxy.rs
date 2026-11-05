@@ -62707,7 +62707,6 @@ mod poll_copy {
 mod poll_relay {
     use super::{Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;
-    #[cfg(test)]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::Duration;
