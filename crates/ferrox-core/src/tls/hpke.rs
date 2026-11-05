@@ -43,6 +43,7 @@ impl Aead {
         }
     }
 
+    /// Seals `plaintext` under `aad` with the fixed 32-byte HPKE key and 12-byte nonce.
     fn seal(
         self,
         key: &[u8; 32],
@@ -91,6 +92,7 @@ impl Aead {
         }
     }
 
+    /// Opens `ciphertext` under `aad` with the fixed 32-byte HPKE key and 12-byte nonce.
     fn open(
         self,
         key: &[u8; 32],
@@ -232,6 +234,7 @@ impl Context {
         }
     }
 
+    /// Builds the per-message nonce by XORing `sequence` into the fixed base nonce's tail.
     fn nonce(&self, sequence: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.base_nonce[..4]);
@@ -245,11 +248,13 @@ impl Context {
         &self.key[..self.aead.key_len()]
     }
 
+    /// Seals one message in the context's sequence.
     fn seal(&self, aad: &[u8], plaintext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
             .seal(&self.key, &self.nonce(sequence), aad, plaintext)
     }
 
+    /// Opens one message in the context's sequence.
     fn open(&self, aad: &[u8], ciphertext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
             .open(&self.key, &self.nonce(sequence), aad, ciphertext)

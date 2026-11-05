@@ -900,6 +900,7 @@ fn handshake(kind: u8, body: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Builds one ECH cover with the picked suite, config id, encapsulation and zero payload length.
 fn ech_cover(suite: (u16, u16), config_id: u8, enc: &[u8], payload_len: usize) -> Vec<u8> {
     let mut body = Vec::with_capacity(12 + enc.len() + payload_len);
     body.push(0);
@@ -1157,6 +1158,23 @@ mod tests {
             &rustls::crypto::hpke::HpkePrivateKey::from(server_key.private_key),
         )
         .expect("opens")
+    }
+
+    /// A real `enable_ech` offer is one allocation the cover's own buffer now costs, beside the parsing and hello work the measured window already prices.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_enable_ech_offer_allocates_only_the_cover_buffer() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
+        let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
+        enabled.expect("ech");
+        assert_eq!(counts.allocs, 25, "the full offer cost: {counts:?}");
+        assert_eq!(
+            counts.zeroed, 0,
+            "the payload is filled in place: {counts:?}"
+        );
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
