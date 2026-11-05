@@ -132,7 +132,7 @@ mod linux {
                 level,
                 SO_ORIGINAL_DST,
                 std::ptr::from_mut(&mut storage).cast(),
-                &mut len,
+                std::ptr::from_mut(&mut len),
             )
         };
         if result != 0 {
@@ -180,11 +180,11 @@ mod linux {
             let mut message: libc::msghdr = zeroed();
             message.msg_name = std::ptr::from_mut(&mut source).cast();
             message.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            message.msg_iov = &mut iov;
+            message.msg_iov = std::ptr::from_mut(&mut iov);
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
             message.msg_controllen = size_of_val(&control) as _;
-            let read = libc::recvmsg(socket.as_raw_fd(), &mut message, 0);
+            let read = libc::recvmsg(socket.as_raw_fd(), std::ptr::from_mut(&mut message), 0);
             if read < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -194,7 +194,7 @@ mod linux {
                     "datagram from an unknown family",
                 )
             })?;
-            let mut header = libc::CMSG_FIRSTHDR(&message);
+            let mut header = libc::CMSG_FIRSTHDR(std::ptr::from_ref(&message));
             while !header.is_null() {
                 let level = (*header).cmsg_level;
                 let kind = (*header).cmsg_type;
@@ -216,7 +216,7 @@ mod linux {
                         return Ok((read as usize, client, destination));
                     }
                 }
-                header = libc::CMSG_NXTHDR(&message, header);
+                header = libc::CMSG_NXTHDR(std::ptr::from_ref(&message), header);
             }
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
