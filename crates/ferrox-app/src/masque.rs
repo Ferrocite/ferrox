@@ -1572,7 +1572,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         .and_then(Json::as_str)
         .unwrap_or_default();
     if security.eq_ignore_ascii_case("none") {
-        return serve_cleartext_inbound(spec, out, address);
+        return serve_cleartext_inbound(&spec, out, address);
     }
     let identity = crate::proxy::quic_inbound_identity(inbound)
         .ok_or("masque inbound requires security tls or none")?;
@@ -1653,7 +1653,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
 }
 
 fn serve_cleartext_inbound(
-    spec: Arc<ServerSpec>,
+    spec: &Arc<ServerSpec>,
     out: &Outbound,
     address: &str,
 ) -> Result<u16, String> {
@@ -1672,7 +1672,7 @@ fn serve_cleartext_inbound(
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
-    crate::masque_h2::serve_cleartext(Arc::clone(&shared), Arc::clone(&spec), listener);
+    crate::masque_h2::serve_cleartext(Arc::clone(&shared), Arc::clone(spec), listener);
     let device = DeviceConfig {
         secret: [0u8; 32],
         addresses: spec.pool.server.clone(),

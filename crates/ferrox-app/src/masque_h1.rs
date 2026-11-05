@@ -113,7 +113,6 @@ pub(crate) const SWITCH: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nConnectio
 
 fn refusal(status: u16) -> Vec<u8> {
     let reason = match status {
-        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         503 => "Service Unavailable",
@@ -185,7 +184,7 @@ impl Client {
             return Err("the edge did not negotiate http/1.1".to_owned());
         }
         deadline.clear();
-        let _ = tls.get_ref().set_read_timeout(Some(READ_WAIT));
+        tls.get_ref().set_read_timeout(Some(READ_WAIT));
         tls.write_all(&request(authority, path, headers))
             .map_err(|error| format!("upgrade request: {error}"))?;
         let mut client = Self {
@@ -574,7 +573,7 @@ mod tests {
             ("connection".to_owned(), "close".to_owned()),
             ("upgrade".to_owned(), "websocket".to_owned()),
             ("capsule-protocol".to_owned(), "?0".to_owned()),
-            ("authorization".to_owned(), "Basic dTpw".to_owned()),
+            ("Authorization".to_owned(), "Basic dTpw".to_owned()),
         ];
         let request = request("edge.example", "/", &headers);
         let text = std::str::from_utf8(&request).expect("text");
