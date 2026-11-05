@@ -12912,6 +12912,15 @@ fn serve_dokodemo(
         _ => None,
     };
     let mut armed = 0;
+    if dokodemo_has(&networks, "tcp")
+        && follow_redirect
+        && transparent.is_none()
+        && rewrite.configured().is_none()
+    {
+        eprintln!(
+            "dokodemo-door in {label}: followRedirect needs a rewrite address with no transparent lookup; each tcp flow closes without a destination"
+        );
+    }
     if dokodemo_has(&networks, "tcp") {
         spawn_role_stopped(
             address,
