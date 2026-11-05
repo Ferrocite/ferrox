@@ -2074,16 +2074,19 @@ impl SessionReader {
     /// A timeout on the upload's own socket is the lane's poll, not the session's end: the lane parks
     /// on that descriptor and the client's next byte wakes it, so an idle upload holds no relay worker.
     fn upload_error(&mut self, error: std::io::Error) -> std::io::Error {
-        if self.upload_fd.is_some()
-            && matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            )
-        {
+        let mapped = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ferrox_core::tls::TlsError>())
+            .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout));
+        let pending = cfg!(windows) && error.raw_os_error() == Some(997);
+        if ferrox_core::tls::TlsError::is_timeout(&error) {
             if let Some(fd) = self.upload_fd {
                 crate::proxy::note_wait_fd(fd);
+                return std::io::Error::from(std::io::ErrorKind::WouldBlock);
             }
-            return std::io::Error::from(std::io::ErrorKind::WouldBlock);
+            if mapped || pending {
+                return error;
+            }
         }
         if poll_grain(&error) {
             return error;
@@ -5537,6 +5540,26 @@ mod tests {
             "a socket poll on a known upload ended the session"
         );
         end_session("known-upload-deadline");
+    }
+
+    /// A TLS half's deadline surfaces as an `io::Error` of another kind; it is a poll, not the end.
+    #[test]
+    fn a_tls_timeout_without_a_descriptor_keeps_the_session() {
+        struct Tls;
+        impl Read for Tls {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(ferrox_core::tls::TlsError::Timeout.into())
+            }
+        }
+        let session = get_or_create_session("tls-timeout-upload");
+        session.set_upload(Box::new(Tls), None);
+        let mut reader = SessionReader::new(Arc::clone(&session), "tls-timeout-upload".to_owned());
+        assert!(reader.read(&mut [0u8; 8]).is_err());
+        assert!(
+            !session.state.lock().expect("session lock").ended,
+            "a TLS timeout ended the session"
+        );
+        end_session("tls-timeout-upload");
     }
 
     /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.

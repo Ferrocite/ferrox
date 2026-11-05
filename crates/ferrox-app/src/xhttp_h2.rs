@@ -211,6 +211,8 @@ struct StreamState {
     request_ended: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,
+    /// The session ended under the reader, so later DATA is discarded instead of queued for an answer already owed.
+    stopped: bool,
     /// The response status a client decoded, so a packet POST can refuse a non-2xx answer.
     status: Option<u16>,
     dead: bool,
@@ -1416,6 +1418,7 @@ impl H2Conn {
             if let Some(state) = state {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.ended = true;
+                st.stopped = true;
                 state.cv.notify_all();
             }
         }
@@ -1498,6 +1501,7 @@ impl H2Conn {
                 ended: end_stream,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -2945,24 +2949,25 @@ fn pump_frame(
                 return true;
             };
             drop(streams);
-            let (finished, abandoned) = {
+            let (finished, abandoned, stopped) = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let finished = st.finished || st.request_ended;
                 let abandoned = st.abandoned;
-                if !abandoned && !st.dead {
+                let stopped = st.stopped;
+                if !abandoned && !st.dead && !stopped {
                     st.body.push_back(body);
                     if flags & F_END != 0 {
                         st.ended = true;
                     }
                 }
                 state.cv.notify_all();
-                (finished, abandoned)
+                (finished, abandoned, stopped)
             };
-            if abandoned {
+            if abandoned || stopped {
                 if !conn.replenish_connection(wire_len) {
                     return false;
                 }
-                if flags & F_END != 0 {
+                if abandoned && flags & F_END != 0 {
                     conn.retire(sid);
                 }
                 return true;
@@ -3388,6 +3393,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -3478,6 +3484,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -3540,6 +3547,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4173,6 +4181,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4233,6 +4242,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4270,6 +4280,31 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&2),
             "the upload stays for its deferred 200"
+        );
+        struct Sink;
+        impl H2Service for Sink {
+            fn open(
+                &self,
+                _conn: &Arc<H2Conn>,
+                _sid: u32,
+                _block: &[u8],
+                _end_stream: bool,
+            ) -> bool {
+                true
+            }
+        }
+        assert!(
+            pump_frame(&conn, &Sink, T_DATA, 0, 2, vec![0xa5; 4096], &mut None),
+            "a late upload frame is discarded instead of ending the connection"
+        );
+        assert!(
+            upload_state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .body
+                .is_empty(),
+            "the stopped upload queues nothing for an answer already owed"
         );
         let mut writer = H2StreamWriter {
             conn: Arc::clone(&conn),
@@ -4514,6 +4549,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4599,6 +4635,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -4649,6 +4686,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5602,6 +5640,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                stopped: false,
                 abandoned: true,
                 status: None,
                 dead: false,
@@ -5664,6 +5703,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5829,6 +5869,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5873,6 +5914,7 @@ mod tests {
                 ended: true,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5932,6 +5974,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -5971,6 +6014,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
@@ -6097,6 +6141,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                stopped: false,
                 abandoned: false,
                 status: None,
                 dead: false,
