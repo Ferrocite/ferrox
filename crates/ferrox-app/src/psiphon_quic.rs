@@ -2168,7 +2168,11 @@ mod tests {
     fn randomized_cipher_suites_stay_tls13() {
         let mut provider = rustls::crypto::ring::default_provider();
         randomize_cipher_suites(&mut provider).expect("suite randomization");
-        assert!(!provider.cipher_suites.is_empty());
+        let first = provider
+            .cipher_suites
+            .first()
+            .expect("a TLS 1.3 suite survives");
+        assert!(first.tls13().is_some());
         assert!(provider
             .cipher_suites
             .iter()
