@@ -7160,10 +7160,14 @@ mod tests {
     #[test]
     fn a_limited_meek_buffer_is_read() {
         let settings = json::parse(r#"{"LimitMeekBufferSizes":true}"#).expect("settings");
-        let settings = Settings::from_json(Some(&settings)).expect("settings");
-        assert!(settings.limit_meek_buffers);
         assert!(
-            !Settings::from_json(None)
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .limit_meek_buffers
+        );
+        let settings = json::parse(r#"{"LimitMeekBufferSizes":false}"#).expect("settings");
+        assert!(
+            !Settings::from_json(Some(&settings))
                 .expect("settings")
                 .limit_meek_buffers
         );

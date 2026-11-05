@@ -11,7 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
-const LIMITED_PAYLOAD: usize = 4 * 1024;
+const LIMITED_READ_CHUNK: usize = 4 * 1024;
 const MIN_COOKIE_PADDING: usize = 16;
 const MAX_COOKIE_PADDING: usize = 256;
 const POLL: Duration = Duration::from_millis(100);
@@ -20,11 +20,21 @@ const POLL_GROWTH: f64 = 1.5;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 
-fn read_buffer_size(limit: bool) -> usize {
+/// Choose the HTTP/1 response body chunk size for the active buffer limit.
+fn response_read_chunk(limit: bool) -> usize {
     if limit {
-        LIMITED_PAYLOAD
+        LIMITED_READ_CHUNK
     } else {
-        MAX_PAYLOAD
+        crate::foxy_account::DEFAULT_READ_CHUNK
+    }
+}
+
+/// Choose the HTTP/3 response body chunk size for the active buffer limit.
+fn h3_read_chunk(limit: bool) -> usize {
+    if limit {
+        LIMITED_READ_CHUNK
+    } else {
+        16 * 1024
     }
 }
 
@@ -195,7 +205,8 @@ fn relay(
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?;
-    let mut buffer = vec![0u8; read_buffer_size(limit_buffer_sizes)];
+    http.limit_buffer_sizes = limit_buffer_sizes;
+    let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
         local
@@ -240,7 +251,8 @@ fn relay_stream(
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?;
-    let mut buffer = vec![0u8; read_buffer_size(limit_buffer_sizes)];
+    http.limit_buffer_sizes = limit_buffer_sizes;
+    let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
         local
@@ -363,6 +375,7 @@ pub(crate) struct MeekHttp {
     front_index: usize,
     alpn_warned: bool,
     preconnected: bool,
+    limit_buffer_sizes: bool,
 }
 
 impl MeekHttp {
@@ -385,6 +398,7 @@ impl MeekHttp {
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
+            limit_buffer_sizes: false,
         })
     }
 
@@ -405,6 +419,7 @@ impl MeekHttp {
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
+            limit_buffer_sizes: false,
         }
     }
 
@@ -426,6 +441,7 @@ impl MeekHttp {
             front_index: 0,
             alpn_warned: false,
             preconnected: true,
+            limit_buffer_sizes: false,
         })
     }
 
@@ -598,7 +614,14 @@ impl MeekHttp {
                 .copied()
                 .filter(|(name, _)| !is_hop_by_hop(name))
                 .collect();
-            let reply = h3.round_trip(host, self.path, &headers, body, self.timeout)?;
+            let reply = h3.round_trip(
+                host,
+                self.path,
+                &headers,
+                body,
+                self.timeout,
+                h3_read_chunk(self.limit_buffer_sizes),
+            )?;
             if reply.status != 200 {
                 return Err(format!("psiphon meek status {}", reply.status));
             }
@@ -614,8 +637,9 @@ impl MeekHttp {
             .write_parts(&[&head, body])
             .and_then(|()| stream.flush())
             .map_err(|error| format!("psiphon meek request: {error}"))?;
-        let reply = crate::foxy_account::read_reply(stream)
-            .map_err(|_| "psiphon meek response".to_owned())?;
+        let reply =
+            crate::foxy_account::read_reply(stream, response_read_chunk(self.limit_buffer_sizes))
+                .map_err(|_| "psiphon meek response".to_owned())?;
         if reply.status != 200 {
             return Err(format!("psiphon meek status {}", reply.status));
         }
@@ -735,9 +759,14 @@ mod tests {
     }
 
     #[test]
-    fn the_limited_buffer_is_four_kib() {
-        assert_eq!(read_buffer_size(false), MAX_PAYLOAD);
-        assert_eq!(read_buffer_size(true), LIMITED_PAYLOAD);
+    fn the_limited_response_chunk_is_four_kib() {
+        assert_eq!(
+            response_read_chunk(false),
+            crate::foxy_account::DEFAULT_READ_CHUNK
+        );
+        assert_eq!(response_read_chunk(true), LIMITED_READ_CHUNK);
+        assert_eq!(h3_read_chunk(false), 16 * 1024);
+        assert_eq!(h3_read_chunk(true), LIMITED_READ_CHUNK);
     }
 
     #[test]

@@ -69,6 +69,7 @@ pub(crate) struct H3 {
     stream: Option<u64>,
     response: Response,
     finished: bool,
+    read_chunk: usize,
 }
 
 impl H3 {
@@ -205,6 +206,7 @@ impl H3 {
                 body: Vec::new(),
             },
             finished: false,
+            read_chunk: 16 * 1024,
         })
     }
 
@@ -222,7 +224,9 @@ impl H3 {
         headers: &[(&str, &str)],
         body: &[u8],
         timeout: Duration,
+        read_chunk: usize,
     ) -> Result<Response, String> {
+        self.read_chunk = read_chunk.max(1);
         let mut list = vec![
             quiche::h3::Header::new(b":method", b"POST"),
             quiche::h3::Header::new(b":scheme", b"https"),
@@ -350,9 +354,11 @@ impl H3 {
                     }
                 }
                 Ok((id, quiche::h3::Event::Data)) if id == stream => {
-                    let mut chunk = [0u8; 16384];
+                    let mut chunk = [0u8; 16 * 1024];
+                    let limit = self.read_chunk.min(chunk.len()).max(1);
+                    let chunk = &mut chunk[..limit];
                     loop {
-                        match self.http3.recv_body(&mut self.conn, stream, &mut chunk) {
+                        match self.http3.recv_body(&mut self.conn, stream, chunk) {
                             Ok(0) | Err(quiche::h3::Error::Done) => break,
                             Ok(read) => {
                                 if self.response.body.len() + read > MAX_RESPONSE {
