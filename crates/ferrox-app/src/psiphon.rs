@@ -140,6 +140,7 @@ struct Settings {
     quic_noise: Option<String>,
     tls_shape: TlsShape,
     meek_padding: (u16, u16),
+    limit_meek_buffers: bool,
     relay_buffer: usize,
     dial_ports: Vec<(String, PortList)>,
     dial_ports_probability: f64,
@@ -495,6 +496,7 @@ impl Inner {
             let client_features = self.settings.client_features.clone();
             let proxy = self.settings.proxy.clone();
             let keepalive = self.settings.keepalive;
+            let limit_meek_buffers = self.settings.limit_meek_buffers;
             let tls_shape = self.settings.tls_shape.clone();
             let conduit =
                 if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
@@ -533,6 +535,7 @@ impl Inner {
                     conduit.as_deref(),
                     keepalive,
                     &tls_shape,
+                    limit_meek_buffers,
                 )
             };
             match race(batch, attempt, budget, stagger, lead) {
@@ -1668,6 +1671,11 @@ impl Settings {
             .or_else(|| text(settings, "inproxyCompartment"))
             .or_else(|| env("AETHER_PSIPHON_COMPARTMENT"))
             .unwrap_or_else(|| PRIVATE_COMPARTMENT_ID.to_owned());
+        let limit_meek_buffers = flag(
+            settings,
+            "LimitMeekBufferSizes",
+            "AETHER_PSIPHON_SMALL_MEEK",
+        );
         let relay_buffer = if flag(
             settings,
             "LimitRelayBufferSizes",
@@ -1735,6 +1743,7 @@ impl Settings {
             quic_noise,
             tls_shape,
             meek_padding,
+            limit_meek_buffers,
             relay_buffer,
             dial_ports,
             dial_ports_probability,
@@ -2291,6 +2300,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "frontedMeekCDNScanSpec",
     "FrontedMeekCDNScanUseBuiltInSpec",
     "FrontedMeekCDNScanBuiltInSets",
+    "LimitMeekBufferSizes",
     "LimitRelayBufferSizes",
     "NetworkLatencyMultiplier",
     "NetworkLatencyMultiplierMin",
@@ -7145,6 +7155,22 @@ mod tests {
         let settings = Settings::from_json(Some(&settings)).expect("settings");
         assert_eq!(settings.pool, 1);
         assert_eq!(settings.workers, 1);
+    }
+
+    #[test]
+    fn a_limited_meek_buffer_is_read() {
+        let settings = json::parse(r#"{"LimitMeekBufferSizes":true}"#).expect("settings");
+        assert!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .limit_meek_buffers
+        );
+        let settings = json::parse(r#"{"LimitMeekBufferSizes":false}"#).expect("settings");
+        assert!(
+            !Settings::from_json(Some(&settings))
+                .expect("settings")
+                .limit_meek_buffers
+        );
     }
 
     #[test]

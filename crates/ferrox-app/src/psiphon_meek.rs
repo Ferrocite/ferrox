@@ -11,6 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
+const LIMITED_READ_CHUNK: usize = 4 * 1024;
 const MIN_COOKIE_PADDING: usize = 16;
 const MAX_COOKIE_PADDING: usize = 256;
 const POLL: Duration = Duration::from_millis(100);
@@ -18,6 +19,24 @@ const MAX_POLL: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
+
+/// Choose the HTTP/1 response body chunk size for the active buffer limit.
+fn response_read_chunk(limit: bool) -> usize {
+    if limit {
+        LIMITED_READ_CHUNK
+    } else {
+        crate::foxy_account::DEFAULT_READ_CHUNK
+    }
+}
+
+/// Choose the HTTP/3 response body chunk size for the active buffer limit.
+fn h3_read_chunk(limit: bool) -> usize {
+    if limit {
+        LIMITED_READ_CHUNK
+    } else {
+        16 * 1024
+    }
+}
 
 /// One server entry's meek front.
 #[derive(Debug, Clone)]
@@ -47,6 +66,7 @@ pub(crate) fn connect(
     meek: &Meek,
     timeout: Duration,
     proxy: Option<&Proxy>,
+    limit_buffer_sizes: bool,
 ) -> Result<TcpStream, String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("psiphon meek listener: {error}"))?;
@@ -66,7 +86,9 @@ pub(crate) fn connect(
         .name("psiphon-meek".to_owned())
         .spawn(move || match listener.accept() {
             Ok((socket, _)) => {
-                if let Err(why) = relay(socket, &config, proxy.as_ref(), timeout) {
+                if let Err(why) =
+                    relay(socket, &config, proxy.as_ref(), timeout, limit_buffer_sizes)
+                {
                     eprintln!("psiphon: fronted-meek relay: {why}");
                 }
             }
@@ -81,6 +103,7 @@ pub(crate) fn connect_inproxy(
     stream: WebRtcStream,
     meek: &Meek,
     timeout: Duration,
+    limit_buffer_sizes: bool,
 ) -> Result<TcpStream, String> {
     let transport = if meek.quic {
         stream.set_timeout(Some(timeout));
@@ -120,7 +143,7 @@ pub(crate) fn connect_inproxy(
     } else {
         MeekStream::WebRtc(stream)
     };
-    start_relay(meek, timeout, transport)
+    start_relay(meek, timeout, transport, limit_buffer_sizes)
 }
 
 /// Send one request over a fresh fronted stream and return its response body.
@@ -136,7 +159,12 @@ pub(crate) fn post(
     http.round_trip(body)
 }
 
-fn start_relay(meek: &Meek, timeout: Duration, transport: MeekStream) -> Result<TcpStream, String> {
+fn start_relay(
+    meek: &Meek,
+    timeout: Duration,
+    transport: MeekStream,
+    limit_buffer_sizes: bool,
+) -> Result<TcpStream, String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("psiphon meek listener: {error}"))?;
     let address = listener
@@ -154,7 +182,9 @@ fn start_relay(meek: &Meek, timeout: Duration, transport: MeekStream) -> Result<
         .name("psiphon-meek".to_owned())
         .spawn(move || match listener.accept() {
             Ok((socket, _)) => {
-                if let Err(why) = relay_stream(socket, &config, timeout, transport) {
+                if let Err(why) =
+                    relay_stream(socket, &config, timeout, transport, limit_buffer_sizes)
+                {
                     eprintln!("psiphon: in-proxy-meek relay: {why}");
                 }
             }
@@ -169,11 +199,13 @@ fn relay(
     meek: &Meek,
     proxy: Option<&Proxy>,
     timeout: Duration,
+    limit_buffer_sizes: bool,
 ) -> Result<(), String> {
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
-    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?;
+    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?
+        .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
@@ -213,11 +245,13 @@ fn relay_stream(
     meek: &Meek,
     timeout: Duration,
     transport: MeekStream,
+    limit_buffer_sizes: bool,
 ) -> Result<(), String> {
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
-    let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?;
+    let mut http = MeekHttp::new_over(meek.clone(), timeout, "/", transport)?
+        .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
@@ -341,6 +375,7 @@ pub(crate) struct MeekHttp {
     front_index: usize,
     alpn_warned: bool,
     preconnected: bool,
+    limit_buffer_sizes: bool,
 }
 
 impl MeekHttp {
@@ -363,6 +398,7 @@ impl MeekHttp {
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
+            limit_buffer_sizes: false,
         })
     }
 
@@ -383,6 +419,7 @@ impl MeekHttp {
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
+            limit_buffer_sizes: false,
         }
     }
 
@@ -404,7 +441,26 @@ impl MeekHttp {
             front_index: 0,
             alpn_warned: false,
             preconnected: true,
+            limit_buffer_sizes: false,
         })
+    }
+
+    /// Apply `LimitMeekBufferSizes` to both response readers.
+    fn with_limit_buffer_sizes(mut self, limit: bool) -> Self {
+        self.limit_buffer_sizes = limit;
+        self
+    }
+
+    /// The HTTP/1 response chunk this client will pass to `read_reply`.
+    #[cfg(test)]
+    fn response_chunk(&self) -> usize {
+        response_read_chunk(self.limit_buffer_sizes)
+    }
+
+    /// The HTTP/3 response chunk this client will pass to `H3::round_trip`.
+    #[cfg(test)]
+    fn h3_response_chunk(&self) -> usize {
+        h3_read_chunk(self.limit_buffer_sizes)
     }
 
     /// Send one request body and return the response body.
@@ -576,7 +632,14 @@ impl MeekHttp {
                 .copied()
                 .filter(|(name, _)| !is_hop_by_hop(name))
                 .collect();
-            let reply = h3.round_trip(host, self.path, &headers, body, self.timeout)?;
+            let reply = h3.round_trip(
+                host,
+                self.path,
+                &headers,
+                body,
+                self.timeout,
+                h3_read_chunk(self.limit_buffer_sizes),
+            )?;
             if reply.status != 200 {
                 return Err(format!("psiphon meek status {}", reply.status));
             }
@@ -592,8 +655,9 @@ impl MeekHttp {
             .write_parts(&[&head, body])
             .and_then(|()| stream.flush())
             .map_err(|error| format!("psiphon meek request: {error}"))?;
-        let reply = crate::foxy_account::read_reply(stream)
-            .map_err(|_| "psiphon meek response".to_owned())?;
+        let reply =
+            crate::foxy_account::read_reply(stream, response_read_chunk(self.limit_buffer_sizes))
+                .map_err(|_| "psiphon meek response".to_owned())?;
         if reply.status != 200 {
             return Err(format!("psiphon meek status {}", reply.status));
         }
@@ -709,6 +773,31 @@ mod tests {
             headers: Vec::new(),
             dns: Vec::new(),
             shape: TlsShape::default(),
+        }
+    }
+
+    #[test]
+    fn the_limited_response_chunk_is_four_kib() {
+        assert_eq!(
+            response_read_chunk(false),
+            crate::foxy_account::DEFAULT_READ_CHUNK
+        );
+        assert_eq!(response_read_chunk(true), LIMITED_READ_CHUNK);
+        assert_eq!(h3_read_chunk(false), 16 * 1024);
+        assert_eq!(h3_read_chunk(true), LIMITED_READ_CHUNK);
+    }
+
+    #[test]
+    fn both_relay_paths_carry_the_limit_into_each_response_reader() {
+        for (limit, http1, h3) in [
+            (false, crate::foxy_account::DEFAULT_READ_CHUNK, 16 * 1024),
+            (true, LIMITED_READ_CHUNK, LIMITED_READ_CHUNK),
+        ] {
+            let http = MeekHttp::new(entry(), None, Duration::from_secs(1), "/", None)
+                .expect("http")
+                .with_limit_buffer_sizes(limit);
+            assert_eq!(http.response_chunk(), http1);
+            assert_eq!(http.h3_response_chunk(), h3);
         }
     }
 

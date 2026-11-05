@@ -15,6 +15,8 @@ pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
 pub(crate) const JSON_ACCEPT: &str = "application/json";
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
+/// The default response body read chunk when the caller does not limit it.
+pub(crate) const DEFAULT_READ_CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Denied {
@@ -370,7 +372,7 @@ pub(crate) fn request(
 }
 
 /// Head to the blank line, then the declared body shape; a TLS record costs a syscall, so the head is buffered.
-pub(crate) fn read_reply<S: Read>(io: &mut S) -> Result<Reply, Failure> {
+pub(crate) fn read_reply<S: Read>(io: &mut S, chunk: usize) -> Result<Reply, Failure> {
     let mut io = BufReader::with_capacity(1024, io);
     let mut lines: Vec<String> = Vec::with_capacity(12);
     let mut total = 0usize;
@@ -411,7 +413,7 @@ pub(crate) fn read_reply<S: Read>(io: &mut S) -> Result<Reply, Failure> {
             line[colon + 1..].trim().to_owned(),
         ));
     }
-    let body = read_body(&mut io, &headers)?;
+    let body = read_body(&mut io, &headers, chunk)?;
     Ok(Reply {
         status,
         headers,
@@ -419,7 +421,13 @@ pub(crate) fn read_reply<S: Read>(io: &mut S) -> Result<Reply, Failure> {
     })
 }
 
-fn read_body<S: BufRead>(io: &mut S, headers: &[(String, String)]) -> Result<Vec<u8>, Failure> {
+/// Read the declared body shape in bounded pieces.
+fn read_body<S: BufRead>(
+    io: &mut S,
+    headers: &[(String, String)],
+    chunk: usize,
+) -> Result<Vec<u8>, Failure> {
+    let chunk = chunk.max(1);
     let header = |name: &str| {
         headers
             .iter()
@@ -445,8 +453,7 @@ fn read_body<S: BufRead>(io: &mut S, headers: &[(String, String)]) -> Result<Vec
             }
             let at = body.len();
             body.resize(at + size, 0);
-            io.read_exact(&mut body[at..])
-                .map_err(|_| Failure::Stream)?;
+            read_exact_chunked(io, &mut body[at..], chunk)?;
             let mut tail = [0u8; 2];
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
@@ -456,8 +463,23 @@ fn read_body<S: BufRead>(io: &mut S, headers: &[(String, String)]) -> Result<Vec
         .unwrap_or(0)
         .min(MAX_BODY);
     let mut body = vec![0u8; len];
-    io.read_exact(&mut body).map_err(|_| Failure::Stream)?;
+    read_exact_chunked(io, &mut body, chunk)?;
     Ok(body)
+}
+
+/// Fill a body slice in bounded pieces so the read buffer matches the active limit.
+fn read_exact_chunked<S: Read>(
+    io: &mut S,
+    mut body: &mut [u8],
+    chunk: usize,
+) -> Result<(), Failure> {
+    while !body.is_empty() {
+        let take = body.len().min(chunk);
+        io.read_exact(&mut body[..take])
+            .map_err(|_| Failure::Stream)?;
+        body = &mut body[take..];
+    }
+    Ok(())
 }
 
 /// Split into the TLS name and the dialled address: a pinned address never becomes the TLS name.
@@ -808,7 +830,8 @@ pub(crate) fn ask(
     tls.write_all(&request(method, &endpoint.origin(), url, headers, body))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
-    read_reply(&mut tls).map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+    read_reply(&mut tls, DEFAULT_READ_CHUNK)
+        .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
 }
 
 /// The browser plane's challenge only exists over HTTP/2 on the real Firefox host; every other host, and every pinned loopback edge, stays HTTP/1.1.
@@ -1238,7 +1261,7 @@ mod tests {
     #[test]
     fn a_reply_splits_its_head_from_a_content_length_body() {
         let raw = piped(b"HTTP/1.1 200 OK\r\nX-Quota-Limit: 10\r\nContent-Length: 5\r\n\r\nhello");
-        let reply = read_reply(&mut raw.as_slice()).expect("reads");
+        let reply = read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK).expect("reads");
         assert_eq!(reply.status, 200);
         assert_eq!(reply.header("x-quota-limit"), Some("10"));
         assert_eq!(reply.header_number("X-Quota-Limit"), Some(10));
@@ -1246,11 +1269,34 @@ mod tests {
     }
 
     #[test]
+    fn a_limited_reply_reads_the_body_in_chunks() {
+        struct Recording<'a> {
+            inner: &'a [u8],
+            max: usize,
+        }
+        impl Read for Recording<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.max = self.max.max(buf.len());
+                self.inner.read(buf)
+            }
+        }
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 8192));
+        let mut reader = Recording {
+            inner: &raw,
+            max: 0,
+        };
+        let reply = read_reply(&mut reader, 4096).expect("reads");
+        assert_eq!(reply.body.len(), 8192);
+        assert!(reader.max <= 4096, "{}", reader.max);
+    }
+
+    #[test]
     fn a_chunked_body_is_reassembled_before_it_is_read() {
         let raw = piped(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
         );
-        let reply = read_reply(&mut raw.as_slice()).expect("reads");
+        let reply = read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK).expect("reads");
         assert_eq!(reply.status, 200);
         assert_eq!(reply.body, b"hello world");
     }
@@ -1258,7 +1304,7 @@ mod tests {
     #[test]
     fn a_reply_without_a_length_is_a_head_and_nothing_else() {
         let raw = piped(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
-        let reply = read_reply(&mut raw.as_slice()).expect("reads");
+        let reply = read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK).expect("reads");
         assert_eq!(reply.status, 407);
         assert_eq!(reply.body, Vec::new());
         assert_eq!(reply.header_number("X-Quota-Reset"), None);
@@ -1272,7 +1318,10 @@ mod tests {
             &b"HTTP/1.1 20 OK\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK"[..],
         ] {
-            assert!(read_reply(&mut &raw[..]).is_err(), "{raw:?}");
+            assert!(
+                read_reply(&mut &raw[..], DEFAULT_READ_CHUNK).is_err(),
+                "{raw:?}"
+            );
         }
     }
 

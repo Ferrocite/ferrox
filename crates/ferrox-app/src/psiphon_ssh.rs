@@ -1197,7 +1197,7 @@ pub(crate) struct Identity<'a> {
 
 impl Session {
     /// Dial a server, negotiate the tunnel, and authenticate as the entry's user.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) fn connect(
         server: &Server,
         identity: &Identity<'_>,
@@ -1206,6 +1206,7 @@ impl Session {
         conduit: Option<&Conduit>,
         keepalive: bool,
         shape: &TlsShape,
+        limit_meek_buffers: bool,
     ) -> Result<Self, String> {
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
@@ -1234,7 +1235,10 @@ impl Session {
                         meek.quic = base == "FRONTED-MEEK-QUIC-OSSH";
                         meek.protocol = destination.protocol;
                         Stream::Tcp(crate::psiphon_meek::connect_inproxy(
-                            stream, &meek, timeout,
+                            stream,
+                            &meek,
+                            timeout,
+                            limit_meek_buffers,
                         )?)
                     }
                     "TLS-OSSH" => tls_tunnel(
@@ -1269,7 +1273,8 @@ impl Session {
                 };
                 (stream, Some(relay), destination.protocol, base)
             } else {
-                let (stream, protocol) = direct_stream(server, timeout, proxy, shape)?;
+                let (stream, protocol) =
+                    direct_stream(server, timeout, proxy, shape, limit_meek_buffers)?;
                 (stream, None, protocol, protocol)
             };
 
@@ -1991,6 +1996,7 @@ fn direct_stream(
     timeout: Duration,
     proxy: Option<&Proxy>,
     shape: &TlsShape,
+    limit_meek_buffers: bool,
 ) -> Result<(Stream, &'static str), String> {
     if server.quic {
         let stream = crate::psiphon_quic::QuicStream::connect(server, timeout, proxy)?;
@@ -1999,7 +2005,7 @@ fn direct_stream(
     let address = SocketAddr::new(server.address, server.port);
     let tls = server.tls && server.meek.is_none() && !server.ss;
     let socket = match &server.meek {
-        Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
+        Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy, limit_meek_buffers)?,
         None => direct_socket(address, server, timeout, proxy)?,
     };
     socket
