@@ -62,7 +62,7 @@ the new medians with the last published run and leaves the committed markdown
 and charts alone when no cell moved by more than 10%, the top of the shared
 runner's noise band.
 
-## Known holes (2026-10-25, rechecked 2026-10-27, standard / ubuntu-latest)
+## Known holes (2026-10-25, rechecked 2026-11-05, standard / ubuntu-latest)
 
 These are the gaps this tree still measures. `scripts/check-matrix-legs.py`
 reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue,
@@ -75,12 +75,16 @@ without paying for the whole grid; the refresh job never publishes that run.
 The 2026-10-27 recheck of the vmess, hysteria and gRPC rows
 is runs [40523513428](https://github.com/FerroxCo/ferrox/actions/runs/40523513428)
 and [40527294332](https://github.com/FerroxCo/ferrox/actions/runs/40527294332).
+The 2026-11-05 recheck of the two gRPC server legs is runs
+[41773748811](https://github.com/vpnguyishere/ferrox-plus/actions/runs/41773748811)
+(main, 0.99x and 1.07x) and
+[42095811948](https://github.com/vpnguyishere/ferrox-plus/actions/runs/42095811948)
+(five repeats, 1.05x and 1.11x): the ferrox server matches or beats the
+xray-core server with the xray-core client, so both rows are removed.
 
 | leg | cell | measurement | issue |
 | --- | ---- | ----------- | ----- |
 | both | `vless-hysteria-down-8`, `vless-hysteria-up-1`, `vless-hysteria-duplex-8` | down server 32.8 vs 109.6 MiB/s and 1.82x CPU; upload/duplex below the gate | [#670](https://github.com/FerroxCo/ferrox/issues/670) |
-| server | `vless-tls-grpc-down-8` | one run moved 450.8 vs 167.0 MiB/s, another stopped at 64 MiB; [#702](https://github.com/FerroxCo/ferrox/issues/702) covers the dropped clients | [#669](https://github.com/FerroxCo/ferrox/issues/669) |
-| server | `vless-reality-grpc-down-8` | 0.78x (121 vs 156 MiB/s) | [#468](https://github.com/FerroxCo/ferrox/issues/468) |
 | both | `vless-reality-xhttp-down-8` | all engines 0 B on the ferrox server; ferrox client 0 B on xray-core | [#668](https://github.com/FerroxCo/ferrox/issues/668) |
 
 The coverage holes with no number — a client that cannot use a ferrox server at all — are tracked in [#480](https://github.com/FerroxCo/ferrox/issues/480):
