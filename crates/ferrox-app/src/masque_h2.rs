@@ -56,6 +56,11 @@ impl Deadline {
         let at = self.0.load(Ordering::Relaxed);
         (at != 0).then(|| Duration::from_nanos(at.saturating_sub(monotonic_nanos())))
     }
+
+    /// The instant the handshake clock names, while it is armed.
+    fn at(&self) -> Option<Instant> {
+        self.remaining().map(|left| Instant::now() + left)
+    }
 }
 
 pub(crate) struct DeadlineStream {
@@ -301,17 +306,20 @@ pub(crate) fn serve_cleartext(shared: Arc<Shared>, spec: Arc<ServerSpec>, listen
 
 /// Serve one prior-knowledge h2c connection over bare TCP.
 fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
-    let deadline = Deadline::default();
-    let io = DeadlineStream::new(stream, deadline.clone());
+    let mut wire = cleartext_wire(stream);
+    if wire.preface() {
+        Session::new(shared, spec).run(&mut wire);
+    }
+}
+
+fn cleartext_wire(stream: TcpStream) -> Wire {
+    let (io, deadline) = handshake_stream(stream);
     io.set_read_timeout(Some(READ_WAIT));
-    let mut wire = Wire {
+    Wire {
         stream: Box::new(io),
         pending: Vec::new(),
         closed: false,
         deadline,
-    };
-    if wire.preface() {
-        Session::new(shared, spec).run(&mut wire);
     }
 }
 
@@ -324,7 +332,10 @@ struct Wire {
 
 impl Wire {
     fn preface(&mut self) -> bool {
-        let deadline = Instant::now() + HANDSHAKE;
+        let deadline = self
+            .deadline
+            .at()
+            .unwrap_or_else(|| Instant::now() + HANDSHAKE);
         while self.pending.len() < PREFACE {
             if Instant::now() > deadline || !self.fill() || self.closed {
                 return false;
@@ -430,6 +441,7 @@ pub(crate) struct Client {
     pub(crate) addresses: Vec<IpAddr>,
     pub(crate) mtu: usize,
     pub(crate) packets: Vec<Vec<u8>>,
+    early_bytes: usize,
     to_stack: Option<Sender<Packet>>,
     routes: Option<UdpRoutes>,
     warp: bool,
@@ -522,6 +534,7 @@ fn handshake(
         addresses: Vec::new(),
         mtu: masque::DEFAULT_MTU,
         packets: Vec::new(),
+        early_bytes: 0,
         to_stack: None,
         routes: None,
         warp: warp.is_some(),
@@ -551,7 +564,11 @@ fn handshake(
     {
         return Err("the edge closed while the request was written".to_owned());
     }
-    let deadline = Instant::now() + HANDSHAKE;
+    let deadline = client
+        .wire
+        .deadline
+        .at()
+        .unwrap_or_else(|| Instant::now() + HANDSHAKE);
     while client.status.is_none() {
         if Instant::now() > deadline {
             return Err("the edge sent no response head".to_owned());
@@ -624,7 +641,6 @@ impl Client {
         let _ = tcp.set_read_timeout(Some(READ_WAIT));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
         let (tcp, deadline) = handshake_stream(tcp);
-        deadline.clear();
         let mut tcp = tcp;
         tcp.set_read_timeout(Some(READ_WAIT));
         tcp.write_all(h2::MAGIC)
@@ -646,7 +662,11 @@ impl Client {
         let mut requests = Vec::with_capacity(40);
         connectip::address_requests(&[(1, 4, &v4), (2, 6, &v6)], &mut requests);
         self.capsule(&requests);
-        let deadline = Instant::now() + HANDSHAKE;
+        let deadline = self
+            .wire
+            .deadline
+            .at()
+            .unwrap_or_else(|| Instant::now() + HANDSHAKE);
         while self.addresses.is_empty() {
             if Instant::now() > deadline {
                 return Err("no address assigned".to_owned());
@@ -675,6 +695,7 @@ impl Client {
         for packet in self.packets.drain(..) {
             deliver(to_stack, routes, &packet);
         }
+        self.early_bytes = 0;
         let mut capsule = Vec::new();
         while !self.wire.closed && !self.end {
             self.pump();
@@ -919,7 +940,12 @@ impl Client {
             connectip::Capsule::Datagram(packet) => {
                 if let (Some(to_stack), Some(routes)) = (&self.to_stack, &self.routes) {
                     deliver(to_stack, routes, packet);
+                } else if self.packets.len() >= masque::EARLY_PACKETS
+                    || self.early_bytes.saturating_add(packet.len()) > masque::EARLY_BYTES
+                {
+                    self.end = true;
                 } else {
+                    self.early_bytes += packet.len();
                     self.packets.push(packet.to_vec());
                 }
                 None
@@ -1026,7 +1052,12 @@ impl Session {
     }
 
     fn run(&mut self, wire: &mut Wire) {
-        self.run_until(wire, Instant::now() + HANDSHAKE);
+        self.run_until(
+            wire,
+            wire.deadline
+                .at()
+                .unwrap_or_else(|| Instant::now() + HANDSHAKE),
+        );
     }
 
     fn run_until(&mut self, wire: &mut Wire, deadline: Instant) {
@@ -1040,6 +1071,10 @@ impl Session {
             loop {
                 match frame_at(&pending, at) {
                     Ok(Some(frame)) => {
+                        if self.request.is_none() && Instant::now() >= deadline {
+                            self.end = true;
+                            break;
+                        }
                         self.on(
                             wire,
                             frame.kind,
@@ -1488,6 +1523,7 @@ mod tests {
             addresses: Vec::new(),
             mtu: masque::DEFAULT_MTU,
             packets: Vec::new(),
+            early_bytes: 0,
             to_stack: None,
             routes: None,
             warp: false,
@@ -1562,6 +1598,38 @@ mod tests {
             "a whole capsule is never staged"
         );
         assert_eq!(client.packets.len(), 0);
+    }
+
+    #[test]
+    fn a_pre_stack_datagram_flood_is_bounded() {
+        let mut capsule = Vec::new();
+        datagram(&udp_packet(53), &mut capsule);
+        let mut client = bare_client();
+        for _ in 0..masque::EARLY_PACKETS {
+            client.capsules(&capsule);
+        }
+        assert!(!client.end, "the count cap itself is accepted");
+        assert_eq!(client.packets.len(), masque::EARLY_PACKETS);
+        client.capsules(&capsule);
+        assert!(client.end, "the next datagram ends the session");
+        assert_eq!(client.packets.len(), masque::EARLY_PACKETS);
+    }
+
+    #[test]
+    fn a_pre_stack_datagram_byte_flood_is_bounded() {
+        let packet = vec![0u8; masque::EARLY_BYTES / masque::EARLY_PACKETS + 1];
+        let mut capsule = Vec::new();
+        datagram(&packet, &mut capsule);
+        let mut client = bare_client();
+        for _ in 0..masque::EARLY_PACKETS {
+            client.capsules(&capsule);
+            if client.end {
+                break;
+            }
+        }
+        assert!(client.end, "the byte cap ends the session");
+        assert!(client.packets.len() < masque::EARLY_PACKETS);
+        assert!(client.early_bytes <= masque::EARLY_BYTES);
     }
 
     /// Each exhausted window independently enforces the documented 64-capsule limit and overflow termination.
@@ -1849,6 +1917,44 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_cleartext_wire_arms_the_handshake_clock() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("an address");
+        let client = TcpStream::connect(address).expect("a client");
+        let (server, _) = listener.accept().expect("a server");
+        let wire = cleartext_wire(server);
+        assert!(wire
+            .deadline
+            .remaining()
+            .is_some_and(|left| left > Duration::ZERO));
+        drop(client);
+    }
+
+    #[test]
+    fn a_due_handshake_clock_is_checked_between_frames() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut pending = Vec::new();
+        pending.extend_from_slice(&h2::frame_head(8, h2::T_PING, 0, 0));
+        pending.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+            }),
+            pending,
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.run_until(&mut wire, Instant::now() - Duration::from_millis(1));
+        assert!(session.end, "the handshake clock ended the session");
+        assert_eq!(
+            out.lock().expect("a recorder").len(),
+            15,
+            "the due clock stopped before the ping was answered"
+        );
     }
 
     #[test]

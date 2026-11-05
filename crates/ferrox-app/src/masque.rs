@@ -45,6 +45,9 @@ const DEFAULT_REMOTE_DNS: [IpAddr; 4] = [
 ];
 pub(crate) const DEFAULT_MTU: usize = 1280;
 pub(crate) const QUEUE: usize = 512;
+/// Datagrams a client may hold before its stack attaches, and their total bytes.
+pub(crate) const EARLY_PACKETS: usize = 64;
+pub(crate) const EARLY_BYTES: usize = 1 << 20;
 /// Frames the connection may hold before `dgram_send` refuses more: the
 /// reference queues 32, and a peer that drains slower drops what the wire
 /// delivers above its own receive queue, which the inner TCP then backs off
@@ -1256,9 +1259,22 @@ struct Stream {
     pending: Vec<Owned>,
     done: bool,
     packets: Vec<Vec<u8>>,
+    early_bytes: usize,
 }
 
 impl Stream {
+    /// Hold a datagram until the stack attaches, within the early-buffer caps.
+    fn stash(&mut self, datagram: Vec<u8>) -> bool {
+        if self.packets.len() >= EARLY_PACKETS
+            || self.early_bytes.saturating_add(datagram.len()) > EARLY_BYTES
+        {
+            return false;
+        }
+        self.early_bytes += datagram.len();
+        self.packets.push(datagram);
+        true
+    }
+
     fn wait_head(
         &mut self,
         conn: &mut quiche::Connection,
@@ -1301,7 +1317,12 @@ impl Stream {
             if stream == self.id {
                 let offset = datagram.len() - packet.len();
                 datagram.drain(..offset);
-                self.packets.push(datagram);
+                if !self.stash(datagram) {
+                    return Err(
+                        "masque: the edge sent too many datagrams before assigning an address"
+                            .to_owned(),
+                    );
+                }
             }
         }
         Ok(())
@@ -3859,5 +3880,24 @@ mod tests {
             Some(Duration::ZERO),
             "a due QUIC deadline was left for the next receive timeout"
         );
+    }
+
+    #[test]
+    fn early_h3_datagrams_are_bounded_by_count_and_bytes() {
+        let mut stream = Stream::default();
+        for _ in 0..EARLY_PACKETS {
+            assert!(stream.stash(vec![0; 32]));
+        }
+        assert!(!stream.stash(vec![0; 32]), "the count cap holds");
+        assert_eq!(stream.packets.len(), EARLY_PACKETS);
+
+        let mut stream = Stream::default();
+        let packet = vec![0u8; EARLY_BYTES / EARLY_PACKETS + 1];
+        let mut accepted = 0;
+        while stream.stash(packet.clone()) {
+            accepted += 1;
+        }
+        assert!(accepted < EARLY_PACKETS, "the byte cap holds");
+        assert!(stream.early_bytes <= EARLY_BYTES);
     }
 }

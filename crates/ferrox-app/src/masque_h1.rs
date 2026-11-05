@@ -176,6 +176,7 @@ pub(crate) struct Client {
     pub(crate) addresses: Vec<IpAddr>,
     pub(crate) mtu: usize,
     pub(crate) packets: Vec<Vec<u8>>,
+    early_bytes: usize,
     to_stack: Option<Sender<Packet>>,
     routes: Option<UdpRoutes>,
     end: bool,
@@ -216,6 +217,7 @@ impl Client {
             addresses: Vec::new(),
             mtu: masque::DEFAULT_MTU,
             packets: Vec::new(),
+            early_bytes: 0,
             to_stack: None,
             routes: None,
             end: false,
@@ -287,6 +289,7 @@ impl Client {
         for packet in self.packets.drain(..) {
             deliver(to_stack, routes, &packet);
         }
+        self.early_bytes = 0;
         let mut capsule = Vec::new();
         while !self.wire.closed && !self.end {
             self.pump();
@@ -366,7 +369,12 @@ impl Client {
             connectip::Capsule::Datagram(packet) => {
                 if let (Some(to_stack), Some(routes)) = (&self.to_stack, &self.routes) {
                     deliver(to_stack, routes, packet);
+                } else if self.packets.len() >= masque::EARLY_PACKETS
+                    || self.early_bytes.saturating_add(packet.len()) > masque::EARLY_BYTES
+                {
+                    self.end = true;
                 } else {
+                    self.early_bytes += packet.len();
                     self.packets.push(packet.to_vec());
                 }
                 None
@@ -611,6 +619,49 @@ mod tests {
         assert_eq!(text.matches("Upgrade:").count(), 1);
         assert_eq!(text.matches("Capsule-Protocol:").count(), 1);
         assert!(text.contains("authorization: Basic dTpw\r\n"));
+    }
+
+    fn bare_client() -> Client {
+        Client {
+            wire: Wire {
+                stream: Box::new(std::io::Cursor::new(Vec::new())),
+                pending: Vec::new(),
+                closed: false,
+            },
+            capsules: Vec::new(),
+            capsule_at: 0,
+            addresses: Vec::new(),
+            mtu: masque::DEFAULT_MTU,
+            packets: Vec::new(),
+            early_bytes: 0,
+            to_stack: None,
+            routes: None,
+            end: false,
+        }
+    }
+
+    #[test]
+    fn a_pre_stack_datagram_flood_is_bounded() {
+        let mut client = bare_client();
+        let packet = [0u8; 32];
+        for _ in 0..masque::EARLY_PACKETS {
+            client.handle(connectip::Capsule::Datagram(&packet));
+        }
+        assert!(!client.end, "the count cap itself is accepted");
+        client.handle(connectip::Capsule::Datagram(&packet));
+        assert!(client.end, "the next datagram ends the session");
+
+        let mut client = bare_client();
+        let packet = vec![0u8; masque::EARLY_BYTES / masque::EARLY_PACKETS + 1];
+        for _ in 0..masque::EARLY_PACKETS {
+            client.handle(connectip::Capsule::Datagram(&packet));
+            if client.end {
+                break;
+            }
+        }
+        assert!(client.end, "the byte cap ends the session");
+        assert!(client.packets.len() < masque::EARLY_PACKETS);
+        assert!(client.early_bytes <= masque::EARLY_BYTES);
     }
 
     #[test]
