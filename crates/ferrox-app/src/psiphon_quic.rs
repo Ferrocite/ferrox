@@ -182,8 +182,8 @@ impl Clone for QuicStream {
     }
 }
 
-/// The obfuscation mode, proof key and packet key an entry selects.
-fn quic_parameters(server: &Server) -> Result<(bool, bool, &str, [u8; 32]), String> {
+/// The obfuscation mode, structural randomization, proof key and packet key an entry selects.
+fn quic_parameters(server: &Server) -> Result<(bool, bool, bool, &str, [u8; 32]), String> {
     let version = if server.quic_versions.is_empty() {
         SUPPORTED_QUIC_VERSIONS
             [bounded_random(SUPPORTED_QUIC_VERSIONS.len()).map_err(|error| error.to_string())?]
@@ -199,6 +199,7 @@ fn quic_parameters(server: &Server) -> Result<(bool, bool, &str, [u8; 32]), Stri
     };
     let obfuscated = matches!(version, "OBFUSCATED-QUICv1" | "DECOY-QUICv1");
     let decoy = version == "DECOY-QUICv1";
+    let randomized = version == "RANDOMIZED-QUICv1";
     let proof_key = tls_passthrough_key(server);
     if proof_key.is_empty() {
         return Err("psiphon quic: entry has no passthrough key".to_owned());
@@ -213,7 +214,7 @@ fn quic_parameters(server: &Server) -> Result<(bool, bool, &str, [u8; 32]), Stri
     } else {
         [0u8; 32]
     };
-    Ok((obfuscated, decoy, proof_key, packet_key))
+    Ok((obfuscated, decoy, randomized, proof_key, packet_key))
 }
 
 /// Wrap a packet source in the entry's QUIC obfuscation layer.
@@ -248,7 +249,7 @@ impl QuicStream {
         if proxy.is_some() {
             return Err("psiphon quic: an upstream proxy cannot carry UDP QUIC".to_owned());
         }
-        let (obfuscated, decoy, proof_key, packet_key) = quic_parameters(server)?;
+        let (obfuscated, decoy, randomized, proof_key, packet_key) = quic_parameters(server)?;
         let remote = SocketAddr::new(server.address, server.port);
         let bind = if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -270,7 +271,7 @@ impl QuicStream {
             }
         }
         let udp = packet_io(PacketIo::Socket(socket), obfuscated, decoy, packet_key)?;
-        Self::connect_over(udp, remote, timeout, proof_key)
+        Self::connect_over(udp, remote, timeout, proof_key, randomized)
     }
 
     /// Dial QUIC-OSSH through an in-proxy WebRTC data channel.
@@ -279,11 +280,11 @@ impl QuicStream {
         timeout: Duration,
         stream: WebRtcStream,
     ) -> Result<Self, String> {
-        let (obfuscated, decoy, proof_key, packet_key) = quic_parameters(server)?;
+        let (obfuscated, decoy, randomized, proof_key, packet_key) = quic_parameters(server)?;
         let remote = SocketAddr::new(server.address, server.port);
         stream.set_timeout(Some(timeout));
         let udp = packet_io(PacketIo::WebRtc(stream), obfuscated, decoy, packet_key)?;
-        Self::connect_over(udp, remote, timeout, proof_key)
+        Self::connect_over(udp, remote, timeout, proof_key, randomized)
     }
 
     /// Complete the QUIC handshake over a packet source and start its driver.
@@ -292,8 +293,9 @@ impl QuicStream {
         remote: SocketAddr,
         timeout: Duration,
         proof_key: &str,
+        randomized: bool,
     ) -> Result<Self, String> {
-        let mut engine = Engine::new(proof_key)?;
+        let mut engine = Engine::new(proof_key, randomized)?;
         let deadline = Instant::now() + timeout;
         let mut datagram = vec![0u8; 65535];
         loop {
@@ -759,13 +761,13 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(key: &str) -> Result<Self, String> {
-        let config = client_config()?;
+    fn new(key: &str, randomized: bool) -> Result<Self, String> {
+        let config = client_config(randomized)?;
         let mut dcid = vec![0u8; CID_LEN];
         getrandom::fill(&mut dcid).map_err(|error| format!("psiphon quic dcid: {error}"))?;
         let mut scid = vec![0u8; CID_LEN];
         getrandom::fill(&mut scid).map_err(|error| format!("psiphon quic scid: {error}"))?;
-        let params = transport_params(&scid);
+        let params = transport_params(&scid, randomized)?;
         let name = quic_server_name();
         let server_name = ServerName::try_from(name.as_str())
             .map_err(|error| format!("psiphon quic server name: {error}"))?
@@ -1826,8 +1828,12 @@ fn fail(shared: &Shared, why: impl Into<String>) {
     shared.writable.notify_all();
 }
 
-fn client_config() -> Result<rustls::ClientConfig, String> {
+fn client_config(randomized: bool) -> Result<rustls::ClientConfig, String> {
     let mut provider = rustls::crypto::ring::default_provider();
+    if randomized {
+        randomize_cipher_suites(&mut provider)?;
+        randomize_kx_groups(&mut provider)?;
+    }
     let schemes = provider
         .signature_verification_algorithms
         .supported_schemes();
@@ -1917,17 +1923,82 @@ fn quic_server_name() -> String {
     name
 }
 
-fn transport_params(scid: &[u8]) -> Vec<u8> {
-    let mut params = Vec::new();
-    put_parameter(&mut params, 0x01, &varint_bytes(60_000));
-    put_parameter(&mut params, 0x03, &varint_bytes(MAX_UDP_PAYLOAD));
-    put_parameter(&mut params, 0x04, &varint_bytes(INITIAL_WINDOW));
-    put_parameter(&mut params, 0x05, &varint_bytes(STREAM_WINDOW));
-    put_parameter(&mut params, 0x06, &varint_bytes(STREAM_WINDOW));
-    put_parameter(&mut params, 0x08, &varint_bytes(1));
-    put_parameter(&mut params, 0x0e, &varint_bytes(2));
-    put_parameter(&mut params, 0x0f, scid);
-    params
+fn transport_params(scid: &[u8], randomized: bool) -> Result<Vec<u8>, String> {
+    let mut params = vec![
+        (0x01, varint_bytes(60_000)),
+        (0x03, varint_bytes(MAX_UDP_PAYLOAD)),
+        (0x04, varint_bytes(INITIAL_WINDOW)),
+        (0x05, varint_bytes(STREAM_WINDOW)),
+        (0x06, varint_bytes(STREAM_WINDOW)),
+        (0x08, varint_bytes(1)),
+        (0x0e, varint_bytes(2)),
+        (0x0f, scid.to_vec()),
+    ];
+    if randomized {
+        let mut grease = [0u8; 16];
+        let length = draw_below(grease.len())?;
+        getrandom::fill(&mut grease[..length])
+            .map_err(|error| format!("psiphon quic transport parameter: {error}"))?;
+        params.push((27 + 31 * draw_below(100)? as u64, grease[..length].to_vec()));
+        shuffle(&mut params)?;
+    }
+    let mut encoded = Vec::new();
+    for (id, value) in params {
+        put_parameter(&mut encoded, id, &value);
+    }
+    Ok(encoded)
+}
+
+/// A uniform draw below `bound`, using the system generator rather than a TLS transcript seed.
+fn draw_below(bound: usize) -> Result<usize, String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(|error| format!("psiphon quic entropy: {error}"))?;
+    Ok((u64::from_be_bytes(bytes) % bound as u64) as usize)
+}
+
+fn shuffle<T>(items: &mut [T]) -> Result<(), String> {
+    for at in (1..items.len()).rev() {
+        let other = draw_below(at + 1)?;
+        items.swap(at, other);
+    }
+    Ok(())
+}
+
+fn randomize_kx_groups(provider: &mut rustls::crypto::CryptoProvider) -> Result<(), String> {
+    let mut groups = std::mem::take(&mut provider.kx_groups);
+    let key_share = groups
+        .iter()
+        .position(|group| u16::from(group.name()) == 0x001d);
+    if let Some(at) = key_share {
+        let x25519 = groups.remove(at);
+        shuffle(&mut groups)?;
+        while !groups.is_empty() && draw_below(2)? == 0 {
+            groups.pop();
+        }
+        groups.insert(0, x25519);
+    } else {
+        shuffle(&mut groups)?;
+    }
+    provider.kx_groups = groups;
+    Ok(())
+}
+
+fn randomize_cipher_suites(provider: &mut rustls::crypto::CryptoProvider) -> Result<(), String> {
+    let mut suites: Vec<_> = provider
+        .cipher_suites
+        .iter()
+        .copied()
+        .filter(|suite| suite.tls13().is_some())
+        .collect();
+    if suites.is_empty() {
+        return Ok(());
+    }
+    shuffle(&mut suites)?;
+    while suites.len() > 1 && draw_below(2)? == 0 {
+        suites.pop();
+    }
+    provider.cipher_suites = suites;
+    Ok(())
 }
 
 fn put_parameter(params: &mut Vec<u8>, id: u64, value: &[u8]) {
@@ -2022,7 +2093,10 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 
 #[cfg(test)]
 mod tests {
-    use super::{ObfuscatedUdp, PacketIo, QuicNoise, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD};
+    use super::{
+        get_varint, randomize_cipher_suites, randomize_kx_groups, transport_params, ObfuscatedUdp,
+        PacketIo, QuicNoise, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD,
+    };
     use std::net::UdpSocket;
     use std::time::Duration;
 
@@ -2055,6 +2129,62 @@ mod tests {
             ),
             (2, 2, 24, 48)
         );
+    }
+
+    fn parameter_ids(encoded: &[u8]) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut at = 0;
+        while at < encoded.len() {
+            let id = get_varint(encoded, &mut at).expect("parameter id");
+            let length = get_varint(encoded, &mut at).expect("parameter length");
+            at += usize::try_from(length).expect("parameter length");
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn randomized_transport_parameters_grease_and_shuffle_their_order() {
+        assert_eq!(
+            parameter_ids(&transport_params(&[7u8; 16], false).expect("fixed")),
+            vec![0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f]
+        );
+        let mut orders = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let encoded = transport_params(&[7u8; 16], true).expect("randomized");
+            let ids = parameter_ids(&encoded);
+            for wanted in [0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f] {
+                assert!(ids.contains(&wanted), "missing {wanted:#x}");
+            }
+            assert!(ids
+                .iter()
+                .any(|id| *id >= 27 && *id <= 3096 && (*id - 27) % 31 == 0));
+            orders.insert(format!("{ids:?}"));
+        }
+        assert!(orders.len() > 1, "the order never moved");
+    }
+
+    #[test]
+    fn randomized_cipher_suites_stay_tls13() {
+        let mut provider = rustls::crypto::ring::default_provider();
+        randomize_cipher_suites(&mut provider).expect("suite randomization");
+        let first = provider
+            .cipher_suites
+            .first()
+            .expect("a TLS 1.3 suite survives");
+        assert!(first.tls13().is_some());
+        assert!(provider
+            .cipher_suites
+            .iter()
+            .all(|suite| suite.tls13().is_some()));
+    }
+
+    #[test]
+    fn randomized_key_groups_keep_x25519_as_the_key_share() {
+        let mut provider = rustls::crypto::ring::default_provider();
+        randomize_kx_groups(&mut provider).expect("group randomization");
+        let first = provider.kx_groups.first().expect("a group");
+        assert_eq!(u16::from(first.name()), 0x001d);
     }
 
     #[test]
