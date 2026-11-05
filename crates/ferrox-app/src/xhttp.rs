@@ -2695,15 +2695,14 @@ pub(crate) fn accept_core<
             if let Some(h2) = h2.as_ref() {
                 h2.bind_upload(sid);
             }
-            // The reference writes the 200 but Go holds it until the handler returns, after the session ends: a client that sees it early closes its upload body.
-            if h2.is_some() {
-                session.wait_ended();
-                plain_ok(&mut write, settings, &padded);
+            // Go writes the 200 only when the handler returns; a stream-up POST hands that answer to its session so no accepted thread waits out the download, and the other shapes keep the inline wait.
+            if h2.is_none() && settings.mode == XhttpMode::StreamUp {
+                let settings = settings.clone();
+                session.defer_response(Box::new(move || plain_ok(&mut write, &settings, &padded)));
                 return Served::Closed;
             }
-            // A plain H1 POST hands its answer to the session and returns, so no accepted thread waits out the download.
-            let settings = settings.clone();
-            session.defer_response(Box::new(move || plain_ok(&mut write, &settings, &padded)));
+            session.wait_ended();
+            plain_ok(&mut write, settings, &padded);
             Served::Closed
         }
         (Some(sid), Some(seq)) => {
