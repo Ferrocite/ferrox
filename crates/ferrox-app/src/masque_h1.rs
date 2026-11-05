@@ -588,8 +588,8 @@ mod tests {
     #[test]
     fn an_absolute_target_still_matches_the_configured_path() {
         assert_eq!(
-            target_path("https://edge.example/.well-known/masque/ip/1.2.3.4/32/"),
-            "/.well-known/masque/ip/1.2.3.4/32/"
+            target_path("https://edge.example/.well-known/masque/ip/192.0.2.1/32/"),
+            "/.well-known/masque/ip/192.0.2.1/32/"
         );
         assert_eq!(
             target_path("/.well-known/masque/ip/*/*/"),
