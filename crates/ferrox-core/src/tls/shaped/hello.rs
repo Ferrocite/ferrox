@@ -238,20 +238,21 @@ impl Hello {
         let head = Prepared {
             version: TLS12,
             random: &offer.inner_random,
-            session_id: &self.session_id,
+            session_id: &[],
             ciphers: &ciphers,
             message_len,
             shares,
         };
-        let transcript = self.encode_prepared(head, &entries, true);
-        let mut encoded = self.encode_prepared(
+        let transcript = self.encode_prepared(
             Prepared {
-                session_id: &[],
+                session_id: &self.session_id,
+                message_len: message_len + self.session_id.len(),
                 ..head
             },
             &entries,
-            false,
+            true,
         );
+        let mut encoded = self.encode_prepared(head, &entries, false);
         let name_pad = match offer.inner_name.as_deref() {
             Some(name) => offer.maximum_name_length.saturating_sub(name.len()),
             None => offer.maximum_name_length + 9,
@@ -1161,7 +1162,7 @@ mod tests {
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 18, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 17, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
