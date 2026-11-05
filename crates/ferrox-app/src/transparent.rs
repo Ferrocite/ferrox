@@ -1,6 +1,7 @@
 //! The kernel side of a transparent inbound: where a redirected flow was really going,
 //! and the socket options that let a listener receive another host's traffic.
 
+#[cfg(not(target_os = "linux"))]
 use std::io;
 use std::net::SocketAddr;
 
@@ -19,7 +20,7 @@ pub(crate) use linux::{
 pub(crate) use darwin::{original_destination, set_transparent};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) use other::{original_destination, set_transparent};
+pub(crate) use other::set_transparent;
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn bind_udp(_address: SocketAddr) -> io::Result<std::net::UdpSocket> {
@@ -371,7 +372,6 @@ mod darwin {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod other {
-    use super::SocketAddr;
     use std::io;
 
     fn unsupported<T>() -> io::Result<T> {
@@ -382,14 +382,6 @@ mod other {
     }
 
     pub(crate) fn set_transparent(_socket: &socket2::Socket, _v6: bool) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub(crate) fn original_destination(
-        _fd: libc::c_int,
-        _peer: SocketAddr,
-        _local: Option<SocketAddr>,
-    ) -> io::Result<SocketAddr> {
         unsupported()
     }
 }

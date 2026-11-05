@@ -539,7 +539,7 @@ mod platform {
                     set_int(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, max_seg)?;
                 }
             }
-            if options.tproxy != Tproxy::Off {
+            if options.tproxy != super::Tproxy::Off {
                 let level = if addr.is_ipv4() {
                     libc::SOL_IP
                 } else {
