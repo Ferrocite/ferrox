@@ -3024,6 +3024,8 @@ mod tests {
     }
 
     impl H2Client {
+        /// Opens the test peer and reads the server's opening frames under the socket deadline, so a
+        /// demux that never answers fails the test instead of parking it.
         fn connect(addr: SocketAddr) -> Self {
             let mut stream = Connection::connect(addr).expect("connects");
             stream
