@@ -1626,6 +1626,7 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut port = None;
     let mut port_map = Vec::new();
     let mut follow_redirect = false;
+    let mut user_level = 0;
     let mut networks = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
@@ -1638,7 +1639,9 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
             }
             (3, 2) => port_map.push(dokodemo_port_map_entry(reader.bytes()?)?),
             (5, 0) => follow_redirect = reader.varint()? != 0,
-            (6, 0) => return Err(reader.uncarried("user_level")),
+            (6, 0) => {
+                user_level = u32_value(reader.varint()?, "xray.proxy.dokodemo.Config: user level")?;
+            }
             // A repeated enum arrives packed into one field or per field, and the packed payload carries no keys.
             (7, 2) => {
                 let mut packed = Reader::new(reader.bytes()?, "xray.proxy.dokodemo.Config");
@@ -1678,6 +1681,9 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
     }
     if follow_redirect {
         settings.push(("followRedirect", Json::Bool(true)));
+    }
+    if user_level != 0 {
+        settings.push(("userLevel", Json::Num(f64::from(user_level))));
     }
     settings.push(("network", Json::Str(allowed.join(","))));
     Ok(object(settings))
@@ -4669,6 +4675,29 @@ mod tests {
             port_map.get("8080").and_then(Json::as_str),
             Some("127.0.0.1:9090")
         );
+    }
+
+    #[test]
+    fn a_dokodemo_user_level_decodes() {
+        let settings = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 8080),
+            varint_field(6, 7),
+            varint_field(7, 2),
+        ]);
+        let json = to_json(&config(
+            &dokodemo_inbound(&receiver(8080, None), &settings),
+            &freedom_outbound(),
+        ))
+        .expect("userLevel decodes");
+        let level = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("userLevel"))
+            .and_then(Json::as_u32);
+        assert_eq!(level, Some(7));
     }
 
     #[test]
