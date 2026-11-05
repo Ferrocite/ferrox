@@ -184,6 +184,7 @@ impl MasqueOut {
     }
 }
 
+/// Open the carrier the configured security and ALPN select.
 fn open(spec: &ClientSpec) -> Result<Inner, String> {
     let Some(tls) = spec.tls.as_deref() else {
         if spec.warp.is_some() {
@@ -236,6 +237,7 @@ fn uses_h1(tls: &TlsConfig) -> bool {
         && !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h3")
 }
 
+/// Open the TLS/HTTP-2 carrier and assemble its tunnel.
 fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     let edge = format!("{}:{}", spec.address, spec.port)
         .to_socket_addrs()
@@ -284,6 +286,7 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     ))
 }
 
+/// Open the TLS/HTTP-1.1 carrier and assemble its tunnel.
 fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
     let tls = spec
         .tls
@@ -308,6 +311,7 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
     ))
 }
 
+/// Open the cleartext prior-knowledge HTTP/2 carrier.
 fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     let edge = resolve_edge(spec)?;
     let authority = authority(spec);
@@ -328,6 +332,7 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     ))
 }
 
+/// Resolve the configured edge to the first address it names.
 fn resolve_edge(spec: &ClientSpec) -> Result<SocketAddr, String> {
     format!("{}:{}", spec.address, spec.port)
         .to_socket_addrs()
@@ -423,6 +428,7 @@ struct ClientSpec {
 }
 
 impl ClientSpec {
+    /// Parse an outbound's settings, transport, and WARP block.
     fn from(outbound: &Json) -> Result<Self, String> {
         let settings = outbound
             .get("settings")
@@ -499,6 +505,7 @@ impl ClientSpec {
     }
 }
 
+/// Read configured headers, lowercasing names as the reference does.
 fn client_headers(transport: Option<&Json>) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> =
         match transport.and_then(|settings| settings.get("headers")) {
@@ -926,6 +933,7 @@ fn establish(
     attempt(spec, sock, peer, local).map_err(|reason| format!("masque: {reason}"))
 }
 
+/// Open one QUIC attempt and take its assigned or configured addresses.
 fn attempt(
     spec: &ClientSpec,
     sock: &Datagram,
@@ -990,6 +998,7 @@ fn attempt(
     })
 }
 
+/// Check the WARP public key or the configured certificate pins.
 fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), String> {
     let tls = spec
         .tls
@@ -1124,6 +1133,7 @@ fn send_data(conn: &mut quiche::Connection, stream: u64, bytes: &[u8]) -> Result
     send_stream(conn, stream, &frame, false)
 }
 
+/// The request authority: configured host, else SNI, with a non-default port.
 fn authority(spec: &ClientSpec) -> String {
     if let Some(host) = &spec.host {
         return host.clone();
@@ -1652,6 +1662,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     Ok(local.port())
 }
 
+/// Open a cleartext inbound's TCP listener and spawn its stack and forwarder.
 fn serve_cleartext_inbound(
     spec: &Arc<ServerSpec>,
     out: &Outbound,
@@ -1699,6 +1710,7 @@ pub(crate) struct ServerSpec {
 }
 
 impl ServerSpec {
+    /// Parse an inbound's prefixes, users, and limits.
     fn from(inbound: &Json) -> Result<Self, String> {
         let settings = inbound
             .get("settings")

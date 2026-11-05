@@ -31,6 +31,7 @@ struct Wire {
 }
 
 impl Wire {
+    /// Read once into the pending buffer, treating EOF and errors as closure.
     fn fill(&mut self) -> bool {
         let mut room = [0u8; READ_ROOM];
         match self.stream.read(&mut room) {
@@ -50,6 +51,7 @@ impl Wire {
         }
     }
 
+    /// Write the whole buffer, marking the wire closed on failure.
     fn send(&mut self, bytes: &[u8]) -> bool {
         if self.closed || self.stream.write_all(bytes).is_err() {
             self.closed = true;
@@ -58,6 +60,7 @@ impl Wire {
         true
     }
 
+    /// Read until the response head ends or the budget runs out.
     fn head(&mut self, budget: Duration) -> Option<usize> {
         let until = Instant::now() + budget;
         loop {
@@ -74,10 +77,17 @@ impl Wire {
     }
 }
 
-/// The request line and upgrade fields, written in the order RFC 9484 §4.2
-/// prints them: an absolute URI, the authority, and the token.
+/// True when the target already carries an http or https scheme.
+fn absolute(path: &str) -> bool {
+    path.find("://").is_some_and(|at| {
+        let scheme = &path[..at];
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+/// The RFC 9484 §4.2 upgrade: an absolute URI, the authority, and the tokens.
 pub(crate) fn request(authority: &str, path: &str, headers: &[(String, String)]) -> Vec<u8> {
-    let target = if path.starts_with("http://") || path.starts_with("https://") {
+    let target = if absolute(path) {
         path.to_owned()
     } else {
         format!("https://{authority}{path}")
@@ -111,6 +121,7 @@ pub(crate) fn request(authority: &str, path: &str, headers: &[(String, String)])
 
 pub(crate) const SWITCH: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n";
 
+/// A minimal error answer; a 401 also carries the Basic challenge.
 fn refusal(status: u16) -> Vec<u8> {
     let reason = match status {
         401 => "Unauthorized",
@@ -129,6 +140,7 @@ fn refusal(status: u16) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// True when a comma-separated header names the token in any case.
 fn header_has(text: &str, name: &str, token: &str) -> bool {
     crate::proxy::header_value_in(text, name).is_some_and(|value| {
         value
@@ -137,19 +149,24 @@ fn header_has(text: &str, name: &str, token: &str) -> bool {
     })
 }
 
+/// True when Capsule-Protocol offers the version `?1`.
 fn capsules_ok(text: &str) -> bool {
     crate::proxy::header_value_in(text, "capsule-protocol")
         .and_then(|value| value.strip_prefix('?'))
         .is_some_and(|value| value.split(';').next() == Some("1"))
 }
 
+/// The path of an absolute-form target, or the target itself.
 fn target_path(target: &str) -> &str {
-    for scheme in ["https://", "http://"] {
-        if let Some(rest) = target.strip_prefix(scheme) {
-            return rest.find('/').map_or("/", |at| &rest[at..]);
-        }
+    let Some(at) = target.find("://") else {
+        return target;
+    };
+    let scheme = &target[..at];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return target;
     }
-    target
+    let rest = &target[at + 3..];
+    rest.find('/').map_or("/", |slash| &rest[slash..])
 }
 
 pub(crate) struct Client {
@@ -165,6 +182,7 @@ pub(crate) struct Client {
 }
 
 impl Client {
+    /// Dial the edge, upgrade to connect-ip, and ask for addresses.
     pub(crate) fn dial(
         tls_config: &TlsConfig,
         edge: SocketAddr,
@@ -231,6 +249,7 @@ impl Client {
         Ok(client)
     }
 
+    /// Ask for one address per family and wait for the assignment.
     fn request_addresses(&mut self) -> Result<(), String> {
         let v4 = [0u8; 4];
         let v6 = [0u8; 16];
@@ -256,6 +275,7 @@ impl Client {
         Ok(())
     }
 
+    /// Pump capsules both ways until the wire or the session ends.
     pub(crate) fn run(
         &mut self,
         from_tunnel: &Receiver<Vec<u8>>,
@@ -290,12 +310,14 @@ impl Client {
         }
     }
 
+    /// Write one capsule unless the session already ended.
     fn capsule(&mut self, capsule: &[u8]) {
         if !self.end && !self.wire.closed {
             self.wire.send(capsule);
         }
     }
 
+    /// Split pending capsules, handle each, and answer the survivors.
     fn pump(&mut self) {
         let bytes = std::mem::take(&mut self.wire.pending);
         let mut capsules = std::mem::take(&mut self.capsules);
@@ -322,6 +344,7 @@ impl Client {
         }
     }
 
+    /// Handle one capsule, returning an answer when one is owed.
     fn handle(&mut self, capsule: connectip::Capsule<'_>) -> Option<Vec<u8>> {
         match capsule {
             connectip::Capsule::AddressAssign(body) => {
@@ -362,6 +385,7 @@ impl Client {
     }
 }
 
+/// Connect with three quick attempts so a just-bound listener is reached.
 fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
     let mut last = None;
     for _ in 0..3 {
@@ -376,6 +400,7 @@ fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
     ))
 }
 
+/// Encode one packet as a context-zero connect-ip datagram capsule.
 fn datagram(packet: &[u8], out: &mut Vec<u8>) {
     frames::quic_varint(out, 0);
     frames::quic_varint(out, (packet.len() + 1) as u64);
@@ -481,6 +506,7 @@ struct Session {
 }
 
 impl Session {
+    /// Pump capsules both ways until the wire or the session ends.
     fn run(&mut self, wire: &mut Wire) {
         let mut capsule = Vec::new();
         while !wire.closed && !self.end {
@@ -509,6 +535,7 @@ impl Session {
         }
     }
 
+    /// Split pending capsules, forward packets, and answer requests.
     fn pump(&mut self, wire: &mut Wire) {
         let bytes = std::mem::take(&mut wire.pending);
         self.capsules.extend_from_slice(&bytes);
@@ -551,11 +578,13 @@ mod tests {
 
     #[test]
     fn an_h1_request_is_the_rfc_upgrade() {
-        let request = request("example.org", "/.well-known/masque/ip/*/*/", &[]);
+        let bytes = request("example.org", "/.well-known/masque/ip/*/*/", &[]);
         assert_eq!(
-            request,
+            bytes,
             b"GET https://example.org/.well-known/masque/ip/*/*/ HTTP/1.1\r\nHost: example.org\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n"
         );
+        let absolute = request("example.org", "HTTPS://example.org/ip", &[]);
+        assert!(absolute.starts_with(b"GET HTTPS://example.org/ip HTTP/1.1\r\n"));
     }
 
     #[test]
@@ -573,7 +602,7 @@ mod tests {
             ("connection".to_owned(), "close".to_owned()),
             ("upgrade".to_owned(), "websocket".to_owned()),
             ("capsule-protocol".to_owned(), "?0".to_owned()),
-            ("Authorization".to_owned(), "Basic dTpw".to_owned()),
+            ("authorization".to_owned(), "Basic dTpw".to_owned()),
         ];
         let request = request("edge.example", "/", &headers);
         let text = std::str::from_utf8(&request).expect("text");
@@ -581,7 +610,7 @@ mod tests {
         assert_eq!(text.matches("Connection:").count(), 1);
         assert_eq!(text.matches("Upgrade:").count(), 1);
         assert_eq!(text.matches("Capsule-Protocol:").count(), 1);
-        assert!(text.contains("Authorization: Basic dTpw\r\n"));
+        assert!(text.contains("authorization: Basic dTpw\r\n"));
     }
 
     #[test]
@@ -594,5 +623,10 @@ mod tests {
             target_path("/.well-known/masque/ip/*/*/"),
             "/.well-known/masque/ip/*/*/"
         );
+        assert_eq!(
+            target_path("HTTPS://edge.example/.well-known/masque/ip/192.0.2.1/32/"),
+            "/.well-known/masque/ip/192.0.2.1/32/"
+        );
+        assert_eq!(target_path("Http://edge.example"), "/");
     }
 }
