@@ -72,6 +72,8 @@ const MSG_REQUEST_FAILURE: u8 = 82;
 const MSG_CHANNEL_OPEN: u8 = 90;
 const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
+/// The server classified this target as untunneled; dial it directly instead.
+const CHANNEL_REJECT_SPLIT_TUNNEL: u32 = 0xFE00_0000;
 const MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 const MSG_CHANNEL_DATA: u8 = 94;
 const MSG_CHANNEL_EOF: u8 = 96;
@@ -921,6 +923,16 @@ impl Proxy {
         target: SocketAddr,
         timeout: Duration,
     ) -> Result<TcpStream, String> {
+        self.connect_host(&target.ip().to_string(), target.port(), timeout)
+    }
+
+    /// Dial any host through the hop; SOCKS5 keeps a domain name for the proxy to resolve.
+    pub(crate) fn connect_host(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<TcpStream, String> {
         let mut last = String::new();
         for address in crate::psiphon_dns::resolve(&self.host, self.port, &self.dns)
             .map_err(|error| format!("psiphon: upstream proxy resolve {}: {error}", self.host))?
@@ -931,9 +943,9 @@ impl Proxy {
                     let _ = stream.set_write_timeout(Some(timeout));
                     let mut stream = stream;
                     if self.http {
-                        self.connect_http(&mut stream, target)?;
+                        self.connect_http(&mut stream, host, port)?;
                     } else {
-                        self.connect_socks(&mut stream, target)?;
+                        self.connect_socks(&mut stream, host, port)?;
                     }
                     return Ok(stream);
                 }
@@ -946,8 +958,8 @@ impl Proxy {
         ))
     }
 
-    fn connect_http(&self, stream: &mut TcpStream, target: SocketAddr) -> Result<(), String> {
-        let authority = authority(target);
+    fn connect_http(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<(), String> {
+        let authority = authority_host(host, port);
         let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if !self.user.is_empty() || !self.pass.is_empty() {
             let encoded =
@@ -988,7 +1000,7 @@ impl Proxy {
         Ok(())
     }
 
-    fn connect_socks(&self, stream: &mut TcpStream, target: SocketAddr) -> Result<(), String> {
+    fn connect_socks(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<(), String> {
         let auth = !self.user.is_empty() || !self.pass.is_empty();
         let greeting: &[u8] = if auth { &[5, 2, 0, 2] } else { &[5, 1, 0] };
         stream
@@ -1025,19 +1037,26 @@ impl Proxy {
             }
             _ => return Err("psiphon: upstream proxy offers no usable method".to_owned()),
         }
-        let mut request = Vec::with_capacity(22);
+        let mut request = Vec::with_capacity(22 + host.len());
         request.extend_from_slice(&[5, 1, 0]);
-        match target.ip() {
-            IpAddr::V4(address) => {
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(address)) => {
                 request.push(1);
                 request.extend_from_slice(&address.octets());
             }
-            IpAddr::V6(address) => {
+            Ok(IpAddr::V6(address)) => {
                 request.push(4);
                 request.extend_from_slice(&address.octets());
             }
+            Err(_) => {
+                let length = u8::try_from(host.len())
+                    .map_err(|_| "psiphon: upstream proxy host name is too long".to_owned())?;
+                request.push(3);
+                request.push(length);
+                request.extend_from_slice(host.as_bytes());
+            }
         }
-        request.extend_from_slice(&target.port().to_be_bytes());
+        request.extend_from_slice(&port.to_be_bytes());
         stream
             .write_all(&request)
             .map_err(|error| format!("psiphon: upstream proxy request: {error}"))?;
@@ -1048,7 +1067,7 @@ impl Proxy {
         if head[0] != 5 || head[1] != 0 {
             return Err(format!(
                 "psiphon: upstream proxy refused {}: status {}",
-                authority(target),
+                authority_host(host, port),
                 head[1]
             ));
         }
@@ -1073,10 +1092,11 @@ impl Proxy {
     }
 }
 
-fn authority(target: SocketAddr) -> String {
-    match target {
-        SocketAddr::V4(address) => address.to_string(),
-        SocketAddr::V6(address) => format!("[{}]:{}", address.ip(), address.port()),
+fn authority_host(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -1137,8 +1157,14 @@ struct ChannelState {
     recv: Mutex<Recv>,
     cond: Condvar,
     window_cond: Condvar,
-    open: Mutex<Option<mpsc::Sender<Result<(), String>>>>,
+    open: Mutex<Option<mpsc::Sender<Result<OpenResult, String>>>>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+/// How the server answered one `direct-tcpip` request.
+enum OpenResult {
+    Confirmed,
+    SplitTunnel,
 }
 
 struct Recv {
@@ -1193,6 +1219,8 @@ pub(crate) struct Identity<'a> {
     pub(crate) device_region: Option<&'a str>,
     pub(crate) device_location: Option<&'a str>,
     pub(crate) client_features: &'a [String],
+    pub(crate) split_tunnel: bool,
+    pub(crate) split_tunnel_regions: &'a [String],
 }
 
 impl Session {
@@ -1350,8 +1378,33 @@ impl Session {
         Ok(Self { inner })
     }
 
-    /// Open one `direct-tcpip` channel to a host and port.
+    /// Open one `direct-tcpip` channel, treating a split-tunnel classification as a refusal.
     pub(crate) fn open(&self, host: &str, port: u16) -> Result<Channel, String> {
+        self.open_named(host, port, b"direct-tcpip")?
+            .ok_or_else(|| {
+                format!("psiphon ssh split-tunnels {host}:{port}; the caller has no direct path")
+            })
+    }
+
+    /// Open a channel the server must tunnel even when split tunnel mode is on.
+    pub(crate) fn open_tunneled(&self, host: &str, port: u16) -> Result<Channel, String> {
+        self.open_named(host, port, b"direct-tcpip-no-split-tunnel@psiphon.ca")?
+            .ok_or_else(|| {
+                format!("psiphon ssh split-tunnels {host}:{port}; this channel must be tunneled")
+            })
+    }
+
+    /// Open one `direct-tcpip` channel, or report that split tunnel sends it direct.
+    pub(crate) fn open_split(&self, host: &str, port: u16) -> Result<Option<Channel>, String> {
+        self.open_named(host, port, b"direct-tcpip")
+    }
+
+    fn open_named(
+        &self,
+        host: &str,
+        port: u16,
+        channel_type: &[u8],
+    ) -> Result<Option<Channel>, String> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err("psiphon ssh is closed".to_owned());
         }
@@ -1378,7 +1431,7 @@ impl Session {
         lock(&self.inner.channels).insert(local, Arc::clone(&state));
 
         let mut payload = vec![MSG_CHANNEL_OPEN];
-        put_str(&mut payload, b"direct-tcpip");
+        put_str(&mut payload, channel_type);
         put_u32(&mut payload, local);
         put_u32(&mut payload, self.inner.channel_window);
         put_u32(&mut payload, CHANNEL_PACKET);
@@ -1393,10 +1446,11 @@ impl Session {
         }
 
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(())) => Ok(Channel {
+            Ok(Ok(OpenResult::Confirmed)) => Ok(Some(Channel {
                 session: Arc::clone(&self.inner),
                 state,
-            }),
+            })),
+            Ok(Ok(OpenResult::SplitTunnel)) => Ok(None),
             // A refusal names the target, not the tunnel, so the session stays open for other flows.
             Ok(Err(why)) => Err(why),
             Err(RecvTimeoutError::Timeout) => {
@@ -1590,6 +1644,12 @@ impl ChannelState {
         drop(recv);
         self.cond.notify_all();
         self.window_cond.notify_all();
+    }
+
+    fn split_tunnel(&self) {
+        if let Some(tx) = lock(&self.open).take() {
+            let _ = tx.send(Ok(OpenResult::SplitTunnel));
+        }
     }
 
     fn fail(&self, why: &str) {
@@ -3170,6 +3230,19 @@ fn handshake_body(relay_protocol: &str, identity: &Identity<'_>, relay: Option<&
     if let Some(location) = identity.device_location {
         let _ = write!(body, r#","device_location":"{}""#, json_escape(location));
     }
+    if identity.split_tunnel {
+        body.push_str(r#","split_tunnel":"1""#);
+    }
+    if !identity.split_tunnel_regions.is_empty() {
+        body.push_str(r#","split_tunnel_regions":["#);
+        for (index, region) in identity.split_tunnel_regions.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let _ = write!(body, "\"{}\"", json_escape(region));
+        }
+        body.push(']');
+    }
     if let Some(relay) = relay {
         let connection_id = ferrox_core::b64::encode(relay.connection_id());
         let packet = ferrox_core::b64::encode(relay.initial());
@@ -3322,7 +3395,7 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             *lock(&state.remote_window) = u64::from(window);
             state.remote_packet.store(packet_size, Ordering::Release);
             if let Some(tx) = lock(&state.open).take() {
-                let _ = tx.send(Ok(()));
+                let _ = tx.send(Ok(OpenResult::Confirmed));
             }
             state.cond.notify_all();
             state.window_cond.notify_all();
@@ -3333,8 +3406,18 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             let Some(local) = take_u32(body, &mut at) else {
                 return Dispatch::Stop;
             };
+            let reason = take_u32(body, &mut at).unwrap_or(0);
+            let description = take_str(body, &mut at)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
             if let Some(state) = lock(&inner.channels).remove(&local) {
-                state.fail("psiphon ssh refused the channel");
+                if reason == CHANNEL_REJECT_SPLIT_TUNNEL {
+                    state.split_tunnel();
+                } else if description.is_empty() {
+                    state.fail("psiphon ssh refused the channel");
+                } else {
+                    state.fail(&format!("psiphon ssh refused the channel: {description}"));
+                }
             }
             Dispatch::Recycle(packet.buffer)
         }
@@ -4255,10 +4338,12 @@ mod tests {
             device_region: Some("IR"),
             device_location: Some("w3g"),
             client_features: &features,
+            split_tunnel: true,
+            split_tunnel_regions: &["US".to_owned(), "DE".to_owned()],
         };
         assert_eq!(
             handshake_body("UNFRONTED-MEEK-HTTPS-OSSH", &identity, None),
-            r#"{"propagation_channel_id":"propagation","sponsor_id":"sponsor","client_version":"453","client_platform":"Android","relay_protocol":"UNFRONTED-MEEK-HTTPS-OSSH","egress_region":"IR","device_region":"IR","device_location":"w3g","client_features":["coarse-location","unsafe\"feature"]}"#
+            r#"{"propagation_channel_id":"propagation","sponsor_id":"sponsor","client_version":"453","client_platform":"Android","relay_protocol":"UNFRONTED-MEEK-HTTPS-OSSH","egress_region":"IR","device_region":"IR","device_location":"w3g","split_tunnel":"1","split_tunnel_regions":["US","DE"],"client_features":["coarse-location","unsafe\"feature"]}"#
         );
     }
 
@@ -4274,6 +4359,8 @@ mod tests {
             device_region: None,
             device_location: None,
             client_features: &[],
+            split_tunnel: false,
+            split_tunnel_regions: &[],
         };
         assert_eq!(
             handshake_body("SSH", &identity, None),
