@@ -2375,6 +2375,7 @@ mod tests {
     #[test]
     fn expire_retransmits_the_old_prefix_and_drops_it() {
         let mut engine = Engine::new("test", false).expect("engine");
+        engine.cwnd = INITIAL_CWND * 2;
         engine.stream_sent = 400;
         engine.stream_data = vec![0u8; 400];
         engine.bytes_in_flight = 400;
