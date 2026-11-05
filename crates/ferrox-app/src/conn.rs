@@ -130,7 +130,6 @@ impl Connection {
 
     /// Whether a write to this stream must pass the chain, which a descriptor-level fast path
     /// addressing the socket would skip. Reads, teardown and the census are unaffected by it.
-    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn masked(&self) -> bool {
         match self {
             Connection::Masked(_) => true,
@@ -145,7 +144,6 @@ impl Connection {
     }
 
     /// Whether a descriptor-level fast path would skip the meter above this stream.
-    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn metered(&self) -> bool {
         match self {
             Connection::Metered(metered) => metered.meter.counts(),
@@ -1347,6 +1345,29 @@ impl Listener {
                 UnixListener::bind(path).map(Listener::Unix)
             }
         }
+    }
+
+    /// Bind the listener a transparent inbound accepts on: the socket may receive
+    /// another host's traffic in either transparent mode.
+    pub(crate) fn bind_transparent(target: &Target) -> io::Result<Listener> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let Target::Ip(address) = target else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a transparent listener needs an IP address",
+            ));
+        };
+        let domain = if address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        crate::transparent::set_transparent(&socket, address.is_ipv6())?;
+        socket.bind(&(*address).into())?;
+        socket.listen(1024)?;
+        Ok(Listener::Tcp(std::net::TcpListener::from(socket)))
     }
 
     /// The socket address a TCP listener holds. A Unix listener has no port to report, so it

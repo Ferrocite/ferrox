@@ -100,6 +100,10 @@ The server relay shared the same copy through `write_mux_frame`, which `encode_i
 
 XUDP now rides this mux. A `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`; datagrams arrive as `Keep` frames carrying their own destination and replies return as `Keep` frames carrying their source, so one XUDP session serves every destination of a SOCKS association instead of dialling a carrier per destination. The client sends the mux request the way upstream does — command 3, no address — so a real peer agrees on the wire. `KeepAlive` is still a no-op, and a session serves every live flow its peer opens.
 
+## Carriers
+
+A mux request is command 3 with no address, and xray answers every transport the same way: the response header, then frames. So the codec does not belong to raw. VLESS carries it over ws, httpUpgrade, gRPC, xhttp and httpheader too, plain, under TLS and under REALITY, and over KCP plain or under TLS; a KCP REALITY inbound answers the same session. The server sends `[0,0]` on the carrier's own writer before handing the halves to `serve_mux_tunnel`; the client writes `vless_mux_header`, reads the answer and returns the same halves to `dial_mux_stream`. Encryption seals the carrier stream before the header, as it does for a direct flow. `a_vless_mux_carries_a_tcp_stream_over_every_carrier` drives the six connection carriers in all three security shapes and KCP plain, under TLS and against a REALITY inbound through `assert_vless_mux_against_inbound`, and its ws arm adds the sealed carrier; XUDP reuses `open_vless_mux`, so `serve_socks_udp_vless_xudp` gains the same carriers without a second path. Hysteria and xdrive keep their direct dial: the outbound reads `mux`, clears it with a one-line warning, and every flow still reaches the destination. Their session is the transport, and this row has no gate for them yet.
+
 ## The open-ended pass
 
 Four things the earlier shape paid for and no longer does. Each one is a copy, an allocation, a syscall or a bounds check that a count or a pointer can see; none of them moves a byte on the wire, which is why the frame vectors and the codec differential are unchanged.

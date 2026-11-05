@@ -29,7 +29,12 @@ const CHANNEL_PACKET: u32 = 32 * 1024;
 /// Channel ids are 0-based, so 0 is a server's first channel; this is the only value
 /// that never names one.
 const NO_CHANNEL: u32 = u32::MAX;
-const WINDOW_ADJUST_AT: u64 = 64 * 1024;
+const WINDOW_ADJUST_AT: u64 = 256 * 1024;
+
+/// Return credit at the cap, or at half the configured window when that comes first.
+fn window_adjust_at(window: u32) -> u64 {
+    WINDOW_ADJUST_AT.min(u64::from(window) / 2)
+}
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const KEEPALIVE_PERIOD: Duration = Duration::from_secs(30);
 const MAX_IDENTIFICATION: usize = 1024;
@@ -226,6 +231,7 @@ pub(crate) struct Server {
     pub(crate) host: String,
     pub(crate) address: IpAddr,
     pub(crate) port: u16,
+    pub(crate) ssh_port: Option<u16>,
     pub(crate) quic: bool,
     pub(crate) quic_port: Option<u16>,
     pub(crate) quic_versions: Vec<String>,
@@ -363,7 +369,7 @@ pub(crate) struct OsshPrefixBytes {
 
 /// The TLS shape a config can impose on the shaped `TLS-OSSH` hello: an exact padding
 /// extension body and a host name chosen from a list or generated from a regex.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct TlsShape {
     pub(crate) min_padding: u16,
     pub(crate) max_padding: u16,
@@ -375,6 +381,27 @@ pub(crate) struct TlsShape {
     pub(crate) randomized_probability: f64,
     pub(crate) shadowsocks_prefix: ShadowsocksPrefix,
     pub(crate) ossh_prefix: OsshPrefix,
+    pub(crate) obfuscated_min_padding: usize,
+    pub(crate) obfuscated_max_padding: usize,
+}
+
+impl Default for TlsShape {
+    fn default() -> Self {
+        Self {
+            min_padding: 0,
+            max_padding: 0,
+            sni_names: Vec::new(),
+            transform_probability: 0.0,
+            hostname_patterns: Vec::new(),
+            limit_protocols: Vec::new(),
+            profiles: Vec::new(),
+            randomized_probability: 0.0,
+            shadowsocks_prefix: ShadowsocksPrefix::default(),
+            ossh_prefix: OsshPrefix::default(),
+            obfuscated_min_padding: MIN_PADDING,
+            obfuscated_max_padding: MAX_PADDING,
+        }
+    }
 }
 
 impl TlsShape {
@@ -402,6 +429,17 @@ impl TlsShape {
     /// The generated OSSH prefix for one dial, or `None` to write the bare seed message.
     pub(crate) fn ossh_prefix(&self, port: &str, keyword: &str) -> Option<OsshPrefixBytes> {
         self.ossh_prefix.generate(port, keyword)
+    }
+
+    /// The OSSH preamble padding for one dial: the reference's configurable window, with
+    /// `MIN_PADDING..=MAX_PADDING` as the default carried by [`TlsShape::default`].
+    pub(crate) fn obfuscated_padding(&self) -> usize {
+        let low = self.obfuscated_min_padding.max(MIN_PADDING);
+        let high = self.obfuscated_max_padding.max(low);
+        if high == low {
+            return low;
+        }
+        low + usize::from(u16::from_be_bytes(random::<2>())) % (high - low + 1)
     }
 
     /// The padding body length for one dial, or `None` when no maximum is configured.
@@ -520,13 +558,13 @@ fn ossh_terminator(keyword: &str, prefix: &[u8]) -> [u8; OSSH_PREFIX_TERMINATOR]
 
 /// A uniform split delay in the configured window, or `None` when both ends are zero.
 fn prefix_split(min: Duration, max: Duration) -> Option<Duration> {
-    let low = u64::try_from(min.as_millis()).unwrap_or(u64::MAX);
-    let high = u64::try_from(max.as_millis()).unwrap_or(u64::MAX).max(low);
+    let low = u64::try_from(min.as_nanos()).unwrap_or(u64::MAX);
+    let high = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX).max(low);
     if high == 0 {
         return None;
     }
     let draw = u64::from_be_bytes(random::<8>()) % (high - low + 1);
-    Some(Duration::from_millis(low + draw))
+    Some(Duration::from_nanos(low + draw))
 }
 
 /// A best-effort byte generator for the prefix transform subset: literals, `\xNN` escapes,
@@ -1606,7 +1644,9 @@ impl Channel {
     }
 
     /// One queued chunk and the window credit it releases, without waiting.
+    #[cfg(test)]
     fn take_chunk(&self) -> (Option<ChannelChunk>, u64) {
+        let adjust_at = window_adjust_at(self.session.channel_window);
         let mut adjust = 0u64;
         let chunk = {
             let mut recv = lock(&self.state.recv);
@@ -1624,7 +1664,7 @@ impl Channel {
                     continue;
                 }
                 recv.pending_adjust += (end - start) as u64;
-                if recv.pending_adjust >= WINDOW_ADJUST_AT {
+                if recv.pending_adjust >= adjust_at {
                     adjust += recv.pending_adjust;
                     recv.local_window += recv.pending_adjust;
                     recv.pending_adjust = 0;
@@ -1643,6 +1683,7 @@ impl Channel {
     }
 
     /// The next packet's payload without copying it out of the receive buffer.
+    #[cfg(test)]
     pub(crate) fn next_chunk(&mut self) -> io::Result<Option<ChannelChunk>> {
         loop {
             let (chunk, adjust) = self.take_chunk();
@@ -1671,55 +1712,97 @@ impl Channel {
         }
     }
 
-    /// Move every queued chunk up to `limit` under one receive lock.
-    pub(crate) fn drain_chunks(&self, batch: &mut Vec<ChannelChunk>, limit: usize) {
-        let mut adjust = 0u64;
-        {
-            let mut recv = lock(&self.state.recv);
-            while batch.len() < limit {
-                let Some((start, end)) = recv.chunks.front().map(|front| (front.start, front.end))
-                else {
-                    break;
-                };
-                if start >= end {
-                    let spent = recv
-                        .chunks
-                        .pop_front()
-                        .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
-                    recycle(&self.state.pool, spent.buffer);
-                    continue;
-                }
-                recv.pending_adjust += (end - start) as u64;
-                if recv.pending_adjust >= WINDOW_ADJUST_AT {
-                    adjust += recv.pending_adjust;
-                    recv.local_window += recv.pending_adjust;
-                    recv.pending_adjust = 0;
-                }
-                let chunk = recv
-                    .chunks
-                    .pop_front()
-                    .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
-                batch.push(ChannelChunk {
-                    buffer: chunk.buffer,
-                    start: chunk.start,
-                    end: chunk.end,
-                });
+    /// Wait for the first chunk, then take every queued chunk up to `limit` under one receive lock.
+    pub(crate) fn next_batch(
+        &mut self,
+        batch: &mut Vec<ChannelChunk>,
+        limit: usize,
+    ) -> io::Result<bool> {
+        let adjust_at = window_adjust_at(self.session.channel_window);
+        loop {
+            let (adjust, spent, eof) = {
+                let mut recv = lock(&self.state.recv);
+                let (adjust, spent) = take_batch(&mut recv, batch, limit, adjust_at);
+                let eof = recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire);
+                (adjust, spent, eof)
+            };
+            if !spent.is_empty() {
+                self.recycle_buffers(spent);
             }
-        }
-        if adjust != 0 {
-            self.adjust(adjust);
+            if adjust != 0 {
+                self.adjust(adjust);
+            }
+            if !batch.is_empty() {
+                return Ok(true);
+            }
+            if eof {
+                return Ok(false);
+            }
+            let mut recv = lock(&self.state.recv);
+            if !recv.chunks.is_empty() {
+                continue;
+            }
+            if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let (guard, _) = self
+                .state
+                .cond
+                .wait_timeout(recv, IO_TIMEOUT)
+                .unwrap_or_else(PoisonError::into_inner);
+            recv = guard;
+            if recv.chunks.is_empty() && (recv.eof || recv.closed) {
+                return Ok(false);
+            }
         }
     }
 
     /// Hand consumed chunks back to the packet pool under one lock.
     pub(crate) fn recycle_chunks(&self, chunks: impl Iterator<Item = ChannelChunk>) {
+        self.recycle_buffers(chunks.map(|chunk| chunk.buffer));
+    }
+
+    /// Hand packet buffers back to the shared pool under one lock.
+    fn recycle_buffers(&self, buffers: impl IntoIterator<Item = Vec<u8>>) {
         let mut pool = lock(&self.state.pool);
-        for chunk in chunks {
+        for buffer in buffers {
             if pool.len() < PACKET_POOL {
-                pool.push(chunk.buffer);
+                pool.push(buffer);
             }
         }
     }
+}
+
+/// Take queued payloads and the window credit they release, leaving empty buffers for recycling.
+fn take_batch(
+    recv: &mut Recv,
+    batch: &mut Vec<ChannelChunk>,
+    limit: usize,
+    adjust_at: u64,
+) -> (u64, Vec<Vec<u8>>) {
+    let mut adjust = 0u64;
+    let mut spent = Vec::new();
+    while batch.len() < limit {
+        let Some(chunk) = recv.chunks.pop_front() else {
+            break;
+        };
+        if chunk.start >= chunk.end {
+            spent.push(chunk.buffer);
+            continue;
+        }
+        recv.pending_adjust += (chunk.end - chunk.start) as u64;
+        if recv.pending_adjust >= adjust_at {
+            adjust += recv.pending_adjust;
+            recv.local_window += recv.pending_adjust;
+            recv.pending_adjust = 0;
+        }
+        batch.push(ChannelChunk {
+            buffer: chunk.buffer,
+            start: chunk.start,
+            end: chunk.end,
+        });
+    }
+    (adjust, spent)
 }
 
 impl Read for Channel {
@@ -1728,6 +1811,7 @@ impl Read for Channel {
             return Ok(0);
         }
         let mut adjust = 0u64;
+        let adjust_at = window_adjust_at(self.session.channel_window);
         let mut drained = None;
         let take = loop {
             let mut recv = lock(&self.state.recv);
@@ -1739,7 +1823,7 @@ impl Read for Channel {
                     let spent = start == chunk.end;
                     chunk.start = start;
                     recv.pending_adjust += u64::try_from(take).unwrap_or(0);
-                    if recv.pending_adjust >= WINDOW_ADJUST_AT {
+                    if recv.pending_adjust >= adjust_at {
                         adjust += recv.pending_adjust;
                         recv.local_window += recv.pending_adjust;
                         recv.pending_adjust = 0;
@@ -2125,7 +2209,7 @@ fn split(
         let seed = random::<SEED_LENGTH>();
         let client = Rc4::new(&derive_key(&seed, key.as_bytes(), b"client_to_server"));
         let remote = Rc4::new(&derive_key(&seed, key.as_bytes(), b"server_to_client"));
-        let padding_len = MIN_PADDING.max(random_padding());
+        let padding_len = shape.obfuscated_padding();
         let header_len = prefix.as_ref().map_or(0, |prefix| 4 + prefix.name.len());
         let prefix_len = prefix.as_ref().map_or(0, |prefix| prefix.bytes.len());
         let mut preamble =
@@ -3508,6 +3592,13 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn the_window_adjust_never_exceeds_half_the_configured_window() {
+        assert_eq!(window_adjust_at(DEFAULT_CHANNEL_WINDOW), WINDOW_ADJUST_AT);
+        assert_eq!(window_adjust_at(64 * 1024), 32 * 1024);
+        assert_eq!(window_adjust_at(128 * 1024), 64 * 1024);
+    }
+
+    #[test]
     fn rc4_matches_the_known_vector() {
         let mut rc4 = Rc4::new(b"Key");
         let mut data = *b"Plaintext";
@@ -3768,15 +3859,20 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_drains_and_recycles_under_one_lock() {
+    fn next_batch_drains_and_recycles() {
         let payloads: Vec<&[u8]> = (0..40).map(|_| &b"x"[..]).collect();
-        let channel = test_channel_with_chunks(&payloads);
+        let mut channel = test_channel_with_chunks(&payloads);
         let pool = Arc::clone(&channel.session.pool);
         let mut batch = Vec::new();
-        channel.drain_chunks(&mut batch, 32);
+        assert!(channel.next_batch(&mut batch, 32).expect("batch"));
         assert_eq!(batch.len(), 32);
         channel.recycle_chunks(batch.drain(..));
         assert_eq!(lock(&pool).len(), 32);
+        assert!(channel.next_batch(&mut batch, 32).expect("rest"));
+        assert_eq!(batch.len(), 8);
+        channel.recycle_chunks(batch.drain(..));
+        assert_eq!(lock(&pool).len(), 40);
+        assert!(!channel.next_batch(&mut batch, 32).expect("eof"));
     }
 
     #[test]

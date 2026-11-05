@@ -25,6 +25,10 @@ on:
         description: tunnels each implementation keeps; blank is one
         required: false
         default: ""
+      window:
+        description: native SSH channel window in bytes; blank keeps the lane's 2 MiB
+        required: false
+        default: ""
 
 concurrency:
   group: psiphon-windows-${{ github.ref }}
@@ -92,6 +96,7 @@ jobs:
         env:
           PSIPHON_REGION: ${{ inputs.region }}
           PSIPHON_POOL: ${{ inputs.pool }}
+          PSIPHON_WINDOW: ${{ inputs.window }}
         run: |
           BIN=target/release/ferrox-app.exe
           test -s "$BIN"
@@ -189,7 +194,11 @@ jobs:
             echo "::error::pool must be an integer from 1 to 32, got '$PSIPHON_POOL'"
             exit 1
           fi
-          PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
+          if [ -n "${PSIPHON_WINDOW:-}" ] && ! [[ "$PSIPHON_WINDOW" =~ ^(0|[1-9][0-9]*)$ && "$PSIPHON_WINDOW" -ge 65536 && "$PSIPHON_WINDOW" -le 67108864 ]]; then
+            echo "::error::window must be an integer from 65536 to 67108864, got '$PSIPHON_WINDOW'"
+            exit 1
+          fi
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_WINDOW="$PSIPHON_WINDOW" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
           import json, os
           settings = {
               "listen": "127.0.0.1:1821",
@@ -201,6 +210,8 @@ jobs:
               settings["region"] = os.environ["PSIPHON_REGION"]
           if os.environ.get("PSIPHON_POOL"):
               settings["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
+          if os.environ.get("PSIPHON_WINDOW"):
+              settings["SSHChannelWindowSize"] = int(os.environ["PSIPHON_WINDOW"])
           document = {
               "inbounds": [
                   {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
@@ -472,9 +483,11 @@ jobs:
           print("engine is pinned to the server and SSH/OSSH protocol the native lane")
           print("chose, so the ratio is the implementation and not a different carrier.")
           print("When the dispatch asks for a pool above one, the reference is still")
-          print("pinned to one server, so the pool rows are native-only. Both verify the")
-          print("same signed list with the key this tree pins. The runner's own egress")
-          print("is the control; byte counts are the gate.")
+          print("pinned to one server, so the pool rows are native-only. A dispatch")
+          print("window sets the native channel window only; the engine keeps its own")
+          print("default, so the ratio includes it. Both verify the same signed list")
+          print("with the key this tree pins. The runner's own egress is the control;")
+          print("byte counts are the gate.")
           print()
           print("| leg | bytes | seconds | MiB/s |")
           print("| --- | --- | --- | --- |")
