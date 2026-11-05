@@ -1735,7 +1735,7 @@ impl Role {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
                     let reader = crate::xhttp::ChainReader::new(prefix, reader);
-                    serve_session_trojan_xhttp(reader, writer, &settings, keys.as_ref(), freedom);
+                    serve_trojan_xhttp_carrier(reader, writer, &settings, keys.as_ref(), freedom);
                 });
             }
             Carrier::HttpUpgrade { path, host, .. } => {
@@ -4133,14 +4133,19 @@ pub(crate) fn serve_grpc_muxed(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
+            |id, flow, cmd, _, _| {
+                let allowed = vless_user_allows(users, &id, flow, cmd, freedom, false);
+                if allowed {
+                    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                allowed
+            },
             resolve_endpoint,
         )
     }) else {
         reader.abort();
         return;
     };
-    opened.store(true, std::sync::atomic::Ordering::Relaxed);
     let ask = reverse_ask(users, &got, flow, cmd);
     if matches!(&ask, ReverseAsk::Refused) {
         reader.abort();
@@ -4294,6 +4299,10 @@ impl<R: Read> HandshakeRead<R> {
     pub(crate) fn disarm(&mut self) {
         self.until = None;
         self.step = None;
+    }
+
+    pub(crate) fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -12285,10 +12294,40 @@ fn serve_vmess_hysteria(flow: crate::hysteria::Flow, users: &crate::vmess::Users
     crate::vmess::serve_decoded_with_finish(reader, flow, &close, decoded, freedom, Some(finish));
 }
 
+/// A TLS xHTTP carrier for vmess: h2 shares the demux with the vless lane, H1 keeps the session
+/// the carrier has always served.
+fn serve_vmess_xhttp_carrier<
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+    close: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return crate::vmess::serve_xhttp_split(chained, write, settings, users, freedom, close);
+    }
+    let users = Arc::clone(users);
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            crate::vmess::serve_xhttp_accepted(reader, writer, &users, freedom, &close);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
 /// The session a `VMess` listener that declares `security: tls` answers, over raw and every carried carrier.
 fn serve_vmess_tls(
     stream: Connection,
-    users: &crate::vmess::Users,
+    users: &crate::vmess::UsersRef,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -12313,7 +12352,7 @@ fn serve_vmess_tls(
             crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+            serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
         }
         Carrier::HttpHeader { path } => {
             crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
@@ -12337,7 +12376,7 @@ fn serve_vmess_tls(
 )]
 fn serve_vmess_reality(
     stream: Connection,
-    users: &crate::vmess::Users,
+    users: &crate::vmess::UsersRef,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
@@ -12396,7 +12435,7 @@ fn serve_vmess_reality(
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                     let _ = raw.shutdown(Shutdown::Both);
                 });
-                crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
+                serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
             });
         }
         Carrier::HttpHeader { path } => {
@@ -19125,16 +19164,53 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    let Some((mut creader, cwriter)) =
-        crate::xhttp::accept_split_with_settings(read, write, settings)
+    let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
     else {
         echo_trace("session xhttp trojan accept refused");
         return;
     };
+    serve_trojan_xhttp_accepted(creader, cwriter, key, freedom);
+}
+
+/// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
+/// session every TLS xhttp client has always reached.
+fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
+    }
+    let keys: Vec<[u8; 56]> = key.to_vec();
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
+fn serve_trojan_xhttp_accepted(
+    creader: Box<dyn crate::proxy::WindowRead + Send>,
+    cwriter: crate::xhttp::XhttpWriter,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
-    let Some((cmd, target)) = decode_trojan_request(&mut creader, key) else {
+    let mut bounded = crate::proxy::HandshakeRead::new(creader, crate::budgets::handshake());
+    let decoded = decode_trojan_request(&mut bounded, key);
+    bounded.disarm();
+    let creader = bounded.into_inner();
+    let Some((cmd, target)) = decoded else {
         echo_trace("session xhttp trojan decode refused");
-        cwriter.finish();
+        cwriter.abort();
         return;
     };
     crate::accesslog::record_current(&target);
@@ -19173,7 +19249,7 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
         return;
     };
     echo_trace("session xhttp relaying");
-    relay_sink_drained(creader, &cwriter, &uplink);
+    relay_sink_xhttp_drained(creader, &cwriter, &uplink);
 }
 
 fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
@@ -66906,6 +66982,74 @@ mod hc_tests {
         assert_eq!(
             exchange(port, b"GET /other HTTP/1.1\r\n\r\n"),
             Vec::<u8>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod h2_carrier_tests {
+    use super::*;
+
+    /// A silent h2 stream that never sends a trojan header ends at the handshake budget: the decode
+    /// claims the poll, so it cannot retry poll timeouts for the relay stall.
+    #[test]
+    fn a_silent_trojan_stream_ends_at_the_handshake_budget() {
+        struct Silent(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    relay_step_owns_poll(),
+                    "a trojan decode read ran outside the poll"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl crate::proxy::WindowRead for Silent {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                unreachable!("the trojan header reads through Read")
+            }
+        }
+
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl FrameWrite for Sink {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                for part in parts {
+                    self.write_all(part).expect("sink");
+                }
+                true
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
+        let began = Instant::now();
+        serve_trojan_xhttp_accepted(
+            Box::new(Silent(Arc::clone(&polled))),
+            crate::xhttp::XhttpWriter::new(Sink(Arc::clone(&out))),
+            &[[0x11u8; 56]],
+            true,
+        );
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(
+            out.lock().expect("lock").ends_with(b"0\r\n\r\n"),
+            "the refusal did not end the carrier"
         );
     }
 }

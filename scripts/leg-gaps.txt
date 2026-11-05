@@ -34,6 +34,8 @@ vless-ws-down-16|server-threads|1.23|1210
 vless-xhttp-duplex-8|server-threads|1.29|696
 vless-xhttp-down-8|server-threads|1.27|696
 vless-tls-xhttp-h2-down-8|server-threads|1.85|696
+trojan-tls-xhttp-h2-down-8|server-threads|1.70|696
+vmess-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-ws-down-8|server-threads|1.54|696
 vmess-reality-raw-down-8|server|0.78|486|ceiling
 vmess-reality-raw-down-8|server-threads|1.08|696
