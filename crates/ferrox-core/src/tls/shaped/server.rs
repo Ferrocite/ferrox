@@ -244,6 +244,8 @@ impl<S: Stream> Server<S> {
                 self.done = true;
                 Ok(())
             }
+            // A poll quantum is not a failure; the record buffer keeps the partial read.
+            Err(TlsError::Timeout) => Err(TlsError::Timeout),
             Err(error) => {
                 self.failure = Some(error.to_string());
                 Err(error)
@@ -564,7 +566,10 @@ impl<S: Stream> Server<S> {
         if self.rec_have < 5 {
             self.rec.resize(5, 0);
             while self.rec_have < 5 {
-                let read = self.io.read(&mut self.rec[self.rec_have..5])?;
+                let read = match self.io.read(&mut self.rec[self.rec_have..5]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
                 if read == 0 {
                     return Err(TlsError::Closed);
                 }
@@ -580,7 +585,10 @@ impl<S: Stream> Server<S> {
         }
         self.rec.resize(5 + len, 0);
         while self.rec_have < self.rec.len() {
-            let read = self.io.read(&mut self.rec[self.rec_have..])?;
+            let read = match self.io.read(&mut self.rec[self.rec_have..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
             if read == 0 {
                 return Err(TlsError::Closed);
             }
@@ -988,15 +996,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_record_read_resumes_after_a_timeout() {
-        let record = [APPLICATION, 3, 3, 0, 2, 0xaa, 0xbb];
-        let io = Trickle::new(vec![
-            Step::Bytes(vec![APPLICATION, 3]),
-            Step::WouldBlock,
-            Step::Bytes(vec![3, 0, 2, 0xaa, 0xbb]),
-        ]);
-        let cfg = TlsServerConfig {
+    fn empty_config() -> TlsServerConfig {
+        TlsServerConfig {
             certs: Vec::new(),
             alpn: Vec::new(),
             min_version: None,
@@ -1007,10 +1008,37 @@ mod tests {
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
             master_key_log: None,
-        };
-        let mut server = Server::new(cfg, io);
+        }
+    }
+
+    #[test]
+    fn a_record_read_resumes_after_a_timeout() {
+        let record = [APPLICATION, 3, 3, 0, 2, 0xaa, 0xbb];
+        let io = Trickle::new(vec![
+            Step::Bytes(vec![APPLICATION, 3]),
+            Step::WouldBlock,
+            Step::Bytes(vec![3, 0, 2, 0xaa, 0xbb]),
+        ]);
+        let mut server = Server::new(empty_config(), io);
         assert!(matches!(server.fill_record(), Err(TlsError::Timeout)));
         assert_eq!(server.fill_record().expect("resumes"), APPLICATION);
         assert_eq!(server.rec, record);
+    }
+
+    #[test]
+    fn a_handshake_resumes_after_a_timeout_in_the_client_hello() {
+        let hello = client_hello(&[0x0303]);
+        let (head, tail) = hello.split_at(7);
+        let io = Trickle::new(vec![
+            Step::Bytes(head.to_vec()),
+            Step::WouldBlock,
+            Step::Bytes(tail.to_vec()),
+        ]);
+        let mut server = Server::new(empty_config(), io);
+        assert!(matches!(server.handshake(), Err(TlsError::Timeout)));
+        assert!(matches!(
+            server.handshake(),
+            Err(TlsError::Other(why)) if why.contains("identity")
+        ));
     }
 }

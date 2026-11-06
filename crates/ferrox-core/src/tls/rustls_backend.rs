@@ -1969,7 +1969,16 @@ pub(crate) fn ech_server_context_builder(
     cfg: &super::TlsServerConfig,
     keys: &[u8],
 ) -> Result<boring::ssl::SslContextBuilder, TlsError> {
-    let builder = server_identity_builder(cfg)?;
+    let mut builder = server_identity_builder(cfg)?;
+    let ceiling = cfg.max_version.unwrap_or(0x0304).min(0x0304);
+    if ceiling < 0x0304 {
+        return Err(TlsError::Other(
+            "an ECH listener cannot cap its maximum below TLS 1.3".to_owned(),
+        ));
+    }
+    builder
+        .set_max_proto_version(Some(crate::tls::legacy::version(ceiling)?))
+        .map_err(|error| boring_error(&error))?;
     let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
     let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
     for key in parsed {
