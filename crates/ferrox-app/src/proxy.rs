@@ -21113,7 +21113,7 @@ fn dial_socks_tls_client(
         return;
     };
     if matches!(socks.carrier, Carrier::Raw(_)) {
-        let Some(session) = dial_tls_session(server, cfg, None) else {
+        let Some(session) = dial_tls_session(server, cfg, socks.carrier.tcp_mask()) else {
             return;
         };
         let Some((reader, writer, _)) = session.into_halves() else {
@@ -25427,7 +25427,7 @@ fn dial_http_outbound(
 
     if let Some(cfg) = http.tls.as_deref() {
         if matches!(http.carrier, Carrier::Raw(_)) {
-            let Some(session) = dial_tls_session(server, cfg, None) else {
+            let Some(session) = dial_tls_session(server, cfg, http.carrier.tcp_mask()) else {
                 return;
             };
             let Some((reader, writer, _)) = session.into_halves() else {
@@ -39093,15 +39093,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_full_carrier_parks_the_lane_instead_of_the_worker() {
+        use std::os::unix::io::AsRawFd;
         use std::time::{Duration, Instant};
+
+        fn small_buffer(fd: std::os::unix::io::RawFd, name: libc::c_int) {
+            let want: libc::c_int = 4096;
+            // SAFETY: `want` outlives the call, and the size is its own.
+            let set = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    name,
+                    std::ptr::addr_of!(want).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "a small socket buffer is refused");
+        }
 
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            small_buffer(stream.as_raw_fd(), libc::SO_SNDBUF);
             crate::ws::accept(stream, "/frame").expect("upgrades")
         });
         let stream = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
+        small_buffer(stream.as_raw_fd(), libc::SO_RCVBUF);
         let (client, _client_writer) =
             crate::ws::connect(stream, "127.0.0.1", "/frame", 0, b"", &[], 0).expect("upgrades");
         let (_reader, writer) = server.join().expect("joins");
@@ -39117,19 +39135,10 @@ mod tests {
             assert!(filled < 256 * 1024 * 1024, "the socket never filled");
         }
 
-        // The peer drains after the send clock the parked lane must not pay.
-        let drain = std::thread::spawn(move || {
-            use std::io::Read as _;
-            std::thread::sleep(Duration::from_millis(250));
-            let mut sink = [0u8; 8192];
-            let mut client = client;
-            let _ = client.read(&mut sink);
-        });
-
         let mut buffer = RelayBuf::with_len(64 * 1024);
-        buffer.as_mut()[..1024].fill(1);
+        buffer.as_mut().fill(1);
         let mut at = Forward::new();
-        at.pending = 1024;
+        at.pending = 64 * 1024;
         let step = crate::proxy::RelayStep::enter();
         let began = Instant::now();
         let next = forward_flush(&buffer, &writer, &mut at);
@@ -39144,6 +39153,14 @@ mod tests {
             "the lane parked without naming the descriptor it waits on"
         );
         drop(step);
+        // The peer drains only after the flush, so a slow fill cannot free the socket the assertion above needs full.
+        let drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            std::thread::sleep(Duration::from_millis(250));
+            let mut sink = [0u8; 8192];
+            let mut client = client;
+            let _ = client.read(&mut sink);
+        });
         let _ = drain.join();
     }
 

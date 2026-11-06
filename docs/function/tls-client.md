@@ -12,9 +12,10 @@ transport as a bare TCP socket.
 outbound parsers refuse `quic`, `kcp`, `hysteria`, `masque`, `xdrive` and unknown
 networks rather than silently dialling them raw.  VLESS, VMess and Trojan keep their
 `tls_carried_parts` path, and Shadowsocks its own KCP TLS lane, so KCP still carries
-TLS for them.  Roots come
-from `caCertFile`, joined with the store, or from no root when `allowInsecure` is
-set.  A plain `network: "tcp"` with no
+TLS for them.  The client loads named roots from `caCertFile` and `certificates`.
+It also loads system roots unless `disableSystemRoot` or `allowInsecure` is set, or
+a certificate pin is configured.  Without a certificate pin, `allowInsecure` skips
+certificate chain and name verification.  A plain `network: "tcp"` with no
 `security` stays a plain dial; only the configured TLS arm changes.
 
 ## Data path
