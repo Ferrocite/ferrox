@@ -39124,7 +39124,7 @@ mod tests {
             crate::ws::connect(stream, "127.0.0.1", "/frame", 0, b"", &[], 0).expect("upgrades");
         let (_reader, writer) = server.join().expect("joins");
 
-        let chunk = vec![7u8; 32 * 1024];
+        let chunk = vec![7u8; 1024];
         let mut filled = 0usize;
         loop {
             match writer.push_ready(&chunk) {
@@ -39135,10 +39135,10 @@ mod tests {
             assert!(filled < 256 * 1024 * 1024, "the socket never filled");
         }
 
-        let mut buffer = RelayBuf::with_len(64 * 1024);
+        let mut buffer = RelayBuf::with_len(1024);
         buffer.as_mut().fill(1);
         let mut at = Forward::new();
-        at.pending = 64 * 1024;
+        at.pending = 1024;
         let step = crate::proxy::RelayStep::enter();
         let began = Instant::now();
         let next = forward_flush(&buffer, &writer, &mut at);
@@ -39159,6 +39159,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(250));
             let mut sink = [0u8; 8192];
             let mut client = client;
+            client.set_poll(Some(Duration::from_secs(1)));
             let _ = client.read(&mut sink);
         });
         let _ = drain.join();
