@@ -659,7 +659,7 @@ impl<S: Stream> Server<S> {
             self.rec.resize(5, 0);
             while self.rec_have < 5 {
                 let read = match self.io.read(&mut self.rec[self.rec_have..5]) {
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     result => result?,
                 };
                 if read == 0 {
@@ -714,7 +714,7 @@ impl<S: Stream> Server<S> {
             match self.io.write(&self.pending[self.pending_at..]) {
                 Ok(0) => return Err(TlsError::Closed),
                 Ok(written) => self.pending_at += written,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut =>
