@@ -60,6 +60,7 @@ struct Prepared<'a> {
 }
 
 impl Hello {
+    /// Builds one hello from a profile and the config's overrides.
     pub(crate) fn build(
         profile: &'static Profile,
         server_name: &str,
@@ -442,6 +443,7 @@ impl Hello {
         self.offer.as_ref().map(|offer| offer.public_name.as_str())
     }
 
+    /// Encodes the message with the current shares and cookie.
     fn encode(&self, cookie: Option<&[u8]>) -> Vec<u8> {
         self.encode_with(&self.shares, cookie)
     }
