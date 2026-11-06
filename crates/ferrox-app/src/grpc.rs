@@ -2198,6 +2198,116 @@ pub(crate) fn serve_muxed_conn(
     );
 }
 
+/// The same connection, many gRPC streams, for VMess: each request block opens one stream and runs
+/// the VMess handler on its own reader and writer pair, so a client that shares one `ClientConn`
+/// across its flows is served concurrently instead of having the next stream refused.
+pub(crate) struct VmGrpcService {
+    path: String,
+    multi_path: String,
+    users: crate::vmess::UsersRef,
+    freedom: bool,
+    opened: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl VmGrpcService {
+    pub(crate) fn new(
+        settings: &GrpcSettings,
+        users: &crate::vmess::UsersRef,
+        freedom: bool,
+        opened: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            path: settings.path.clone(),
+            multi_path: settings.multi_path.clone(),
+            users: Arc::clone(users),
+            freedom,
+            opened,
+        }
+    }
+}
+
+impl crate::xhttp_h2::H2Service for VmGrpcService {
+    fn open(
+        &self,
+        conn: &Arc<crate::xhttp_h2::H2Conn>,
+        sid: u32,
+        block: &[u8],
+        end_stream: bool,
+    ) -> bool {
+        let mut gate = Gate::default();
+        if !conn.decode_block(block, |name, value| {
+            gate.take(name, value, &self.path, &self.multi_path);
+        }) || gate.served != Some(true)
+            || gate.posted != Some(true)
+            || gate.typed != Some(true)
+        {
+            conn.reset(sid);
+            return false;
+        }
+        let method = if gate.multi == Some(true) {
+            Method::MultiHunk
+        } else {
+            Method::Hunk
+        };
+        let Some((body, _head, out)) = conn.open(sid, end_stream) else {
+            return false;
+        };
+        if !conn.respond(
+            sid,
+            &[
+                (":status", "200"),
+                ("content-type", "application/grpc"),
+                ("grpc-encoding", "identity"),
+            ],
+        ) {
+            conn.reset(sid);
+            return false;
+        }
+        let (reader, writer) = mux_stream(conn, body, out, sid, method);
+        let users = Arc::clone(&self.users);
+        let freedom = self.freedom;
+        let opened = Arc::clone(&self.opened);
+        crate::proxy::lane_pool::submit_stream_setup(move || {
+            crate::vmess::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
+        });
+        // The head is not a request until the VMess header decodes: `serve_grpc_muxed` puts the clock away then.
+        false
+    }
+}
+
+pub(crate) fn serve_muxed_vmess<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &GrpcSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) {
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = VmGrpcService::new(settings, users, freedom, Arc::clone(&opened));
+    let until = std::time::Instant::now() + crate::budgets::handshake();
+    let mut step = crate::xhttp_h2::h2_lane(read, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    crate::proxy::lane_pool::submit_demux(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
+}
+
+pub(crate) fn serve_muxed_vmess_conn(
+    read: Connection,
+    write: Tail,
+    settings: &GrpcSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) {
+    serve_muxed_vmess(read, write, settings, users, freedom);
+}
+
 #[cfg(test)]
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
     accept_with(stream, &GrpcSettings::path(path))
@@ -4635,7 +4745,8 @@ mod tests {
         let mut last = [0u8; 8];
         last[..4].copy_from_slice(&1u32.to_be_bytes());
         assert!(
-            !text.windows(17)
+            !text
+                .windows(17)
                 .any(|part| part == frame(T_GOAWAY, 0, 0, &last)),
             "the stream must outlive the headers for a peer that buffers its first body"
         );

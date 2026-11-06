@@ -1677,7 +1677,9 @@ where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    pump_relay_carried_with_finish(plain, reader, writer, close, send, recv, pending, None, None)
+    pump_relay_carried_with_finish(
+        plain, reader, writer, close, send, recv, pending, None, None,
+    )
 }
 
 /// The carried pump with the carrier's own write-side finish: a clean target EOF ends the request, and a markerless one under `NoTerminationSignal` leaves the carrier FIN as the only end the peer sees.
@@ -1969,6 +1971,7 @@ pub(crate) fn serve_decoded<R, W>(
 
 /// The gRPC carrier reads a hunk shorter than 2 KiB only at stream end, so the response header rides
 /// the first body write instead of leaving alone in a hunk the peer's reader would park on.
+#[cfg(test)]
 pub(crate) fn serve_decoded_deferred<R, W>(
     reader: R,
     writer: W,
@@ -2133,6 +2136,7 @@ pub(crate) fn serve_grpc(stream: Connection, path: &str, users: &Users, freedom:
     );
 }
 
+#[cfg(test)]
 pub(crate) fn serve_grpc_with(
     stream: Connection,
     settings: &crate::config::GrpcSettings,
@@ -2148,29 +2152,98 @@ pub(crate) fn serve_grpc_with(
     serve_decoded_deferred(reader, writer, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_grpc_split<R, W>(
+pub(crate) fn serve_grpc_muxed_split<R, W>(
     reader: R,
-    writer: W,
+    mut writer: W,
     settings: &crate::config::GrpcSettings,
-    users: &Users,
+    users: &crate::vmess::UsersRef,
     freedom: bool,
-    close: &Close,
 ) where
-    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
-    else {
+    crate::proxy::FrameWrite::arm_write(&mut writer, crate::budgets::RELAY_POLL);
+    crate::grpc::serve_muxed_vmess(reader, writer, settings, users, freedom);
+}
+
+pub(crate) fn serve_grpc_muxed_with(
+    stream: Connection,
+    settings: &crate::config::GrpcSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) {
+    let Ok(write) = stream.try_clone() else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, users);
-    let closer = writer.clone();
-    let shutdown = std::sync::Arc::clone(close);
-    let close: Close = std::sync::Arc::new(move || {
-        closer.close();
-        shutdown();
-    });
-    serve_decoded_deferred(reader, writer, &close, decoded, freedom);
+    let _ = stream.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+    crate::grpc::serve_muxed_vmess_conn(
+        stream,
+        crate::grpc::Tail::new(Box::new(write)),
+        settings,
+        users,
+        freedom,
+    );
+}
+
+/// One gRPC stream of a shared connection: the VMess header names the target, the response prefix
+/// rides the writer, and the demux pays the windows, so the flow parks only on its own body.
+pub(crate) fn serve_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    writer: crate::grpc::GrpcWriter,
+    users: &Users,
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
+    let Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user,
+    }) = under_handshake(&mut reader, |read| accept_request(read, users))
+    else {
+        reader.abort();
+        return;
+    };
+    if !freedom || !matches!(cmd, 1 | 2) {
+        reader.abort();
+        return;
+    }
+    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::accesslog::record_current(&target);
+    match cmd {
+        1 => {
+            let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
+                writer.close();
+                return;
+            };
+            let uplink = uplink.with_meter(user.reversed());
+            if !writer.send(&prefix) {
+                reader.abort();
+                return;
+            }
+            let reset = reader.reset_handle();
+            if crate::proxy::relay_sink_drained_queued(
+                reader,
+                &writer,
+                &uplink,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            )
+            .is_none()
+            {
+                reset();
+            }
+        }
+        2 => {
+            let closer = writer.clone();
+            let close: Close = std::sync::Arc::new(move || closer.close());
+            serve_udp_carried(reader, writer, &close, &target, &prefix, send, recv, &user);
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {

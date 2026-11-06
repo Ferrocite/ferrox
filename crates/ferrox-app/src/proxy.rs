@@ -12991,7 +12991,7 @@ fn serve_vmess_tls(
             );
         }
         Carrier::Grpc(settings) => {
-            crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
+            crate::vmess::serve_grpc_muxed_split(reader, writer, settings, users, freedom);
         }
         refused_carriers!() => {}
     }
@@ -13097,17 +13097,13 @@ fn serve_vmess_reality(
             });
         }
         Carrier::Grpc(settings) => {
-            let Ok(raw) = stream.try_clone() else { return };
-            let Ok(out) = raw.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    let _ = raw.shutdown(Shutdown::Both);
-                });
-                crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
+                crate::vmess::serve_grpc_muxed_split(reader, writer, settings, users, freedom);
             });
         }
         refused_carriers!() => {}
@@ -69575,7 +69571,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &users, freedom);
             }
             Carrier::Grpc(settings) => {
-                crate::vmess::serve_grpc_with(stream, &settings, &users, freedom);
+                crate::vmess::serve_grpc_muxed_with(stream, &settings, &users, freedom);
             }
             refused_carriers!() => {}
         },
