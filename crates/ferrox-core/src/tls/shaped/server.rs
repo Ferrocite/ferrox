@@ -133,6 +133,9 @@ impl Hello {
     }
 }
 
+/// The pre-master secret a TLS 1.2 RSA key exchange always carries.
+const PRE_MASTER: usize = 48;
+
 /// The raw records a hello may occupy before the peek hands the connection to the other engine.
 const MAX_PEEK: usize = MAX_HANDSHAKE + 5 * MAX_RECORD;
 
@@ -445,7 +448,7 @@ impl<S: Stream> Server<S> {
         let rsa = key
             .rsa()
             .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
-        let mut fallback = [0u8; 48];
+        let mut fallback = [0u8; PRE_MASTER];
         SystemRandom::new()
             .fill(&mut fallback)
             .map_err(|_| TlsError::Other("rsa fallback".to_owned()))?;
@@ -454,9 +457,9 @@ impl<S: Stream> Server<S> {
             .private_decrypt(encrypted, &mut out, Padding::PKCS1)
             .unwrap_or(0);
         // BoringSSL's PKCS#1 check is constant-time; select the fallback without a branch.
-        let diff = (len ^ 48) as u64;
+        let diff = (len ^ PRE_MASTER) as u64;
         let mask = (((diff | diff.wrapping_neg()) >> 63) as u8).wrapping_sub(1);
-        let mut secret = vec![0u8; 48];
+        let mut secret = vec![0u8; PRE_MASTER];
         for (i, slot) in secret.iter_mut().enumerate() {
             *slot = (out.get(i).copied().unwrap_or(0) & mask) | (fallback[i] & !mask);
         }
