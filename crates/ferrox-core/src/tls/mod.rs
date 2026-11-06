@@ -837,7 +837,26 @@ pub fn accept<S: Stream + Send>(
     cfg: &TlsServerConfig,
     io: S,
 ) -> Result<RustlsServerProvider<reality::RecordLimiter<S>>, TlsError> {
-    RustlsServerProvider::accept(cfg.clone(), reality::RecordLimiter::new_open(io))
+    let mut io = io;
+    let mut prefix = None;
+    let shaped = if cipher_suites::shaped_listener(&cfg.cipher_suites, cfg.min_version) {
+        if cfg.max_version.unwrap_or(0x0304) <= 0x0303 || cfg.ech_server_keys.is_some() {
+            true
+        } else {
+            let (bytes, delegate) = shaped::server::peek_hello(&mut io).map_err(|error| {
+                TlsError::Other(format!("tls: reading the client hello: {error}"))
+            })?;
+            prefix = Some(bytes);
+            !delegate
+        }
+    } else {
+        false
+    };
+    let mut limiter = reality::RecordLimiter::new_open(io);
+    if let Some(bytes) = prefix {
+        limiter.set_prefix(bytes);
+    }
+    RustlsServerProvider::accept_decided(cfg.clone(), limiter, shaped)
 }
 
 pub fn active_backends() -> &'static [&'static str] {

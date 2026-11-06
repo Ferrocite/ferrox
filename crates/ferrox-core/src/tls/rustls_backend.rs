@@ -1076,6 +1076,21 @@ impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
 impl<S: Stream> RustlsServerProvider<S> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn accept(cfg: super::TlsServerConfig, io: S) -> Result<Self, TlsError> {
+        let shaped = crate::tls::cipher_suites::shaped_server(
+            &cfg.cipher_suites,
+            cfg.min_version,
+            cfg.max_version,
+        );
+        Self::accept_decided(cfg, io, shaped)
+    }
+
+    /// `shaped` is the caller's verdict, because a `ClientHello` peek is what tells a TLS 1.2 client
+    /// from one that offers TLS 1.3 on a listener that also offers TLS 1.3.
+    pub(crate) fn accept_decided(
+        cfg: super::TlsServerConfig,
+        io: S,
+        shaped: bool,
+    ) -> Result<Self, TlsError> {
         if cfg.ech_server_keys.is_some() {
             let ctx = cached_ech_server_context(&cfg)?;
             let ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
@@ -1089,11 +1104,7 @@ impl<S: Stream> RustlsServerProvider<S> {
                 eof: false,
             });
         }
-        if crate::tls::cipher_suites::shaped_server(
-            &cfg.cipher_suites,
-            cfg.min_version,
-            cfg.max_version,
-        ) {
+        if shaped {
             return Ok(Self {
                 inner: ServerInner::Shaped(Box::new(crate::tls::shaped::server::Server::new(
                     cfg, io,
@@ -4048,6 +4059,64 @@ mod tests {
                 assert_eq!(&buf, b"ping");
             });
         }
+    }
+
+    /// A listener that also offers TLS 1.3 reads the hello first: the five go to the shaped engine
+    /// for a TLS 1.2 client, and a client that offers TLS 1.3 goes to the engine that carries it.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine() {
+        let identity = crate::tls::TlsServerConfig {
+            certs: vec![rsa_identity()],
+            alpn: Vec::new(),
+            min_version: Some(0x0303),
+            max_version: Some(0x0304),
+            cipher_suites: vec![0x003c, 0xc012, 0x0005, 0xc007, 0xc011],
+            send_tickets: false,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        };
+        let serve = |bound: &crate::tls::TlsServerConfig, offer: Vec<u16>| {
+            let bound = bound.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            thread::scope(|scope| {
+                let server = scope.spawn(move || {
+                    let (stream, _) = listener.accept().expect("accepts");
+                    let mut server = crate::tls::accept(&bound, stream).expect("accepts");
+                    server.handshake().expect("handshakes");
+                    let suite = server.suite();
+                    let mut buf = [0u8; 4];
+                    server.read_exact(&mut buf).expect("reads");
+                    server.write_all(&buf).expect("writes");
+                    server.flush().expect("flushes");
+                    suite
+                });
+                let mut cfg = client("tls.test", &[]);
+                cfg.insecure = true;
+                cfg.cipher_suites = offer.into();
+                let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+                session.handshake().expect("handshakes");
+                session.write_all(b"ping").expect("writes");
+                session.flush().expect("flushes");
+                let mut buf = [0u8; 4];
+                session.read_exact(&mut buf).expect("reads");
+                assert_eq!(&buf, b"ping");
+                server.join().expect("server")
+            })
+        };
+        let mut twelve = identity.clone();
+        twelve.certs = vec![rsa_identity()];
+        assert_eq!(serve(&twelve, vec![0x003c]), Some(0x003c));
+        let mut thirteen = identity;
+        thirteen.certs = vec![rsa_identity()];
+        assert_eq!(serve(&thirteen, vec![0x1301, 0x1302, 0x1303, 0x003c]), None);
     }
 
     /// The listener's role: a config naming a static-RSA suite answers an RSA identity.

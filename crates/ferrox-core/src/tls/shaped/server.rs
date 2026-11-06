@@ -133,6 +133,48 @@ impl Hello {
     }
 }
 
+/// The raw records that carried the `ClientHello`, and whether it offers a version newer than TLS 1.2.
+/// A listener that also offers TLS 1.3 replays those bytes to the other engine; a hello this peek
+/// cannot read is replayed too, so the engine that owned the connection before still answers it.
+pub(crate) fn peek_hello<R: Read>(io: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut raw = Vec::new();
+    let mut handshake = Vec::new();
+    loop {
+        let mut header = [0u8; 5];
+        io.read_exact(&mut header)?;
+        let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        let at = raw.len();
+        raw.extend_from_slice(&header);
+        if header[0] != HANDSHAKE || len > MAX_RECORD {
+            return Ok((raw, true));
+        }
+        raw.resize(at + 5 + len, 0);
+        io.read_exact(&mut raw[at + 5..])?;
+        handshake.extend_from_slice(&raw[at + 5..]);
+        if handshake.len() < 4 {
+            continue;
+        }
+        let body = u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+        if body > MAX_HANDSHAKE {
+            return Ok((raw, true));
+        }
+        if handshake.len() < 4 + body {
+            continue;
+        }
+        return match Hello::parse(&handshake[4..4 + body]) {
+            Ok(hello) => Ok((
+                raw,
+                hello.version >= 0x0304
+                    || hello
+                        .versions
+                        .as_ref()
+                        .is_some_and(|versions| versions.iter().any(|&id| id >= 0x0304)),
+            )),
+            Err(_) => Ok((raw, true)),
+        };
+    }
+}
+
 /// One listener session: the handshake is driven on the first read or write, then every
 /// record seals and opens here, because this lane owns its transport like the Boring one.
 pub(crate) struct Server<S: Stream> {
