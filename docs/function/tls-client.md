@@ -111,6 +111,6 @@ functional path; a throughput number waits for a CI cell.
 
 <!-- scope:begin -->
 - paths: -
-- symbols: dial_socks_tls_client, dial_tls_carried_stream, RelayWrite, read_exact_within, a_handshake_read_waits_out_a_polled_transport, socks_tls_outbound_parses_diallable_carriers, http_tls_outbound_parses_diallable_carriers, socks_tls_over_raw_reaches_echo, socks_tls_over_ws_reaches_echo, http_tls_over_raw_reaches_echo, http_tls_over_ws_reaches_echo
+- symbols: dial_socks_tls_client, dial_tls_carried_stream, RelayWrite, socks_tls_outbound_parses_diallable_carriers, http_tls_outbound_parses_diallable_carriers, socks_tls_over_raw_reaches_echo, socks_tls_over_ws_reaches_echo, http_tls_over_raw_reaches_echo, http_tls_over_ws_reaches_echo
 - go: ./transport/internet/tls/..., ./proxy/socks/..., ./proxy/http/...
 <!-- scope:end -->
