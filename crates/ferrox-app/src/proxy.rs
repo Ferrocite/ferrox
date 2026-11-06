@@ -21093,9 +21093,14 @@ fn dial_socks_client(
     let Some(upstream) = dial_or_report(server) else {
         return;
     };
+    let read = upstream.read_timeout().ok().flatten();
+    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
+    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
     let Some(tunnel) = crate::socks::connect(upstream, credential, destination, version) else {
         return;
     };
+    let _ = tunnel.set_read_timeout(read);
+    let _ = tunnel.set_write_timeout(None);
     relay_handoff(client, &tunnel);
 }
 

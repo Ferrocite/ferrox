@@ -166,6 +166,9 @@ fn read_exact_within(stream: &mut impl Read, buf: &mut [u8], until: Instant) -> 
     use std::io::ErrorKind;
     let mut at = 0;
     while at < buf.len() {
+        if Instant::now() >= until {
+            return None;
+        }
         match stream.read(&mut buf[at..]) {
             Ok(0) => return None,
             Ok(n) => at += n,
