@@ -572,7 +572,7 @@ impl Aes128Gcm {
         }
     }
 
-    #[inline]
+    #[cfg_attr(target_arch = "aarch64", inline)]
     #[must_use]
     pub fn seal_in_place(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         assert!(
@@ -654,7 +654,7 @@ impl Aes128Gcm {
         }
     }
 
-    #[inline]
+    #[cfg_attr(target_arch = "aarch64", inline)]
     #[must_use]
     pub fn open_in_place(
         &self,
@@ -1177,7 +1177,7 @@ impl Aes256Gcm {
         }
     }
 
-    #[inline]
+    #[cfg_attr(target_arch = "aarch64", inline)]
     #[must_use]
     pub fn seal_in_place(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         assert!(
@@ -1324,7 +1324,7 @@ impl Aes256Gcm {
         }
     }
 
-    #[inline]
+    #[cfg_attr(target_arch = "aarch64", inline)]
     #[must_use]
     pub fn open_in_place(
         &self,
