@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -36,7 +36,31 @@ fn window_adjust_at(window: u32) -> u64 {
     WINDOW_ADJUST_AT.min(u64::from(window) / 2)
 }
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
-const KEEPALIVE_PERIOD: Duration = Duration::from_secs(30);
+
+/// The reference's `SSHKeepAlive*` window: a jittered period, random padding,
+/// an inactivity gate, and a reply deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeepAlive {
+    pub(crate) period_min: Duration,
+    pub(crate) period_max: Duration,
+    pub(crate) padding_min: usize,
+    pub(crate) padding_max: usize,
+    pub(crate) inactive: Duration,
+    pub(crate) timeout: Duration,
+}
+
+impl KeepAlive {
+    fn period(&self) -> Duration {
+        let span = self.period_max.saturating_sub(self.period_min);
+        let unit = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        self.period_min + span.mul_f64(unit)
+    }
+
+    fn padding(&self) -> usize {
+        let span = self.padding_max.saturating_sub(self.padding_min);
+        self.padding_min + usize::from(u16::from_be_bytes(random::<2>())) % (span + 1)
+    }
+}
 const MAX_IDENTIFICATION: usize = 1024;
 const CLIENT_CAPABILITIES: &str = "server-requests";
 /// One channel packet plus its header, padding and tag; a larger peer packet
@@ -1145,6 +1169,8 @@ struct Inner {
     socket: Stream,
     relay: Mutex<Option<Relay>>,
     opened_at: Instant,
+    last_read: AtomicU64,
+    pending_request: Mutex<Option<mpsc::Sender<bool>>>,
     server: String,
     protocol: &'static str,
 }
@@ -1232,7 +1258,7 @@ impl Session {
         timeout: Duration,
         proxy: Option<&Proxy>,
         conduit: Option<&Conduit>,
-        keepalive: bool,
+        keepalive: Option<KeepAlive>,
         shape: &TlsShape,
         limit_meek_buffers: bool,
     ) -> Result<Self, String> {
@@ -1357,6 +1383,8 @@ impl Session {
             socket: control,
             relay: Mutex::new(relay),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: format!("{}:{}", server.host, server.port),
             protocol,
         });
@@ -1365,11 +1393,11 @@ impl Session {
             .name("psiphon-ssh".to_owned())
             .spawn(move || read_loop(read_inner, input))
             .map_err(|error| format!("psiphon ssh reader: {error}"))?;
-        if keepalive {
+        if let Some(keepalive) = keepalive {
             let keepalive_inner = Arc::downgrade(&inner);
             if let Err(error) = std::thread::Builder::new()
                 .name("psiphon-ssh-keepalive".to_owned())
-                .spawn(move || ssh_keepalive(&keepalive_inner))
+                .spawn(move || ssh_keepalive(&keepalive_inner, keepalive))
             {
                 inner.close();
                 return Err(format!("psiphon ssh keepalive: {error}"));
@@ -1492,29 +1520,43 @@ impl Drop for Session {
     }
 }
 
-/// Refresh NAT and tunnel liveness without asking for a reply, the way OpenSSH clients do.
-fn ssh_keepalive(inner: &Weak<Inner>) {
+/// Refresh NAT and tunnel liveness with a jittered `keepalive@openssh.com`,
+/// closing the session when the server misses the reply deadline.
+fn ssh_keepalive(inner: &Weak<Inner>, config: KeepAlive) {
     loop {
-        std::thread::sleep(KEEPALIVE_PERIOD);
+        std::thread::sleep(config.period());
         let Some(inner) = inner.upgrade() else {
             return;
         };
         if inner.closed.load(Ordering::Acquire) {
             return;
         }
-        let mut request = Vec::with_capacity(64);
+        if inner.idle() < config.inactive {
+            continue;
+        }
+        let padding = config.padding();
+        let mut request = Vec::with_capacity(64 + padding);
         request.push(MSG_GLOBAL_REQUEST);
         put_str(&mut request, b"keepalive@openssh.com");
-        request.push(0);
-        let padding = random_padding();
-        let mut bytes = vec![0u8; padding];
-        if getrandom::fill(&mut bytes).is_err() {
+        request.push(1);
+        let at = request.len();
+        request.resize(at + padding, 0);
+        if getrandom::fill(&mut request[at..]).is_err() {
             return;
         }
-        request.extend_from_slice(&bytes);
+        let (reply, wait) = mpsc::channel();
+        *lock(&inner.pending_request) = Some(reply);
         if inner.send(&request).is_err() {
             inner.close();
             return;
+        }
+        match wait.recv_timeout(config.timeout) {
+            Ok(true) => {}
+            _ => {
+                let _ = lock(&inner.pending_request).take();
+                inner.close();
+                return;
+            }
         }
     }
 }
@@ -1586,11 +1628,23 @@ impl Inner {
         relay_round_trip(&mut relay, payload)
     }
 
+    /// Record the read clock the keep-alive inactivity gate compares against.
+    fn touch(&self) {
+        let now = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_read.store(now, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let now = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(now.saturating_sub(self.last_read.load(Ordering::Relaxed)))
+    }
+
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         let _ = self.socket.shutdown();
+        let _ = lock(&self.pending_request).take();
         let channels: Vec<Arc<ChannelState>> = lock(&self.channels)
             .drain()
             .map(|(_, state)| state)
@@ -2324,11 +2378,6 @@ fn split(
             PacketReader::new(socket, None, None, None, pool),
         ))
     }
-}
-
-pub(crate) fn random_padding() -> usize {
-    let bytes = random::<2>();
-    MIN_PADDING + usize::from(u16::from_be_bytes(bytes)) % (MAX_PADDING - MIN_PADDING + 1)
 }
 
 pub(crate) fn random<const N: usize>() -> [u8; N] {
@@ -3362,6 +3411,7 @@ enum Dispatch {
 #[allow(clippy::needless_pass_by_value)]
 fn read_loop(inner: Arc<Inner>, mut reader: PacketReader) {
     while let Ok(packet) = reader.recv() {
+        inner.touch();
         match dispatch(&inner, packet) {
             Dispatch::Recycle(buffer) => reader.recycle(buffer),
             Dispatch::Queued => {}
@@ -3540,6 +3590,12 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             }
             Dispatch::Recycle(packet.buffer)
         }
+        MSG_REQUEST_SUCCESS | MSG_REQUEST_FAILURE => {
+            if let Some(reply) = lock(&inner.pending_request).take() {
+                let _ = reply.send(kind == MSG_REQUEST_SUCCESS);
+            }
+            Dispatch::Recycle(packet.buffer)
+        }
         // Rekey is not implemented; a stalled session is worse than a reconnect.
         MSG_DISCONNECT | MSG_KEXINIT => Dispatch::Stop,
         _ => Dispatch::Recycle(packet.buffer),
@@ -3636,6 +3692,8 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         socket: Stream::Tcp(peer),
         relay: Mutex::new(None),
         opened_at: Instant::now(),
+        last_read: AtomicU64::new(0),
+        pending_request: Mutex::new(None),
         server: "test".to_owned(),
         protocol: "SSH",
     });
@@ -3908,6 +3966,8 @@ mod tests {
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -3985,6 +4045,8 @@ mod tests {
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4048,6 +4110,8 @@ mod tests {
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4136,6 +4200,8 @@ mod tests {
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4219,6 +4285,8 @@ mod tests {
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4258,6 +4326,8 @@ mod tests {
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            pending_request: Mutex::new(None),
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4404,5 +4474,23 @@ mod tests {
         assert_eq!(proxy.user, "user");
         assert_eq!(proxy.pass, "p@ss");
         assert!(Proxy::parse("socks4://127.0.0.1:1", &[]).is_err());
+    }
+
+    #[test]
+    fn the_keepalive_window_stays_inside_its_bounds() {
+        let keepalive = KeepAlive {
+            period_min: Duration::from_millis(1),
+            period_max: Duration::from_millis(2),
+            padding_min: 3,
+            padding_max: 5,
+            inactive: Duration::from_millis(1),
+            timeout: Duration::from_millis(1),
+        };
+        for _ in 0..1_000 {
+            let period = keepalive.period();
+            assert!(period >= Duration::from_millis(1));
+            assert!(period <= Duration::from_millis(2));
+            assert!((3..=5).contains(&keepalive.padding()));
+        }
     }
 }
