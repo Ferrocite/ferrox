@@ -834,8 +834,8 @@ engine-api seconds-per-api-call UNBLESSED CI bench.yml (no cell yet)
 
 # --- wireguard tunnel, both roles ---------------------------------------------
 wireguard ops-retired-instructions UNBLESSED scripts/count-ops.sh
-wireguard route-scan-instructions UNBLESSED ferrox-app-wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
-wireguard route-table-instructions UNBLESSED ferrox-app-wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
+wireguard route-scan-instructions 68609 ferrox-app-wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
+wireguard route-table-instructions 585 ferrox-app-wg::tests::a_prefix_table_picks_the_peer_the_scan_picks
 wireguard transport-header-bytes 16 ferrox-core-wireguard::tests::the_reference_message_sizes
 wireguard initiation-bytes 148 ferrox-core-wireguard::tests::the_reference_message_sizes
 wireguard response-bytes 92 ferrox-core-wireguard::tests::the_reference_message_sizes
