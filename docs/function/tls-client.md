@@ -8,10 +8,13 @@ transport as a bare TCP socket.
 
 `tls_parts` reads `streamSettings.security = "tls"` into
 `(Carrier, server name, TlsConfig)`.  The carrier set is raw TCP, `ws`,
-`httpupgrade`, `grpc`, `xhttp` and the TCP `http` header; `quic`, `kcp`,
-`hysteria`, `masque`, `xdrive` and unknown networks are refused at parse time rather
-than silently dialled raw.  Roots come from `caCertFile`, joined with the store, or
-from no root when `allowInsecure` is set.  A plain `network: "tcp"` with no
+`httpupgrade`, `grpc`, `xhttp` and the TCP `http` header; the SOCKS and HTTP
+outbound parsers refuse `quic`, `kcp`, `hysteria`, `masque`, `xdrive` and unknown
+networks rather than silently dialling them raw.  VLESS, VMess and Trojan keep their
+`tls_carried_parts` path, and Shadowsocks its own KCP TLS lane, so KCP still carries
+TLS for them.  Roots come
+from `caCertFile`, joined with the store, or from no root when `allowInsecure` is
+set.  A plain `network: "tcp"` with no
 `security` stays a plain dial; only the configured TLS arm changes.
 
 ## Data path
@@ -55,8 +58,10 @@ graph TD
 <!-- counts:end -->
 
 The two parse rows are the six carrier forms in `tls_stream_cases`: raw, `ws`,
-`grpc`, `xhttp`, `httpupgrade` and the TCP `http` header.  The same test also holds
-all three of `quic`, `kcp` and `hysteria` refused.  The echo rows run the real
+`grpc`, `xhttp`, `httpupgrade` and the TCP `http` header.  For the SOCKS and HTTP
+parsers the same test also holds all three of `quic`, `kcp` and `hysteria` refused;
+the VLESS, VMess, Trojan and Shadowsocks lanes keep their KCP-carried TLS path.  The
+echo rows run the real
 `dial_socks_outbound` or `dial_http_outbound` over a TLS echo listener; the carried
 row reaches the listener through a WebSocket upgrade inside the TLS session, not
 through a raw TCP re-dial.
@@ -65,7 +70,7 @@ through a raw TCP re-dial.
 
 ```bash
 ./scripts/count-ops.sh report \
-  socks_tls_over_ws_reaches_echo 'proxy::dial_socks_tls_client'
+  socks_tls_over_ws_reaches_echo 'proxy::tests::socks_tls_over_ws_reaches_echo'
 ```
 
 `UNBLESSED`.  The dial and first handshake happen once per flow; no instruction count
@@ -97,6 +102,12 @@ functional path; a throughput number waits for a CI cell.
   flow under load. The SOCKS greeting, request and bound-address reads now wait out
   the poll under the handshake budget, and
   `a_handshake_read_waits_out_a_polled_transport` is the deterministic witness.
+
+The bullets above are removals against earlier Ferrox, not against the references.
+Against Xray-core, sing-box and ZeroNet no instruction, syscall, copy or time removal
+is claimed: each also dials TLS and hands it to the carrier, and this page has no
+comparison cell for a ratio.  The two parse rows and four echo rows are correctness
+witnesses; the four cost rows stay `UNBLESSED`.
 
 ## Pins
 

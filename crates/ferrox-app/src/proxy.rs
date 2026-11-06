@@ -8929,14 +8929,14 @@ impl Write for RelayWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0
             .lock()
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Interrupted))?
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
             .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.0
             .lock()
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Interrupted))?
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
             .flush()
     }
 }
@@ -33856,6 +33856,9 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
             (c, h, Some(t))
         } else {
             let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(carrier, Carrier::Raw(_)) {
+                continue;
+            }
             (carrier, host, None)
         };
         let (carrier_headers, heartbeat) =
@@ -34347,6 +34350,9 @@ fn find_http_outbound(root: &Json) -> Option<HttpOut> {
                 (c, h, Some(t))
             } else {
                 let (carrier, host) = outbound_carrier(outbound, &address);
+                if !matches!(carrier, Carrier::Raw(_)) {
+                    continue;
+                }
                 (carrier, host, None)
             };
             let (carrier_headers, heartbeat) =
@@ -34921,6 +34927,31 @@ mod tests {
     use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN, SINK_GRACE};
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
+
+    #[test]
+    fn a_poisoned_relay_write_stops_instead_of_looping() {
+        let sink = RelayWrite::new(Box::new(std::io::sink()));
+        let lock = std::sync::Arc::clone(&sink.0);
+        let poisoned = std::thread::spawn(move || {
+            let _held = lock.lock().expect("lock");
+            panic!("poison the relay write");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the helper thread poisons the lock");
+        let mut sink = sink;
+        assert_eq!(
+            std::io::Write::write(&mut sink, b"x")
+                .expect_err("a poisoned write stops")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            std::io::Write::flush(&mut sink)
+                .expect_err("a poisoned flush stops")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
 
     fn freedom() -> Outbound {
         Outbound::Freedom(Arc::default())
