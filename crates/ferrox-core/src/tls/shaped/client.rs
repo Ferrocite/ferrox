@@ -149,6 +149,21 @@ impl<S: Stream> Session<S> {
                 "shaped: a stock fingerprint has no shaped session".to_owned(),
             ));
         };
+        Self::with_profile(profile, cfg, io, false)
+    }
+
+    /// The stock hello a config's `cipherSuites` rides when ring and `BoringSSL` carry none of it:
+    /// Go's own extension table, with the config's list in place of a preset's.
+    pub(crate) fn connect_stock(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
+        Self::with_profile(super::stock_profile(), cfg, io, true)
+    }
+
+    fn with_profile(
+        profile: &'static Profile,
+        cfg: &TlsConfig,
+        io: S,
+        configured_ciphers: bool,
+    ) -> Result<Self, TlsError> {
         let mut hello = Hello::build(
             profile,
             &cfg.server_name,
@@ -157,6 +172,9 @@ impl<S: Stream> Session<S> {
             &cfg.curves,
             cfg.client_random,
         )?;
+        if configured_ciphers && !cfg.cipher_suites.is_empty() {
+            hello.set_ciphers(&cfg.cipher_suites);
+        }
         if let Some(padding) = cfg.padding {
             hello.set_padding(usize::from(padding));
         }

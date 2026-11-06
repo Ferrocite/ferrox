@@ -431,9 +431,98 @@ pub(crate) fn profile_of(cfg: &TlsConfig) -> Option<&'static Profile> {
     cfg.fingerprint.and_then(Fingerprint::profile)
 }
 
+/// The stock `crypto/tls` hello behind `unsafe`: no GREASE, no preset table, Go's extension order,
+/// and the cipher list a config's `cipherSuites` overrides.
+pub(crate) static GO_STOCK: Profile = Profile {
+    name: "golang",
+    ciphers: &[],
+    shuffle: false,
+    exts: &[
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x001d, 0x0017, 0x0018, 0x0019]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603,
+                0x0201, 0x0203,
+            ]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x001d],
+                reuse: false,
+            },
+        },
+    ],
+};
+
+pub(crate) fn stock_profile() -> &'static Profile {
+    &GO_STOCK
+}
+
+/// Whether a list names an id neither ring nor `BoringSSL` carries, so only the stock shaped
+/// hello can put it on the wire and negotiate it.
+pub(crate) fn needs_stock_hello(ids: &[u16]) -> bool {
+    ids.iter().any(|&id| {
+        !crate::tls::rustls_backend::carries(id) && crate::tls::legacy::suite_name(id).is_none()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stock hello a config naming the five unreachable ids rides: Go's preference order,
+    /// and the TLS 1.3 trio appended, exactly the field the oracle captured.
+    #[test]
+    fn the_stock_hello_carries_the_five_ids_neither_backend_has() {
+        use crate::tls::cipher_suites::{field_bytes, hello_ids, parse};
+        let list = "TLS_RSA_WITH_RC4_128_SHA:TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:TLS_ECDHE_RSA_WITH_RC4_128_SHA:TLS_RSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA";
+        let ids = hello_ids(&parse(list), 0x0303, 0x0304, true);
+        assert_eq!(
+            ids,
+            vec![0xc012, 0x003c, 0xc007, 0xc011, 0x0005, 0x1301, 0x1302, 0x1303]
+        );
+        let mut hello = hello::Hello::build(stock_profile(), "example.com", &[], false, &[], None)
+            .expect("the stock hello builds");
+        hello.set_ciphers(&ids);
+        let msg = &hello.msg;
+        let mut at = 4 + 2 + 32;
+        at += 1 + usize::from(msg[at]);
+        let len = usize::from(u16::from_be_bytes([msg[at], msg[at + 1]]));
+        assert_eq!(&msg[at..at + 2 + len], field_bytes(&ids).as_slice());
+    }
 
     /// Every accepted spelling resolves to a preset the oracle replays by name, so
     /// widening the vocabulary adds no bytes: this test holds the pointers, the oracle the preset.

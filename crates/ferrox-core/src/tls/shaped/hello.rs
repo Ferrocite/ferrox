@@ -18,6 +18,8 @@ pub(crate) struct Hello {
     pub session_id: [u8; 32],
     pub shares: Vec<Share>,
     profile: &'static Profile,
+    /// A config's `cipherSuites` list, which the stock hello puts where a preset's table would.
+    ciphers: Option<Vec<u16>>,
     /// The groups a config's `curvePreferences` names, in its order: `None` keeps the profile's
     /// own list and shares, the hello a browser would send.
     groups: Option<Vec<u16>>,
@@ -87,6 +89,7 @@ impl Hello {
             session_id,
             shares,
             profile,
+            ciphers: None,
             groups: (!curves.is_empty()).then(|| curves.to_vec()),
             grease,
             alpn: alpn_override(alpn, websocket),
@@ -105,6 +108,16 @@ impl Hello {
     pub(crate) fn set_padding(&mut self, padding: usize) {
         self.padding = Some(padding.min(0x3000));
         self.msg = self.encode(None);
+    }
+
+    /// Replaces the hello's cipher list, the field a config's `cipherSuites` owns.
+    pub(crate) fn set_ciphers(&mut self, ciphers: &[u16]) {
+        self.ciphers = Some(ciphers.to_vec());
+        self.msg = self.encode(None);
+    }
+
+    fn cipher_table(&self) -> &[u16] {
+        self.ciphers.as_deref().unwrap_or(self.profile.ciphers)
     }
 
     /// Replaces the GREASE cover with a real ECH offer sealed to the named config.
@@ -292,6 +305,7 @@ impl Hello {
             session_id: self.session_id,
             shares,
             profile: self.profile,
+            ciphers: self.ciphers.clone(),
             groups: self.groups.clone(),
             grease: self.grease,
             alpn: self.alpn,
@@ -419,7 +433,7 @@ impl Hello {
     /// and the one compression method. The padding extension is sized from it, and the message
     /// is reserved to it, so neither pass guesses at the width.
     fn fixed_len(&self) -> usize {
-        2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.profile.ciphers.len() + 1 + 1
+        2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.cipher_table().len() + 1 + 1
     }
 
     /// Two walks of one body rule and two buffers: the first runs every walk into a width, so the
@@ -443,8 +457,8 @@ impl Hello {
         msg.extend_from_slice(&self.random);
         msg.push(self.session_id.len() as u8);
         msg.extend_from_slice(&self.session_id);
-        msg.extend_from_slice(&(2 * self.profile.ciphers.len() as u16).to_be_bytes());
-        for &cipher in self.profile.ciphers {
+        msg.extend_from_slice(&(2 * self.cipher_table().len() as u16).to_be_bytes());
+        for &cipher in self.cipher_table() {
             msg.extend_from_slice(&grease_or(cipher, &self.grease, 0).to_be_bytes());
         }
         msg.extend_from_slice(&[1, 0]);
@@ -458,8 +472,7 @@ impl Hello {
     }
 
     fn cipher_values(&self, tls13_only: bool) -> Vec<u16> {
-        self.profile
-            .ciphers
+        self.cipher_table()
             .iter()
             .filter(|&&c| !tls13_only || matches!(c, 0x1301..=0x1303))
             .map(|&c| grease_or(c, &self.grease, 0))
@@ -635,7 +648,7 @@ impl Hello {
     fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) -> usize {
         Self::pad_prepared(
             entries,
-            self.profile.ciphers.len(),
+            self.cipher_table().len(),
             self.session_id.len(),
             self.padding,
         )
@@ -683,6 +696,7 @@ impl Hello {
             session_id: [0u8; 32],
             shares: keys::canonical(groups),
             profile,
+            ciphers: None,
             groups: None,
             grease: distinct_grease([0; 5]),
             alpn: None,
