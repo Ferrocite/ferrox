@@ -64,6 +64,7 @@ pub(crate) struct DeviceConfig {
     pub(crate) reserved: [u8; 3],
     pub(crate) is_client: Option<bool>,
     pub(crate) no_kernel_tun: bool,
+    pub(crate) large_segments: bool,
     pub(crate) dns: Vec<IpAddr>,
 }
 
@@ -131,6 +132,10 @@ impl DeviceConfig {
             reserved,
             is_client: settings.get("isClient").and_then(Json::as_bool),
             no_kernel_tun,
+            large_segments: settings
+                .get("largeSegments")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             dns,
         })
     }
@@ -424,6 +429,7 @@ mod tests {
         ))
         .expect("defaults");
         assert_eq!(config.mtu, DEFAULT_MTU);
+        assert!(!config.large_segments);
         assert_eq!(
             config.addresses,
             vec![
@@ -452,6 +458,17 @@ mod tests {
         )))
         .expect("both");
         assert!(!both.no_kernel_tun);
+    }
+
+    #[test]
+    fn large_segments_are_opt_in() {
+        let base = r#""secretKey":"0000000000000000000000000000000000000000000000000000000000000001",
+                "peers":[{"publicKey":"0000000000000000000000000000000000000000000000000000000000000002"}]"#;
+        let absent = DeviceConfig::from_json(&json(&format!("{{{base}}}"))).expect("absent");
+        assert!(!absent.large_segments);
+        let opted = DeviceConfig::from_json(&json(&format!("{{{base},\"largeSegments\":true}}")))
+            .expect("opted");
+        assert!(opted.large_segments);
     }
 
     #[test]

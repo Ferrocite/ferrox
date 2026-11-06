@@ -2388,6 +2388,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let peers = peers(&config, [0; 12]);
@@ -2797,6 +2798,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
@@ -2847,6 +2849,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::new(config).expect("outbound");
@@ -2869,6 +2872,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, packets) = mpsc::channel();
@@ -3048,6 +3052,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let peers = peers(&config, [0; 12]);
@@ -3172,6 +3177,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let socket = bind_socket(&config).expect("dual-stack socket");
@@ -3347,6 +3353,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let server = UdpSocket::bind("127.0.0.1:0").expect("server");

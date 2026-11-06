@@ -219,6 +219,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         alive,
         move |from_tunnel, to_stack, routes| {
@@ -286,6 +287,7 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
@@ -311,6 +313,7 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
@@ -333,6 +336,7 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
@@ -365,6 +369,7 @@ fn resolve_edge(spec: &ClientSpec) -> Result<SocketAddr, String> {
 fn assemble(
     addresses: Vec<IpAddr>,
     mtu: usize,
+    large_segments: bool,
     initial: Vec<Vec<u8>>,
     alive: Arc<AtomicBool>,
     run: impl FnOnce(Receiver<Vec<u8>>, Sender<Packet>, UdpRoutes) + Send + 'static,
@@ -377,6 +382,7 @@ fn assemble(
         reserved: [0u8; 3],
         is_client: Some(true),
         no_kernel_tun: true,
+        large_segments,
         dns: Vec::new(),
     });
     let (packets_tx, packets_rx) = mpsc::channel();
@@ -435,6 +441,7 @@ struct ClientSpec {
     remote_dns: Vec<IpAddr>,
     warp: Option<Warp>,
     keepalive: Option<i64>,
+    large_segments: bool,
 }
 
 impl ClientSpec {
@@ -516,6 +523,10 @@ impl ClientSpec {
         credentials(user, pass, &mut headers)?;
         let keepalive = keepalive(transport)?;
         let remote_dns = remote_dns(settings)?;
+        let large_segments = settings
+            .get("largeSegments")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         Ok(Self {
             address,
             port,
@@ -526,6 +537,7 @@ impl ClientSpec {
             remote_dns,
             warp,
             keepalive,
+            large_segments,
         })
     }
 
@@ -1760,6 +1772,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         reserved: [0u8; 3],
         is_client: Some(false),
         no_kernel_tun: true,
+        large_segments: false,
         dns: Vec::new(),
     };
     let stack_out = out.clone();
@@ -1806,6 +1819,7 @@ fn serve_cleartext_inbound(
         reserved: [0u8; 3],
         is_client: Some(false),
         no_kernel_tun: true,
+        large_segments: false,
         dns: Vec::new(),
     };
     let stack_out = out.clone();
@@ -2911,6 +2925,7 @@ mod tests {
         let inner = assemble(
             Vec::new(),
             DEFAULT_MTU,
+            false,
             Vec::new(),
             Arc::new(AtomicBool::new(true)),
             move |from_tunnel, _to_stack, _routes| {
@@ -2979,6 +2994,7 @@ mod tests {
             remote_dns: Vec::new(),
             warp: None,
             keepalive: None,
+            large_segments: false,
         };
         let mut config = client_config(&spec).expect("config");
         let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
@@ -3896,6 +3912,21 @@ mod tests {
     }
 
     #[test]
+    fn large_segments_are_opt_in_for_masque() {
+        let plain = ClientSpec::from(&outbound(8443)).expect("the default spec");
+        assert!(!plain.large_segments);
+        let opted = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443,"largeSegments":true},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the opted outbound");
+        assert!(
+            ClientSpec::from(&opted)
+                .expect("the opted spec")
+                .large_segments
+        );
+    }
+
+    #[test]
     fn the_reference_keepalive_period_reaches_the_carrier() {
         let plain = crate::json::parse(
             r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
@@ -4159,6 +4190,7 @@ mod tests {
             remote_dns: Vec::new(),
             warp: None,
             keepalive: None,
+            large_segments: false,
         };
         let mut client_config = client_config(&spec).expect("client config");
         let server_lane = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));

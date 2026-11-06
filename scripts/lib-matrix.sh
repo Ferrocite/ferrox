@@ -343,7 +343,7 @@ masque_client_settings() {
   dir="$(matrix_tls_dir)"
   pin="$(matrix_tls_pin "$dir/cert.pem")"
   auth="$(printf '%s' "matrix@carrier.test:$PASSWORD" | base64)"
-  echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+  echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port, \"largeSegments\": true}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
 
 httpupgrade_settings() {
@@ -466,7 +466,7 @@ wireguard_server() {
 
 wireguard_client() {
   local port="$1" kernel="${2:-true}"
-  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"noKernelTun\": $kernel, \"secretKey\": \"$(matrix_wireguard_client_private)\", \"address\": [\"10.0.0.2/32\", \"fd00::2/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_server_public)\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
+  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"largeSegments\": true, \"noKernelTun\": $kernel, \"secretKey\": \"$(matrix_wireguard_client_private)\", \"address\": [\"10.0.0.2/32\", \"fd00::2/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_server_public)\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
 }
 
 wireguard_kernel_client() {

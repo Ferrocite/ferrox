@@ -1260,7 +1260,12 @@ struct ClientStack {
 impl ClientStack {
     /// Build the client's interface, sockets and routes over a device that reserves its headroom.
     fn new(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, headroom: usize) -> Self {
-        let mut device = QueueDevice::new(INNER_MTU, headroom);
+        let mtu = if config.large_segments {
+            INNER_MTU
+        } else {
+            config.mtu
+        };
+        let mut device = QueueDevice::new(mtu, headroom);
         let mut iface = Interface::new(
             iface_config(0x5eed_1234),
             &mut device,
@@ -2659,6 +2664,7 @@ mod tests {
             reserved: [0u8; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, queries): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = std::sync::mpsc::channel();
@@ -2715,6 +2721,7 @@ mod tests {
             reserved: [0u8; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
@@ -2887,6 +2894,7 @@ mod tests {
             reserved: [0u8; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
@@ -3236,6 +3244,7 @@ mod tests {
             reserved: [0u8; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, replies) = std::sync::mpsc::channel();
@@ -3316,6 +3325,7 @@ mod tests {
             reserved: [0u8; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
@@ -3387,6 +3397,7 @@ mod tests {
             reserved: [0u8; 3],
             is_client: Some(is_client),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         }
     }
@@ -3826,7 +3837,9 @@ mod tests {
     fn the_client_advertises_the_inner_mss() {
         let (app, proxy) = loopback().expect("pair");
         let (to_tunnel, packets) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        let mut config = device(&["10.0.0.2"], true);
+        config.large_segments = true;
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
         stack
             .connect(ClientFlow {
                 client: proxy,
@@ -3840,6 +3853,27 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
         assert_eq!(tcp_mss(&syn), 65_495);
+        drop(app);
+    }
+
+    #[test]
+    fn the_client_keeps_the_tunnel_mss_without_large_segments() {
+        let (app, proxy) = loopback().expect("pair");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        stack
+            .connect(ClientFlow {
+                client: proxy,
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+            })
+            .expect("connect");
+        let mut buf = [0u8; 2048];
+        stack.poll(&mut buf);
+        let syn = packets
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the client's SYN");
+        assert_eq!(tcp_mss(&syn), 1_380);
         drop(app);
     }
 
@@ -4231,6 +4265,7 @@ mod client_tests {
             reserved: [0u8; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         }
     }
@@ -4683,6 +4718,7 @@ mod client_tests {
             reserved: [0u8; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
@@ -4768,6 +4804,7 @@ mod client_tests {
             reserved: [0u8; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: true,
             dns: Vec::new(),
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
@@ -4824,6 +4861,7 @@ mod client_tests {
             reserved: [0u8; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: true,
             dns: Vec::new(),
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();

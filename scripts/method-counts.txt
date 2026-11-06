@@ -854,6 +854,7 @@ wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_pa
 wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard download-bytes-reassembled 16384 ferrox-app-wg-stack::tests::a_server_download_leaves_as_fragments_the_client_reassembles
 wireguard ipv6-fragment-round-trips 1 ferrox-app-wg-stack::tests::an_ipv6_packet_fragments_and_reassembles_without_its_fragment_header
+wireguard syn-conservative-mss-bytes 1380 ferrox-app-wg-stack::tests::the_client_keeps_the_tunnel_mss_without_large_segments
 wireguard syn-advertised-mss-bytes 65495 ferrox-app-wg-stack::tests::the_client_advertises_the_inner_mss
 wireguard syn-ack-advertised-mss-bytes 1380 ferrox-app-wg-stack::tests::the_server_keeps_the_syn_mss_and_lowers_its_answer
 wireguard tcp-bytes-echoed 9 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
