@@ -999,6 +999,31 @@ struct Peer {
     tunnel: Tunnel,
 }
 
+trait Allowed {
+    fn allowed(&self) -> &[(IpAddr, u8)];
+    fn longest_prefix(&self, destination: IpAddr) -> Option<u8>;
+}
+
+impl Allowed for Peer {
+    fn allowed(&self) -> &[(IpAddr, u8)] {
+        &self.config.allowed
+    }
+
+    fn longest_prefix(&self, destination: IpAddr) -> Option<u8> {
+        self.config.longest_prefix(destination)
+    }
+}
+
+impl Allowed for PeerConfig {
+    fn allowed(&self) -> &[(IpAddr, u8)] {
+        &self.allowed
+    }
+
+    fn longest_prefix(&self, destination: IpAddr) -> Option<u8> {
+        PeerConfig::longest_prefix(self, destination)
+    }
+}
+
 struct Peers {
     peers: Vec<Peer>,
     routes: Routes,
@@ -2013,14 +2038,14 @@ struct Routes {
 }
 
 impl Routes {
-    fn new(peers: &[Peer]) -> Self {
+    fn new<A: Allowed>(peers: &[A]) -> Self {
         let mut prefixes = 0usize;
         let mut valid = true;
         let mut v4_prefixes = 0usize;
         let mut v6_prefixes = 0usize;
         for peer in peers {
-            prefixes += peer.config.allowed.len();
-            for (address, bits) in &peer.config.allowed {
+            prefixes += peer.allowed().len();
+            for (address, bits) in peer.allowed() {
                 match address {
                     IpAddr::V4(_) if *bits <= 32 => v4_prefixes += 1,
                     IpAddr::V6(_) if *bits <= 128 => v6_prefixes += 1,
@@ -2042,7 +2067,7 @@ impl Routes {
             nodes
         });
         for (index, peer) in peers.iter().enumerate() {
-            for (address, bits) in &peer.config.allowed {
+            for (address, bits) in peer.allowed() {
                 match address {
                     IpAddr::V4(address) => {
                         if let Some(nodes) = v4.as_mut() {
@@ -2072,7 +2097,7 @@ impl Routes {
         Self { v4, v6 }
     }
 
-    fn peer_for(&self, peers: &[Peer], destination: IpAddr) -> Option<usize> {
+    fn peer_for<A: Allowed>(&self, peers: &[A], destination: IpAddr) -> Option<usize> {
         match destination {
             IpAddr::V4(address) => {
                 let Some(nodes) = &self.v4 else {
@@ -2126,15 +2151,11 @@ fn lookup_route(nodes: &[RouteNode], value: u128, width: usize) -> Option<usize>
     found
 }
 
-fn peer_for_scan(peers: &[Peer], destination: IpAddr) -> Option<usize> {
+fn peer_for_scan<A: Allowed>(peers: &[A], destination: IpAddr) -> Option<usize> {
     peers
         .iter()
         .enumerate()
-        .filter_map(|(index, peer)| {
-            peer.config
-                .longest_prefix(destination)
-                .map(|bits| (index, bits))
-        })
+        .filter_map(|(index, peer)| peer.longest_prefix(destination).map(|bits| (index, bits)))
         .max_by_key(|(_, bits)| *bits)
         .map(|(index, _)| index)
 }
@@ -2270,16 +2291,14 @@ mod tests {
             .expect("an outbound packet")
     }
 
-    fn routed_peers(count: u16) -> Peers {
+    fn routed_configs(count: u16) -> Vec<PeerConfig> {
         let mut peers = Vec::with_capacity(usize::from(count));
         for index in 0..count {
-            let mut public = [0u8; 32];
-            public[..4].copy_from_slice(&u32::from(index).to_le_bytes());
             let v4 = Ipv4Addr::new(10, (index >> 8) as u8, index as u8, 1);
             let v6 =
                 Ipv6Addr::from(0xfd00_0000_0000_0000_0000_0000_0000_0000u128 | u128::from(index));
-            let config = PeerConfig {
-                public,
+            peers.push(PeerConfig {
+                public: [index as u8; 32],
                 preshared: [0; 32],
                 endpoint: None,
                 endpoints: Vec::new(),
@@ -2290,40 +2309,33 @@ mod tests {
                     ("fd00::".parse().unwrap(), 8),
                     (IpAddr::V6(v6), 128),
                 ],
-            };
-            peers.push(Peer {
-                config,
-                tunnel: Tunnel::new(
-                    [0x11; 32],
-                    public,
-                    [0; 32],
-                    SocketAddr::from(([127, 0, 0, 1], 0)),
-                    0,
-                    [0; 3],
-                    [0; 12],
-                ),
             });
         }
-        Peers::new(peers)
+        peers
     }
 
     #[inline(never)]
-    fn route_scan_once(peers: &Peers, destination: IpAddr) -> Option<usize> {
+    fn route_scan_once(peers: &[PeerConfig], destination: IpAddr) -> Option<usize> {
         peer_for_scan(peers, destination)
     }
 
     #[inline(never)]
-    fn route_table_once(peers: &Peers, destination: IpAddr) -> Option<usize> {
-        peers.routes.peer_for(peers, destination)
+    fn route_table_once(
+        peers: &[PeerConfig],
+        routes: &Routes,
+        destination: IpAddr,
+    ) -> Option<usize> {
+        routes.peer_for(peers, destination)
     }
 
     /// The prefix table answers every lookup the peer scan answered, including
     /// the last peer on a tie and the deepest prefix on an overlap.
     #[test]
     fn a_prefix_table_picks_the_peer_the_scan_picks() {
-        let peers = routed_peers(512);
+        let peers = routed_configs(512);
+        let routes = Routes::new(&peers);
         assert!(
-            peers.routes.v4.is_some() && peers.routes.v6.is_some(),
+            routes.v4.is_some() && routes.v6.is_some(),
             "both tables are the path under test"
         );
         for destination in [
@@ -2336,14 +2348,14 @@ mod tests {
         ] {
             let destination: IpAddr = destination.parse().unwrap();
             assert_eq!(
-                peers.peer_for(destination),
+                routes.peer_for(&peers, destination),
                 peer_for_scan(&peers, destination)
             );
         }
         let destination = "10.0.1.1".parse().unwrap();
         assert_eq!(
             route_scan_once(&peers, destination),
-            route_table_once(&peers, destination)
+            route_table_once(&peers, &routes, destination)
         );
     }
 
