@@ -439,8 +439,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state =
-            unsafe { self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq) };
+        let state = unsafe { self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq) };
         super::finish(
             &self.h,
             state,
