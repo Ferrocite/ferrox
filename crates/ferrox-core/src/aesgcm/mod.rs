@@ -12,9 +12,12 @@ mod x86v;
 
 use aes_gcm::aead::AeadInOut as _;
 
+#[cfg(target_arch = "aarch64")]
 const SHORT_MIN: usize = 256;
+#[cfg(target_arch = "aarch64")]
 const SHORT_MAX: usize = 512;
 
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn in_short_band(len: usize) -> bool {
     (SHORT_MIN..=SHORT_MAX).contains(&len)
@@ -582,9 +585,9 @@ impl Aes128Gcm {
         );
         match &self.inner {
             #[cfg(target_arch = "x86_64")]
-            Inner::X86V(e) => unsafe { e.engine.seal(nonce, aad, buf) },
+            Inner::X86V(e) => unsafe { e.seal(nonce, aad, buf) },
             #[cfg(target_arch = "x86_64")]
-            Inner::X86(e) => unsafe { e.engine.seal(nonce, aad, buf) },
+            Inner::X86(e) => unsafe { e.seal(nonce, aad, buf) },
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(e) => {
                 if in_short_band(buf.len()) {
@@ -625,9 +628,9 @@ impl Aes128Gcm {
         );
         match &self.inner {
             #[cfg(target_arch = "x86_64")]
-            Inner::X86V(e) => unsafe { e.engine.seal_from(nonce, aad, src, dst) },
+            Inner::X86V(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
             #[cfg(target_arch = "x86_64")]
-            Inner::X86(e) => unsafe { e.engine.seal_from(nonce, aad, src, dst) },
+            Inner::X86(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(e) => {
                 if in_short_band(src.len()) {
@@ -670,9 +673,9 @@ impl Aes128Gcm {
         );
         match &self.inner {
             #[cfg(target_arch = "x86_64")]
-            Inner::X86V(e) => unsafe { e.engine.open(nonce, aad, buf, tag) },
+            Inner::X86V(e) => unsafe { e.open(nonce, aad, buf, tag) },
             #[cfg(target_arch = "x86_64")]
-            Inner::X86(e) => unsafe { e.engine.open(nonce, aad, buf, tag) },
+            Inner::X86(e) => unsafe { e.open(nonce, aad, buf, tag) },
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(e) => {
                 if in_short_band(buf.len()) {
@@ -1187,9 +1190,9 @@ impl Aes256Gcm {
         );
         match &self.inner {
             #[cfg(target_arch = "x86_64")]
-            Inner256::X86V(e) => unsafe { e.engine.seal(nonce, aad, buf) },
+            Inner256::X86V(e) => unsafe { e.seal(nonce, aad, buf) },
             #[cfg(target_arch = "x86_64")]
-            Inner256::X86(e) => unsafe { e.engine.seal(nonce, aad, buf) },
+            Inner256::X86(e) => unsafe { e.seal(nonce, aad, buf) },
             #[cfg(target_arch = "aarch64")]
             Inner256::Arm(e) => {
                 if in_short_band(buf.len()) {
@@ -1230,9 +1233,9 @@ impl Aes256Gcm {
         );
         match &self.inner {
             #[cfg(target_arch = "x86_64")]
-            Inner256::X86V(e) => unsafe { e.engine.seal_from(nonce, aad, src, dst) },
+            Inner256::X86V(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
             #[cfg(target_arch = "x86_64")]
-            Inner256::X86(e) => unsafe { e.engine.seal_from(nonce, aad, src, dst) },
+            Inner256::X86(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
             #[cfg(target_arch = "aarch64")]
             Inner256::Arm(e) => {
                 if in_short_band(src.len()) {
@@ -1340,9 +1343,9 @@ impl Aes256Gcm {
         );
         match &self.inner {
             #[cfg(target_arch = "x86_64")]
-            Inner256::X86V(e) => unsafe { e.engine.open(nonce, aad, buf, tag) },
+            Inner256::X86V(e) => unsafe { e.open(nonce, aad, buf, tag) },
             #[cfg(target_arch = "x86_64")]
-            Inner256::X86(e) => unsafe { e.engine.open(nonce, aad, buf, tag) },
+            Inner256::X86(e) => unsafe { e.open(nonce, aad, buf, tag) },
             #[cfg(target_arch = "aarch64")]
             Inner256::Arm(e) => {
                 if in_short_band(buf.len()) {
