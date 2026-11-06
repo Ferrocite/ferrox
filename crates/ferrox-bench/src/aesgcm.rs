@@ -12,7 +12,7 @@ fn payloads() -> Vec<usize> {
     vec![64, 256, 512, 1400, 4096, 8171, 16_383]
 }
 
-const BYTE_BUDGET: u64 = 4 * 1024 * 1024;
+const BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 
 pub(crate) struct Window {
     len: usize,
@@ -92,7 +92,7 @@ fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
 
     check_allocs(len, plain, &ours, windows);
 
-    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
+    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 2_000_000);
 
     let mut ref_buf = plain.to_vec();
     let mut reference_run = || {
@@ -163,7 +163,7 @@ fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> R
     );
     assert_eq!(opened, plain, "{len}: the same bytes back");
 
-    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
+    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 2_000_000);
 
     let mut ref_buf = plain.to_vec();
     let mut reference_run = || {
@@ -229,7 +229,7 @@ fn check_and_time_256_from(len: usize, plain: &[u8]) -> Row {
     fresh.extend_from_slice(&tag);
     assert_eq!(old, fresh, "{len}: the same ciphertext and tag either way");
 
-    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
+    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 2_000_000);
 
     let mut old_buf = Vec::with_capacity(len + 16);
     let mut base = || {
@@ -303,7 +303,9 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
         "The crate both hot paths used to seal with, against the fused engine that\n\
          replaces it: the same arithmetic re-associated so four blocks share one\n\
          reduction, with the `CTR` pass fused into the `GHASH` pass so the message is\n\
-         read once. Every row asserts equal ciphertext and equal tag *before* either\n\
+         read once above 512 bytes; at or below 512 the two passes run separately so\n\
+         the AES and carry-less-multiply pipes overlap on a message already in cache.\n\
+         Every row asserts equal ciphertext and equal tag *before* either\n\
          side is timed, and the rows go to the same 0.95x bar as gates 3, 4, 7 and 8.\n\
          \n\
          | | |\n\

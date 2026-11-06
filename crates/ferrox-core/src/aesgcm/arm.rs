@@ -5,6 +5,8 @@ use super::Lanes;
 )]
 use core::arch::aarch64::*;
 
+const SHORT_SEAL_BYTES: usize = 512;
+
 pub(crate) struct Engine {
     rk: [uint8x16_t; 11],
     h: [(uint8x16_t, uint8x16_t); 4],
@@ -326,6 +328,10 @@ fn ctr_ghash8(
     mut ctr: u32,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
+    if buf.len() <= SHORT_SEAL_BYTES {
+        ctr_only8(rk, template, buf, ctr);
+        return ghash8(ghash, state, buf, tailq);
+    }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
     let done = groups.len() * 8;
@@ -470,6 +476,10 @@ fn ctr_ghash8_256(
     mut ctr: u32,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
+    if buf.len() <= SHORT_SEAL_BYTES {
+        ctr_only8_256(rk, template, buf, ctr);
+        return ghash8(ghash, state, buf, tailq);
+    }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
     let done = groups.len() * 8;
