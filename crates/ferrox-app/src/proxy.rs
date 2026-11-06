@@ -4002,9 +4002,41 @@ fn serve_ss_tls_session<R, W>(
     }
 }
 
+#[cfg(test)]
 fn serve_vless(
     stream: Connection,
     users: &[VlessUser],
+    carrier: &Carrier,
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+) {
+    serve_vless_inner(stream, users, None, carrier, freedom, fallbacks, decryption);
+}
+
+fn serve_vless_shared(
+    stream: Connection,
+    users: &VlessUsers,
+    carrier: &Carrier,
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+) {
+    serve_vless_inner(
+        stream,
+        users.as_ref(),
+        Some(users),
+        carrier,
+        freedom,
+        fallbacks,
+        decryption,
+    );
+}
+
+fn serve_vless_inner(
+    stream: Connection,
+    users: &[VlessUser],
+    shared: Option<&VlessUsers>,
     carrier: &Carrier,
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
@@ -4038,7 +4070,7 @@ fn serve_vless(
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            serve_vless_xhttp(stream, settings, users, freedom, decryption);
+            serve_vless_xhttp(stream, settings, users, shared, freedom, decryption);
         }
         Carrier::HttpHeader { path } => {
             serve_vless_httpheader(stream, users, path, freedom, decryption.cloned().as_deref());
@@ -7952,6 +7984,7 @@ fn serve_vless_xhttp(
     stream: Connection,
     settings: &crate::xhttp::XhttpSettings,
     users: &[VlessUser],
+    shared: Option<&VlessUsers>,
     freedom: bool,
     decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
 ) {
@@ -7973,7 +8006,7 @@ fn serve_vless_xhttp(
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
             chained.arm_relay_poll();
             let settings = settings.clone();
-            let users: VlessUsers = users.into();
+            let users = shared.cloned().unwrap_or_else(|| Arc::from(users));
             spawn_carried(move || {
                 serve_session_xhttp(chained, stream, &settings, &users, freedom, None, fd);
             });
@@ -16341,6 +16374,14 @@ where
         }
         None => Arc::new(Mutex::new(session)),
     };
+    if cipher.is_none() {
+        if let Some(wire) = clock.as_ref() {
+            let _ = wire.set_write_timeout(Some(RELAY_POLL));
+        }
+        if let Ok(mut sealed) = out.lock() {
+            sealed.paced = true;
+        }
+    }
     if let (Some(wire), Ok(mut sealed)) = (clock, out.lock()) {
         sealed.wire = Some(wire);
     }
@@ -19792,22 +19833,29 @@ fn relay_trojan_with_fallbacks<S>(
         );
     };
     let mut window = [0u8; PROBE_READ];
-    let window: &[u8] = if first.is_empty() {
-        let n = {
-            let mut deadline = HandshakeDeadline {
-                inner: &mut session,
-                until: Instant::now() + budgets::handshake(),
-            };
-            match deadline.read(&mut window) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            }
+    let mut n = first.len().min(PROBE_READ);
+    window[..n].copy_from_slice(&first[..n]);
+    {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
         };
-        &window[..n]
-    } else {
-        &first[..first.len().min(PROBE_READ)]
-    };
-    let n = window.len();
+        while n < 58 {
+            if window[..n].iter().any(|byte| !byte.is_ascii_hexdigit()) {
+                break;
+            }
+            if n >= 56 && !key.iter().any(|key| key_agrees(&window[..56], key)) {
+                break;
+            }
+            if n >= 57 && window[56] != b'\r' {
+                break;
+            }
+            match deadline.read(&mut window[n..]) {
+                Ok(0) | Err(_) => break,
+                Ok(got) => n += got,
+            }
+        }
+    }
     if n < 58 || window[56] != b'\r' || !key.iter().any(|key| key_agrees(&window[..56], key)) {
         let Some(raw) = raw.as_ref() else {
             return;
@@ -19821,7 +19869,7 @@ fn relay_trojan_with_fallbacks<S>(
             until: Instant::now() + budgets::handshake(),
         };
         let mut replay = Prefixed {
-            head: window,
+            head: &window[..n],
             at: 0,
             tail: &mut deadline,
             carried: &mut read_ahead,
@@ -67930,7 +67978,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             freedom,
             fallbacks,
             decryption,
-        } => serve_vless(
+        } => serve_vless_shared(
             stream,
             &users,
             &carrier,

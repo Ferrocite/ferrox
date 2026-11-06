@@ -1153,6 +1153,7 @@ impl<S: Stream> RustlsServerProvider<S> {
                     }
                     Err(boring::ssl::HandshakeError::Failure(mid)) => {
                         let why = format!("boring tls handshake: {}", mid.error());
+                        *handshake = Some(mid);
                         *failure = Some(why.clone());
                         Err(TlsError::Other(why))
                     }
@@ -1307,7 +1308,11 @@ fn write_segments<W: Write + ?Sized>(
 pub struct ServerConfigCacheInner {
     pub plain: Option<std::sync::Arc<rustls::ServerConfig>>,
     pub reality: Option<std::sync::Arc<rustls::ServerConfig>>,
-    pub ech: Option<std::sync::Arc<boring::ssl::SslContext>>,
+    /// The ECH listener context, with the identities it was built for.
+    pub ech: Option<(
+        Vec<super::CertEntry>,
+        std::sync::Arc<boring::ssl::SslContext>,
+    )>,
     /// The legacy listener context, with the identities it was built for.
     pub legacy: Option<(
         Vec<super::CertEntry>,
@@ -1866,15 +1871,21 @@ fn cached_ech_server_context(
         .server_config_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cached) = guard.ech.as_ref() {
-        return Ok(Arc::clone(cached));
+    let current = guard.served.as_deref().unwrap_or(&cfg.certs);
+    if let Some((built_for, cached)) = guard.ech.as_ref() {
+        if built_for.as_slice() == current {
+            return Ok(Arc::clone(cached));
+        }
     }
     let keys = cfg
         .ech_server_keys
         .as_deref()
         .ok_or_else(|| TlsError::Other("ech server identity has no keys".to_owned()))?;
-    let built = Arc::new(ech_server_context(cfg, keys)?);
-    guard.ech = Some(Arc::clone(&built));
+    let served = current.to_vec();
+    let mut fresh = cfg.clone();
+    fresh.certs.clone_from(&served);
+    let built = Arc::new(ech_server_context(&fresh, keys)?);
+    guard.ech = Some((served, Arc::clone(&built)));
     Ok(built)
 }
 

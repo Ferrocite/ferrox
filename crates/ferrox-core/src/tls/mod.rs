@@ -461,13 +461,20 @@ impl TlsServerConfig {
         let Some(entries) = self.reread(&served) else {
             return false;
         };
-        let mut fresh = self.clone();
-        fresh.certs.clone_from(&entries);
-        let Ok(config) = crate::tls::rustls_backend::server_config(fresh) else {
-            return false;
+        let config = if crate::tls::legacy::needed(&self.cipher_suites) {
+            None
+        } else {
+            let mut fresh = self.clone();
+            fresh.certs.clone_from(&entries);
+            match crate::tls::rustls_backend::server_config(fresh) {
+                Ok(config) => Some(std::sync::Arc::new(config)),
+                Err(_) => return false,
+            }
         };
         guard.served = Some(entries);
-        guard.plain = Some(std::sync::Arc::new(config));
+        guard.legacy = None;
+        guard.ech = None;
+        guard.plain = config;
         true
     }
 

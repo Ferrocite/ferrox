@@ -2034,11 +2034,28 @@ impl Session {
         self.wait_ended_for(crate::budgets::relay_stall());
     }
     fn wait_ended_for(&self, idle: std::time::Duration) {
+        if let Some(response) = self.wait_session(idle, false) {
+            response();
+        }
+    }
+    fn expire_without_downlink(&self, idle: std::time::Duration) {
+        if let Some(response) = self.wait_session(idle, true) {
+            response();
+        }
+    }
+    fn wait_session(
+        &self,
+        idle: std::time::Duration,
+        stop_on_downlink: bool,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
         let started = std::time::Instant::now();
         let mut expired = false;
         let mut st = self.state.lock().expect("session lock");
         while !st.ended {
             if st.downlink {
+                if stop_on_downlink {
+                    return None;
+                }
                 st = self.cv.wait(st).expect("session lock");
                 continue;
             }
@@ -2058,10 +2075,12 @@ impl Session {
                 break;
             }
         }
+        let response = st.response.take();
         drop(st);
         if expired {
             remove_session_if_owned(&self.id, self);
         }
+        response
     }
 }
 
@@ -2204,6 +2223,11 @@ impl Read for SessionReader {
             if st.ended || st.upload_done {
                 return Ok(0);
             }
+            if !st.upload_attached && st.last_seen.elapsed() >= crate::budgets::relay_stall() {
+                st.ended = true;
+                self.session.cv.notify_all();
+                return Ok(0);
+            }
             let (guard, wait) = self
                 .session
                 .cv
@@ -2256,6 +2280,11 @@ impl crate::proxy::WindowRead for SessionReader {
             if st.ended || st.upload_done {
                 return Ok(crate::proxy::Window::empty());
             }
+            if !st.upload_attached && st.last_seen.elapsed() >= crate::budgets::relay_stall() {
+                st.ended = true;
+                self.session.cv.notify_all();
+                return Ok(crate::proxy::Window::empty());
+            }
             let (guard, wait) = self
                 .session
                 .cv
@@ -2269,7 +2298,7 @@ impl crate::proxy::WindowRead for SessionReader {
     }
 
     fn parks_on_timeout(&self) -> bool {
-        self.upload.is_none() || self.upload_fd.is_some()
+        true
     }
 }
 
@@ -2728,6 +2757,10 @@ pub(crate) fn accept_core<
             if h2.is_none() && settings.mode == XhttpMode::StreamUp {
                 let settings = settings.clone();
                 session.defer_response(Box::new(move || plain_ok(&mut write, &settings, &padded)));
+                let waiter = Arc::clone(&session);
+                crate::proxy::spawn_carried(move || {
+                    waiter.expire_without_downlink(crate::budgets::relay_stall());
+                });
                 return Served::Closed;
             }
             session.wait_ended();
@@ -5390,6 +5423,30 @@ mod tests {
                 .lock()
                 .expect("sessions lock")
                 .contains_key("post-only-idle"),
+            "the idle session is removed"
+        );
+    }
+
+    #[test]
+    fn a_stream_up_session_with_no_downlink_writes_its_deferred_answer() {
+        let session = get_or_create_session("post-only-answer");
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        session.defer_response(Box::new(move || {
+            let _ = sent_tx.send(());
+        }));
+        let waiter = Arc::clone(&session);
+        let worker = thread::spawn(move || {
+            waiter.expire_without_downlink(std::time::Duration::from_millis(100));
+        });
+        sent_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the deferred answer is written when the session expires");
+        worker.join().expect("joins");
+        assert!(
+            !sessions()
+                .lock()
+                .expect("sessions lock")
+                .contains_key("post-only-answer"),
             "the idle session is removed"
         );
     }

@@ -395,6 +395,7 @@ impl<S: Stream> TlsProvider for Session<S> {
                     return Err(TlsError::Timeout);
                 }
                 let why = format!("boring tls handshake: {}", mid.error());
+                self.handshake = Some(mid);
                 self.failure = Some(why.clone());
                 Err(TlsError::Other(why))
             }
