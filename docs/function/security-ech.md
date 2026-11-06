@@ -25,7 +25,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | aes256-gcm-seal-retired-instructions | 15414 | scripts/count-ops.sh |
-| aes256-gcm-open-retired-instructions | 15348 | scripts/count-ops.sh |
+| aes256-gcm-open-retired-instructions | 15332 | scripts/count-ops.sh |
 | syscalls-per-ech-handshake | UNBLESSED | scripts/count-ops.sh |
 | user-space-copies-per-ech-handshake | UNBLESSED | no copy checker yet |
 | seconds-per-ech-handshake | UNBLESSED | CI bench.yml (no cell yet) |
@@ -53,7 +53,7 @@ The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key
   'ferrox_core::tls::hpke::Context::open'
 ```
 
-The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, under a fixed hello and fixed inner length. The rows price the HPKE context's key schedule and dispatch frames; the AEAD body is priced in a separate frame in this binary's thin-LTO layout. `ops.yml` on this head reports `seal` 15414 and `open` 15348 retired instructions; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
+The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, under a fixed hello and fixed inner length. The rows price the HPKE context's key schedule and dispatch frames; the AEAD body is priced in a separate frame in this binary's thin-LTO layout. `ops.yml` on this head reports `seal` 15414 and `open` 15332 retired instructions; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
 
 ## Time
 
