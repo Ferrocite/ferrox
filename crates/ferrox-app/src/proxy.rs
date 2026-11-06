@@ -20893,6 +20893,14 @@ struct FreedomNoiseGate {
     pending: Vec<Vec<u8>>,
 }
 
+impl FreedomNoiseGate {
+    fn queue(&mut self, payload: &[u8]) {
+        if self.pending.len() < UDP_BURST {
+            self.pending.push(payload.to_vec());
+        }
+    }
+}
+
 /// The socket a freedom flow dials: its redirect first, then the family the strategy names.
 fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAddr> {
     let asked = freedom
@@ -23339,7 +23347,7 @@ fn serve_socks_udp_freedom(
                 drop(gate);
                 let _ = socket.send(payload);
             } else {
-                gate.pending.push(payload.to_vec());
+                gate.queue(payload);
             }
             continue;
         }
@@ -23350,6 +23358,9 @@ fn serve_socks_udp_freedom(
             continue;
         };
         let Ok(writer) = up.try_clone() else {
+            continue;
+        };
+        let Ok(relay_write) = relay.try_clone() else {
             continue;
         };
         let Ok(noise_socket) = up.try_clone() else {
@@ -23364,16 +23375,6 @@ fn serve_socks_udp_freedom(
                 vec![payload.to_vec()]
             },
         }));
-        start_freedom_noises(
-            freedom.noises.clone(),
-            freedom.override_port() == 53,
-            noise_socket,
-            dest,
-            Arc::clone(&gate),
-        );
-        let Ok(relay_write) = relay.try_clone() else {
-            continue;
-        };
         let done = freedom_reader(
             up,
             Arc::clone(&source),
@@ -23381,7 +23382,14 @@ fn serve_socks_udp_freedom(
             Arc::clone(&replies),
             dest,
         );
-        uplinks.insert(dest, (writer, done, gate));
+        uplinks.insert(dest, (writer, done, Arc::clone(&gate)));
+        start_freedom_noises(
+            freedom.noises.clone(),
+            freedom.override_port() == 53,
+            noise_socket,
+            dest,
+            gate,
+        );
     }
     for (_, (_, handle, _)) in uplinks {
         // The relayed datagrams are on their own sockets, so this exit is their idle timeout.
@@ -61745,6 +61753,18 @@ mod tests {
             assert!(!freedom.blocks(crate::router::Network::Tcp, private, 443));
             assert!(freedom.blocks(crate::router::Network::Tcp, public, 443));
         }
+    }
+
+    /// A noise wait holds at most one burst of payloads and drops the rest in order.
+    #[test]
+    fn a_freedom_noise_queue_drops_past_the_burst_limit() {
+        let mut gate = FreedomNoiseGate::default();
+        for byte in 0..=UDP_BURST {
+            gate.queue(&[byte as u8]);
+        }
+        assert_eq!(gate.pending.len(), UDP_BURST);
+        assert_eq!(gate.pending[0], vec![0]);
+        assert_eq!(gate.pending[UDP_BURST - 1], vec![(UDP_BURST - 1) as u8]);
     }
 
     /// A wait too large for `Instant` closes the blocked client instead of panicking.
