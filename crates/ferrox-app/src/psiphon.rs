@@ -2812,18 +2812,20 @@ fn listen_address(settings: Option<&Json>) -> Result<SocketAddr, String> {
                 ferrox_core::psiphon::DEFAULT_BIND.to_owned()
             }
         });
-    let address = text
-        .parse::<SocketAddr>()
-        .map_err(|_| format!("psiphon: listen {text:?} is not an address and a port"))?;
     let address = if private {
         // The flag removes the reference's local SOCKS listener, but the embedded lane keeps an ephemeral loopback edge for its own outbound.
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-    } else if explicit {
-        address
-    } else if let Some(interface) = interface {
-        SocketAddr::new(interface_ip(&interface, address.ip()), address.port())
     } else {
-        address
+        let address = text
+            .parse::<SocketAddr>()
+            .map_err(|_| format!("psiphon: listen {text:?} is not an address and a port"))?;
+        if explicit {
+            address
+        } else if let Some(interface) = interface {
+            SocketAddr::new(interface_ip(&interface, address.ip()), address.port())
+        } else {
+            address
+        }
     };
     Ok(if address.port() == 0 {
         SocketAddr::new(address.ip(), free_port(address.ip())?)

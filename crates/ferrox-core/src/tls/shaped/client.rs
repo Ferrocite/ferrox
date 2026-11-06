@@ -21,6 +21,11 @@ const MAX_PLAINTEXT: usize = 16384;
 /// How long a shaped handshake may spend waiting for its peer, matching the KCP path's read deadline.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The one deadline a shaped handshake runs under, on either side.
+pub(crate) fn handshake_deadline() -> Instant {
+    Instant::now() + HANDSHAKE_TIMEOUT
+}
+
 /// How long an immediate `WouldBlock` waits before the handshake asks again; a transport with a read timeout has already waited, a nonblocking one has not.
 const WOULD_BLOCK_RETRY: Duration = Duration::from_millis(1);
 
@@ -1913,7 +1918,7 @@ fn exact_before<S: Read>(io: &mut S, buf: &mut [u8]) -> (usize, Result<(), TlsEr
 }
 
 /// Fills `buf` from the transport; a handshake's deadline lets a poll-quantum expiry wait for the peer instead of failing a hello that is already on the wire.
-fn exact_until<S: Read>(
+pub(crate) fn exact_until<S: Read>(
     io: &mut S,
     mut buf: &mut [u8],
     deadline: Option<Instant>,
@@ -1925,6 +1930,7 @@ fn exact_until<S: Read>(
         match io.read(buf) {
             Ok(0) => return Err(TlsError::Closed),
             Ok(n) => buf = &mut buf[n..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if TlsError::is_timeout(&error) => {
                 if deadline.is_none() {
                     return Err(TlsError::Timeout);

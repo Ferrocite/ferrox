@@ -133,23 +133,27 @@ impl Hello {
     }
 }
 
+/// The raw records a hello may occupy before the peek hands the connection to the other engine.
+const MAX_PEEK: usize = MAX_HANDSHAKE + 5 * MAX_RECORD;
+
 /// The raw records that carried the `ClientHello`, and whether it offers a version newer than TLS 1.2.
 /// A listener that also offers TLS 1.3 replays those bytes to the other engine; a hello this peek
 /// cannot read is replayed too, so the engine that owned the connection before still answers it.
-pub(crate) fn peek_hello<R: Read>(io: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
+pub(crate) fn peek_hello<R: Read>(io: &mut R) -> Result<(Vec<u8>, bool), TlsError> {
+    let until = Some(super::client::handshake_deadline());
     let mut raw = Vec::new();
     let mut handshake = Vec::new();
     loop {
         let mut header = [0u8; 5];
-        io.read_exact(&mut header)?;
+        super::client::exact_until(io, &mut header, until)?;
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
         let at = raw.len();
         raw.extend_from_slice(&header);
-        if header[0] != HANDSHAKE || len > MAX_RECORD {
+        if header[0] != HANDSHAKE || len > MAX_RECORD || raw.len() + len > MAX_PEEK {
             return Ok((raw, true));
         }
         raw.resize(at + 5 + len, 0);
-        io.read_exact(&mut raw[at + 5..])?;
+        super::client::exact_until(io, &mut raw[at + 5..], until)?;
         handshake.extend_from_slice(&raw[at + 5..]);
         if handshake.len() < 4 {
             continue;
@@ -165,10 +169,11 @@ pub(crate) fn peek_hello<R: Read>(io: &mut R) -> std::io::Result<(Vec<u8>, bool)
             Ok(hello) => Ok((
                 raw,
                 hello.version >= 0x0304
-                    || hello
-                        .versions
-                        .as_ref()
-                        .is_some_and(|versions| versions.iter().any(|&id| id >= 0x0304)),
+                    || hello.versions.as_ref().is_some_and(|versions| {
+                        versions.iter().any(|&id| {
+                            id >= 0x0304 && !(id & 0x0f0f == 0x0a0a && id >> 8 == id & 0x00ff)
+                        })
+                    }),
             )),
             Err(_) => Ok((raw, true)),
         };
@@ -187,6 +192,7 @@ pub(crate) struct Server<S: Stream> {
     key: Option<PKey<Private>>,
     transcript: Vec<u8>,
     rec: Vec<u8>,
+    rec_have: usize,
     hs: Vec<u8>,
     hs_at: usize,
     plain_at: usize,
@@ -210,6 +216,7 @@ impl<S: Stream> Server<S> {
             key: None,
             transcript: Vec::new(),
             rec: Vec::new(),
+            rec_have: 0,
             hs: Vec::new(),
             hs_at: 0,
             plain_at: 0,
@@ -438,20 +445,21 @@ impl<S: Stream> Server<S> {
         let rsa = key
             .rsa()
             .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
+        let mut fallback = [0u8; 48];
+        SystemRandom::new()
+            .fill(&mut fallback)
+            .map_err(|_| TlsError::Other("rsa fallback".to_owned()))?;
         let mut out = vec![0u8; rsa.size() as usize];
-        let secret = rsa
+        let len = rsa
             .private_decrypt(encrypted, &mut out, Padding::PKCS1)
-            .ok()
-            .map(|len| {
-                out.truncate(len);
-                out
-            })
-            .filter(|secret| secret.len() == 48)
-            .unwrap_or_else(|| {
-                let mut fallback = vec![0u8; 48];
-                let _ = SystemRandom::new().fill(&mut fallback);
-                fallback
-            });
+            .unwrap_or(0);
+        // BoringSSL's PKCS#1 check is constant-time; select the fallback without a branch.
+        let diff = (len ^ 48) as u64;
+        let mask = (((diff | diff.wrapping_neg()) >> 63) as u8).wrapping_sub(1);
+        let mut secret = vec![0u8; 48];
+        for (i, slot) in secret.iter_mut().enumerate() {
+            *slot = (out.get(i).copied().unwrap_or(0) & mask) | (fallback[i] & !mask);
+        }
         Ok(secret)
     }
 
@@ -550,17 +558,32 @@ impl<S: Stream> Server<S> {
     }
 
     fn fill_record(&mut self) -> Result<u8, TlsError> {
-        self.rec.clear();
-        self.rec.resize(5, 0);
-        self.io.read_exact(&mut self.rec)?;
+        if self.rec_have < 5 {
+            self.rec.resize(5, 0);
+            while self.rec_have < 5 {
+                let read = self.io.read(&mut self.rec[self.rec_have..5])?;
+                if read == 0 {
+                    return Err(TlsError::Closed);
+                }
+                self.rec_have += read;
+            }
+        }
         let len = usize::from(u16::from_be_bytes([self.rec[3], self.rec[4]]));
         if len > MAX_RECORD {
+            self.rec_have = 0;
             return Err(TlsError::Other(
                 "record exceeds the maximum length".to_owned(),
             ));
         }
         self.rec.resize(5 + len, 0);
-        self.io.read_exact(&mut self.rec[5..])?;
+        while self.rec_have < self.rec.len() {
+            let read = self.io.read(&mut self.rec[self.rec_have..])?;
+            if read == 0 {
+                return Err(TlsError::Closed);
+            }
+            self.rec_have += read;
+        }
+        self.rec_have = 0;
         Ok(self.rec[0])
     }
 
@@ -728,7 +751,7 @@ fn seal_parts(keys: &mut Direction, parts: &[&[u8]], out: &mut Vec<u8>) -> Resul
 fn ecdsa(id: u16) -> bool {
     matches!(
         id,
-        0xc007 | 0xc009 | 0xc00a | 0xc023 | 0xc027 | 0xcca9 | 0xc02b | 0xc02c
+        0xc007 | 0xc009 | 0xc00a | 0xc023 | 0xcca9 | 0xc02b | 0xc02c
     )
 }
 
@@ -827,6 +850,7 @@ fn alert(body: &[u8]) -> TlsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn hello(bytes: &[u8]) -> Hello {
         Hello::parse(bytes).expect("hello")
@@ -872,5 +896,118 @@ mod tests {
             hello(&body).tls12(),
             Err(TlsError::NoSharedCipher)
         ));
+    }
+
+    fn client_hello(versions: &[u16]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x33; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x3c]);
+        body.push(1);
+        body.push(0);
+        let mut list = Vec::with_capacity(1 + versions.len() * 2);
+        list.push((versions.len() * 2) as u8);
+        for id in versions {
+            list.extend_from_slice(&id.to_be_bytes());
+        }
+        let mut ext = Vec::new();
+        extension(&mut ext, 0x002b, &list);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut message = vec![1];
+        u24_push(&mut message, body.len());
+        message.extend_from_slice(&body);
+        let mut record = vec![HANDSHAKE, 3, 3];
+        record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        record.extend_from_slice(&message);
+        record
+    }
+
+    #[test]
+    fn a_grease_version_does_not_delegate_a_tls12_hello() {
+        let mut io = std::io::Cursor::new(client_hello(&[0x0a0a, 0x0303]));
+        let (_, delegate) = peek_hello(&mut io).expect("peek");
+        assert!(!delegate);
+        let mut io = std::io::Cursor::new(client_hello(&[0x0a0a, 0x0304, 0x0303]));
+        let (_, delegate) = peek_hello(&mut io).expect("peek");
+        assert!(delegate);
+    }
+
+    enum Step {
+        Bytes(Vec<u8>),
+        WouldBlock,
+    }
+
+    struct Trickle {
+        steps: Vec<Step>,
+        at: usize,
+    }
+
+    impl Trickle {
+        fn new(steps: Vec<Step>) -> Self {
+            Self { steps, at: 0 }
+        }
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                match self.steps.get_mut(self.at) {
+                    None => return Ok(0),
+                    Some(Step::Bytes(bytes)) => {
+                        if bytes.is_empty() {
+                            self.at += 1;
+                            continue;
+                        }
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        bytes.drain(..n);
+                        return Ok(n);
+                    }
+                    Some(Step::WouldBlock) => {
+                        self.at += 1;
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                }
+            }
+        }
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_record_read_resumes_after_a_timeout() {
+        let record = [APPLICATION, 3, 3, 0, 2, 0xaa, 0xbb];
+        let io = Trickle::new(vec![
+            Step::Bytes(vec![APPLICATION, 3]),
+            Step::WouldBlock,
+            Step::Bytes(vec![3, 0, 2, 0xaa, 0xbb]),
+        ]);
+        let cfg = TlsServerConfig {
+            certs: Vec::new(),
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            send_tickets: false,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        };
+        let mut server = Server::new(cfg, io);
+        assert!(matches!(server.fill_record(), Err(TlsError::Timeout)));
+        assert_eq!(server.fill_record().expect("resumes"), APPLICATION);
+        assert_eq!(server.rec, record);
     }
 }
