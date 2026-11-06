@@ -999,6 +999,61 @@ struct Peer {
     tunnel: Tunnel,
 }
 
+trait Allowed {
+    fn allowed(&self) -> &[(IpAddr, u8)];
+    fn longest_prefix(&self, destination: IpAddr) -> Option<u8>;
+}
+
+impl Allowed for Peer {
+    fn allowed(&self) -> &[(IpAddr, u8)] {
+        &self.config.allowed
+    }
+
+    fn longest_prefix(&self, destination: IpAddr) -> Option<u8> {
+        self.config.longest_prefix(destination)
+    }
+}
+
+impl Allowed for PeerConfig {
+    fn allowed(&self) -> &[(IpAddr, u8)] {
+        &self.allowed
+    }
+
+    fn longest_prefix(&self, destination: IpAddr) -> Option<u8> {
+        PeerConfig::longest_prefix(self, destination)
+    }
+}
+
+struct Peers {
+    peers: Vec<Peer>,
+    routes: Routes,
+}
+
+impl std::ops::Deref for Peers {
+    type Target = [Peer];
+
+    fn deref(&self) -> &[Peer] {
+        &self.peers
+    }
+}
+
+impl std::ops::DerefMut for Peers {
+    fn deref_mut(&mut self) -> &mut [Peer] {
+        &mut self.peers
+    }
+}
+
+impl Peers {
+    fn new(peers: Vec<Peer>) -> Self {
+        let routes = Routes::new(&peers);
+        Self { peers, routes }
+    }
+
+    fn peer_for(&self, destination: IpAddr) -> Option<usize> {
+        self.routes.peer_for(&self.peers, destination)
+    }
+}
+
 /// The tunnel reader and writer: inner packets leave, datagrams arrive, and the
 /// timers run on the same clock.
 #[allow(clippy::needless_pass_by_value)]
@@ -1067,7 +1122,7 @@ fn io(
             else {
                 continue;
             };
-            let Some(index) = peer_for(&peers, destination) else {
+            let Some(index) = peers.peer_for(destination) else {
                 continue;
             };
             if pending != Some(index) {
@@ -1254,7 +1309,7 @@ fn io(
 /// Read one datagram's message kind without slicing past a short packet.
 #[allow(clippy::too_many_arguments)]
 fn receive_datagram(
-    peers: &mut [Peer],
+    peers: &mut Peers,
     cookies: &mut CookieGuard,
     now: u64,
     source: SocketAddr,
@@ -1312,7 +1367,7 @@ fn receive_datagram(
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn receive_datagram_owned(
-    peers: &mut [Peer],
+    peers: &mut Peers,
     cookies: &mut CookieGuard,
     now: u64,
     source: SocketAddr,
@@ -1536,7 +1591,7 @@ impl ReceiveBatch {
 /// Validate an initiation, apply the cookie gate, and answer with a response.
 #[allow(clippy::too_many_arguments)]
 fn handle_initiation(
-    peers: &mut [Peer],
+    peers: &mut Peers,
     now: u64,
     source: SocketAddr,
     packet: &[u8],
@@ -1603,7 +1658,7 @@ fn flush(
     socket: &UdpSocket,
     to_stack: &Sender<Packet>,
     routes: Option<&UdpRoutes>,
-    peers: &[Peer],
+    peers: &Peers,
     peer: Option<usize>,
     ipv6_socket: bool,
     sends: &mut Vec<Vec<u8>>,
@@ -1660,7 +1715,7 @@ fn flush(
 fn deliver_data(
     inner: Vec<u8>,
     at: usize,
-    peers: &[Peer],
+    peers: &Peers,
     peer: Option<usize>,
     routes: Option<&UdpRoutes>,
     to_stack: &Sender<Packet>,
@@ -1674,7 +1729,7 @@ fn deliver_data(
         recycle_slot(inner, at, recycle);
         return;
     };
-    if peer_for(peers, source) != Some(index) {
+    if peers.peer_for(source) != Some(index) {
         recycle_slot(inner, at, recycle);
         return;
     }
@@ -1929,43 +1984,178 @@ fn tai64n_now() -> [u8; 12] {
     tai64n(now.as_secs(), now.subsec_nanos())
 }
 
-fn peers(config: &DeviceConfig, epoch: [u8; 12]) -> Vec<Peer> {
-    config
-        .peers
-        .iter()
-        .map(|peer| Peer {
-            config: peer.clone(),
-            tunnel: Tunnel::new(
-                config.secret,
-                peer.public,
-                peer.preshared,
-                peer.endpoint.unwrap_or_else(|| {
-                    let address = config
-                        .addresses
-                        .iter()
-                        .find(|address| address.is_ipv4())
-                        .or_else(|| config.addresses.first())
-                        .copied()
-                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                    SocketAddr::new(address, 0)
-                }),
-                peer.keepalive,
-                config.reserved,
-                epoch,
-            ),
-        })
-        .collect()
+fn peers(config: &DeviceConfig, epoch: [u8; 12]) -> Peers {
+    Peers::new(
+        config
+            .peers
+            .iter()
+            .map(|peer| Peer {
+                config: peer.clone(),
+                tunnel: Tunnel::new(
+                    config.secret,
+                    peer.public,
+                    peer.preshared,
+                    peer.endpoint.unwrap_or_else(|| {
+                        let address = config
+                            .addresses
+                            .iter()
+                            .find(|address| address.is_ipv4())
+                            .or_else(|| config.addresses.first())
+                            .copied()
+                            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                        SocketAddr::new(address, 0)
+                    }),
+                    peer.keepalive,
+                    config.reserved,
+                    epoch,
+                ),
+            })
+            .collect(),
+    )
 }
 
-fn peer_for(peers: &[Peer], destination: IpAddr) -> Option<usize> {
+const ROUTE_V4_LINEAR: usize = 32;
+const ROUTE_V6_LINEAR: usize = 128;
+const NO_PEER: u32 = u32::MAX;
+
+struct RouteNode {
+    child: [u32; 2],
+    peer: u32,
+}
+
+impl RouteNode {
+    fn new() -> Self {
+        Self {
+            child: [NO_PEER; 2],
+            peer: NO_PEER,
+        }
+    }
+}
+
+struct Routes {
+    v4: Option<Vec<RouteNode>>,
+    v6: Option<Vec<RouteNode>>,
+}
+
+impl Routes {
+    fn new<A: Allowed>(peers: &[A]) -> Self {
+        let mut prefixes = 0usize;
+        let mut valid = true;
+        let mut v4_prefixes = 0usize;
+        let mut v6_prefixes = 0usize;
+        for peer in peers {
+            prefixes += peer.allowed().len();
+            for (address, bits) in peer.allowed() {
+                match address {
+                    IpAddr::V4(_) if *bits <= 32 => v4_prefixes += 1,
+                    IpAddr::V6(_) if *bits <= 128 => v6_prefixes += 1,
+                    _ => valid = false,
+                }
+            }
+        }
+        if !valid {
+            return Self { v4: None, v6: None };
+        }
+        let mut v4 = (v4_prefixes > 0 && prefixes > ROUTE_V4_LINEAR).then(|| {
+            let mut nodes = Vec::with_capacity(v4_prefixes + 1);
+            nodes.push(RouteNode::new());
+            nodes
+        });
+        let mut v6 = (v6_prefixes > 0 && prefixes > ROUTE_V6_LINEAR).then(|| {
+            let mut nodes = Vec::with_capacity(v6_prefixes + 1);
+            nodes.push(RouteNode::new());
+            nodes
+        });
+        for (index, peer) in peers.iter().enumerate() {
+            for (address, bits) in peer.allowed() {
+                match address {
+                    IpAddr::V4(address) => {
+                        if let Some(nodes) = v4.as_mut() {
+                            insert_route(
+                                nodes,
+                                u128::from(u32::from_be_bytes(address.octets())),
+                                usize::from(*bits),
+                                32,
+                                index,
+                            );
+                        }
+                    }
+                    IpAddr::V6(address) => {
+                        if let Some(nodes) = v6.as_mut() {
+                            insert_route(
+                                nodes,
+                                u128::from_be_bytes(address.octets()),
+                                usize::from(*bits),
+                                128,
+                                index,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Self { v4, v6 }
+    }
+
+    fn peer_for<A: Allowed>(&self, peers: &[A], destination: IpAddr) -> Option<usize> {
+        match destination {
+            IpAddr::V4(address) => {
+                let Some(nodes) = &self.v4 else {
+                    return peer_for_scan(peers, destination);
+                };
+                lookup_route(nodes, u128::from(u32::from_be_bytes(address.octets())), 32)
+            }
+            IpAddr::V6(address) => {
+                let Some(nodes) = &self.v6 else {
+                    return peer_for_scan(peers, destination);
+                };
+                lookup_route(nodes, u128::from_be_bytes(address.octets()), 128)
+            }
+        }
+    }
+}
+
+fn insert_route(nodes: &mut Vec<RouteNode>, value: u128, bits: usize, width: usize, peer: usize) {
+    debug_assert!(peer < NO_PEER as usize);
+    let mut at = 0usize;
+    for depth in 0..bits {
+        let bit = ((value >> (width - 1 - depth)) & 1) as usize;
+        let next = nodes[at].child[bit];
+        at = if next == NO_PEER {
+            nodes.push(RouteNode::new());
+            let next = nodes.len() - 1;
+            nodes[at].child[bit] = next as u32;
+            next
+        } else {
+            next as usize
+        };
+    }
+    nodes[at].peer = peer as u32;
+}
+
+fn lookup_route(nodes: &[RouteNode], value: u128, width: usize) -> Option<usize> {
+    let root = nodes.first()?;
+    let mut at = 0usize;
+    let mut found = (root.peer != NO_PEER).then_some(root.peer as usize);
+    for depth in 0..width {
+        let bit = ((value >> (width - 1 - depth)) & 1) as usize;
+        let next = nodes[at].child[bit];
+        if next == NO_PEER {
+            break;
+        }
+        at = next as usize;
+        if nodes[at].peer != NO_PEER {
+            found = Some(nodes[at].peer as usize);
+        }
+    }
+    found
+}
+
+fn peer_for_scan<A: Allowed>(peers: &[A], destination: IpAddr) -> Option<usize> {
     peers
         .iter()
         .enumerate()
-        .filter_map(|(index, peer)| {
-            peer.config
-                .longest_prefix(destination)
-                .map(|bits| (index, bits))
-        })
+        .filter_map(|(index, peer)| peer.longest_prefix(destination).map(|bits| (index, bits)))
         .max_by_key(|(_, bits)| *bits)
         .map(|(index, _)| index)
 }
@@ -2099,6 +2289,74 @@ mod tests {
                 Event::Data(_) | Event::DataPrefixed(_) => None,
             })
             .expect("an outbound packet")
+    }
+
+    fn routed_configs(count: u16) -> Vec<PeerConfig> {
+        let mut peers = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let v4 = Ipv4Addr::new(10, (index >> 8) as u8, index as u8, 1);
+            let v6 =
+                Ipv6Addr::from(0xfd00_0000_0000_0000_0000_0000_0000_0000u128 | u128::from(index));
+            peers.push(PeerConfig {
+                public: [index as u8; 32],
+                preshared: [0; 32],
+                endpoint: None,
+                endpoints: Vec::new(),
+                keepalive: 0,
+                allowed: vec![
+                    ("10.0.0.0".parse().unwrap(), 8),
+                    (IpAddr::V4(v4), 32),
+                    ("fd00::".parse().unwrap(), 8),
+                    (IpAddr::V6(v6), 128),
+                ],
+            });
+        }
+        peers
+    }
+
+    #[inline(never)]
+    fn route_scan_once(peers: &[PeerConfig], destination: IpAddr) -> Option<usize> {
+        peer_for_scan(peers, destination)
+    }
+
+    #[inline(never)]
+    fn route_table_once(
+        peers: &[PeerConfig],
+        routes: &Routes,
+        destination: IpAddr,
+    ) -> Option<usize> {
+        routes.peer_for(peers, destination)
+    }
+
+    /// The prefix table answers every lookup the peer scan answered, including
+    /// the last peer on a tie and the deepest prefix on an overlap.
+    #[test]
+    fn a_prefix_table_picks_the_peer_the_scan_picks() {
+        let peers = routed_configs(512);
+        let routes = Routes::new(&peers);
+        assert!(
+            routes.v4.is_some() && routes.v6.is_some(),
+            "both tables are the path under test"
+        );
+        for destination in [
+            "10.0.1.1",
+            "10.9.9.9",
+            "192.0.2.1",
+            "fd00::101",
+            "fd00::ffff",
+            "2001:db8::1",
+        ] {
+            let destination: IpAddr = destination.parse().unwrap();
+            assert_eq!(
+                routes.peer_for(&peers, destination),
+                peer_for_scan(&peers, destination)
+            );
+        }
+        let destination = "10.0.1.1".parse().unwrap();
+        assert_eq!(
+            route_scan_once(&peers, destination),
+            route_table_once(&peers, &routes, destination)
+        );
     }
 
     /// A peer cannot claim another peer's source address as its own.
@@ -2327,7 +2585,7 @@ mod tests {
             return;
         };
         let (to_stack, _stack) = mpsc::channel();
-        let mut peers = Vec::new();
+        let mut peers = Peers::new(Vec::new());
         let mut cookies = CookieGuard::default();
         let mut incoming = Vec::new();
         let mut sends = Vec::new();
