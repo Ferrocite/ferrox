@@ -301,12 +301,14 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
     let _ = writeln!(
         out,
         "The crate both hot paths used to seal with, against the fused engine that\n\
-         replaces it: the same arithmetic re-associated so four blocks share one\n\
-         reduction, with the `CTR` pass fused into the `GHASH` pass so the message is\n\
-         read once above 512 bytes; at or below 512 the two passes run separately so\n\
-         the AES and carry-less-multiply pipes overlap on a message already in cache.\n\
-         Every row asserts equal ciphertext and equal tag *before* either\n\
-         side is timed, and the rows go to the same 0.95x bar as gates 3, 4, 7 and 8.\n\
+         replaces it above 512 bytes: the same arithmetic re-associated so four blocks\n\
+         share one reduction, with the `CTR` pass fused into the `GHASH` pass so the\n\
+         message is read once. At 256 and 512 bytes the dispatch hands the band to the\n\
+         crate, so those rows price the dispatch against the crate it calls; at 128 and\n\
+         below the fused engine runs with its two passes separate so the AES and\n\
+         carry-less-multiply pipes overlap on a message already in cache. Every row\n\
+         asserts equal ciphertext and equal tag *before* either side is timed, and the\n\
+         rows go to the same 0.95x bar as gates 3, 4, 7 and 8.\n\
          \n\
          | | |\n\
          | --- | --- |\n\
