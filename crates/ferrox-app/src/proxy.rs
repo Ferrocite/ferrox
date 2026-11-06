@@ -39111,17 +39111,23 @@ mod tests {
             assert_eq!(set, 0, "a small socket buffer is refused");
         }
 
-        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
+        let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().expect("pairs");
+        small_buffer(server_stream.as_raw_fd(), libc::SO_SNDBUF);
+        small_buffer(client_stream.as_raw_fd(), libc::SO_RCVBUF);
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accepts");
-            small_buffer(stream.as_raw_fd(), libc::SO_SNDBUF);
-            crate::ws::accept(stream, "/frame").expect("upgrades")
+            crate::ws::accept(crate::conn::Connection::Unix(server_stream), "/frame")
+                .expect("upgrades")
         });
-        let stream = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
-        small_buffer(stream.as_raw_fd(), libc::SO_RCVBUF);
-        let (client, _client_writer) =
-            crate::ws::connect(stream, "127.0.0.1", "/frame", 0, b"", &[], 0).expect("upgrades");
+        let (client, _client_writer) = crate::ws::connect(
+            crate::conn::Connection::Unix(client_stream),
+            "127.0.0.1",
+            "/frame",
+            0,
+            b"",
+            &[],
+            0,
+        )
+        .expect("upgrades");
         let (_reader, writer) = server.join().expect("joins");
 
         let chunk = vec![7u8; 1024];
