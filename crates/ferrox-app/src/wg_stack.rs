@@ -103,6 +103,9 @@ const REASSEMBLY_BYTES: usize = 8 * 1024 * 1024;
 /// The most incomplete sets one stack holds, so a flood of first fragments is
 /// bounded by count as well as bytes.
 const REASSEMBLY_SETS: usize = 1_024;
+/// The most incomplete sets one peer may hold, so its flood cannot evict
+/// another peer's work.
+const REASSEMBLY_PEER_SETS: usize = 64;
 /// How long an incomplete fragment set waits for the rest.
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
@@ -529,6 +532,16 @@ enum FragmentKey {
     },
 }
 
+type FragmentParts = (FragmentKey, usize, usize, usize, usize, bool, Option<usize>);
+
+impl FragmentKey {
+    fn peer(&self) -> [u8; 32] {
+        match *self {
+            Self::V4 { peer, .. } | Self::V6 { peer, .. } => peer,
+        }
+    }
+}
+
 struct FragmentSet {
     at: usize,
     header: Vec<u8>,
@@ -549,6 +562,7 @@ impl FragmentSet {
         if packet[self.at] >> 4 == 4 {
             let length = (header_len + total) as u16;
             packet[self.at + 2..self.at + 4].copy_from_slice(&length.to_be_bytes());
+            packet[self.at + 4..self.at + 6].copy_from_slice(&0u16.to_be_bytes());
             packet[self.at + 6..self.at + 8].copy_from_slice(&0u16.to_be_bytes());
             packet[self.at + 10..self.at + 12].copy_from_slice(&0u16.to_be_bytes());
             let checksum = ipv4_checksum(&packet[self.at..self.at + header_len]);
@@ -578,17 +592,18 @@ enum Reassembled {
 
 impl Reassembly {
     fn accept(&mut self, peer: [u8; 32], packet: &[u8], at: usize) -> Reassembled {
-        let Some((key, header_len, offset, payload_at, _more, total)) = fragment(peer, packet)
+        let Some((key, header_len, offset, payload_at, end, _more, total)) = fragment(peer, packet)
         else {
             return Reassembled::Pass;
         };
         self.expire();
-        let end = offset + packet.len() - payload_at;
-        if end > INNER_MTU {
+        if end > INNER_MTU || (packet[0] >> 4 == 4 && header_len + end > 65_535) {
             return Reassembled::Held;
         }
         if !self.parts.contains_key(&key) {
-            self.make_room(end, key);
+            if !self.make_room(end, key) {
+                return Reassembled::Held;
+            }
             self.parts.insert(
                 key,
                 FragmentSet {
@@ -602,13 +617,29 @@ impl Reassembly {
                 },
             );
         }
-        let part = self.parts.get_mut(&key).expect("the set was just inserted");
-        if part.at != at {
+        if self.parts.get(&key).is_some_and(|part| part.at != at) {
             if let Some(part) = self.parts.remove(&key) {
                 self.bytes -= part.payload.len();
             }
             return Reassembled::Held;
         }
+        let len = self.parts.get(&key).map_or(0, |part| part.payload.len());
+        if end > len {
+            let grow = end - len;
+            if self.bytes + grow > REASSEMBLY_BYTES {
+                if let Some(part) = self.parts.remove(&key) {
+                    self.bytes -= part.payload.len();
+                }
+                return Reassembled::Held;
+            }
+            self.bytes += grow;
+            self.parts
+                .get_mut(&key)
+                .expect("the set was just admitted")
+                .payload
+                .resize(end, 0);
+        }
+        let part = self.parts.get_mut(&key).expect("the set was just admitted");
         if offset == 0 && part.header.is_empty() {
             part.header.extend_from_slice(&packet[..header_len]);
             part.next_header = if packet[0] >> 4 == 6 { packet[40] } else { 0 };
@@ -623,11 +654,7 @@ impl Reassembly {
             }
             return Reassembled::Held;
         }
-        if part.payload.len() < end {
-            self.bytes += end - part.payload.len();
-            part.payload.resize(end, 0);
-        }
-        part.payload[offset..end].copy_from_slice(&packet[payload_at..]);
+        part.payload[offset..end].copy_from_slice(&packet[payload_at..payload_at + (end - offset)]);
         part.ranges.push((offset, end));
         if let Some(total) = total {
             part.last = Some(total);
@@ -651,20 +678,34 @@ impl Reassembly {
         Reassembled::Complete(part.assemble(total))
     }
 
-    fn make_room(&mut self, need: usize, keep: FragmentKey) {
-        while self.bytes + need > REASSEMBLY_BYTES || self.parts.len() >= REASSEMBLY_SETS {
-            let oldest = self
-                .parts
-                .iter()
-                .filter(|(key, _)| **key != keep)
-                .min_by_key(|(_, part)| part.started)
-                .map(|(key, _)| *key);
-            let Some(oldest) = oldest else {
-                return;
+    fn make_room(&mut self, need: usize, key: FragmentKey) -> bool {
+        let peer = key.peer();
+        while self.parts.keys().filter(|part| part.peer() == peer).count() >= REASSEMBLY_PEER_SETS {
+            let Some(oldest) = self.oldest(peer) else {
+                return false;
             };
-            if let Some(part) = self.parts.remove(&oldest) {
-                self.bytes -= part.payload.len();
-            }
+            self.drop(&oldest);
+        }
+        while self.bytes + need > REASSEMBLY_BYTES || self.parts.len() >= REASSEMBLY_SETS {
+            let Some(oldest) = self.oldest(peer) else {
+                return false;
+            };
+            self.drop(&oldest);
+        }
+        true
+    }
+
+    fn oldest(&self, peer: [u8; 32]) -> Option<FragmentKey> {
+        self.parts
+            .iter()
+            .filter(|(key, _)| key.peer() == peer)
+            .min_by_key(|(_, part)| part.started)
+            .map(|(key, _)| *key)
+    }
+
+    fn drop(&mut self, key: &FragmentKey) {
+        if let Some(part) = self.parts.remove(key) {
+            self.bytes -= part.payload.len();
         }
     }
 
@@ -684,12 +725,9 @@ impl Reassembly {
     }
 }
 
-/// The key, header length, fragment offset, payload start, more-fragments flag
-/// and original payload length of an IPv4 or IPv6 fragment.
-fn fragment(
-    peer: [u8; 32],
-    packet: &[u8],
-) -> Option<(FragmentKey, usize, usize, usize, bool, Option<usize>)> {
+/// The key, header length, fragment offset, payload start, declared payload end,
+/// more-fragments flag and original payload length of an IPv4 or IPv6 fragment.
+fn fragment(peer: [u8; 32], packet: &[u8]) -> Option<FragmentParts> {
     match packet.first()? >> 4 {
         4 => {
             if packet.len() < IPV4_HEADER {
@@ -716,7 +754,15 @@ fn fragment(
                 id: u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]),
             };
             let end = offset + total - header;
-            Some((key, header, offset, header, more, (!more).then_some(end)))
+            Some((
+                key,
+                header,
+                offset,
+                header,
+                end,
+                more,
+                (!more).then_some(end),
+            ))
         }
         6 => {
             if packet.len() < IPV6_HEADER + 8 || packet.get(6) != Some(&44) {
@@ -751,6 +797,7 @@ fn fragment(
                 IPV6_HEADER,
                 offset,
                 payload_at,
+                total,
                 more,
                 (!more).then_some(total),
             ))
@@ -915,6 +962,7 @@ fn fragment_packet(packet: &[u8], headroom: usize, limit: usize) -> Option<Vec<V
                 return None;
             }
             let piece = (limit.saturating_sub(header) & !7).max(8);
+            let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed) as u16;
             let mut fragments = Vec::with_capacity(payload.len().div_ceil(piece));
             let mut at = 0;
             while at < payload.len() {
@@ -925,6 +973,7 @@ fn fragment_packet(packet: &[u8], headroom: usize, limit: usize) -> Option<Vec<V
                 fragment.extend_from_slice(&ip[..header]);
                 let total = (header + length) as u16;
                 fragment[headroom + 2..headroom + 4].copy_from_slice(&total.to_be_bytes());
+                fragment[headroom + 4..headroom + 6].copy_from_slice(&id.to_be_bytes());
                 let offset = (at / 8) as u16;
                 let flags = (if more { 0x2000 } else { 0 }) | offset;
                 fragment[headroom + 6..headroom + 8].copy_from_slice(&flags.to_be_bytes());
@@ -1291,6 +1340,7 @@ impl ClientStack {
     /// Drive the interface, every flow, and the queued transmits one turn.
     fn poll(&mut self, buf: &mut [u8]) -> bool {
         let now = self.now();
+        self.reassembly.expire();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let ready = self.readiness.sync(&self.flows);
         let mut retiring = std::mem::take(&mut self.retiring);
@@ -1526,6 +1576,7 @@ impl ServerStack {
     /// Drive the server interface and hand off every completed flow.
     fn poll(&mut self, buf: &mut [u8]) -> bool {
         self.syn_ports.clear();
+        self.reassembly.expire();
         for (packet, at) in &self.device.rx {
             if let Some(port) = tcp_syn_port(&packet[*at..]) {
                 self.syn_ports.push(port);
@@ -2715,6 +2766,15 @@ mod tests {
         &packet[offset..total.min(packet.len())]
     }
 
+    /// The TCP sequence number of an inner packet, so a test can put a download
+    /// back in order even when segments arrive out of order or twice.
+    fn tcp_sequence(packet: &[u8]) -> Option<u32> {
+        let (ip_header, _, _) = tcp_view(packet)?;
+        Some(u32::from_be_bytes(
+            packet.get(ip_header + 4..ip_header + 8)?.try_into().ok()?,
+        ))
+    }
+
     /// Every byte the stack handed the tunnel since the last drain, with the TCP headers removed.
     fn tunnel_payload(packets: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -3422,7 +3482,7 @@ mod tests {
 
     #[test]
     fn a_server_download_leaves_as_fragments_the_client_reassembles() {
-        let payload = vec![0x5a; 16 * 1024];
+        let payload: Vec<u8> = (0..16 * 1024).map(|byte| (byte % 251) as u8).collect();
         let sink = std::net::TcpListener::bind("127.0.0.1:0").expect("sink");
         let sink_port = sink.local_addr().expect("addr").port();
         let served = payload.clone();
@@ -3471,17 +3531,35 @@ mod tests {
         });
 
         let mut reassembly = Reassembly::default();
+        let mut chunks = std::collections::BTreeMap::new();
         let mut got = Vec::new();
+        let mut want = server_sequence + 1;
         let mut saw_fragment = false;
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             stack.poll(&mut buf);
             while let Ok(packet) = packets.try_recv() {
                 saw_fragment |= fragment([0u8; 32], &packet).is_some();
-                if let Reassembled::Complete(packet) = reassembly.accept([0u8; 32], &packet, 0) {
-                    if packet.get(9) == Some(&PROTOCOL_TCP) {
-                        got.extend_from_slice(tcp_payload(&packet));
+                let packet = match reassembly.accept([0u8; 32], &packet, 0) {
+                    Reassembled::Complete(packet) => packet,
+                    Reassembled::Pass => packet,
+                    Reassembled::Held => continue,
+                };
+                if packet.get(9) == Some(&PROTOCOL_TCP) {
+                    let sequence = tcp_sequence(&packet).expect("the server's sequence");
+                    let data = tcp_payload(&packet);
+                    if !data.is_empty() {
+                        chunks.insert(sequence, data.to_vec());
                     }
                 }
+            }
+            while let Some(data) = chunks.remove(&want) {
+                want = want.wrapping_add(data.len() as u32);
+                got.extend_from_slice(&data);
+                stack.receive(Packet {
+                    peer: [0u8; 32],
+                    bytes: tcp_segment(source, 1234, destination, 80, 1001, want, 0x10),
+                    at: 0,
+                });
             }
             if got.len() >= payload.len() {
                 break;
@@ -3490,8 +3568,8 @@ mod tests {
         }
         assert!(saw_fragment, "the 16 KiB segment was not fragmented");
         assert_eq!(
-            &got[..payload.len()],
-            payload.as_slice(),
+            got.get(..payload.len()),
+            Some(payload.as_slice()),
             "the client reassembled the download"
         );
     }
@@ -3614,15 +3692,32 @@ mod tests {
         let fragments = fragment_packet(&original, 0, TUNNEL_FRAGMENT).expect("fragments");
         assert_eq!(TUNNEL_FRAGMENT, 1_344);
         assert_eq!(fragments.len(), 4, "a 5 KiB segment takes four fragments");
+        let id = u16::from_be_bytes([fragments[0][4], fragments[0][5]]);
         for fragment in &fragments {
             assert!(
                 fragment.len() <= TUNNEL_FRAGMENT,
                 "a fragment fits the tunnel"
             );
+            assert_eq!(
+                u16::from_be_bytes([fragment[4], fragment[5]]),
+                id,
+                "one packet's fragments share an identification"
+            );
         }
+        let other = fragment_packet(&original, 0, TUNNEL_FRAGMENT).expect("fragments");
+        assert_ne!(
+            u16::from_be_bytes([other[0][4], other[0][5]]),
+            id,
+            "a later packet gets its own identification"
+        );
+        let mut padded = fragments.clone();
+        padded
+            .last_mut()
+            .expect("the last fragment")
+            .extend_from_slice(b"trailing");
         let mut reassembly = Reassembly::default();
         let mut complete = None;
-        for fragment in fragments.iter().rev() {
+        for fragment in padded.iter().rev() {
             if let Reassembled::Complete(packet) = reassembly.accept([0u8; 32], fragment, 0) {
                 complete = Some(packet);
             }
@@ -3641,9 +3736,14 @@ mod tests {
             assert_eq!(fragment[6], 44, "the fragment header is present");
             assert!(fragment.len() <= TUNNEL_FRAGMENT);
         }
+        let mut padded = fragments.clone();
+        padded
+            .last_mut()
+            .expect("the last fragment")
+            .extend_from_slice(b"trailing");
         let mut reassembly = Reassembly::default();
         let mut complete = None;
-        for fragment in &fragments {
+        for fragment in &padded {
             if let Reassembled::Complete(packet) = reassembly.accept([0u8; 32], fragment, 0) {
                 complete = Some(packet);
             }
@@ -3701,25 +3801,107 @@ mod tests {
         assert_eq!(stack.fragment, TUNNEL_FRAGMENT);
     }
 
+    fn first_fragment(source: [u8; 4], id: u16) -> Vec<u8> {
+        let mut packet = tcp_data(source, [192, 0, 2, 1], &[0x5a; 3000]);
+        packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        let mut fragment = fragment_packet(&packet, 0, TUNNEL_FRAGMENT)
+            .and_then(|fragments| fragments.into_iter().next())
+            .expect("a first fragment");
+        fragment[4..6].copy_from_slice(&id.to_be_bytes());
+        fragment
+    }
+
     #[test]
     fn a_flood_of_first_fragments_is_bounded_by_count() {
         let mut reassembly = Reassembly::default();
-        let mut seen = 0;
-        for id in 0..=(REASSEMBLY_SETS as u16 + 16) {
-            let mut packet = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 3000]);
-            packet[4..6].copy_from_slice(&id.to_be_bytes());
-            packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
-            if let Some(fragment) = fragment_packet(&packet, 0, TUNNEL_FRAGMENT)
-                .and_then(|fragments| fragments.into_iter().next())
-            {
-                reassembly.accept([0u8; 32], &fragment, 0);
-                seen = seen.max(reassembly.parts.len());
+        for peer in 0..16u8 {
+            for id in 0..REASSEMBLY_PEER_SETS as u16 {
+                reassembly.accept([peer; 32], &first_fragment([10, 0, 0, peer + 2], id), 0);
             }
         }
+        assert_eq!(reassembly.parts.len(), REASSEMBLY_SETS);
+        reassembly.accept([16u8; 32], &first_fragment([10, 0, 0, 18], 0), 0);
         assert_eq!(
-            seen, REASSEMBLY_SETS,
+            reassembly.parts.len(),
+            REASSEMBLY_SETS,
             "the set count was not bounded at the cap"
         );
+        assert!(!reassembly.parts.keys().any(|key| key.peer() == [16u8; 32]));
+    }
+
+    #[test]
+    fn one_peers_fragments_do_not_evict_anothers() {
+        let mut reassembly = Reassembly::default();
+        for id in 0..REASSEMBLY_PEER_SETS as u16 {
+            reassembly.accept([0u8; 32], &first_fragment([10, 0, 0, 2], id), 0);
+        }
+        reassembly.accept([1u8; 32], &first_fragment([10, 0, 0, 3], 0), 0);
+        reassembly.accept([0u8; 32], &first_fragment([10, 0, 0, 2], 64), 0);
+        assert!(
+            reassembly.parts.keys().any(|key| key.peer() == [1u8; 32]),
+            "one peer's flood evicted another peer's set"
+        );
+        assert_eq!(
+            reassembly
+                .parts
+                .keys()
+                .filter(|key| key.peer() == [0u8; 32])
+                .count(),
+            REASSEMBLY_PEER_SETS,
+            "the flooding peer exceeded its own cap"
+        );
+    }
+
+    #[test]
+    fn a_growing_set_cannot_exceed_the_reassembly_byte_cap() {
+        let mut fragment = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 2_797]);
+        fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        let mut reassembly = Reassembly::default();
+        for id in 0..128 {
+            reassembly.parts.insert(
+                FragmentKey::V4 {
+                    peer: [0u8; 32],
+                    source: [10, 0, 0, 2],
+                    destination: [192, 0, 2, 1],
+                    protocol: PROTOCOL_TCP,
+                    id,
+                },
+                FragmentSet {
+                    at: 0,
+                    header: fragment[..20].to_vec(),
+                    next_header: 0,
+                    payload: vec![0; 65_514],
+                    ranges: Vec::new(),
+                    last: None,
+                    started: StdInstant::now(),
+                },
+            );
+            reassembly.bytes += 65_514;
+        }
+        let key = FragmentKey::V4 {
+            peer: [0u8; 32],
+            source: [10, 0, 0, 2],
+            destination: [192, 0, 2, 1],
+            protocol: PROTOCOL_TCP,
+            id: 128,
+        };
+        reassembly.parts.insert(
+            key,
+            FragmentSet {
+                at: 0,
+                header: fragment[..20].to_vec(),
+                next_header: 0,
+                payload: vec![0; 2_816],
+                ranges: Vec::new(),
+                last: None,
+                started: StdInstant::now(),
+            },
+        );
+        reassembly.bytes = REASSEMBLY_BYTES;
+        fragment[4..6].copy_from_slice(&128u16.to_be_bytes());
+        let _ = reassembly.accept([0u8; 32], &fragment, 0);
+        assert!(!reassembly.parts.contains_key(&key));
+        assert!(reassembly.bytes <= REASSEMBLY_BYTES);
     }
 
     /// A client packet cannot lower the server's MTU.

@@ -846,6 +846,8 @@ wireguard inner-mtu-bytes 65535 ferrox-app-wg-stack::tests::a_client_cannot_narr
 wireguard tunnel-fragment-bytes 1344 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard wireguard-fragment-bytes 1420 ferrox-app-wg-stack::tests::the_fragment_limit_follows_the_carrier
 wireguard reassembly-set-cap 1024 ferrox-app-wg-stack::tests::a_flood_of_first_fragments_is_bounded_by_count
+wireguard reassembly-peer-set-cap 64 ferrox-app-wg-stack::tests::one_peers_fragments_do_not_evict_anothers
+wireguard reassembly-byte-cap 8388608 ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap
 wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard download-bytes-reassembled 16384 ferrox-app-wg-stack::tests::a_server_download_leaves_as_fragments_the_client_reassembles

@@ -1572,6 +1572,7 @@ impl ReceiveBatch {
         } else if buffer.len() > self.slot {
             buffer.truncate(self.slot);
         }
+        buffer.shrink_to(self.slot);
         self.spare.push(buffer);
     }
 
