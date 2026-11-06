@@ -17,8 +17,12 @@ graph TD
     E --> S{"an id ring has not?"}
     S -->|no| B["rustls provider sorted to<br/>the crafted order"]
     S -->|yes| L["BoringSSL cipher list in<br/>the config's order"]
+    E --> X{"listener capped at<br/>TLS 1.2, a shaped-only id?"}
+    X -->|yes| H["shaped TLS 1.2 engine:<br/>Go's server suite pick"]
+    X -->|no| B
     B --> W(("hello on the wire"))
     L --> W
+    H --> N(("suite negotiated"))
 ```
 
 ## Measured
@@ -35,6 +39,7 @@ graph TD
 | tls12-list-ids-equal-reference-in-order | 1 | ferrox-core-tls::rustls_backend::tests::a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire |
 | tls12-suite-negotiated-by-the-dialer | 1 | ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite |
 | tls12-suite-negotiated-by-the-listener | 1 | ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation |
+| shaped-listener-negotiates-the-five-unreachable-ids | 5 | ferrox-core-tls::rustls_backend::tests::a_shaped_listener_serves_the_five_ids_neither_backend_has |
 | legacy-dial-tls12-ids-equal-reference-in-order | 1 | ferrox-core-tls::rustls_backend::tests::a_legacy_dial_offers_the_reference_cipher_ids_in_order |
 | legacy-cbc-suite-negotiated-by-the-dialer | 1 | ferrox-core-tls::rustls_backend::tests::a_legacy_dial_negotiates_a_cbc_suite |
 | legacy-static-rsa-suite-negotiated-by-the-listener | 1 | ferrox-core-tls::rustls_backend::tests::a_legacy_listener_negotiates_static_rsa |
@@ -79,10 +84,19 @@ are reachable.
   keep the config's order (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`), a CBC
   suite is negotiated by the dial (`a_legacy_dial_negotiates_a_cbc_suite`) and a static-RSA
   suite by the listener (`a_legacy_listener_negotiates_static_rsa`).
-- **Five ids by neither.** RC4 (`0x0005`, `0xc007`, `0xc011`), ECDHE-3DES (`0xc012`) and
-  static-RSA AES-128-CBC-SHA256 (`0x003c`): BoringSSL 5.4 no longer compiles them, and ring
-  never had them. `set_cipher_list` silently drops such a name, so `needed` refuses to route a
-  list of only those ids and the rustls lane keeps the stock field.
+- **Five ids by neither, served by the shaped lane.** RC4 (`0x0005`, `0xc007`, `0xc011`),
+  ECDHE-3DES (`0xc012`) and static-RSA AES-128-CBC-SHA256 (`0x003c`): BoringSSL 5.4 no longer
+  compiles them, and ring never had them. `set_cipher_list` silently drops such a name, so
+  `needed` refuses to route a list of only those ids and the rustls lane keeps the stock field.
+  A listener whose `minVersion`/`maxVersion` leave it at TLS 1.2 and whose list names one of the
+  five now runs the shaped engine on the server side too: it reads the hello in place, picks the
+  suite in `crypto/tls`'s global preference order restricted to the configured list, gates it on
+  the certificate's key kind, and builds the flight, ChangeCipherSpec and Finished itself.
+  `a_shaped_listener_serves_the_five_ids_neither_backend_has` dials each id through the same
+  shaped client and asserts the negotiated suite and a payload round trip; `0xc007` needs an
+  ECDSA leaf, the other four a RSA one. The ceiling is named: a listener that also offers TLS 1.3
+  keeps the old engine and drops the five, and a Go client against this listener is a
+  CI/conformance question, not a local gate.
 - **One id rustls adds that `crypto/tls` never sends: `0x00ff`.** rustls appends
   `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` to every hello that offers TLS 1.2; Go only ever *reads*
   that id on a server. BoringSSL appends no SCSV, so the legacy lane is free of it.
@@ -104,9 +118,10 @@ are reachable.
   BoringSSL's `P-256`/`P-384`/`X25519`, so the legacy hello keeps the named group order; the
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
 
-Not done, deliberately and with the cost named: the five ids above, an exact whole-field hello
-on the legacy lane, ECH together with CBC, and resumption on that lane. Each is a ceiling of a
-linked backend rather than a rewrite of this derivation.
+Not done, deliberately and with the cost named: the five ids on the *dialer's* negotiated path
+when the peer offers TLS 1.3, an exact whole-field hello on the legacy lane, ECH together with
+CBC, resumption on that lane, and a shaped listener that also offers TLS 1.3. Each is a ceiling
+of the dispatch rule or a linked backend rather than a rewrite of this derivation.
 
 ## What we removed
 

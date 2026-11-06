@@ -1036,6 +1036,7 @@ enum ServerInner<S: Stream> {
         failure: Option<String>,
         ech: bool,
     },
+    Shaped(Box<crate::tls::shaped::server::Server<S>>),
 }
 
 pub struct RustlsServerProvider<S: Stream> {
@@ -1063,6 +1064,11 @@ impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
                     .field("failure", failure)
                     .finish_non_exhaustive()
             }
+            ServerInner::Shaped(server) => f
+                .debug_struct("RustlsServerProvider")
+                .field("alpn", &server.alpn())
+                .field("suite", &server.suite())
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -1080,6 +1086,18 @@ impl<S: Stream> RustlsServerProvider<S> {
                     failure: None,
                     ech: true,
                 },
+                eof: false,
+            });
+        }
+        if crate::tls::cipher_suites::shaped_server(
+            &cfg.cipher_suites,
+            cfg.min_version,
+            cfg.max_version,
+        ) {
+            return Ok(Self {
+                inner: ServerInner::Shaped(Box::new(crate::tls::shaped::server::Server::new(
+                    cfg, io,
+                ))),
                 eof: false,
             });
         }
@@ -1163,12 +1181,25 @@ impl<S: Stream> RustlsServerProvider<S> {
                     }
                 }
             }
+            ServerInner::Shaped(server) => server.handshake(),
         }
     }
 
-    /// Whether this session is a `BoringSSL` path, which owns its transport.
-    pub fn is_boring(&self) -> bool {
-        matches!(self.inner, ServerInner::Boring { .. })
+    /// Whether this session owns its transport rather than handing the caller its ciphertext.
+    pub fn owns_transport(&self) -> bool {
+        matches!(
+            self.inner,
+            ServerInner::Boring { .. } | ServerInner::Shaped(_)
+        )
+    }
+
+    /// The suite the shaped listener negotiated, for a test that pins the reference's pick.
+    #[cfg(test)]
+    pub(crate) fn suite(&self) -> Option<u16> {
+        match &self.inner {
+            ServerInner::Shaped(server) => server.suite(),
+            _ => None,
+        }
     }
 
     /// Whether this session is the ECH path.
@@ -1202,6 +1233,7 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
                 ..
             } => handshake.get_mut().engage_record_alignment(),
             ServerInner::Boring { .. } => {}
+            ServerInner::Shaped(server) => server.engage_record_alignment(),
         }
     }
 
@@ -1217,6 +1249,7 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
                 ..
             } => handshake.get_mut().disarm_record_alignment(),
             ServerInner::Boring { .. } => {}
+            ServerInner::Shaped(server) => server.disarm_record_alignment(),
         }
     }
 
@@ -1248,6 +1281,7 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
             ServerInner::Boring { .. } => {
                 Err(std::io::Error::other("tls handshake is not complete"))
             }
+            ServerInner::Shaped(server) => server.write_all_slices(parts),
         }
     }
 }
@@ -1358,7 +1392,7 @@ impl rustls::server::ResolvesServerCert for IdentityResolver {
 }
 
 /// xray matches the exact name or a certificate's `*.suffix`, which covers one label only.
-fn sni_matches(names: &[String], sni: &str) -> bool {
+pub(crate) fn sni_matches(names: &[String], sni: &str) -> bool {
     let wildcard = match sni.find('.') {
         Some(at) => format!("*{}", &sni[at..]),
         None => "*".to_owned(),
@@ -1369,7 +1403,7 @@ fn sni_matches(names: &[String], sni: &str) -> bool {
 }
 
 /// The names xray compares an SNI against: the leaf's DNS SANs and subject common name.
-fn certificate_names(leaf: &[u8]) -> Vec<String> {
+pub(crate) fn certificate_names(leaf: &[u8]) -> Vec<String> {
     let Ok(cert) = boring::x509::X509::from_der(leaf) else {
         return Vec::new();
     };
@@ -1609,10 +1643,13 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
     }
 
     fn suites(&self) -> Vec<String> {
-        rustls::crypto::ring::ALL_CIPHER_SUITES
-            .iter()
-            .map(|cs| format!("{:?}", cs.suite()))
-            .collect()
+        match &self.inner {
+            ServerInner::Shaped(server) => server.suites(),
+            _ => rustls::crypto::ring::ALL_CIPHER_SUITES
+                .iter()
+                .map(|cs| format!("{:?}", cs.suite()))
+                .collect(),
+        }
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {
@@ -1627,6 +1664,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 ..
             } => stream.ssl().selected_alpn_protocol(),
             ServerInner::Boring { .. } => None,
+            ServerInner::Shaped(server) => server.alpn(),
         }
     }
 
@@ -1640,10 +1678,12 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 .ssl()
                 .servername_raw(boring::ssl::NameType::HOST_NAME),
             ServerInner::Boring { .. } => None,
+            ServerInner::Shaped(server) => server.sni(),
         }
     }
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.handshake()?;
         match &mut self.inner {
             ServerInner::Rustls { conn, .. } => {
                 let len = conn.writer().write(plaintext)?;
@@ -1666,6 +1706,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
             ServerInner::Boring { .. } => {
                 Err(std::io::Error::other("tls handshake is not complete"))
             }
+            ServerInner::Shaped(server) => Ok(std::io::Write::write(server, plaintext)?),
         }
     }
 
@@ -1694,6 +1735,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
             ServerInner::Boring { .. } => {
                 Err(std::io::Error::other("tls handshake is not complete"))
             }
+            ServerInner::Shaped(server) => server.write_all_slices(parts),
         }
     }
 
@@ -1735,7 +1777,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 };
                 Ok((plain, taken))
             }
-            ServerInner::Boring { .. } => Err(std::io::Error::other(
+            ServerInner::Boring { .. } | ServerInner::Shaped(_) => Err(std::io::Error::other(
                 "this session reads its own transport",
             )),
         }
@@ -1743,6 +1785,10 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 
     fn closed(&self) -> bool {
         self.eof
+            || match &self.inner {
+                ServerInner::Shaped(server) => server.closed(),
+                _ => false,
+            }
     }
 }
 
@@ -1779,6 +1825,13 @@ impl<S: Stream> Read for RustlsServerProvider<S> {
             ServerInner::Boring { .. } => {
                 Err(std::io::Error::other("tls handshake is not complete"))
             }
+            ServerInner::Shaped(server) => match server.read(buf) {
+                Ok(0) => {
+                    self.eof = true;
+                    Ok(0)
+                }
+                outcome => outcome,
+            },
         }
     }
 }
@@ -1797,6 +1850,7 @@ impl<S: Stream> RustlsServerProvider<S> {
                 ..
             } => handshake.get_ref(),
             ServerInner::Boring { .. } => unreachable!("an ech session always owns a transport"),
+            ServerInner::Shaped(server) => server.get_ref(),
         }
     }
 }
@@ -1825,6 +1879,7 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
             ServerInner::Boring { .. } => {
                 Err(std::io::Error::other("tls handshake is not complete"))
             }
+            ServerInner::Shaped(server) => server.write(buf),
         }
     }
 
@@ -1851,6 +1906,7 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
             ServerInner::Boring { .. } => {
                 Err(std::io::Error::other("tls handshake is not complete"))
             }
+            ServerInner::Shaped(server) => server.flush(),
         }
     }
 }
@@ -3752,6 +3808,34 @@ mod tests {
         }
     }
 
+    fn ecdsa_identity() -> crate::tls::CertEntry {
+        let group = boring::ec::EcGroup::from_curve_name(boring::nid::Nid::X9_62_PRIME256V1)
+            .expect("group");
+        let key = boring::ec::EcKey::generate(&group).expect("ec key");
+        let key = boring::pkey::PKey::from_ec_key(key).expect("pkey");
+        let mut name = boring::x509::X509NameBuilder::new().expect("name");
+        name.append_entry_by_nid(boring::nid::Nid::COMMONNAME, "tls.test")
+            .expect("common name");
+        let name = name.build();
+        let mut cert = boring::x509::X509Builder::new().expect("builder");
+        cert.set_version(2).expect("version");
+        cert.set_subject_name(&name).expect("subject");
+        cert.set_issuer_name(&name).expect("issuer");
+        cert.set_pubkey(&key).expect("pubkey");
+        cert.set_not_before(&boring::asn1::Asn1Time::days_from_now(0).expect("from"))
+            .expect("not before");
+        cert.set_not_after(&boring::asn1::Asn1Time::days_from_now(30).expect("to"))
+            .expect("not after");
+        cert.sign(&key, boring::hash::MessageDigest::sha256())
+            .expect("signs");
+        crate::tls::CertEntry {
+            cert_chain: vec![cert.build().to_der().expect("der")],
+            key_der: key.private_key_to_der_pkcs8().expect("pkcs8"),
+            key_kind: crate::tls::ServerKeyKind::Pkcs8,
+            reload: None,
+        }
+    }
+
     #[test]
     fn the_legacy_lane_covers_the_cbc_and_static_rsa_ids_ring_has_not() {
         for id in [
@@ -3904,6 +3988,66 @@ mod tests {
                 "a context built for tls.test must not verify other.test"
             );
         });
+    }
+
+    /// A listener pinned to TLS 1.2 serves the five ids neither ring nor the legacy lane carries,
+    /// with the suite selected in the reference's global preference order.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_shaped_listener_serves_the_five_ids_neither_backend_has() {
+        let identity = crate::tls::TlsServerConfig {
+            certs: vec![rsa_identity()],
+            alpn: Vec::new(),
+            min_version: Some(0x0303),
+            max_version: Some(0x0303),
+            cipher_suites: vec![0x003c, 0xc012, 0x0005, 0xc007, 0xc011],
+            send_tickets: false,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        };
+        for id in [0x003c, 0xc012, 0x0005, 0xc007, 0xc011] {
+            let mut bound = identity.clone();
+            bound.certs = vec![if id == 0xc007 {
+                ecdsa_identity()
+            } else {
+                rsa_identity()
+            }];
+            bound.cipher_suites = vec![id];
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    let (stream, _) = listener.accept().expect("accepts");
+                    let mut server = crate::tls::accept(&bound, stream).expect("accepts");
+                    server.handshake().expect("handshakes");
+                    assert_eq!(
+                        server.suite(),
+                        Some(id),
+                        "the listener negotiated the configured suite"
+                    );
+                    let mut buf = [0u8; 4];
+                    server.read_exact(&mut buf).expect("reads");
+                    server.write_all(&buf).expect("writes");
+                    server.flush().expect("flushes");
+                });
+                let mut cfg = client("tls.test", &[]);
+                cfg.insecure = true;
+                cfg.cipher_suites = vec![id].into();
+                let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+                session.handshake().expect("handshakes");
+                session.write_all(b"ping").expect("writes");
+                session.flush().expect("flushes");
+                let mut buf = [0u8; 4];
+                session.read_exact(&mut buf).expect("reads");
+                assert_eq!(&buf, b"ping");
+            });
+        }
     }
 
     /// The listener's role: a config naming a static-RSA suite answers an RSA identity.
