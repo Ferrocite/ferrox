@@ -18,11 +18,15 @@ pub(crate) struct Hello {
     pub session_id: [u8; 32],
     pub shares: Vec<Share>,
     profile: &'static Profile,
+    /// A config's `cipherSuites` list, which the stock hello puts where a preset's table would.
+    ciphers: Option<Vec<u16>>,
     /// The groups a config's `curvePreferences` names, in its order: `None` keeps the profile's
     /// own list and shares, the hello a browser would send.
     groups: Option<Vec<u16>>,
     grease: [u16; 5],
     alpn: Option<&'static [&'static [u8]]>,
+    /// A stock hello's config-named ALPN list, which Go puts where the preset's table would.
+    stock_alpn: Option<Vec<Vec<u8>>>,
     sni: Option<String>,
     ech: Option<Vec<u8>>,
     /// A config-named padding extension body length, placed first as Psiphon does; `None`
@@ -55,6 +59,7 @@ struct Prepared<'a> {
 }
 
 impl Hello {
+    /// Builds one hello from a profile and the config's overrides.
     pub(crate) fn build(
         profile: &'static Profile,
         server_name: &str,
@@ -74,8 +79,9 @@ impl Hello {
         }
         let grease = distinct_grease(grease);
         // A config that names curves offers those and no profile group beside them, drawing a share for each in its order.
-        let (groups, reuse) = if curves.is_empty() {
-            share_spec(profile)
+        let (profile_groups, profile_reuse) = share_spec(profile);
+        let (groups, reuse) = if curves.is_empty() || profile_groups.is_empty() {
+            (profile_groups, profile_reuse)
         } else {
             (curves, false)
         };
@@ -86,9 +92,11 @@ impl Hello {
             session_id,
             shares,
             profile,
+            ciphers: None,
             groups: (!curves.is_empty()).then(|| curves.to_vec()),
             grease,
             alpn: alpn_override(alpn, websocket),
+            stock_alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, false),
             padding: None,
@@ -104,6 +112,25 @@ impl Hello {
     pub(crate) fn set_padding(&mut self, padding: usize) {
         self.padding = Some(padding.min(0x3000));
         self.msg = self.encode(None);
+    }
+
+    /// Replaces the hello's cipher list, the field a config's `cipherSuites` owns.
+    pub(crate) fn set_ciphers(&mut self, ciphers: &[u16]) {
+        self.ciphers = Some(ciphers.to_vec());
+        self.msg = self.encode(None);
+    }
+
+    /// The list this hello puts on the wire: the config's, else the profile's.
+    fn cipher_table(&self) -> &[u16] {
+        self.ciphers.as_deref().unwrap_or(self.profile.ciphers)
+    }
+
+    /// Replaces the hello's ALPN table with the config's list.
+    pub(crate) fn set_alpn(&mut self, alpn: &[Vec<u8>]) {
+        if !alpn.is_empty() {
+            self.stock_alpn = Some(alpn.to_vec());
+            self.msg = self.encode(None);
+        }
     }
 
     /// Replaces the GREASE cover with a real ECH offer sealed to the named config.
@@ -297,9 +324,11 @@ impl Hello {
             session_id: self.session_id,
             shares,
             profile: self.profile,
+            ciphers: self.ciphers.clone(),
             groups: self.groups.clone(),
             grease: self.grease,
             alpn: self.alpn,
+            stock_alpn: self.stock_alpn.clone(),
             sni: self.sni.clone(),
             ech: self.ech.clone(),
             padding: self.padding,
@@ -380,6 +409,9 @@ impl Hello {
     /// Whether the hello offered a protocol: a configured list or the preset's own table,
     /// checked where either lies so a server's pick costs no copy.
     pub(crate) fn offers_alpn(&self, pick: &[u8]) -> bool {
+        if let Some(list) = &self.stock_alpn {
+            return list.iter().any(|name| name.as_slice() == pick);
+        }
         if let Some(list) = self.alpn {
             return list.contains(&pick);
         }
@@ -418,6 +450,7 @@ impl Hello {
         self.sni.as_deref()
     }
 
+    /// Encodes the message with the current shares and cookie.
     fn encode(&self, cookie: Option<&[u8]>) -> Vec<u8> {
         self.encode_with(&self.shares, cookie)
     }
@@ -426,7 +459,7 @@ impl Hello {
     /// and the one compression method. The padding extension is sized from it, and the message
     /// is reserved to it, so neither pass guesses at the width.
     fn fixed_len(&self) -> usize {
-        2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.profile.ciphers.len() + 1 + 1
+        2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.cipher_table().len() + 1 + 1
     }
 
     /// Two walks of one body rule and two buffers: the first runs every walk into a width, so the
@@ -450,8 +483,8 @@ impl Hello {
         msg.extend_from_slice(&self.random);
         msg.push(self.session_id.len() as u8);
         msg.extend_from_slice(&self.session_id);
-        msg.extend_from_slice(&(2 * self.profile.ciphers.len() as u16).to_be_bytes());
-        for &cipher in self.profile.ciphers {
+        msg.extend_from_slice(&(2 * self.cipher_table().len() as u16).to_be_bytes());
+        for &cipher in self.cipher_table() {
             msg.extend_from_slice(&grease_or(cipher, &self.grease, 0).to_be_bytes());
         }
         msg.extend_from_slice(&[1, 0]);
@@ -465,8 +498,7 @@ impl Hello {
     }
 
     fn cipher_values(&self, tls13_only: bool) -> Vec<u16> {
-        self.profile
-            .ciphers
+        self.cipher_table()
             .iter()
             .filter(|&&c| !tls13_only || matches!(c, 0x1301..=0x1303))
             .map(|&c| grease_or(c, &self.grease, 0))
@@ -604,14 +636,19 @@ impl Hello {
                 Source::Groups(self.groups.as_deref().unwrap_or(groups)),
             ),
             Body::Sigalgs(values) => (0x000d, false, Source::Sigalgs(values)),
-            Body::Alpn(table) => (
-                ALPN,
-                false,
-                match self.alpn {
-                    Some(list) => Source::Alpn(list),
-                    None => Source::Fixed(table),
-                },
-            ),
+            Body::Alpn(table) => {
+                let source = match (&self.stock_alpn, self.alpn) {
+                    (Some(list), _) => Source::StockAlpn(list),
+                    (None, Some(list)) => Source::Alpn(list),
+                    (None, None) => {
+                        if table.is_empty() {
+                            return None;
+                        }
+                        Source::Fixed(table)
+                    }
+                };
+                (ALPN, false, source)
+            }
             Body::Versions(values) => (0x002b, false, Source::Versions(values)),
             Body::KeyShare { .. } if shares.is_empty() => return None,
             Body::KeyShare { .. } => (0x0033, false, Source::Shares),
@@ -644,6 +681,7 @@ impl Hello {
                 uint8_list(out, values, |v| grease_or(v, &self.grease, 4));
             }
             Source::Alpn(list) => alpn_body(out, list),
+            Source::StockAlpn(list) => stock_alpn_body(out, list),
             Source::Fixed(body) => out.put(body),
             Source::Shares => key_share_body(out, shares),
             Source::Cookie(value) => {
@@ -656,7 +694,7 @@ impl Hello {
     fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) -> usize {
         Self::pad_prepared(
             entries,
-            self.profile.ciphers.len(),
+            self.cipher_table().len(),
             self.session_id.len(),
             self.padding,
         )
@@ -704,9 +742,11 @@ impl Hello {
             session_id: [0u8; 32],
             shares: keys::canonical(groups),
             profile,
+            ciphers: None,
             groups: None,
             grease: distinct_grease([0; 5]),
             alpn: None,
+            stock_alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, true),
             padding: None,
@@ -747,6 +787,7 @@ enum Source<'a> {
     Sigalgs(&'a [u16]),
     Versions(&'a [u16]),
     Alpn(&'a [&'a [u8]]),
+    StockAlpn(&'a [Vec<u8>]),
     Fixed(&'a [u8]),
     Shares,
     Cookie(&'a [u8]),
@@ -867,6 +908,16 @@ fn alpn_body<W: Sink>(out: &mut W, list: &[&[u8]]) {
     let protocols: usize = list.iter().map(|proto| proto.len() + 1).sum();
     out.put(&(protocols as u16).to_be_bytes());
     for &proto in list {
+        out.put(&[proto.len() as u8]);
+        out.put(proto);
+    }
+}
+
+/// The same body from a config's owned protocol list.
+fn stock_alpn_body<W: Sink>(out: &mut W, list: &[Vec<u8>]) {
+    let protocols: usize = list.iter().map(|proto| proto.len() + 1).sum();
+    out.put(&(protocols as u16).to_be_bytes());
+    for proto in list {
         out.put(&[proto.len() as u8]);
         out.put(proto);
     }
@@ -1493,6 +1544,76 @@ mod tests {
         let forced = forced.expect("a websocket carrier forces a list");
         assert_eq!(forced.len(), 2, "the caller's own pair is kept");
         assert_eq!(counts.allocs, 0, "the forced list is a static: {counts:?}");
+    }
+
+    /// The stock table is Go's shape at both version ceilings: ALPN between the signature
+    /// algorithms and `supported_versions`, the hybrid share and its X25519 fallback above 1.2,
+    /// and neither share nor hybrid group at a 1.2 ceiling.
+    #[test]
+    fn the_stock_table_is_go_shape_at_both_version_ceilings() {
+        let mut tls13 = Hello::build(
+            &crate::tls::shaped::GO_STOCK,
+            "example.com",
+            &[],
+            false,
+            &[],
+            None,
+        )
+        .expect("the stock hello builds");
+        tls13.set_alpn(&[b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let exts = extensions(&tls13.msg[4..]);
+        let kinds: Vec<u16> = exts.iter().map(|ext| kind(ext)).collect();
+        let alpn = kinds
+            .iter()
+            .position(|&kind| kind == ALPN)
+            .expect("the config names ALPN");
+        assert_eq!(kinds[alpn - 1], 0x000d, "after the signature algorithms");
+        assert_eq!(kinds[alpn + 1], 0x002b, "and before supported_versions");
+        assert!(tls13.offers_alpn(b"h2"), "the config's list is the offer");
+        let share = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x0033)
+            .expect("a TLS 1.3 hello shares");
+        let body = &share[4..];
+        let mut at = 2;
+        let mut named = Vec::new();
+        while at + 4 <= body.len() {
+            named.push(u16::from_be_bytes([body[at], body[at + 1]]));
+            at += 4 + usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
+        }
+        assert_eq!(named, [0x11ec, 0x001d], "the hybrid, then its fallback");
+
+        let tls12 = Hello::build(
+            &crate::tls::shaped::GO_STOCK_12,
+            "example.com",
+            &[],
+            false,
+            &[],
+            None,
+        )
+        .expect("the TLS 1.2 stock hello builds");
+        let exts = extensions(&tls12.msg[4..]);
+        assert!(
+            exts.iter().all(|ext| kind(ext) != 0x0033),
+            "no key share below 1.3"
+        );
+        assert!(
+            exts.iter().all(|ext| kind(ext) != ALPN),
+            "no ALPN unless the config names one"
+        );
+        let groups = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x000a)
+            .expect("the hello names its groups");
+        assert!(
+            !groups.windows(2).any(|pair| pair == [0x11, 0xec]),
+            "the hybrid group stays off a TLS 1.2 hello"
+        );
+        let versions = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x002b)
+            .expect("the hello names its versions");
+        assert_eq!(&versions[4..], &[0x02, 0x03, 0x03], "1.2 only");
     }
 
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
