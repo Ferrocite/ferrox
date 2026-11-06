@@ -2066,7 +2066,6 @@ impl Routes {
                             );
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -2110,9 +2109,7 @@ fn insert_route(nodes: &mut Vec<RouteNode>, value: u128, bits: usize, width: usi
 }
 
 fn lookup_route(nodes: &[RouteNode], value: u128, width: usize) -> Option<usize> {
-    let Some(root) = nodes.first() else {
-        return None;
-    };
+    let root = nodes.first()?;
     let mut at = 0usize;
     let mut found = (root.peer != NO_PEER).then_some(root.peer as usize);
     for depth in 0..width {
