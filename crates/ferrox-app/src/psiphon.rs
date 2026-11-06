@@ -3,7 +3,8 @@
 
 use crate::json::{self, Json};
 use crate::psiphon_ssh::{
-    Channel, ChannelChunk, Identity, Proxy, Server, Session, TlsShape, MAX_PADDING, MIN_PADDING,
+    Channel, ChannelChunk, Identity, KeepAlive, Proxy, Server, Session, TlsShape, MAX_PADDING,
+    MIN_PADDING,
 };
 use crate::socks::{Credential, Destination, Version};
 use ferrox_core::tls::Fingerprint;
@@ -125,7 +126,7 @@ struct Settings {
     stagger: Duration,
     pause: Duration,
     affinity_grace: Duration,
-    keepalive: bool,
+    keepalive: Option<KeepAlive>,
     propagation: String,
     platform: String,
     client_version: String,
@@ -1892,15 +1893,19 @@ impl Settings {
         } else {
             RELAY_BUFFER
         };
-        let keepalive = !flag(
+        let keepalive = if flag(
             settings,
             "DisablePeriodicSshKeepAlive",
             "AETHER_PSIPHON_DISABLE_KEEPALIVE",
-        ) && !flag(
+        ) || flag(
             settings,
             "DisableKeepAlive",
             "AETHER_PSIPHON_DISABLE_KEEPALIVE",
-        );
+        ) {
+            None
+        } else {
+            Some(keepalive(settings))
+        };
         Ok(Self {
             state: text(settings, "state")
                 .or_else(|| text(settings, "dataRootDirectory"))
@@ -2114,6 +2119,32 @@ fn coin(probability: f64) -> bool {
         return false;
     }
     f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0 < probability
+}
+
+/// The reference's periodic keep-alive window, clamped so a hostile config cannot stall a session.
+fn keepalive(settings: Option<&Json>) -> KeepAlive {
+    let millis = |key, default: u64| {
+        Duration::from_millis(
+            number(settings, key)
+                .unwrap_or(default)
+                .clamp(1_000, 300_000),
+        )
+    };
+    let period_min = millis("SSHKeepAlivePeriodMinMilliseconds", 60_000);
+    let period_max = millis("SSHKeepAlivePeriodMaxMilliseconds", 120_000).max(period_min);
+    let padding = |key, default: u64| {
+        usize::try_from(number(settings, key).unwrap_or(default).min(8_192)).unwrap_or(8_192)
+    };
+    let padding_min = padding("SSHKeepAlivePaddingMinBytes", 0);
+    let padding_max = padding("SSHKeepAlivePaddingMaxBytes", 256).max(padding_min);
+    KeepAlive {
+        period_min,
+        period_max,
+        padding_min,
+        padding_max,
+        inactive: millis("SSHKeepAlivePeriodicInactivePeriodMilliseconds", 10_000),
+        timeout: millis("SSHKeepAlivePeriodicTimeoutMilliseconds", 30_000),
+    }
 }
 
 /// The reference's `LimitTunnelDialPortNumbers`: protocol names (or `All`) to port ranges.
@@ -2453,6 +2484,20 @@ const KNOWN_SETTINGS: &[&str] = &[
     "DisableRemoteServerListFetcher",
     "DisablePeriodicSshKeepAlive",
     "DisableKeepAlive",
+    "SSHKeepAliveSpeedTestSampleProbability",
+    "SSHKeepAlivePaddingMinBytes",
+    "SSHKeepAlivePaddingMaxBytes",
+    "SSHKeepAlivePeriodMinMilliseconds",
+    "SSHKeepAlivePeriodMaxMilliseconds",
+    "SSHKeepAlivePeriodicTimeoutMilliseconds",
+    "SSHKeepAlivePeriodicInactivePeriodMilliseconds",
+    "SSHKeepAliveProbeTimeoutMilliseconds",
+    "SSHKeepAliveProbeInactivePeriodMilliseconds",
+    "SSHKeepAliveNetworkConnectivityPollingPeriodMilliseconds",
+    "SSHKeepAliveResetOnFailureProbability",
+    "SSHKeepAliveResumeProbeTimeoutMilliseconds",
+    "SSHKeepAliveResumeProbeInactivePeriodMilliseconds",
+    "SSHKeepAliveResumeReconnectInactivePeriodMilliseconds",
     "LocalSocksProxyPort",
     "ListenInterface",
     "LocalHttpProxyPort",
@@ -7424,13 +7469,39 @@ mod tests {
         let settings = Settings::from_json(Some(&settings)).expect("settings");
         assert_eq!(settings.relay_buffer, 4 * 1024);
         assert_eq!(settings.stagger, Duration::from_millis(250));
-        assert!(settings.keepalive);
+        assert!(settings.keepalive.is_some());
         let quiet = json::parse(r#"{"DisablePeriodicSshKeepAlive":true}"#).expect("settings");
-        assert!(
-            !Settings::from_json(Some(&quiet))
-                .expect("settings")
-                .keepalive
-        );
+        assert!(Settings::from_json(Some(&quiet))
+            .expect("settings")
+            .keepalive
+            .is_none());
+    }
+
+    #[test]
+    fn the_reference_keepalive_window_is_read() {
+        let defaults = Settings::from_json(None).expect("settings");
+        let keepalive = defaults.keepalive.expect("keepalive");
+        assert_eq!(keepalive.period_min, Duration::from_secs(60));
+        assert_eq!(keepalive.period_max, Duration::from_secs(120));
+        assert_eq!(keepalive.padding_min, 0);
+        assert_eq!(keepalive.padding_max, 256);
+        assert_eq!(keepalive.inactive, Duration::from_secs(10));
+        assert_eq!(keepalive.timeout, Duration::from_secs(30));
+
+        let settings = json::parse(
+            r#"{"SSHKeepAlivePeriodMinMilliseconds":5000,"SSHKeepAlivePeriodMaxMilliseconds":6000,"SSHKeepAlivePaddingMinBytes":10,"SSHKeepAlivePaddingMaxBytes":20,"SSHKeepAlivePeriodicInactivePeriodMilliseconds":2000,"SSHKeepAlivePeriodicTimeoutMilliseconds":3000}"#,
+        )
+        .expect("settings");
+        let keepalive = Settings::from_json(Some(&settings))
+            .expect("settings")
+            .keepalive
+            .expect("keepalive");
+        assert_eq!(keepalive.period_min, Duration::from_secs(5));
+        assert_eq!(keepalive.period_max, Duration::from_secs(6));
+        assert_eq!(keepalive.padding_min, 10);
+        assert_eq!(keepalive.padding_max, 20);
+        assert_eq!(keepalive.inactive, Duration::from_secs(2));
+        assert_eq!(keepalive.timeout, Duration::from_secs(3));
     }
 
     #[test]
