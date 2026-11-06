@@ -11624,6 +11624,7 @@ fn dial_vmess_quic(client: &Connection, vmess: &VmessOut, target: &Destination) 
         send,
         recv,
         Some((response_key, response_iv, auth)),
+        None,
         Some(finish),
     );
 }
@@ -11685,6 +11686,7 @@ fn dial_vmess_hysteria(
         send,
         recv,
         Some((response_key, response_iv, auth)),
+        None,
         Some(finish),
     );
 }
@@ -11979,6 +11981,7 @@ fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination
         &close,
         send,
         recv,
+        None,
         None,
         Some(Arc::clone(&close)),
     );
