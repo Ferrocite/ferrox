@@ -2796,12 +2796,13 @@ impl RangeSet {
 
 fn merge<T>(ranges: &[(T, T)]) -> Vec<(T, T)>
 where
-    T: Copy + Ord + std::ops::Add<Output = T> + From<u8>,
+    T: Copy + Ord + std::ops::Sub<Output = T> + From<u8>,
 {
     let mut out: Vec<(T, T)> = Vec::with_capacity(ranges.len());
     for &(start, end) in ranges {
         match out.last_mut() {
-            Some((_, last_end)) if start <= *last_end + T::from(1) => {
+            // `start > last_end` guards the subtraction, so a range ending at `T::MAX` cannot overflow.
+            Some((_, last_end)) if start <= *last_end || start - *last_end == T::from(1) => {
                 *last_end = (*last_end).max(end);
             }
             _ => out.push((start, end)),
@@ -3186,6 +3187,9 @@ fn add_ip_rule(
         reverse = !reverse;
     }
     if let Some(rest) = value.strip_prefix("geoip:") {
+        if rest.eq_ignore_ascii_case("private") {
+            return add_private(positive, negative, reverse);
+        }
         return add_geoip(positive, negative, "geoip.dat", rest, reverse, assets);
     }
     for prefix in ["ext:", "ext-ip:"] {
@@ -3193,6 +3197,9 @@ fn add_ip_rule(
             let (file, code) = rest
                 .split_once(':')
                 .ok_or_else(|| format!("ip rule `{value}`: expected file:code"))?;
+            if file.eq_ignore_ascii_case("geoip.dat") && code.eq_ignore_ascii_case("private") {
+                return add_private(positive, negative, reverse);
+            }
             return add_geoip(positive, negative, file, code, reverse, assets);
         }
     }
@@ -3202,6 +3209,77 @@ fn add_ip_rule(
     let target = if reverse { negative } else { positive };
     target.v4.extend(set.v4);
     target.v6.extend(set.v6);
+    Ok(())
+}
+
+/// The reference's built-in `geoip:private` set, so a config that names it does not need a
+/// `geoip.dat` on disk before a final rule can refuse a private destination.
+const PRIVATE_IPV4_RULES: &[([u8; 4], u8)] = &[
+    ([0, 0, 0, 0], 8),
+    ([0, 0, 0, 0], 32),
+    ([10, 0, 0, 0], 8),
+    ([100, 64, 0, 0], 10),
+    ([127, 0, 0, 0], 8),
+    ([169, 254, 0, 0], 16),
+    ([172, 16, 0, 0], 12),
+    ([192, 0, 0, 0], 29),
+    ([192, 0, 0, 8], 32),
+    ([192, 0, 0, 9], 32),
+    ([192, 0, 0, 10], 32),
+    ([192, 0, 0, 170], 32),
+    ([192, 0, 0, 171], 32),
+    ([192, 0, 2, 0], 24),
+    ([192, 52, 193, 0], 24),
+    ([192, 88, 99, 2], 32),
+    ([192, 168, 0, 0], 16),
+    ([198, 18, 0, 0], 15),
+    ([198, 51, 100, 0], 24),
+    ([203, 0, 113, 0], 24),
+    ([240, 0, 0, 0], 4),
+    ([255, 255, 255, 255], 32),
+    ([224, 0, 0, 0], 4),
+];
+
+const PRIVATE_IPV6_RULES: &[&str] = &[
+    "::1/128",
+    "::/128",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "100:0:0:1::/64",
+    "2001::/32",
+    "2001:1::1/128",
+    "2001:1::2/128",
+    "2001:1::3/128",
+    "2001:2::/48",
+    "2001:3::/32",
+    "2001:20::/28",
+    "2001:30::/28",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+    "5f00::/16",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
+
+fn add_private(
+    positive: &mut RangeSet,
+    negative: &mut RangeSet,
+    reverse: bool,
+) -> Result<(), String> {
+    let target = if reverse { negative } else { positive };
+    for &(octets, prefix) in PRIVATE_IPV4_RULES {
+        target.add(
+            IpAddr::V4(std::net::Ipv4Addr::from(octets)),
+            u32::from(prefix),
+        )?;
+    }
+    for rule in PRIVATE_IPV6_RULES {
+        let (ip, prefix) = parse_cidr(rule)?;
+        target.add(ip, prefix)?;
+    }
     Ok(())
 }
 
@@ -3224,6 +3302,9 @@ fn add_geoip(
     }
     if code.is_empty() {
         return Err(format!("ip rule `{file}:` names an empty code"));
+    }
+    if file.eq_ignore_ascii_case("geoip.dat") && code.eq_ignore_ascii_case("private") {
+        return add_private(positive, negative, reverse);
     }
     let target = if reverse { negative } else { positive };
     for (ip, prefix) in assets.ip(file, code)?.iter() {

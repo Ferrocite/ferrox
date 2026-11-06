@@ -155,7 +155,7 @@ Rows 1–26 are the proxy-protocol world; rows 27–52 are the xray-core config 
 | 42 | ECH | partial — TLS and QUIC both roles | Partial TLS/QUIC both roles; retry-list bytes differ; accepted offers are unchanged. | [security-ech](docs/function/security-ech.md) |
 | 43 | transport stack as one shareable string | planned | Planned; pipe-separated stack in one share string. | — |
 | 44 | Hysteria v1 | implemented — both roles, TCP and UDP, xplus and port hop | Both roles, TCP and UDP, xplus and port hop. | [carrier-hysteria](docs/function/carrier-hysteria.md) |
-| 45 | Freedom outbound options | planned — high priority | Planned high priority; freedom `domainStrategy`, fragment/noises/finalRules. | — |
+| 45 | Freedom outbound options | implemented — both roles | `domainStrategy`, `fragment`, `proxyProtocol`, `noises` and `finalRules` from JSON and xray protobuf; explicit rules only, the reference's inbound-derived default private block is not applied. | — |
 | 46 | SOCKS front HTTP fallback | planned — high priority | Planned high priority; the `socks` front does not fall back to HTTP. | [socks](docs/function/socks.md) |
 | 47 | HTTP proxy chaining (`dialerProxy` over CONNECT) | planned — high priority | Planned high priority; HTTP CONNECT hop for `dialerProxy`. | [http-proxy](docs/function/http-proxy.md) |
 | 48 | TLS min/max version, curves, `pinnedPeerCertSha256`, `rejectUnknownSNI`, `masterKeyLog` | planned — high priority | Planned high priority; TLS versions/curves/pins/rejectUnknownSNI/masterKeyLog. | — |
