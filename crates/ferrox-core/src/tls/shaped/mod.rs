@@ -464,6 +464,65 @@ pub(crate) static GO_STOCK: Profile = Profile {
         },
         Ext {
             kind: 0x000a,
+            body: Body::Groups(&[0x11ec, 0x001d, 0x0017, 0x0018, 0x0019]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603,
+                0x0201, 0x0203,
+            ]),
+        },
+        Ext {
+            kind: 0x0010,
+            body: Body::Alpn(&[]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x11ec, 0x001d],
+                reuse: true,
+            },
+        },
+    ],
+};
+
+/// The same table with TLS 1.2 the ceiling: no hybrid group, no key share, and the one version Go names.
+pub(crate) static GO_STOCK_12: Profile = Profile {
+    name: "golang",
+    ciphers: &[],
+    shuffle: false,
+    exts: &[
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000a,
             body: Body::Groups(&[0x001d, 0x0017, 0x0018, 0x0019]),
         },
         Ext {
@@ -474,15 +533,12 @@ pub(crate) static GO_STOCK: Profile = Profile {
             ]),
         },
         Ext {
-            kind: 0x002b,
-            body: Body::Versions(&[0x0304, 0x0303]),
+            kind: 0x0010,
+            body: Body::Alpn(&[]),
         },
         Ext {
-            kind: 0x0033,
-            body: Body::KeyShare {
-                groups: &[0x001d],
-                reuse: false,
-            },
+            kind: 0x002b,
+            body: Body::Versions(&[0x0303]),
         },
     ],
 };

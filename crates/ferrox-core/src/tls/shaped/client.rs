@@ -155,7 +155,16 @@ impl<S: Stream> Session<S> {
     /// The stock hello a config's `cipherSuites` rides when ring and `BoringSSL` carry none of it:
     /// Go's own extension table, with the config's list in place of a preset's.
     pub(crate) fn connect_stock(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
-        Self::with_profile(&super::GO_STOCK, cfg, io, true)
+        let profile = if cfg
+            .cipher_suites
+            .iter()
+            .any(|id| (0x1301..=0x1303).contains(id))
+        {
+            &super::GO_STOCK
+        } else {
+            &super::GO_STOCK_12
+        };
+        Self::with_profile(profile, cfg, io, true)
     }
 
     /// The one builder both the preset and the stock hellos share.
@@ -163,18 +172,21 @@ impl<S: Stream> Session<S> {
         profile: &'static Profile,
         cfg: &TlsConfig,
         io: S,
-        configured_ciphers: bool,
+        stock: bool,
     ) -> Result<Self, TlsError> {
         let mut hello = Hello::build(
             profile,
             &cfg.server_name,
-            &cfg.alpn,
-            cfg.websocket,
+            if stock { &[] } else { &cfg.alpn },
+            !stock && cfg.websocket,
             &cfg.curves,
             cfg.client_random,
         )?;
-        if configured_ciphers && !cfg.cipher_suites.is_empty() {
-            hello.set_ciphers(&cfg.cipher_suites);
+        if stock {
+            if !cfg.cipher_suites.is_empty() {
+                hello.set_ciphers(&cfg.cipher_suites);
+            }
+            hello.set_alpn(&cfg.alpn);
         }
         if let Some(padding) = cfg.padding {
             hello.set_padding(usize::from(padding));
