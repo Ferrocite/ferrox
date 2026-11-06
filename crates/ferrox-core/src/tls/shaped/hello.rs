@@ -171,6 +171,7 @@ impl Hello {
         Ok(())
     }
 
+    /// Seals the inner hello into the outer cover and returns the framed outer hello.
     fn seal_offer(
         &self,
         offer: &mut EchOffer,
@@ -184,6 +185,11 @@ impl Hello {
         let cover = ech_cover(offer.suite, offer.config_id, enc, encoded.len() + 16);
         let entries =
             self.extension_entries(shares, cookie, self.sni.as_deref(), Some(&cover), true);
+        if entries.last().map(|entry| entry.kind) != Some(0xfe0d) {
+            return Err(TlsError::Other(
+                "ech: profile has no ECH payload".to_owned(),
+            ));
+        }
         let mut outer = self.encode_body(
             TLS12,
             &self.random,
@@ -204,6 +210,7 @@ impl Hello {
         Ok(outer)
     }
 
+    /// The inner hello and its transcript, both framed where they are written.
     fn inner_hello(
         &self,
         offer: &EchOffer,
@@ -405,6 +412,7 @@ impl Hello {
         self.offer.as_ref().map(|offer| offer.inner_random)
     }
 
+    /// The public name a real offer sends in the outer hello.
     pub(crate) fn ech_public_name(&self) -> Option<&str> {
         self.offer.as_ref()?;
         self.sni.as_deref()
@@ -1167,6 +1175,20 @@ mod tests {
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
         );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_profile_without_an_ech_slot_is_refused() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::resolve("hellochrome_58")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
+        hello.set_padding(0x3000);
+        assert!(hello.enable_ech(&list).is_err());
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]

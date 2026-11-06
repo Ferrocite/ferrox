@@ -21,6 +21,7 @@ pub(crate) struct Config<'a> {
 }
 
 impl<'a> Config<'a> {
+    /// The config's encoded length, header included.
     pub(crate) fn encoded_len(&self) -> usize {
         let contents = 1
             + 2
@@ -36,6 +37,7 @@ impl<'a> Config<'a> {
         4 + contents
     }
 
+    /// The config in one buffer reserved to its exact length.
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         // The length is known before the first byte, so the config lands in one buffer and no contents copy.
@@ -44,6 +46,7 @@ impl<'a> Config<'a> {
         out
     }
 
+    /// Appends the config, header included, to `out`.
     pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
         let contents = self.encoded_len() - 4;
         out.extend_from_slice(&VERSION.to_be_bytes());
@@ -61,6 +64,7 @@ impl<'a> Config<'a> {
         out.extend_from_slice(self.extensions);
     }
 
+    /// The four-byte cipher suite entries as `(kdf, aead)` pairs.
     pub(crate) fn suites(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
         self.cipher_suites.as_chunks::<4>().0.iter().map(|suite| {
             (
@@ -83,6 +87,7 @@ impl<'a> Config<'a> {
         Self::decode_contents(bytes, at, config_end)
     }
 
+    /// Parses one config body whose version and length header the caller has read.
     fn decode_contents(
         bytes: &'a [u8],
         at: &mut usize,
