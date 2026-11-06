@@ -53,7 +53,7 @@ The sniffer no longer refuses. An enabled `sniffing` block is parsed with the re
 
 ## What was not removed
 
-The local hop itself. An in-process dispatch moves no handshake; this one dials `127.0.0.1` and handshakes as any client would, which costs one connect and the inbound's handshake bytes per flow. That is the re-inject the row names, not overhead around it, so it stays on the page rather than in a follow-up. The second routing pass stays for row 27: the named inbound's own routing rules are not consulted here, and xray would run them. The protobuf form stays refused alongside it: no pinned scenario names a loopback, so there is no seam to prove it through — the xray-core scenario suite has no loopback test, ZeroNet's loopback tests are in-process, and the xray-core-rust suite ships disabled.
+The local hop itself. An in-process dispatch moves no handshake; this one dials `127.0.0.1` and handshakes as any client would, which costs one connect and the inbound's handshake bytes per flow. That is the re-inject the row names, not overhead around it, so it stays on the page rather than in a follow-up. The second routing pass stays for row 30: the named inbound's own routing rules are not consulted here, and xray would run them. The protobuf form stays refused alongside it: no pinned scenario names a loopback, so there is no seam to prove it through — the xray-core scenario suite has no loopback test, ZeroNet's loopback tests are in-process, and the xray-core-rust suite ships disabled.
 
 ## Pins
 

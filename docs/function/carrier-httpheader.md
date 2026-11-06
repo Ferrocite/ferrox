@@ -45,7 +45,7 @@ graph TD
   httpheader::tests::header_carries_an_echo_over_loopback 'proxy::kept_head_rounds'
 ```
 
-`UNBLESSED`, as above. The reader named here is the one this carrier reaches; the `read_http_head` the page named before it is the `peek` reader row 12 left behind.
+`UNBLESSED`, as above. The reader named here is the one this carrier reaches; the `read_http_head` the page named before it is the `peek` reader row 13 left behind.
 
 ## Time
 

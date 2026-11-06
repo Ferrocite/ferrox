@@ -223,11 +223,11 @@ fn cells(line: &str) -> Vec<String> {
     cells
 }
 
-/// Whether a header line names a column exactly `state` or `binary`.
-fn state_column(header: &[String]) -> Option<usize> {
-    header
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case("state") || name.eq_ignore_ascii_case("binary"))
+fn doc_page(line: &str) -> Option<String> {
+    let start = line.find("](docs/function/")? + 2;
+    let rest = &line[start..];
+    let end = rest.find(')')?;
+    Some(rest[..end].to_owned())
 }
 
 /// Lowercase hyphenated slug for a suggested page path; runs of non-alphanumerics collapse to one dash.
@@ -265,8 +265,6 @@ pub fn read_methods(root: &Path) -> Vec<MethodRow> {
 pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
     let mut rows = Vec::new();
     let mut section: Option<char> = None;
-    // Recomputed per header so table A's `binary` and the rest's `state` are both honoured.
-    let mut state_col = 2usize;
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("### ") {
@@ -275,9 +273,6 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
             continue;
         }
         if trimmed.starts_with("| # |") || trimmed.starts_with("|#|") {
-            if let Some(col) = state_column(&cells(trimmed)) {
-                state_col = col;
-            }
             continue;
         }
         // A separator row (`| --- | --- |`) or any non-table line: nothing to do.
@@ -291,22 +286,13 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
             continue;
         };
         let Some(name) = row.get(1) else { continue };
-        // A row shorter than its state column is malformed; skip rather than read a neighbouring cell as the verdict.
-        if row.len() <= state_col {
+        let Some(state_cell) = row.get(2) else {
             continue;
-        }
-        let state = clean_cell(&row[state_col]);
-        let (page, real_page) = match row.get(4) {
-            // Table A's `page` column links the real path; other tables suggest one from the slug.
-            Some(cell) if state_col == 3 && cell.contains("docs/function/") => (
-                cell.chars()
-                    .skip_while(|c| *c != '(')
-                    .skip(1)
-                    .take_while(|c| *c != ')')
-                    .collect::<String>(),
-                true,
-            ),
-            _ => (
+        };
+        let state = clean_cell(state_cell);
+        let (page, real_page) = match doc_page(trimmed) {
+            Some(page) => (page, true),
+            None => (
                 format!("docs/function/{}.md", slugify_method(&clean_cell(name))),
                 false,
             ),
@@ -425,20 +411,20 @@ mod tests {
     const MATRIX: &str = "\
 ### A — proxy protocols
 
-| # | method | link | binary | page | notes |
-| --- | --- | --- | --- | --- | --- |
-| 1 | VLESS TCP REALITY | `vless-x` | **server only** | [vless](docs/function/vless.md) | notes |
-| 3 | VLESS TCP none | `vless-tcp-none` | implemented | [vless](docs/function/vless.md) | both roles |
-| 16 | ed httpUpgrade | — | parsed, **not carried** | [x](docs/function/carrier-httpupgrade.md) | note |
-| 17 | a half-wired row | — | partial — high priority | [x](docs/function/half.md) | note |
+| # | method | state | notes | supported today by |
+| --- | --- | --- | --- | --- |
+| 1 | VLESS TCP REALITY | **server only** | [vless](docs/function/vless.md) | notes |
+| 3 | VLESS TCP none | implemented | [vless](docs/function/vless.md) | both roles |
+| 16 | ed httpUpgrade | parsed, **not carried** | [x](docs/function/carrier-httpupgrade.md) | note |
+| 17 | a half-wired row | partial — high priority | [x](docs/function/half.md) | note |
 
 ### C — VPN
 
-| # | method | state | supported today by |
-| --- | --- | --- | --- |
-| 45 | WireGuard (UDP) | planned | Xray-core, sing-box |
-| 46 | Out of rotation | not-scheduled | configer |
-| 76 | Foxy lane | in tree, proven | configer |
+| # | method | state | notes | supported today by |
+| --- | --- | --- | --- | --- |
+| 45 | WireGuard (UDP) | planned | Xray-core, sing-box | — |
+| 46 | Out of rotation | not-scheduled | configer | — |
+| 76 | Foxy lane | in tree, proven | configer | — |
 ";
 
     fn find(rows: &[MethodRow], index: u32) -> MethodRow {
@@ -470,9 +456,8 @@ mod tests {
     }
 
     #[test]
-    fn the_state_column_is_found_per_table() {
+    fn the_state_cell_is_the_third_column_in_every_table() {
         let rows = methods_from_text(MATRIX);
-        // Table A reads its verdict from `binary`; table C from `state`.
         assert_eq!(find(&rows, 1).section, 'A');
         assert_eq!(find(&rows, 1).state, "server only");
         assert_eq!(find(&rows, 45).section, 'C');
@@ -495,7 +480,6 @@ mod tests {
     fn method_names_are_cleaned_and_pages_derived() {
         let rows = methods_from_text(MATRIX);
         assert_eq!(find(&rows, 1).method, "VLESS TCP REALITY");
-        // Table A's page column is the real path; table C suggests one.
         assert_eq!(find(&rows, 1).page, "docs/function/vless.md");
         assert_eq!(find(&rows, 45).page, "docs/function/wireguard-udp.md");
     }
@@ -503,13 +487,13 @@ mod tests {
     #[test]
     fn the_live_matrix_reads_and_has_open_rows() {
         let rows = methods_from_text(include_str!("../../../README.md"));
-        assert!(rows.len() > 80, "the matrix should have ~130 rows");
+        assert!(rows.len() > 80, "the matrix should have ~180 rows");
         // Some rows done, some not: a reader finding only one class has mis-parsed a column.
         assert!(rows.iter().any(|row| row.implemented));
         assert!(rows.iter().any(|row| !row.implemented));
         // G and H are prose lists with no `| # |` matrix, so they contribute no rows by design.
         for letter in [
-            'A', 'B', 'C', 'D', 'E', 'F', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+            'A', 'B', 'C', 'D', 'E', 'F', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
         ] {
             assert!(
                 rows.iter().any(|row| row.section == letter),
@@ -590,7 +574,7 @@ mod tests {
         let tun = rows
             .iter()
             .find(|row| row.method.starts_with("tun2socks"))
-            .expect("row 59 is in the matrix");
+            .expect("the tun2socks row is in the matrix");
         let tun_refs = references_for(&pins, &tun.text).to_ascii_lowercase();
         assert!(tun_refs.contains("zeptun"), "{tun_refs}");
         assert!(
