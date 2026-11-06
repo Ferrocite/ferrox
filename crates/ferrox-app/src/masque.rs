@@ -1573,7 +1573,7 @@ fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
             .cloned()
             .map(Delivery::Udp);
     }
-    (wg_stack::inner_protocol(packet) == Some(6)).then_some(Delivery::Stack)
+    wg_stack::stack_packet(packet).then_some(Delivery::Stack)
 }
 
 pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
@@ -3073,6 +3073,21 @@ mod tests {
         packet
     }
 
+    fn ipv6_fragment() -> Vec<u8> {
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8u16.to_be_bytes());
+        packet[6] = 44;
+        packet[7] = 64;
+        packet[8..24]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        packet[24..40]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        packet[40] = 6;
+        packet[42..44].copy_from_slice(&1u16.to_be_bytes());
+        packet
+    }
+
     #[test]
     fn a_packet_from_outside_the_tunnel_is_not_forwarded() {
         let (packets, _packets_rx) = mpsc::channel();
@@ -3210,6 +3225,23 @@ mod tests {
             capacity,
             "the buffer did not grow on its way to the stack"
         );
+    }
+
+    #[test]
+    fn an_ipv6_fragment_reaches_the_stack() {
+        let (to_stack, stack_rx) = mpsc::channel();
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let packet = ipv6_fragment();
+        deliver(&to_stack, &routes, &packet);
+        let delivered = stack_rx.recv().expect("delivered");
+        assert_eq!(delivered.bytes, packet);
+        let mut datagram = Vec::with_capacity(3 + packet.len());
+        connectip::datagram_prefix(4, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let offset = datagram.len() - packet.len();
+        deliver_owned(&to_stack, &routes, datagram, offset);
+        let delivered = stack_rx.recv().expect("delivered from its datagram");
+        assert_eq!(delivered.bytes, packet);
     }
 
     #[test]

@@ -847,13 +847,15 @@ wireguard tunnel-fragment-bytes 1344 ferrox-app-wg-stack::tests::a_large_inner_p
 wireguard wireguard-fragment-bytes 1420 ferrox-app-wg-stack::tests::the_fragment_limit_follows_the_carrier
 wireguard reassembly-set-cap 1024 ferrox-app-wg-stack::tests::a_flood_of_first_fragments_is_bounded_by_count
 wireguard reassembly-peer-set-cap 64 ferrox-app-wg-stack::tests::one_peers_fragments_do_not_evict_anothers
+wireguard reassembly-peer-byte-cap 524288 ferrox-app-wg-stack::tests::a_peer_cannot_take_the_whole_reassembly_byte_budget
+wireguard reassembly-range-cap 256 ferrox-app-wg-stack::tests::range_metadata_is_bounded
 wireguard reassembly-byte-cap 8388608 ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap
 wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard download-bytes-reassembled 16384 ferrox-app-wg-stack::tests::a_server_download_leaves_as_fragments_the_client_reassembles
 wireguard ipv6-fragment-round-trips 1 ferrox-app-wg-stack::tests::an_ipv6_packet_fragments_and_reassembles_without_its_fragment_header
-wireguard syn-advertised-mss-bytes 65495 ferrox-app-wg-stack::tests::a_syn_mss_is_raised_for_the_inner_stack_and_lowered_on_the_answer
-wireguard syn-ack-advertised-mss-bytes 1380 ferrox-app-wg-stack::tests::the_server_raises_the_syn_mss_and_lowers_its_answer
+wireguard syn-advertised-mss-bytes 65495 ferrox-app-wg-stack::tests::the_client_advertises_the_inner_mss
+wireguard syn-ack-advertised-mss-bytes 1380 ferrox-app-wg-stack::tests::the_server_keeps_the_syn_mss_and_lowers_its_answer
 wireguard tcp-bytes-echoed 9 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 wireguard client-datagram-bytes-echoed 6 ferrox-app-wg-stack::tests::a_client_datagram_lane_frames_and_unframes
 wireguard server-datagram-bytes-echoed 2 ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom
