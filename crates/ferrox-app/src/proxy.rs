@@ -11312,6 +11312,20 @@ fn kcp_tls_connect(
     shake_tls(&mut session).then_some(session)
 }
 
+fn kcp_tls_session(
+    carrier: &Carrier,
+    address: &str,
+    port: u16,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<(
+    Arc<ferrox_core::kcp::Connection>,
+    ferrox_core::tls::ClientSession<KcpIo>,
+)> {
+    let conn = kcp_dial_session(carrier, address, port)?;
+    let session = kcp_tls_connect(&conn, cfg)?;
+    Some((conn, session))
+}
+
 /// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
 fn relay_kcp_under<S>(
     client: &Connection,
@@ -21422,10 +21436,9 @@ fn dial_socks_tls_client(
         return;
     };
     if matches!(socks.carrier, Carrier::Kcp(_)) {
-        let Some(conn) = kcp_dial_session(&socks.carrier, &socks.address, socks.port) else {
-            return;
-        };
-        let Some(session) = kcp_tls_connect(&conn, cfg) else {
+        let Some((conn, session)) =
+            kcp_tls_session(&socks.carrier, &socks.address, socks.port, cfg)
+        else {
             return;
         };
         let Some(tunnel) =
@@ -25767,6 +25780,56 @@ fn dial_http_tls_carried(
     relay_sink(reader, &sink, &downstream, |_| {});
 }
 
+fn http_connect<S, L>(
+    client: &Connection,
+    mut stream: S,
+    http: &HttpOut,
+    target: &Destination,
+    lane: L,
+) where
+    S: std::io::Read + std::io::Write + Send + 'static,
+    L: FnOnce(S, Connection, std::sync::Arc<dyn Fn() + Send + Sync>) + Send + 'static,
+{
+    use std::io::Write;
+    let mut req = Vec::new();
+    http_connect_request(target, http, &mut req);
+    if stream.write_all(&req).is_err() {
+        return;
+    }
+    // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
+    let Some((head, at)) = read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+    else {
+        return;
+    };
+    let code = head[..at]
+        .split(|b| *b == b'\n')
+        .next()
+        .and_then(|line| line.split(|b| *b == b' ').nth(1))
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+    if code != 200 {
+        return;
+    }
+    let Ok(mut downstream) = client.try_clone() else {
+        return;
+    };
+    // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    if at < head.len() && downstream.write_all(&head[at..]).is_err() {
+        return;
+    }
+    let close_downstream = downstream.try_clone().ok();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if let Some(d) = close_downstream.as_ref() {
+            let _ = d.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    lane(stream, downstream, close);
+}
+
 fn dial_http_outbound(
     client: &Connection,
     server: &SocketAddr,
@@ -25775,66 +25838,14 @@ fn dial_http_outbound(
     _ladder: &Ladder,
 ) {
     use ferrox_core::vless_encryption::SplitIo as _;
-    fn do_connect<S, L>(
-        client: &Connection,
-        mut stream: S,
-        http: &HttpOut,
-        target: &Destination,
-        lane: L,
-    ) where
-        S: std::io::Read + std::io::Write + Send + 'static,
-        L: FnOnce(S, Connection, std::sync::Arc<dyn Fn() + Send + Sync>) + Send + 'static,
-    {
-        use std::io::Write;
-        let mut req = Vec::new();
-        http_connect_request(target, http, &mut req);
-        if stream.write_all(&req).is_err() {
-            return;
-        }
-        // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
-        let Some((head, at)) =
-            read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
-        else {
-            return;
-        };
-        let code = head[..at]
-            .split(|b| *b == b'\n')
-            .next()
-            .and_then(|line| line.split(|b| *b == b' ').nth(1))
-            .and_then(|code| std::str::from_utf8(code).ok())
-            .and_then(|code| code.trim().parse::<u16>().ok())
-            .unwrap_or(0);
-        if code != 200 {
-            return;
-        }
-        let Ok(mut downstream) = client.try_clone() else {
-            return;
-        };
-        // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
-        if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-            return;
-        }
-        if at < head.len() && downstream.write_all(&head[at..]).is_err() {
-            return;
-        }
-        let close_downstream = downstream.try_clone().ok();
-        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-            if let Some(d) = close_downstream.as_ref() {
-                let _ = d.shutdown(std::net::Shutdown::Both);
-            }
-        });
-        lane(stream, downstream, close);
-    }
-
     if let Some(cfg) = http.tls.as_deref() {
         if matches!(http.carrier, Carrier::Kcp(_)) {
-            let Some(conn) = kcp_dial_session(&http.carrier, &http.address, http.port) else {
+            let Some((conn, session)) =
+                kcp_tls_session(&http.carrier, &http.address, http.port, cfg)
+            else {
                 return;
             };
-            let Some(session) = kcp_tls_connect(&conn, cfg) else {
-                return;
-            };
-            do_connect(
+            http_connect(
                 client,
                 session,
                 http,
@@ -25852,7 +25863,7 @@ fn dial_http_outbound(
             let Some((reader, writer, _)) = session.into_halves() else {
                 return;
             };
-            do_connect(
+            http_connect(
                 client,
                 CarrierStream { reader, writer },
                 http,
@@ -25876,7 +25887,7 @@ fn dial_http_outbound(
     if s.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    do_connect(client, s, http, target, |stream, downstream, close| {
+    http_connect(client, s, http, target, |stream, downstream, close| {
         relay_shared(Half::socket(stream), Half::socket(downstream), &close);
     });
 }
@@ -43413,10 +43424,9 @@ mod tests {
                 return None;
             }
             match stream.read(buf) {
-                Ok(0) => return None,
-                Ok(read) => buf = &mut buf[read..],
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return None,
+                Ok(0) | Err(_) => return None,
+                Ok(read) => buf = &mut buf[read..],
             }
         }
         Some(())
@@ -43427,9 +43437,8 @@ mod tests {
         let mut buf = [0u8; 1024];
         loop {
             match stream.read(&mut buf) {
-                Ok(0) => return None,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return None,
+                Ok(0) | Err(_) => return None,
                 Ok(read) => {
                     stream.write_all(&buf[..read]).ok()?;
                 }
