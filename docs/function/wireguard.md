@@ -43,6 +43,8 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| route-scan-instructions | UNBLESSED | ferrox-app-wg::tests::a_prefix_table_picks_the_peer_the_scan_picks |
+| route-table-instructions | UNBLESSED | ferrox-app-wg::tests::a_prefix_table_picks_the_peer_the_scan_picks |
 | transport-header-bytes | 16 | ferrox-core-wireguard::tests::the_reference_message_sizes |
 | initiation-bytes | 148 | ferrox-core-wireguard::tests::the_reference_message_sizes |
 | response-bytes | 92 | ferrox-core-wireguard::tests::the_reference_message_sizes |
@@ -59,7 +61,7 @@ graph TD
 | kernel-iif-priority | 32764 | ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel |
 <!-- counts:end -->
 
-The size rows are the constants the record and handshake write, asserted against the reference's numbers. The echo rows are bytes, not durations: a TCP flow crosses both tunnel directions, the smoltcp handoff, the freedom dial and a loopback echo with its nine bytes unchanged; a client datagram lane frames a six-byte answer and unframes it; a server datagram lane frames a two-byte answer through `serve_udp_lane` and wraps the reply; and the stack answers an echo request to its own address at both families while refusing another destination. The rule rows are the two priorities the kernel path installs, asserted by the message builders; the privileged test that creates and removes the link is `#[ignore]`d because it needs `CAP_NET_ADMIN`. The scenario gate is `TestWireguard` in `upstream/pins.toml`; it is green in `conformance.yml` at this pin.
+The two routing rows are one test's two wrappers: `route_scan_once` calls the peer-by-peer longest-prefix scan and `route_table_once` calls the prefix table for the same destination in the same run, so the difference is the lookup and not a different binary. A config with more than 32 IPv4 or 128 IPv6 prefixes builds the table once at startup; below that the scan stays because its list is shorter than the table's fixed 32 or 128 probes. The differential test covers an exact `/32`, a `/8` tie, a miss, an exact `/128`, a `/8` tie and a miss, and asserts the table and the scan agree on every one. The size rows are the constants the record and handshake write, asserted against the reference's numbers. The echo rows are bytes, not durations: a TCP flow crosses both tunnel directions, the smoltcp handoff, the freedom dial and a loopback echo with its nine bytes unchanged; a client datagram lane frames a six-byte answer and unframes it; a server datagram lane frames a two-byte answer through `serve_udp_lane` and wraps the reply; and the stack answers an echo request to its own address at both families while refusing another destination. The rule rows are the two priorities the kernel path installs, asserted by the message builders; the privileged test that creates and removes the link is `#[ignore]`d because it needs `CAP_NET_ADMIN`. The scenario gate is `TestWireguard` in `upstream/pins.toml`; it is green in `conformance.yml` at this pin.
 
 ## Ops
 
@@ -68,6 +70,13 @@ The size rows are the constants the record and handshake write, asserted against
 ```
 
 `UNBLESSED`. `scripts/count-ops.sh` needs valgrind, which does not exist on macOS/aarch64, so this count is CI-only (`ops.yml`) and nothing quotes it until the artefact has been read.
+
+The two routing-table lookup paths are measured together, so their difference is one run on one binary:
+
+```bash
+./scripts/count-ops.sh report wg::tests::a_prefix_table_picks_the_peer_the_scan_picks \
+  ferrox_app::wg::tests::route_scan_once ferrox_app::wg::tests::route_table_once
+```
 
 ## Syscalls
 
@@ -83,7 +92,7 @@ Zero extra copies on the stack send path. Every producer reserves the 16-byte tr
 
 ## What we removed
 
-The iptables control plane. The upstream kernel-mode work installs mangle rules, toggles `src_valid_mark`, and vendors an iptables runner; this tree writes route and generic netlink only, uses a private table with `SO_MARK` on the inner sockets, and adds an `iif` rule so the reverse-path lookup stays on the link. No firewall chain, global sysctl or `SO_BINDTODEVICE` is touched, and the link, table and rules are removed on drop. The host resolver for a client name is also gone: the query rides the tunnel against `remoteDNS`, so the name and the answer are not visible to the host's resolver. The reserved bytes are handled in one place — after the MACs are computed, before any parse, and put back when a record is refused — so the WARP form and the vanilla form are the same code path rather than two.
+The per-packet peer-by-peer longest-prefix scan. The client's outbound lookup and the server's source-owner check now walk one bit trie per family, so a packet costs at most 32 or 128 probes instead of one full scan of every peer's allowed list. The scan remains for configs below the table's break-even count, and the table preserves the scan's deepest-prefix choice and its last-peer tie. The iptables control plane. The upstream kernel-mode work installs mangle rules, toggles `src_valid_mark`, and vendors an iptables runner; this tree writes route and generic netlink only, uses a private table with `SO_MARK` on the inner sockets, and adds an `iif` rule so the reverse-path lookup stays on the link. No firewall chain, global sysctl or `SO_BINDTODEVICE` is touched, and the link, table and rules are removed on drop. The host resolver for a client name is also gone: the query rides the tunnel against `remoteDNS`, so the name and the answer are not visible to the host's resolver. The reserved bytes are handled in one place — after the MACs are computed, before any parse, and put back when a record is refused — so the WARP form and the vanilla form are the same code path rather than two.
 
 The per-datagram frame on the server datagram lane. Its head is now the lane's reused buffer and its payload is the second iovec of one `sendmsg`, so the relay gets the SOCKS frame without a new `Vec` and without copying the inner payload into it; on Windows the connected lane's `WSASend` does the same. The client lane still builds its reply frame in the buffer it already reused.
 
