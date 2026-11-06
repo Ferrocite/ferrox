@@ -3537,6 +3537,11 @@ pub(crate) struct HttpOut {
     address: String,
     port: u16,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+    /// The carrier the TLS rides when the config names one; the plain dial stays raw.
+    carrier: Carrier,
+    host: String,
+    carrier_headers: Vec<(String, String)>,
+    heartbeat: u32,
     headers: Vec<(String, String)>,
     user: Option<String>,
     pass: Option<String>,
@@ -3553,6 +3558,12 @@ pub(crate) struct SocksOut {
     port: u16,
     credential: crate::socks::Credential,
     version: crate::socks::Version,
+    tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+    /// The carrier the TLS rides when the config names one; the plain dial stays raw.
+    carrier: Carrier,
+    host: String,
+    carrier_headers: Vec<(String, String)>,
+    heartbeat: u32,
 }
 
 impl SocksOut {
@@ -3573,6 +3584,11 @@ impl SocksOut {
                 pass: pass.to_owned(),
             },
             version,
+            tls: None,
+            carrier: Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+            host: address.to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
         }
     }
 }
@@ -8896,6 +8912,43 @@ fn finish_reality<S>(
     }
     let front = FrontNames::of(&session);
     relay_vless(session, raw, users, freedom, true, fallbacks, &front);
+}
+
+/// A carrier write end that can be handed to the relay lanes: the writer behind one lock, so the
+/// download lane can send while the upload lane reads, and the two never touch the same bytes.
+#[derive(Clone)]
+struct RelayWrite(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl RelayWrite {
+    fn new(w: Box<dyn Write + Send>) -> Self {
+        Self(Arc::new(Mutex::new(w)))
+    }
+}
+
+impl Write for RelayWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+            .flush()
+    }
+}
+
+impl CarrierSink for RelayWrite {
+    fn send(&self, bytes: &[u8]) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|mut write| write.write_all(bytes).is_ok())
+    }
+
+    fn close(&self) {}
 }
 
 struct CarrierStream<R, W> {
@@ -16516,6 +16569,66 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
         .or_else(|| tls_unreachable(server))
 }
 
+/// A front whose own header rides a carrier under TLS: the session is dialled, the carrier is
+/// connected inside it, and the two ends come back as one boxed byte stream, so a front can write
+/// its CONNECT or SOCKS handshake without knowing which carrier carried it.
+fn dial_tls_carried_stream(
+    server: &SocketAddr,
+    tls: &ferrox_core::tls::TlsConfig,
+    carrier: &Carrier,
+    host: &str,
+    headers: &[(String, String)],
+    heartbeat: u32,
+) -> Option<CarrierStream<Box<dyn Read + Send>, Box<dyn Write + Send>>> {
+    let session = dial_tls_session(server, tls, carrier.tcp_mask())?;
+    match carrier {
+        Carrier::Ws { path, ed } => {
+            let (reader, writer) =
+                tls_ws(server, session, host, path, *ed, &[], headers, heartbeat)?;
+            Some(CarrierStream {
+                reader: Box::new(reader) as Box<dyn Read + Send>,
+                writer: Box::new(writer) as Box<dyn Write + Send>,
+            })
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let (reader, writer) = tls_httpupgrade(server, session, host, path, &[], headers)?;
+            Some(CarrierStream {
+                reader: Box::new(reader) as Box<dyn Read + Send>,
+                writer: Box::new(writer) as Box<dyn Write + Send>,
+            })
+        }
+        Carrier::HttpHeader { path } => {
+            let (reader, writer) = tls_httpheader(server, session, host, path, headers)?;
+            Some(CarrierStream {
+                reader: Box::new(reader) as Box<dyn Read + Send>,
+                writer: Box::new(writer) as Box<dyn Write + Send>,
+            })
+        }
+        Carrier::Grpc(settings) => {
+            let (reader, writer) = tls_grpc(server, session, host, settings)?;
+            Some(CarrierStream {
+                reader: Box::new(reader) as Box<dyn Read + Send>,
+                writer: Box::new(writer) as Box<dyn Write + Send>,
+            })
+        }
+        Carrier::Xhttp { settings } => {
+            let (reader, writer) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, tls, carrier.tcp_mask()),
+                host,
+                settings,
+                false,
+            )?;
+            Some(CarrierStream {
+                reader: reader as Box<dyn Read + Send>,
+                writer: Box::new(writer) as Box<dyn Write + Send>,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// xHTTP outside TLS: stream-one replaces the whole session; the session shapes dial a second plain transport for the GET downlink (`dialer.go:411`).
 fn xhttp_pair(
     uplink: Connection,
@@ -20919,13 +21032,17 @@ fn dial_socks_outbound(
         }
         Outbound::Socks(socks) => {
             let destination = socks_destination(target);
-            dial_socks_client(
-                client,
-                server,
-                &socks.credential,
-                socks.version,
-                &destination,
-            );
+            if socks.tls.is_none() {
+                dial_socks_client(
+                    client,
+                    server,
+                    &socks.credential,
+                    socks.version,
+                    &destination,
+                );
+            } else {
+                dial_socks_tls_client(client, server, socks, &destination);
+            }
         }
         Outbound::Psiphon(lane) => {
             let destination = socks_destination(target);
@@ -20976,10 +21093,71 @@ fn dial_socks_client(
     let Some(upstream) = dial_or_report(server) else {
         return;
     };
+    let read = upstream.read_timeout().ok().flatten();
+    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
+    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
     let Some(tunnel) = crate::socks::connect(upstream, credential, destination, version) else {
         return;
     };
+    let _ = tunnel.set_read_timeout(read);
+    let _ = tunnel.set_write_timeout(None);
     relay_handoff(client, &tunnel);
+}
+
+/// The SOCKS5 handshake inside a TLS session: the transport is dialled, the carrier is
+/// connected inside the session when the config names one, and the SOCKS exchange runs
+/// over that byte stream instead of the raw socket.
+fn dial_socks_tls_client(
+    client: &Connection,
+    server: &SocketAddr,
+    socks: &SocksOut,
+    destination: &crate::socks::Destination<'_>,
+) {
+    use ferrox_core::vless_encryption::SplitIo as _;
+    let Some(cfg) = socks.tls.as_ref() else {
+        return;
+    };
+    if matches!(socks.carrier, Carrier::Raw(_)) {
+        let Some(session) = dial_tls_session(server, cfg, socks.carrier.tcp_mask()) else {
+            return;
+        };
+        let Some((reader, writer, _)) = session.into_halves() else {
+            return;
+        };
+        let Some(tunnel) = crate::socks::connect(
+            CarrierStream { reader, writer },
+            &socks.credential,
+            destination,
+            socks.version,
+        ) else {
+            return;
+        };
+        let Some((reader, writer)) = tunnel.split_io() else {
+            return;
+        };
+        let sink = RelayWrite::new(Box::new(writer));
+        relay_sink(reader, &sink, client, |_| {});
+        return;
+    }
+    let Some(stream) = dial_tls_carried_stream(
+        server,
+        cfg,
+        &socks.carrier,
+        &socks.host,
+        &socks.carrier_headers,
+        socks.heartbeat,
+    ) else {
+        return;
+    };
+    let Some(tunnel) = crate::socks::connect(stream, &socks.credential, destination, socks.version)
+    else {
+        return;
+    };
+    let Some((reader, writer)) = tunnel.split_io() else {
+        return;
+    };
+    let sink = RelayWrite::new(writer);
+    relay_sink(reader, &sink, client, |_| {});
 }
 
 /// The split-tunnel list: targets this lane does not carry, which leave by the plain dial.
@@ -25143,6 +25321,56 @@ fn http_connect_request(target: &Destination, http: &HttpOut, req: &mut Vec<u8>)
     req.extend_from_slice(b"\r\n");
 }
 
+fn dial_http_tls_carried(
+    client: &Connection,
+    server: &SocketAddr,
+    http: &HttpOut,
+    target: &Destination,
+    cfg: &ferrox_core::tls::TlsConfig,
+) {
+    use ferrox_core::vless_encryption::SplitIo as _;
+    let Some(mut stream) = dial_tls_carried_stream(
+        server,
+        cfg,
+        &http.carrier,
+        &http.host,
+        &http.carrier_headers,
+        http.heartbeat,
+    ) else {
+        return;
+    };
+    let mut req = Vec::new();
+    http_connect_request(target, http, &mut req);
+    if stream.write_all(&req).is_err() {
+        return;
+    }
+    let Some((head, at)) = read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+    else {
+        return;
+    };
+    let code = head[..at]
+        .split(|b| *b == b'\n')
+        .next()
+        .and_then(|line| line.split(|b| *b == b' ').nth(1))
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+    if code != 200 {
+        return;
+    }
+    let Ok(mut downstream) = client.try_clone() else {
+        return;
+    };
+    if at < head.len() && downstream.write_all(&head[at..]).is_err() {
+        return;
+    }
+    let Some((reader, writer)) = stream.split_io() else {
+        return;
+    };
+    let sink = RelayWrite::new(writer);
+    relay_sink(reader, &sink, &downstream, |_| {});
+}
+
 fn dial_http_outbound(
     client: &Connection,
     server: &SocketAddr,
@@ -25150,6 +25378,7 @@ fn dial_http_outbound(
     target: &Destination,
     _ladder: &Ladder,
 ) {
+    use ferrox_core::vless_encryption::SplitIo as _;
     fn do_connect<S, L>(
         client: &Connection,
         mut stream: S,
@@ -25202,39 +25431,40 @@ fn dial_http_outbound(
     }
 
     if let Some(cfg) = http.tls.as_deref() {
-        let Some(session) = dial_tls_session(server, cfg, None) else {
-            return;
-        };
-        // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
-        if session
-            .get_ref()
-            .set_read_timeout(Some(RELAY_POLL))
-            .is_err()
-        {
-            return;
-        }
-        // The transport's wait leaves the lock, and only the decryption stays under it; a split that fails falls back to the shared shape.
-        do_connect(
-            client,
-            session,
-            http,
-            target,
-            |stream, downstream, close| match driven_halves(stream, RELAY_POLL) {
-                Ok(half) => relay_shared(half, Half::socket(downstream), &close),
-                Err(stream) => relay_shared(Half::shared(stream), Half::socket(downstream), &close),
-            },
-        );
-    } else {
-        let Some(s) = dial_or_report(server) else {
-            return;
-        };
-        if s.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        if matches!(http.carrier, Carrier::Raw(_)) {
+            let Some(session) = dial_tls_session(server, cfg, http.carrier.tcp_mask()) else {
+                return;
+            };
+            let Some((reader, writer, _)) = session.into_halves() else {
+                return;
+            };
+            do_connect(
+                client,
+                CarrierStream { reader, writer },
+                http,
+                target,
+                |stream, downstream, _| {
+                    let Some((reader, writer)) = stream.split_io() else {
+                        return;
+                    };
+                    let sink = RelayWrite::new(Box::new(writer));
+                    relay_sink(reader, &sink, &downstream, |_| {});
+                },
+            );
             return;
         }
-        do_connect(client, s, http, target, |stream, downstream, close| {
-            relay_shared(Half::socket(stream), Half::socket(downstream), &close);
-        });
+        dial_http_tls_carried(client, server, http, target, cfg);
+        return;
     }
+    let Some(s) = dial_or_report(server) else {
+        return;
+    };
+    if s.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    do_connect(client, s, http, target, |stream, downstream, close| {
+        relay_shared(Half::socket(stream), Half::socket(downstream), &close);
+    });
 }
 
 pub(crate) const UDP_BUF: usize = 65535;
@@ -33624,7 +33854,27 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
                     .or_else(|| user.get("password").and_then(Json::as_str))
             })
             .unwrap_or_default();
-        return Some(SocksOut::new(&address, port, user, pass, version));
+        let (carrier, host, tls) = if stream_security(outbound) == "tls" {
+            let Some((c, h, t)) = tls_parts(outbound, &address) else {
+                continue;
+            };
+            (c, h, Some(t))
+        } else {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(carrier, Carrier::Raw(_)) {
+                continue;
+            }
+            (carrier, host, None)
+        };
+        let (carrier_headers, heartbeat) =
+            crate::config::carrier_headers(outbound.get("streamSettings"));
+        let mut socks = SocksOut::new(&address, port, user, pass, version);
+        socks.tls = tls;
+        socks.carrier = carrier;
+        socks.host = host;
+        socks.carrier_headers = carrier_headers;
+        socks.heartbeat = heartbeat;
+        return Some(socks);
     }
     None
 }
@@ -34098,14 +34348,20 @@ fn find_http_outbound(root: &Json) -> Option<HttpOut> {
             let address = server.get("address").and_then(Json::as_str)?.to_owned();
             let port = server.get("port").and_then(Json::as_port)?;
             let security = stream_security(outbound);
-            let tls = if security == "tls" {
-                let Some((_, _, t)) = tls_parts(outbound, &address) else {
+            let (carrier, host, tls) = if security == "tls" {
+                let Some((c, h, t)) = tls_parts(outbound, &address) else {
                     continue;
                 };
-                Some(t)
+                (c, h, Some(t))
             } else {
-                None
+                let (carrier, host) = outbound_carrier(outbound, &address);
+                if !matches!(carrier, Carrier::Raw(_)) {
+                    continue;
+                }
+                (carrier, host, None)
             };
+            let (carrier_headers, heartbeat) =
+                crate::config::carrier_headers(outbound.get("streamSettings"));
             let mut headers: Vec<(String, String)> = Vec::new();
             if let Some(hdrs) = server.get("headers").and_then(Json::as_arr) {
                 for h in hdrs {
@@ -34140,6 +34396,10 @@ fn find_http_outbound(root: &Json) -> Option<HttpOut> {
                 address,
                 port,
                 tls,
+                carrier,
+                host,
+                carrier_headers,
+                heartbeat,
                 headers,
                 user,
                 pass,
@@ -34672,6 +34932,31 @@ mod tests {
     use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN, SINK_GRACE};
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
+
+    #[test]
+    fn a_poisoned_relay_write_stops_instead_of_looping() {
+        let sink = RelayWrite::new(Box::new(std::io::sink()));
+        let lock = std::sync::Arc::clone(&sink.0);
+        let poisoned = std::thread::spawn(move || {
+            let _held = lock.lock().expect("lock");
+            panic!("poison the relay write");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the helper thread poisons the lock");
+        let mut sink = sink;
+        assert_eq!(
+            std::io::Write::write(&mut sink, b"x")
+                .expect_err("a poisoned write stops")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            std::io::Write::flush(&mut sink)
+                .expect_err("a poisoned flush stops")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
 
     fn freedom() -> Outbound {
         Outbound::Freedom(Arc::default())
@@ -38813,20 +39098,44 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_full_carrier_parks_the_lane_instead_of_the_worker() {
+        use std::os::unix::io::AsRawFd;
         use std::time::{Duration, Instant};
 
-        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
+        fn small_buffer(fd: std::os::unix::io::RawFd, name: libc::c_int) {
+            let want: libc::c_int = 4096;
+            // SAFETY: `want` outlives the call, and the size is its own.
+            let set = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    name,
+                    std::ptr::addr_of!(want).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "a small socket buffer is refused");
+        }
+
+        let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().expect("pairs");
+        small_buffer(server_stream.as_raw_fd(), libc::SO_SNDBUF);
+        small_buffer(client_stream.as_raw_fd(), libc::SO_RCVBUF);
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accepts");
-            crate::ws::accept(stream, "/frame").expect("upgrades")
+            crate::ws::accept(crate::conn::Connection::Unix(server_stream), "/frame")
+                .expect("upgrades")
         });
-        let stream = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (client, _client_writer) =
-            crate::ws::connect(stream, "127.0.0.1", "/frame", 0, b"", &[], 0).expect("upgrades");
+        let (client, _client_writer) = crate::ws::connect(
+            crate::conn::Connection::Unix(client_stream),
+            "127.0.0.1",
+            "/frame",
+            0,
+            b"",
+            &[],
+            0,
+        )
+        .expect("upgrades");
         let (_reader, writer) = server.join().expect("joins");
 
-        let chunk = vec![7u8; 32 * 1024];
+        let chunk = vec![7u8; 1024];
         let mut filled = 0usize;
         loop {
             match writer.push_ready(&chunk) {
@@ -38837,17 +39146,8 @@ mod tests {
             assert!(filled < 256 * 1024 * 1024, "the socket never filled");
         }
 
-        // The peer drains after the send clock the parked lane must not pay.
-        let drain = std::thread::spawn(move || {
-            use std::io::Read as _;
-            std::thread::sleep(Duration::from_millis(250));
-            let mut sink = [0u8; 8192];
-            let mut client = client;
-            let _ = client.read(&mut sink);
-        });
-
-        let mut buffer = RelayBuf::with_len(64 * 1024);
-        buffer.as_mut()[..1024].fill(1);
+        let mut buffer = RelayBuf::with_len(1024);
+        buffer.as_mut().fill(1);
         let mut at = Forward::new();
         at.pending = 1024;
         let step = crate::proxy::RelayStep::enter();
@@ -38864,6 +39164,15 @@ mod tests {
             "the lane parked without naming the descriptor it waits on"
         );
         drop(step);
+        // The peer drains only after the flush, so a slow fill cannot free the socket the assertion above needs full.
+        let drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            std::thread::sleep(Duration::from_millis(250));
+            let mut sink = [0u8; 8192];
+            let mut client = client;
+            client.set_poll(Some(Duration::from_secs(1)));
+            let _ = client.read(&mut sink);
+        });
         let _ = drain.join();
     }
 
@@ -42284,6 +42593,228 @@ mod tests {
 
     /// `allowInsecure` dials with no root at all: the handshake still completes against a
     /// certificate no store holds, and the session speaks both ways.
+    trait FakeIo: Read + Write {}
+    impl<T: Read + Write> FakeIo for T {}
+    type FakeStream = Box<dyn FakeIo + Send>;
+
+    fn socks_tls_carrier(path: Option<&str>) -> Carrier {
+        match path {
+            Some(path) => Carrier::Ws {
+                path: path.to_owned(),
+                ed: 0,
+            },
+            None => Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+        }
+    }
+
+    fn tls_accept_fake(
+        stream: Connection,
+        server_config: &Arc<ferrox_core::tls::TlsServerConfig>,
+        path: Option<&str>,
+    ) -> Option<FakeStream> {
+        use ferrox_core::tls::TlsProvider as _;
+        let mut tls = ferrox_core::tls::accept(server_config, stream).ok()?;
+        tls.handshake().ok()?;
+        let Some(path) = path else {
+            return Some(Box::new(tls));
+        };
+        let out = tls.get_ref().get_ref().try_clone().ok()?;
+        let shared = Arc::new(Mutex::new(tls));
+        let out = Arc::new(Mutex::new(Sealed::new(out)));
+        let reader = TlsHalf::<_, Connection> {
+            session: Arc::clone(&shared),
+            out: Arc::clone(&out),
+            driven: None,
+            sleep_on_timeout: true,
+        };
+        let writer = TlsHalf::<_, Connection> {
+            session: shared,
+            out,
+            driven: None,
+            sleep_on_timeout: true,
+        };
+        let (reader, writer) = crate::ws::accept_split(reader, writer, path)?;
+        Some(Box::new(CarrierStream { reader, writer }))
+    }
+
+    fn serve_fake_socks(stream: &mut FakeStream) -> Option<()> {
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).ok()?;
+        if greeting != [5, 1, 0] {
+            return None;
+        }
+        stream.write_all(&[5, 0]).ok()?;
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head).ok()?;
+        match head[3] {
+            1 => stream.read_exact(&mut [0u8; 6]).ok()?,
+            3 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).ok()?;
+                stream
+                    .read_exact(&mut vec![0u8; len[0] as usize + 2])
+                    .ok()?;
+            }
+            4 => stream.read_exact(&mut [0u8; 18]).ok()?,
+            _ => return None,
+        }
+        stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => {
+                    stream.write_all(&buf[..n]).ok()?;
+                }
+            }
+        }
+    }
+
+    fn socks_tls_over_carrier_reaches_echo(path: Option<&str>) {
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr: SocketAddr = listener.local_addr().expect("addr");
+        let server_path = path.map(str::to_owned);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            let mut tls = tls_accept_fake(stream, &server_config, server_path.as_deref())
+                .expect("tls over carrier");
+            let _ = serve_fake_socks(&mut tls);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relay_path = path.map(str::to_owned);
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let socks = SocksOut {
+                address: "127.0.0.1".to_owned(),
+                port: server_addr.port(),
+                credential: crate::socks::Credential::default(),
+                version: crate::socks::Version::V5,
+                tls: Some(Arc::new(client_config)),
+                carrier: socks_tls_carrier(relay_path.as_deref()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+            };
+            dial_socks_outbound(
+                &client,
+                &Outbound::Socks(socks),
+                &server_addr,
+                &Destination::from(server_addr),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn socks_tls_over_raw_reaches_echo() {
+        socks_tls_over_carrier_reaches_echo(None);
+    }
+
+    #[test]
+    fn socks_tls_over_ws_reaches_echo() {
+        socks_tls_over_carrier_reaches_echo(Some("/w"));
+    }
+
+    fn serve_fake_http_proxy(stream: &mut FakeStream) {
+        let Some((head, at)) = read_exact_head(stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+        else {
+            return;
+        };
+        if stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nboot").is_err() {
+            return;
+        }
+        if at < head.len() && stream.write_all(&head[at..]).is_err() {
+            return;
+        }
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn http_tls_over_carrier_reaches_echo(path: Option<&str>) {
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr: SocketAddr = listener.local_addr().expect("addr");
+        let server_path = path.map(str::to_owned);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            let mut tls = tls_accept_fake(stream, &server_config, server_path.as_deref())
+                .expect("tls over carrier");
+            serve_fake_http_proxy(&mut tls);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relay_path = path.map(str::to_owned);
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let http = HttpOut {
+                address: "127.0.0.1".to_owned(),
+                port: server_addr.port(),
+                tls: Some(Arc::new(client_config)),
+                carrier: socks_tls_carrier(relay_path.as_deref()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+                headers: Vec::new(),
+                user: None,
+                pass: None,
+            };
+            dial_http_outbound(
+                &client,
+                &server_addr,
+                &http,
+                &Destination::from(server_addr),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut early = [0u8; 4];
+        client.read_exact(&mut early).expect("early bytes");
+        assert_eq!(&early, b"boot");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn http_tls_over_raw_reaches_echo() {
+        http_tls_over_carrier_reaches_echo(None);
+    }
+
+    #[test]
+    fn http_tls_over_ws_reaches_echo() {
+        http_tls_over_carrier_reaches_echo(Some("/w"));
+    }
+
     #[test]
     fn an_insecure_dial_speaks_the_whole_session() {
         use ferrox_core::tls::TlsProvider as _;
@@ -43727,6 +44258,24 @@ mod tests {
         relaying.join().expect("joins");
     }
 
+    fn socks_tls_root(stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "socks",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn http_tls_root(stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "http",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
     fn vnext_tls_root(protocol: &str, stream: &str) -> crate::json::Json {
         crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "{protocol}",
@@ -44007,6 +44556,68 @@ mod tests {
             crate::vmess::Cipher::Auto,
             "security none is the reference's auto when the length is authenticated"
         );
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn socks_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("socks-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = socks_tls_root(&stream);
+            let out = find_socks_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            assert!(
+                find_socks_outbound(&socks_tls_root(&stream)).is_none(),
+                "{network}"
+            );
+        }
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "socks",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 443}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_socks_outbound(&plain)
+            .expect("finds plain")
+            .tls
+            .is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn http_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("http-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = http_tls_root(&stream);
+            let out = find_http_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            assert!(
+                find_http_outbound(&http_tls_root(&stream)).is_none(),
+                "{network}"
+            );
+        }
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "http",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 443}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_http_outbound(&plain)
+            .expect("finds plain")
+            .tls
+            .is_none());
         let _ = std::fs::remove_file(&ca);
     }
 
@@ -61492,6 +62103,10 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: proxy,
             tls: None,
+            carrier: Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
             headers: Vec::new(),
             user: None,
             pass: None,
@@ -61797,6 +62412,10 @@ mod tests {
             address: "proxy.example".to_string(),
             port: 8080,
             tls: None,
+            carrier: Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+            host: "proxy.example".to_string(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
             headers: headers
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))

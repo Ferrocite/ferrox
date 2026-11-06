@@ -814,6 +814,18 @@ front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-healthcheck answer-allocations 0 ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating
 front-healthcheck answer-bytes 85 ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating
 
+# --- TLS client from config -------------------------------------------------
+tls-client ops-retired-instructions UNBLESSED scripts/count-ops.sh
+tls-client syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+tls-client relay-staging-copies-per-byte UNBLESSED not measured
+tls-client seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
+tls-client socks-tls-carriers-parsed 6 ferrox-app-proxy::tests::socks_tls_outbound_parses_diallable_carriers
+tls-client http-tls-carriers-parsed 6 ferrox-app-proxy::tests::http_tls_outbound_parses_diallable_carriers
+tls-client socks-tls-raw-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_raw_reaches_echo
+tls-client socks-tls-ws-echo-round-trips 1 ferrox-app-proxy::tests::socks_tls_over_ws_reaches_echo
+tls-client http-tls-raw-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_raw_reaches_echo
+tls-client http-tls-ws-echo-round-trips 1 ferrox-app-proxy::tests::http_tls_over_ws_reaches_echo
+
 # --- Commander gRPC management API ----------------------------------------
 engine-api ops-retired-instructions UNBLESSED scripts/count-ops.sh
 engine-api syscalls-per-api-call UNBLESSED scripts/count-ops.sh

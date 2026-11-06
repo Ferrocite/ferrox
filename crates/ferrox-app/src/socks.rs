@@ -24,6 +24,7 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::time::Instant;
 
 #[cfg(test)]
 use crate::conn::Connection;
@@ -160,26 +161,49 @@ fn write_user_pass<W: Write>(stream: &mut W, user: &[u8], pass: &[u8]) -> Option
     Some(())
 }
 
+/// A handshake read over a session that polls its transport: a timeout is another round, not the end of the exchange.
+fn read_exact_within(stream: &mut impl Read, buf: &mut [u8], until: Instant) -> Option<()> {
+    use std::io::ErrorKind;
+    let mut at = 0;
+    while at < buf.len() {
+        if Instant::now() >= until {
+            return None;
+        }
+        match stream.read(&mut buf[at..]) {
+            Ok(0) => return None,
+            Ok(n) => at += n,
+            Err(error) => match error.kind() {
+                ErrorKind::Interrupted => {}
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                    if Instant::now() >= until {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+        }
+    }
+    Some(())
+}
+
 /// Consume the bound address a granted reply carries, without owning it: a TCP tunnel
 /// uses nothing the server bound, so the bytes are read to put the stream at the first
 /// tunnel octet and no `Vec` or `String` is built for a name that is then dropped.
-fn skip_bound<R: Read>(stream: &mut R, atyp: u8) -> Option<()> {
+fn skip_bound<R: Read>(stream: &mut R, atyp: u8, until: Instant) -> Option<()> {
     match atyp {
         socks::ATYP_IPV4 => {
             let mut body = [0u8; 6];
-            stream.read_exact(&mut body).ok()?;
+            read_exact_within(stream, &mut body, until)?;
         }
         socks::ATYP_IPV6 => {
             let mut body = [0u8; 18];
-            stream.read_exact(&mut body).ok()?;
+            read_exact_within(stream, &mut body, until)?;
         }
         socks::ATYP_DOMAIN => {
             let mut len = [0u8; 1];
-            stream.read_exact(&mut len).ok()?;
+            read_exact_within(stream, &mut len, until)?;
             let mut body = [0u8; 257];
-            stream
-                .read_exact(&mut body[..usize::from(len[0]) + 2])
-                .ok()?;
+            read_exact_within(stream, &mut body[..usize::from(len[0]) + 2], until)?;
         }
         _ => return None,
     }
@@ -198,6 +222,7 @@ enum Bound {
 /// A SOCKS5 client session over one connection.
 pub(crate) struct Session<S> {
     stream: S,
+    until: Instant,
 }
 
 impl<S: Read + Write> Session<S> {
@@ -208,12 +233,13 @@ impl<S: Read + Write> Session<S> {
     /// A server that answers a method this session cannot serve is refused: the pinned Go
     /// client refuses it too (`"auth method not supported."`).
     pub(crate) fn open(mut stream: S, credential: &Credential) -> Option<Self> {
+        let until = Instant::now() + crate::budgets::handshake();
         let offered = credential.method()?;
         stream
             .write_all(&socks::greeting(offered == socks::METHOD_USER))
             .ok()?;
         let mut method = [0u8; 2];
-        stream.read_exact(&mut method).ok()?;
+        read_exact_within(&mut stream, &mut method, until)?;
         if method[0] != socks::VERSION || method[1] != offered {
             return None;
         }
@@ -224,12 +250,12 @@ impl<S: Read + Write> Session<S> {
                 credential.pass.as_bytes(),
             )?;
             let mut status = [0u8; 2];
-            stream.read_exact(&mut status).ok()?;
+            read_exact_within(&mut stream, &mut status, until)?;
             if status[0] != socks::AUTH_VERSION || status[1] != 0 {
                 return None;
             }
         }
-        Some(Self { stream })
+        Some(Self { stream, until })
     }
 
     /// Send a request and wait for the reply's head, returning the address type byte.
@@ -241,7 +267,7 @@ impl<S: Read + Write> Session<S> {
     fn send(&mut self, cmd: u8, destination: &Destination<'_>) -> Option<u8> {
         write_request(&mut self.stream, cmd, destination)?;
         let mut head = [0u8; 4];
-        self.stream.read_exact(&mut head).ok()?;
+        read_exact_within(&mut self.stream, &mut head, self.until)?;
         if head[0] != socks::VERSION || head[1] != 0 {
             return None;
         }
@@ -260,7 +286,7 @@ impl<S: Read + Write> Session<S> {
         match atyp {
             socks::ATYP_IPV4 => {
                 let mut body = [0u8; 6];
-                self.stream.read_exact(&mut body).ok()?;
+                read_exact_within(&mut self.stream, &mut body, self.until)?;
                 let mut octets = [0u8; 4];
                 octets.copy_from_slice(&body[..4]);
                 Some(Bound::Ip(SocketAddr::from((
@@ -270,7 +296,7 @@ impl<S: Read + Write> Session<S> {
             }
             socks::ATYP_IPV6 => {
                 let mut body = [0u8; 18];
-                self.stream.read_exact(&mut body).ok()?;
+                read_exact_within(&mut self.stream, &mut body, self.until)?;
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&body[..16]);
                 Some(Bound::Ip(SocketAddr::from((
@@ -280,10 +306,10 @@ impl<S: Read + Write> Session<S> {
             }
             socks::ATYP_DOMAIN => {
                 let mut len = [0u8; 1];
-                self.stream.read_exact(&mut len).ok()?;
+                read_exact_within(&mut self.stream, &mut len, self.until)?;
                 let name_len = usize::from(len[0]);
                 let mut body = vec![0u8; name_len + 2];
-                self.stream.read_exact(&mut body).ok()?;
+                read_exact_within(&mut self.stream, &mut body, self.until)?;
                 let name = String::from_utf8_lossy(&body[..name_len]).into_owned();
                 let port = u16::from_be_bytes([body[name_len], body[name_len + 1]]);
                 Some(Bound::Name(name, port))
@@ -298,7 +324,7 @@ impl<S: Read + Write> Session<S> {
     /// but its octets are read so the stream sits where the tunnel begins.
     fn connect(&mut self, destination: &Destination<'_>) -> Option<()> {
         let atyp = self.send(socks::CMD_CONNECT, destination)?;
-        skip_bound(&mut self.stream, atyp)?;
+        skip_bound(&mut self.stream, atyp, self.until)?;
         Some(())
     }
 
@@ -321,7 +347,10 @@ impl<S: Read + Write> Session<S> {
     /// Open a SOCKS4 session: there is no greeting and no method to negotiate, so the
     /// request is the first thing on the wire.
     pub(crate) fn open4(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            until: Instant::now() + crate::budgets::handshake(),
+        }
     }
 
     /// The SOCKS4 request: the version, the command, the port, the address, the user
@@ -352,7 +381,7 @@ impl<S: Read + Write> Session<S> {
             self.stream.write_all(&request[..total]).ok()?;
         }
         let mut reply = [0u8; 8];
-        self.stream.read_exact(&mut reply).ok()?;
+        read_exact_within(&mut self.stream, &mut reply, self.until)?;
         if reply[1] != socks::REPLY4_GRANTED {
             return None;
         }
@@ -497,6 +526,49 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// A transport that polls: the first reads answer `WouldBlock` and the script is not consumed until they stop.
+    struct Polled {
+        inner: Script,
+        polls: usize,
+    }
+
+    impl Read for Polled {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.polls > 0 {
+                self.polls -= 1;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for Polled {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// A polled transport's timeout is another round: a handshake that reads once would fail here.
+    #[test]
+    fn a_handshake_read_waits_out_a_polled_transport() {
+        let reply = vec![5, 0, 5, 0, 0, 1, 127, 0, 0, 1, 0, 0];
+        let mut stream = Polled {
+            inner: Script::new(reply),
+            polls: 3,
+        };
+        assert!(connect(
+            &mut stream,
+            &Credential::default(),
+            &Destination::V4([127, 0, 0, 1], 80),
+            Version::V5,
+        )
+        .is_some());
     }
 
     #[test]
