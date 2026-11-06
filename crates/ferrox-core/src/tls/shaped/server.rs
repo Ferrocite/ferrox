@@ -219,7 +219,7 @@ pub(crate) struct Server<S: Stream> {
     phase: Phase,
     client_random: [u8; 32],
     ems: bool,
-    server_random: [u8; 32],
+    own_random: [u8; 32],
     share: Option<keys::Share>,
     master: Option<Vec<u8>>,
 }
@@ -249,7 +249,7 @@ impl<S: Stream> Server<S> {
             phase: Phase::Hello,
             client_random: [0u8; 32],
             ems: false,
-            server_random: [0u8; 32],
+            own_random: [0u8; 32],
             share: None,
             master: None,
         }
@@ -278,150 +278,165 @@ impl<S: Stream> Server<S> {
 
     fn run(&mut self) -> Result<(), TlsError> {
         if self.phase == Phase::Hello {
-            let hello_message = self.next_plain(1)?;
-            let hello = Hello::parse(&hello_message[4..])?;
-            hello.tls12()?;
-            self.sni = hello.sni.as_ref().map(|name| name.as_bytes().to_vec());
-
-            let cert = self.pick_cert(hello.sni.as_deref())?;
-            let key = PKey::private_key_from_der(&self.cfg.certs[cert].key_der)
-                .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
-            let rsa = key.rsa().is_ok();
-            let suite_id = crate::tls::cipher_suites::server_pick(
-                &self.cfg.cipher_suites,
-                &hello.ciphers,
-                crate::tls::cipher_suites::aesgcm_preferred(&hello.ciphers),
-                |id| ecdsa(id) != rsa,
-            )
-            .ok_or(TlsError::NoSharedCipher)?;
-            let suite = Suite::from_id(suite_id)
-                .filter(|suite| !suite.is_tls13())
-                .ok_or(TlsError::NoSharedCipher)?;
-            self.key = Some(key);
-            self.suite = Some(suite_id);
-            self.alpn = pick_alpn(&self.cfg.alpn, &hello.alpn);
-
-            let mut random = [0u8; 32];
-            SystemRandom::new()
-                .fill(&mut random)
-                .map_err(|_| TlsError::Other("server random".to_owned()))?;
-
-            let share = if suite.is_rsa() {
-                None
-            } else {
-                let group = CURVES
-                    .iter()
-                    .copied()
-                    .find(|group| hello.groups.is_empty() || hello.groups.contains(group))
-                    .ok_or(TlsError::NoSharedCipher)?;
-                let mut shares = keys::generate(&[group], false)
-                    .map_err(|why| TlsError::Other(format!("server share: {why}")))?;
-                Some(shares.pop().ok_or(TlsError::NoSharedCipher)?)
-            };
-
-            let mut flight = self.server_hello(&hello, suite_id, &random, share.is_some());
-            let mut transcript = Vec::new();
-            transcript.extend_from_slice(&hello_message);
-            transcript.extend_from_slice(&flight);
-            let certificate = certificate_message(&self.cfg.certs[cert].cert_chain);
-            transcript.extend_from_slice(&certificate);
-            flight.extend_from_slice(&certificate);
-            if let Some(share) = &share {
-                let exchange = self.key_exchange(&hello, share, &random)?;
-                transcript.extend_from_slice(&exchange);
-                flight.extend_from_slice(&exchange);
-            }
-            let done = message(14, &[]);
-            transcript.extend_from_slice(&done);
-            flight.extend_from_slice(&done);
-            self.write_plain(HANDSHAKE, &flight)?;
-
-            self.transcript = transcript;
-            self.client_random = hello.random;
-            self.ems = hello.ems;
-            self.server_random = random;
-            self.share = share;
-            self.phase = Phase::KeyExchange;
+            self.run_hello()?;
         }
-
         if self.phase == Phase::KeyExchange {
-            let suite = self
-                .suite
-                .and_then(Suite::from_id)
-                .ok_or(TlsError::NoSharedCipher)?;
-            let cke = self.next_plain(16)?;
-            self.transcript.extend_from_slice(&cke);
-            let pre_master = match self.share.take() {
-                Some(share) => {
-                    let mut r = Reader::new(&cke[4..]);
-                    let peer = r.vec8()?;
-                    share
-                        .agree(peer)
-                        .map_err(|why| TlsError::Other(format!("server agree: {why}")))?
-                }
-                None => self.rsa_pre_master(&cke[4..])?,
-            };
-            let session_hash = self.ems.then(|| suite.hash().hash(&self.transcript));
-            let (master, directions) = tls12::keys(
-                suite,
-                &pre_master,
-                &self.client_random,
-                &self.server_random,
-                session_hash.as_deref(),
-            );
-            if let Some(log) = &self.cfg.master_key_log {
-                rustls::KeyLog::log(log.as_ref(), "CLIENT_RANDOM", &self.client_random, &master);
-            }
-            self.read = Some(directions.client);
-            self.write = Some(directions.server);
-            self.master = Some(master);
-            self.phase = Phase::Ccs;
+            self.run_key_exchange()?;
         }
-
         if self.phase == Phase::Ccs {
             self.expect_ccs()?;
             self.phase = Phase::Finished;
         }
-
         if self.phase == Phase::Finished {
-            let finished = self.next_encrypted(20)?;
-            let expected = {
-                let suite = self
-                    .suite
-                    .and_then(Suite::from_id)
-                    .ok_or(TlsError::NoSharedCipher)?;
-                let master = self
-                    .master
-                    .as_ref()
-                    .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
-                tls12::finished(suite, master, b"client finished", &self.transcript)
-            };
-            if finished[4..] != expected[..] {
-                return Err(TlsError::Other("client Finished did not verify".to_owned()));
-            }
-            self.transcript.extend_from_slice(&finished);
-            self.phase = Phase::ServerFinished;
+            self.run_finished()?;
         }
-
         if self.phase == Phase::ServerFinished {
-            let verify = {
-                let suite = self
-                    .suite
-                    .and_then(Suite::from_id)
-                    .ok_or(TlsError::NoSharedCipher)?;
-                let master = self
-                    .master
-                    .as_ref()
-                    .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
-                tls12::finished(suite, master, b"server finished", &self.transcript)
-            };
-            self.write_plain(CCS, &[1])?;
-            let done = message(20, &verify);
-            self.write_encrypted(HANDSHAKE, &done)?;
-            self.transcript.extend_from_slice(&done);
-            self.phase = Phase::Done;
+            self.run_server_finished()?;
         }
+        Ok(())
+    }
 
+    fn run_hello(&mut self) -> Result<(), TlsError> {
+        let hello_message = self.next_plain(1)?;
+        let hello = Hello::parse(&hello_message[4..])?;
+        hello.tls12()?;
+        self.sni = hello.sni.as_ref().map(|name| name.as_bytes().to_vec());
+
+        let cert = self.pick_cert(hello.sni.as_deref())?;
+        let key = PKey::private_key_from_der(&self.cfg.certs[cert].key_der)
+            .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
+        let rsa = key.rsa().is_ok();
+        let suite_id = crate::tls::cipher_suites::server_pick(
+            &self.cfg.cipher_suites,
+            &hello.ciphers,
+            crate::tls::cipher_suites::aesgcm_preferred(&hello.ciphers),
+            |id| ecdsa(id) != rsa,
+        )
+        .ok_or(TlsError::NoSharedCipher)?;
+        let suite = Suite::from_id(suite_id)
+            .filter(|suite| !suite.is_tls13())
+            .ok_or(TlsError::NoSharedCipher)?;
+        self.key = Some(key);
+        self.suite = Some(suite_id);
+        self.alpn = pick_alpn(&self.cfg.alpn, &hello.alpn);
+
+        let mut random = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| TlsError::Other("server random".to_owned()))?;
+
+        let share = if suite.is_rsa() {
+            None
+        } else {
+            let group = CURVES
+                .iter()
+                .copied()
+                .find(|group| hello.groups.is_empty() || hello.groups.contains(group))
+                .ok_or(TlsError::NoSharedCipher)?;
+            let mut shares = keys::generate(&[group], false)
+                .map_err(|why| TlsError::Other(format!("server share: {why}")))?;
+            Some(shares.pop().ok_or(TlsError::NoSharedCipher)?)
+        };
+
+        let mut flight = self.server_hello(&hello, suite_id, &random, share.is_some());
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(&hello_message);
+        transcript.extend_from_slice(&flight);
+        let certificate = certificate_message(&self.cfg.certs[cert].cert_chain);
+        transcript.extend_from_slice(&certificate);
+        flight.extend_from_slice(&certificate);
+        if let Some(share) = &share {
+            let exchange = self.key_exchange(&hello, share, &random)?;
+            transcript.extend_from_slice(&exchange);
+            flight.extend_from_slice(&exchange);
+        }
+        let done = message(14, &[]);
+        transcript.extend_from_slice(&done);
+        flight.extend_from_slice(&done);
+        self.write_plain(HANDSHAKE, &flight)?;
+
+        self.transcript = transcript;
+        self.client_random = hello.random;
+        self.ems = hello.ems;
+        self.own_random = random;
+        self.share = share;
+        self.phase = Phase::KeyExchange;
+        Ok(())
+    }
+
+    fn run_key_exchange(&mut self) -> Result<(), TlsError> {
+        let suite = self
+            .suite
+            .and_then(Suite::from_id)
+            .ok_or(TlsError::NoSharedCipher)?;
+        let cke = self.next_plain(16)?;
+        self.transcript.extend_from_slice(&cke);
+        let pre_master = match self.share.take() {
+            Some(share) => {
+                let mut r = Reader::new(&cke[4..]);
+                let peer = r.vec8()?;
+                share
+                    .agree(peer)
+                    .map_err(|why| TlsError::Other(format!("server agree: {why}")))?
+            }
+            None => self.rsa_pre_master(&cke[4..])?,
+        };
+        let session_hash = self.ems.then(|| suite.hash().hash(&self.transcript));
+        let (master, directions) = tls12::keys(
+            suite,
+            &pre_master,
+            &self.client_random,
+            &self.own_random,
+            session_hash.as_deref(),
+        );
+        if let Some(log) = &self.cfg.master_key_log {
+            rustls::KeyLog::log(log.as_ref(), "CLIENT_RANDOM", &self.client_random, &master);
+        }
+        self.read = Some(directions.client);
+        self.write = Some(directions.server);
+        self.master = Some(master);
+        self.phase = Phase::Ccs;
+        Ok(())
+    }
+
+    fn run_finished(&mut self) -> Result<(), TlsError> {
+        let finished = self.next_encrypted(20)?;
+        let expected = {
+            let suite = self
+                .suite
+                .and_then(Suite::from_id)
+                .ok_or(TlsError::NoSharedCipher)?;
+            let master = self
+                .master
+                .as_ref()
+                .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
+            tls12::finished(suite, master, b"client finished", &self.transcript)
+        };
+        if finished[4..] != expected[..] {
+            return Err(TlsError::Other("client Finished did not verify".to_owned()));
+        }
+        self.transcript.extend_from_slice(&finished);
+        self.phase = Phase::ServerFinished;
+        Ok(())
+    }
+
+    fn run_server_finished(&mut self) -> Result<(), TlsError> {
+        let verify = {
+            let suite = self
+                .suite
+                .and_then(Suite::from_id)
+                .ok_or(TlsError::NoSharedCipher)?;
+            let master = self
+                .master
+                .as_ref()
+                .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
+            tls12::finished(suite, master, b"server finished", &self.transcript)
+        };
+        self.write_plain(CCS, &[1])?;
+        let done = message(20, &verify);
+        self.write_encrypted(HANDSHAKE, &done)?;
+        self.transcript.extend_from_slice(&done);
+        self.phase = Phase::Done;
         Ok(())
     }
 
