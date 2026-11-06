@@ -2108,11 +2108,14 @@ impl Session {
     }
     /// The 200 an H1 POST owes: written by whichever half ends the session, so the POST keeps no thread.
     fn defer_response(&self, response: Box<dyn FnOnce() + Send>) {
-        let deadline = std::time::Instant::now()
+        let at = std::time::Instant::now()
             .checked_add(crate::budgets::relay_stall())
             .unwrap_or_else(std::time::Instant::now);
+        self.defer_response_at(at, response);
+    }
+    fn defer_response_at(&self, at: std::time::Instant, response: Box<dyn FnOnce() + Send>) {
         let mut response = Some(DeferredResponse {
-            at: deadline,
+            at,
             write: response,
         });
         let stored = {
@@ -5511,15 +5514,14 @@ mod tests {
 
     #[test]
     fn a_stream_up_session_with_no_downlink_writes_its_deferred_answer() {
-        crate::budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(std::time::Duration::from_millis(100)),
-            ..Default::default()
-        });
         let session = get_or_create_session("post-only-answer");
         let (sent_tx, sent_rx) = std::sync::mpsc::channel();
-        session.defer_response(Box::new(move || {
-            let _ = sent_tx.send(());
-        }));
+        session.defer_response_at(
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+            Box::new(move || {
+                let _ = sent_tx.send(());
+            }),
+        );
         sent_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the deferred answer is written when the session expires");
@@ -5530,7 +5532,6 @@ mod tests {
                 .contains_key("post-only-answer"),
             "the idle session is removed"
         );
-        crate::budgets::clear();
     }
 
     #[test]
