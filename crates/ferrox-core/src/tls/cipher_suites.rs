@@ -144,6 +144,52 @@ pub fn field_bytes(ids: &[u16]) -> Vec<u8> {
     bytes
 }
 
+/// The suites neither ring nor the legacy lane carries on either role.
+const SHAPED_ONLY: [u16; 5] = [0x003c, 0xc012, 0x0005, 0xc007, 0xc011];
+
+pub(crate) fn shaped_only(id: u16) -> bool {
+    SHAPED_ONLY.contains(&id)
+}
+
+/// Whether a listener's derived suite list and version window leave the shaped engine the only
+/// one that can serve: a shaped-only id, and a ceiling the reference would keep at TLS 1.2.
+pub(crate) fn shaped_server(ids: &[u16], min: Option<u16>, max: Option<u16>) -> bool {
+    min.unwrap_or(V12) <= V12 && max.unwrap_or(V13) <= V12 && ids.iter().any(|&id| shaped_only(id))
+}
+
+/// `crypto/tls`'s `aesgcmPreferred`: the `AES-GCM` flag of the first known suite the client lists,
+/// which moves a server to the `NoAES` order when a `ChaCha` or CBC suite leads.
+pub(crate) fn aesgcm_preferred(client: &[u16]) -> bool {
+    const AES: [u16; 8] = [
+        0x1301, 0x1302, 0xc02b, 0xc02c, 0xc02f, 0xc030, 0x009c, 0x009d,
+    ];
+    for &id in client {
+        if AES.contains(&id) {
+            return true;
+        }
+        if SUITES.iter().any(|&(_, known)| known == id) {
+            return false;
+        }
+    }
+    false
+}
+
+/// `crypto/tls`'s `pickCipherSuite` and `selectCipherSuite`: the global preference order
+/// restricted to the configured list, then the first id the client offered that the certificate
+/// can key.
+pub(crate) fn server_pick(
+    configured: &[u16],
+    client: &[u16],
+    aes: bool,
+    key_ok: impl Fn(u16) -> bool,
+) -> Option<u16> {
+    let order = if aes { PREF_AES } else { PREF_NOAES };
+    order
+        .iter()
+        .copied()
+        .find(|id| configured.contains(id) && client.contains(id) && key_ok(*id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

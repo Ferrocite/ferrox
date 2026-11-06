@@ -16925,7 +16925,7 @@ impl Drivable
     for ferrox_core::tls::RustlsServerProvider<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
     fn transport(&self) -> Option<Connection> {
-        if self.is_boring() {
+        if self.owns_transport() {
             return None;
         }
         self.get_ref().get_ref().try_clone().ok()

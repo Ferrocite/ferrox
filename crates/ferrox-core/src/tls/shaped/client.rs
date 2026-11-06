@@ -10,13 +10,13 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const HANDSHAKE: u8 = 22;
+pub(crate) const HANDSHAKE: u8 = 22;
 const ALERT: u8 = 21;
-const CCS: u8 = 20;
-const APPLICATION: u8 = 23;
-const MAX_RECORD: usize = 16384 + 256;
+pub(crate) const CCS: u8 = 20;
+pub(crate) const APPLICATION: u8 = 23;
+pub(crate) const MAX_RECORD: usize = 16384 + 256;
 const RECORD_READ: usize = 16384;
-const MAX_HANDSHAKE: usize = 1 << 20;
+pub(crate) const MAX_HANDSHAKE: usize = 1 << 20;
 const MAX_PLAINTEXT: usize = 16384;
 /// How long a shaped handshake may spend waiting for its peer, matching the KCP path's read deadline.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1210,40 +1210,15 @@ impl<S: Stream> Session<S> {
         if !self.reply.is_empty() {
             out.append(&mut self.reply);
         }
-        if !parts.is_empty()
-            && parts.iter().all(|part| !part.is_empty())
-            && parts.iter().map(|part| part.len()).sum::<usize>() <= MAX_PLAINTEXT
-        {
-            return self.seal_chunk(parts, out);
-        }
-        let mut chunk: Vec<&[u8]> = Vec::new();
-        let mut held = 0usize;
-        for part in parts {
-            let mut rest = *part;
-            while !rest.is_empty() {
-                let room = MAX_PLAINTEXT - held;
-                if rest.len() <= room {
-                    chunk.push(rest);
-                    held += rest.len();
-                    if held == MAX_PLAINTEXT {
-                        self.seal_chunk(&chunk, out)?;
-                        chunk.clear();
-                        held = 0;
-                    }
-                    break;
-                }
-                let (lead, tail) = rest.split_at(room);
-                chunk.push(lead);
-                self.seal_chunk(&chunk, out)?;
-                chunk.clear();
-                held = 0;
-                rest = tail;
-            }
-        }
-        if !chunk.is_empty() {
-            self.seal_chunk(&chunk, out)?;
-        }
-        Ok(())
+        let version = self.version;
+        let keys = self
+            .write_key
+            .as_mut()
+            .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
+        seal_chunks(parts, out, |chunk, out| match version {
+            Some(Version::Tls12) => record::seal12_parts(keys, APPLICATION, chunk, out),
+            _ => record::seal13_parts(keys, APPLICATION, chunk, out),
+        })
     }
 
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
@@ -1258,17 +1233,6 @@ impl<S: Stream> Session<S> {
         sent
     }
 
-    fn seal_chunk(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
-        let keys = self
-            .write_key
-            .as_mut()
-            .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-        match self.version {
-            Some(Version::Tls12) => record::seal12_parts(keys, APPLICATION, parts, out),
-            _ => record::seal13_parts(keys, APPLICATION, parts, out),
-        }
-    }
-
     fn flush_reply(&mut self) -> std::io::Result<()> {
         if !self.reply.is_empty() {
             self.io.write_all(&self.reply)?;
@@ -1276,6 +1240,49 @@ impl<S: Stream> Session<S> {
         }
         Ok(())
     }
+}
+
+/// The chunks a frame seals into: one record while the whole frame fits the record's plaintext
+/// budget, and a split at the budget otherwise, so a gathered write keeps its one-record shape.
+pub(crate) fn seal_chunks(
+    parts: &[&[u8]],
+    out: &mut Vec<u8>,
+    mut seal: impl FnMut(&[&[u8]], &mut Vec<u8>) -> Result<(), TlsError>,
+) -> Result<(), TlsError> {
+    if !parts.is_empty()
+        && parts.iter().all(|part| !part.is_empty())
+        && parts.iter().map(|part| part.len()).sum::<usize>() <= MAX_PLAINTEXT
+    {
+        return seal(parts, out);
+    }
+    let mut chunk: Vec<&[u8]> = Vec::new();
+    let mut held = 0usize;
+    for part in parts {
+        let mut rest = *part;
+        while !rest.is_empty() {
+            let room = MAX_PLAINTEXT - held;
+            if rest.len() <= room {
+                chunk.push(rest);
+                held += rest.len();
+                if held == MAX_PLAINTEXT {
+                    seal(&chunk, out)?;
+                    chunk.clear();
+                    held = 0;
+                }
+                break;
+            }
+            let (lead, tail) = rest.split_at(room);
+            chunk.push(lead);
+            seal(&chunk, out)?;
+            chunk.clear();
+            held = 0;
+            rest = tail;
+        }
+    }
+    if !chunk.is_empty() {
+        seal(&chunk, out)?;
+    }
+    Ok(())
 }
 
 impl<S: Stream> TlsProvider for Session<S> {
@@ -1489,21 +1496,21 @@ fn encrypted_extensions(body: &[u8]) -> Result<Option<Vec<u8>>, TlsError> {
     Ok(None)
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.at >= self.bytes.len()
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], TlsError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], TlsError> {
         let end = self
             .at
             .checked_add(n)
@@ -1514,32 +1521,32 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    fn u8(&mut self) -> Result<u8, TlsError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, TlsError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, TlsError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, TlsError> {
         let bytes = self.take(2)?;
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
-    fn u24(&mut self) -> Result<usize, TlsError> {
+    pub(crate) fn u24(&mut self) -> Result<usize, TlsError> {
         let bytes = self.take(3)?;
         Ok(u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]) as usize)
     }
 
-    fn vec8(&mut self) -> Result<&'a [u8], TlsError> {
+    pub(crate) fn vec8(&mut self) -> Result<&'a [u8], TlsError> {
         let len = usize::from(self.u8()?);
         self.take(len)
     }
 
-    fn vec16(&mut self) -> Result<&'a [u8], TlsError> {
+    pub(crate) fn vec16(&mut self) -> Result<&'a [u8], TlsError> {
         let len = usize::from(self.u16()?);
         self.take(len)
     }
 
     /// A three-byte length prefix, as a certificate list carries.
-    fn vec24(&mut self) -> Result<&'a [u8], TlsError> {
+    pub(crate) fn vec24(&mut self) -> Result<&'a [u8], TlsError> {
         let len = self.u24()?;
         self.take(len)
     }
@@ -1838,7 +1845,7 @@ fn rsa_exchange(leaf: &[u8]) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     Ok((secret, exchange))
 }
 
-fn message(kind: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn message(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(kind);
     out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
