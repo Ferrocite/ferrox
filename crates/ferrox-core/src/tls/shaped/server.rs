@@ -659,7 +659,7 @@ impl<S: Stream> Server<S> {
             self.rec.resize(5, 0);
             while self.rec_have < 5 {
                 let read = match self.io.read(&mut self.rec[self.rec_have..5]) {
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     result => result?,
                 };
                 if read == 0 {
