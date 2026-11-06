@@ -21421,6 +21421,21 @@ fn dial_socks_tls_client(
     let Some(cfg) = socks.tls.as_ref() else {
         return;
     };
+    if matches!(socks.carrier, Carrier::Kcp(_)) {
+        let Some(conn) = kcp_dial_session(&socks.carrier, &socks.address, socks.port) else {
+            return;
+        };
+        let Some(session) = kcp_tls_connect(&conn, cfg) else {
+            return;
+        };
+        let Some(tunnel) =
+            crate::socks::connect(session, &socks.credential, destination, socks.version)
+        else {
+            return;
+        };
+        relay_kcp_under(client, &conn, tunnel, &[], |_| true);
+        return;
+    }
     if matches!(socks.carrier, Carrier::Raw(_)) {
         let Some(session) = dial_tls_session(server, cfg, socks.carrier.tcp_mask()) else {
             return;
@@ -25812,6 +25827,24 @@ fn dial_http_outbound(
     }
 
     if let Some(cfg) = http.tls.as_deref() {
+        if matches!(http.carrier, Carrier::Kcp(_)) {
+            let Some(conn) = kcp_dial_session(&http.carrier, &http.address, http.port) else {
+                return;
+            };
+            let Some(session) = kcp_tls_connect(&conn, cfg) else {
+                return;
+            };
+            do_connect(
+                client,
+                session,
+                http,
+                target,
+                move |stream, downstream, _| {
+                    relay_kcp_under(&downstream, &conn, stream, &[], |_| true);
+                },
+            );
+            return;
+        }
         if matches!(http.carrier, Carrier::Raw(_)) {
             let Some(session) = dial_tls_session(server, cfg, http.carrier.tcp_mask()) else {
                 return;
@@ -34562,7 +34595,7 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
             })
             .unwrap_or_default();
         let (carrier, host, tls) = if stream_security(outbound) == "tls" {
-            let Some((c, h, t)) = tls_parts(outbound, &address) else {
+            let Some((c, h, t)) = tls_carried_parts(outbound, &address) else {
                 continue;
             };
             (c, h, Some(t))
@@ -35056,7 +35089,7 @@ fn find_http_outbound(root: &Json) -> Option<HttpOut> {
             let port = server.get("port").and_then(Json::as_port)?;
             let security = stream_security(outbound);
             let (carrier, host, tls) = if security == "tls" {
-                let Some((c, h, t)) = tls_parts(outbound, &address) else {
+                let Some((c, h, t)) = tls_carried_parts(outbound, &address) else {
                     continue;
                 };
                 (c, h, Some(t))
@@ -43344,37 +43377,95 @@ mod tests {
         Some(Box::new(CarrierStream { reader, writer }))
     }
 
+    fn kcp_tls_serve(
+        server_config: Arc<ferrox_core::tls::TlsServerConfig>,
+        serve: impl FnOnce(&mut FakeStream) + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+        use ferrox_core::tls::TlsProvider as _;
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            let Ok(mut tls) =
+                ferrox_core::tls::accept(&server_config, KcpIo::new(Arc::clone(&conn)))
+            else {
+                return;
+            };
+            if tls.handshake().is_err() {
+                return;
+            }
+            let mut stream: FakeStream = Box::new(tls);
+            serve(&mut stream);
+            let _ = wait.recv();
+        });
+        (port, done, server)
+    }
+
+    fn read_exact_stream(stream: &mut FakeStream, mut buf: &mut [u8]) -> Option<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !buf.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            match stream.read(buf) {
+                Ok(0) => return None,
+                Ok(read) => buf = &mut buf[read..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return None,
+            }
+        }
+        Some(())
+    }
+
     fn serve_fake_socks(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => return None,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return None,
+                Ok(read) => {
+                    stream.write_all(&buf[..read]).ok()?;
+                }
+            }
+        }
+    }
+
+    fn serve_fake_socks_once(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
+    fn socks_grant(stream: &mut FakeStream) -> Option<()> {
         let mut greeting = [0u8; 3];
-        stream.read_exact(&mut greeting).ok()?;
+        read_exact_stream(stream, &mut greeting)?;
         if greeting != [5, 1, 0] {
             return None;
         }
         stream.write_all(&[5, 0]).ok()?;
         let mut head = [0u8; 4];
-        stream.read_exact(&mut head).ok()?;
+        read_exact_stream(stream, &mut head)?;
         match head[3] {
-            1 => stream.read_exact(&mut [0u8; 6]).ok()?,
+            1 => read_exact_stream(stream, &mut [0u8; 6])?,
             3 => {
                 let mut len = [0u8; 1];
-                stream.read_exact(&mut len).ok()?;
-                stream
-                    .read_exact(&mut vec![0u8; len[0] as usize + 2])
-                    .ok()?;
+                read_exact_stream(stream, &mut len)?;
+                read_exact_stream(stream, &mut vec![0u8; len[0] as usize + 2])?;
             }
-            4 => stream.read_exact(&mut [0u8; 18]).ok()?,
+            4 => read_exact_stream(stream, &mut [0u8; 18])?,
             _ => return None,
         }
         stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
-        let mut buf = [0u8; 1024];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => {
-                    stream.write_all(&buf[..n]).ok()?;
-                }
-            }
-        }
+        Some(())
     }
 
     fn socks_tls_over_carrier_reaches_echo(path: Option<&str>) {
@@ -43459,6 +43550,18 @@ mod tests {
         }
     }
 
+    fn serve_fake_http_proxy_once(stream: &mut FakeStream) -> Option<()> {
+        let (head, at) = read_exact_head(stream, HTTP_HEAD_LIMIT, budgets::head_arrival())?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nboot").ok()?;
+        if at < head.len() {
+            stream.write_all(&head[at..]).ok()?;
+        }
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
     fn http_tls_over_carrier_reaches_echo(path: Option<&str>) {
         let (server_config, client_config) = carried_tls_configs();
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -43520,6 +43623,97 @@ mod tests {
     #[test]
     fn http_tls_over_ws_reaches_echo() {
         http_tls_over_carrier_reaches_echo(Some("/w"));
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_reaches_echo() {
+        let (server_config, client_config) = carried_tls_configs();
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, |stream| {
+            let _ = serve_fake_socks_once(stream);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let socks = SocksOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                credential: crate::socks::Credential::default(),
+                version: crate::socks::Version::V5,
+                tls: Some(Arc::new(client_config)),
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+            };
+            let server_addr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Socks(socks),
+                &server_addr,
+                &Destination::from(server_addr),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        let _ = done.send(());
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn http_tls_over_kcp_reaches_echo() {
+        let (server_config, client_config) = carried_tls_configs();
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, |stream| {
+            let _ = serve_fake_http_proxy_once(stream);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let http = HttpOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                tls: Some(Arc::new(client_config)),
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+                headers: Vec::new(),
+                user: None,
+                pass: None,
+            };
+            let server_addr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+            dial_http_outbound(
+                &client,
+                &server_addr,
+                &http,
+                &Destination::from(server_addr),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut early = [0u8; 4];
+        client.read_exact(&mut early).expect("early bytes");
+        assert_eq!(&early, b"boot");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        let _ = done.send(());
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
     }
 
     #[test]
@@ -45012,6 +45206,12 @@ mod tests {
                 ),
             ),
             (
+                "kcp".to_owned(),
+                format!(
+                    r#""network": "kcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
                 "ws".to_owned(),
                 format!(
                     r#""network": "ws", "security": "tls", "wsSettings": {{"path": "/w"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
@@ -45052,6 +45252,7 @@ mod tests {
             Carrier::Grpc(_) => "grpc",
             Carrier::Xhttp { .. } => "xhttp",
             Carrier::HttpHeader { .. } => "httpheader",
+            Carrier::Kcp(_) => "kcp",
             _ => "other",
         }
     }
@@ -45275,7 +45476,7 @@ mod tests {
             assert_eq!(carrier_tag(&out.carrier), want, "{want}");
             assert!(out.tls.is_some(), "{want}");
         }
-        for network in ["quic", "kcp", "hysteria"] {
+        for network in ["quic", "hysteria"] {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
@@ -45306,7 +45507,7 @@ mod tests {
             assert_eq!(carrier_tag(&out.carrier), want, "{want}");
             assert!(out.tls.is_some(), "{want}");
         }
-        for network in ["quic", "kcp", "hysteria"] {
+        for network in ["quic", "hysteria"] {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
