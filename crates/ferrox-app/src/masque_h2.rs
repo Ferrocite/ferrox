@@ -20,6 +20,7 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_ROOM: usize = 16 * 1024;
 const PREFACE: usize = 24;
 const SETTINGS_INITIAL_WINDOW: u16 = 0x4;
@@ -448,6 +449,7 @@ pub(crate) struct Client {
     routes: Option<UdpRoutes>,
     warp: bool,
     end: bool,
+    last_frame: Instant,
 }
 
 /// An edge still binding refuses the first dial the way a QUIC handshake loses it, so a refused dial is retried for a second.
@@ -541,6 +543,7 @@ fn handshake(
         routes: None,
         warp: warp.is_some(),
         end: false,
+        last_frame: Instant::now(),
     };
     let mut settings = Vec::with_capacity(12);
     settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
@@ -692,6 +695,7 @@ impl Client {
         from_tunnel: &Receiver<Vec<u8>>,
         to_stack: &Sender<Packet>,
         routes: &UdpRoutes,
+        keepalive: Option<Duration>,
     ) {
         self.to_stack = Some(to_stack.clone());
         self.routes = Some(routes.clone());
@@ -700,10 +704,28 @@ impl Client {
         }
         self.early_bytes = 0;
         let mut capsule = Vec::new();
+        let mut ping_at = None;
         while !self.wire.closed && !self.end {
             self.pump();
             if self.wire.closed || self.end {
                 break;
+            }
+            if let Some(period) = keepalive {
+                let now = Instant::now();
+                if let Some(at) = ping_at {
+                    if self.last_frame >= at {
+                        ping_at = None;
+                    } else if now.duration_since(at) >= PING_TIMEOUT {
+                        self.end = true;
+                        break;
+                    }
+                }
+                if ping_at.is_none() && now.duration_since(self.last_frame) >= period {
+                    if !self.wire.send(h2::T_PING, 0, 0, &[0u8; 8]) {
+                        break;
+                    }
+                    ping_at = Some(now);
+                }
             }
             self.flush();
             if self.wire.closed || self.end {
@@ -765,6 +787,7 @@ impl Client {
     }
 
     fn on(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) {
+        self.last_frame = Instant::now();
         match kind {
             h2::T_SETTINGS if flags & h2::F_ACK == 0 => {
                 let mut at = 0;
@@ -1534,6 +1557,7 @@ mod tests {
             routes: None,
             warp: false,
             end: false,
+            last_frame: Instant::now(),
         }
     }
 
@@ -2145,7 +2169,7 @@ mod tests {
         }
         let (to_stack, _) = mpsc::channel();
         let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        client.run(&receiver, &to_stack, &routes);
+        client.run(&receiver, &to_stack, &routes, None);
         assert!(client.end);
         assert_eq!(client.queued.len(), QUEUED_CAP);
         assert_eq!(receiver.try_iter().count(), 1);
@@ -2185,7 +2209,7 @@ mod tests {
         client.wire.stream = Box::new(std::io::Cursor::new(Vec::<u8>::new().into_boxed_slice()));
         let (to_stack, _) = mpsc::channel();
         let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        client.run(&receiver, &to_stack, &routes);
+        client.run(&receiver, &to_stack, &routes, None);
         assert!(client.wire.closed);
         assert!(!client.end, "write failure alone closes the wire");
         assert_eq!(
@@ -2193,6 +2217,28 @@ mod tests {
             [43]
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// A quiet client sends the reference's PING once the period has passed.
+    #[test]
+    fn a_quiet_client_pings_at_the_configured_period() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut client = bare_client();
+        client.wire.stream = Box::new(Recorder {
+            out: Arc::clone(&out),
+        });
+        let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
+        drop(sender);
+        let (to_stack, _) = mpsc::channel();
+        let routes = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        client.run(&receiver, &to_stack, &routes, Some(Duration::ZERO));
+        let written = out.lock().expect("a recorder");
+        assert!(
+            written
+                .windows(9)
+                .any(|head| { head == [0, 0, 8, h2::T_PING, 0, 0, 0, 0, 0].as_slice() }),
+            "the quiet client sent the h2 PING: {written:?}"
+        );
     }
 
     /// Terminal calls preserve queue contents, partial offsets, window credit and wire output.

@@ -189,7 +189,7 @@ Rows 1–26 are the proxy-protocol world; rows 27–52 are the xray-core config 
 | --- | --- | --- | --- | --- |
 | 67 | WireGuard (UDP) | implemented | Implemented both roles over smoltcp; Noise, timers, dual-stack, WARP, remoteDNS and kernel TUN; `TestWireguard` green. xray scenarios 1/1. | [wireguard](docs/function/wireguard.md) |
 | 68 | AmneziaWG | planned | — | amneziawg-go, amnezia-client, mlmvpn |
-| 69 | MASQUE CONNECT-IP over QUIC | implemented — both roles over h3, h2, h1 and cleartext h2c; transport `masque` | Implemented both roles over h3/h2/h1/h2c; address pool, WARP, remoteDNS and ICMP limits. xray scenarios 6/6. | [carrier-masque](docs/function/carrier-masque.md) |
+| 69 | MASQUE CONNECT-IP over QUIC | implemented — both roles over h3, h2, h1 and cleartext h2c; transport `masque` | Implemented both roles over h3/h2/h1/h2c; address pool, `user`/`pass` auth, `{target}`/`{ipproto}` path templates, `xmux.hKeepAlivePeriod`, WARP, remoteDNS and ICMP limits. xray scenarios 6/6. | [carrier-masque](docs/function/carrier-masque.md) |
 | 70 | MASQUE over HTTP/3 vs HTTP/2 | implemented — h3, h2, h1 and cleartext h2c, both roles | Implemented both roles over h3/h2/h1/h2c; shared TLS port, ALPN select. xray scenarios 6/6. | quiche; Aether; mqvpn |
 | 71 | Multipath QUIC | planned | — | mqvpn, slipstream, quiche |
 | 72 | quiche: QUIC + HTTP/3, 0-RTT, migration, key updates, batched datagrams | partial — key updates and peer path validation; 0-RTT and client migration unexposed; batched datagrams on Linux | Partial provider: key updates and peer path validation; 0-RTT and client migration unexposed; batched datagrams on Linux. | quiche |

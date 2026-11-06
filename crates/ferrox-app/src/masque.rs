@@ -27,6 +27,9 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+/// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
+const H3_KEEPALIVE: Duration = Duration::from_secs(10);
+const H2_KEEPALIVE: Duration = Duration::from_secs(45);
 const RETRY: Duration = Duration::from_millis(1);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -212,13 +215,14 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     let mtu = lane.mtu;
     let initial = std::mem::take(&mut lane.packets);
     let alive = Arc::clone(&lane.alive);
+    let keepalive = spec.keepalive(H3_KEEPALIVE);
     Ok(assemble(
         addresses,
         mtu,
         initial,
         alive,
         move |from_tunnel, to_stack, routes| {
-            io(lane, &sock, local, from_tunnel, to_stack, routes);
+            io(lane, &sock, local, keepalive, from_tunnel, to_stack, routes);
         },
     ))
 }
@@ -265,6 +269,7 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
         .tls
         .as_deref()
         .ok_or("masque: HTTP/2 requires security tls")?;
+    let keepalive = spec.keepalive(H2_KEEPALIVE);
     let mut client = crate::masque_h2::Client::dial(
         tls,
         tls.insecure,
@@ -284,7 +289,7 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
-            client.run(&from_tunnel, &to_stack, &routes);
+            client.run(&from_tunnel, &to_stack, &routes, keepalive);
         },
     ))
 }
@@ -318,6 +323,7 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
 fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     let edge = resolve_edge(spec)?;
     let authority = authority(spec);
+    let keepalive = spec.keepalive(H2_KEEPALIVE);
     let mut client =
         crate::masque_h2::Client::dial_cleartext(edge, &authority, &spec.path, &spec.headers)
             .map_err(|reason| format!("masque: {reason}"))?;
@@ -330,7 +336,7 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
-            client.run(&from_tunnel, &to_stack, &routes);
+            client.run(&from_tunnel, &to_stack, &routes, keepalive);
         },
     ))
 }
@@ -428,6 +434,7 @@ struct ClientSpec {
     headers: Vec<(String, String)>,
     remote_dns: Vec<IpAddr>,
     warp: Option<Warp>,
+    keepalive: Option<i64>,
 }
 
 impl ClientSpec {
@@ -481,19 +488,33 @@ impl ClientSpec {
             .and_then(|settings| settings.get("warp"))
             .map(Warp::from)
             .transpose()?;
-        let path = transport
-            .and_then(|settings| settings.get("path"))
+        let user = transport
+            .and_then(|settings| settings.get("user"))
             .and_then(Json::as_str)
-            .filter(|path| !path.is_empty())
-            .unwrap_or(if warp.is_some() { "/" } else { DEFAULT_PATH })
-            .to_owned();
+            .unwrap_or_default();
+        let pass = transport
+            .and_then(|settings| settings.get("pass"))
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        if warp.is_some() && (!user.is_empty() || !pass.is_empty()) {
+            return Err("masque warp: `user` and `pass` cannot be used with `warp`".to_owned());
+        }
+        let path = expand_path(
+            transport
+                .and_then(|settings| settings.get("path"))
+                .and_then(Json::as_str)
+                .filter(|path| !path.is_empty())
+                .unwrap_or(if warp.is_some() { "/" } else { DEFAULT_PATH }),
+        );
         let host = transport
             .and_then(|settings| settings.get("host"))
             .and_then(Json::as_str)
             .filter(|host| !host.is_empty())
             .map(str::to_owned)
             .or_else(|| warp.as_ref().map(|_| WARP_HOST.to_owned()));
-        let headers = client_headers(transport);
+        let mut headers = client_headers(transport);
+        credentials(user, pass, &mut headers)?;
+        let keepalive = keepalive(transport)?;
         let remote_dns = remote_dns(settings)?;
         Ok(Self {
             address,
@@ -504,8 +525,51 @@ impl ClientSpec {
             headers,
             remote_dns,
             warp,
+            keepalive,
         })
     }
+
+    /// The keepalive the carrier sends when it has been quiet: xray's
+    /// `xmux.hKeepAlivePeriod` in seconds, or the carrier's own default.
+    fn keepalive(&self, default: Duration) -> Option<Duration> {
+        match self.keepalive {
+            None | Some(0) => Some(default),
+            Some(seconds) if seconds > 0 => Some(Duration::from_secs(seconds as u64)),
+            Some(_) => None,
+        }
+    }
+}
+
+/// The Basic header xray writes for `user`/`pass`, and the headers it refuses beside them.
+fn credentials(user: &str, pass: &str, headers: &mut Vec<(String, String)>) -> Result<(), String> {
+    if user.is_empty() && pass.is_empty() {
+        return Ok(());
+    }
+    if user.contains(':') {
+        return Err("masque `user` contains a colon".to_owned());
+    }
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    {
+        return Err(
+            "masque `headers` cannot contain `authorization` when `user` or `pass` is set"
+                .to_owned(),
+        );
+    }
+    let token = ferrox_core::b64::encode(format!("{user}:{pass}").as_bytes());
+    headers.push(("authorization".to_owned(), format!("Basic {token}")));
+    Ok(())
+}
+
+/// The path templates xray accepts resolve to the wildcard query it sends.
+fn expand_path(path: &str) -> String {
+    path.replace("{target}", "*")
+        .replace("{ipproto}", "*")
+        .replace("{?target,ipproto}", "?target=*&ipproto=*")
+        .replace("{?ipproto,target}", "?ipproto=*&target=*")
+        .replace("{&target,ipproto}", "&target=*&ipproto=*")
+        .replace("{&ipproto,target}", "&ipproto=*&target=*")
 }
 
 /// Read configured headers, lowercasing names as the reference does.
@@ -539,6 +603,20 @@ fn client_headers(transport: Option<&Json>) -> Vec<(String, String)> {
     });
     browser_user_agent(&mut headers);
     headers
+}
+
+/// xray's `xmux.hKeepAlivePeriod` is seconds; a zero names the carrier default and a negative value disables it.
+fn keepalive(transport: Option<&Json>) -> Result<Option<i64>, String> {
+    let Some(seconds) = transport
+        .and_then(|settings| settings.get("xmux"))
+        .and_then(|xmux| xmux.get("hKeepAlivePeriod"))
+    else {
+        return Ok(None);
+    };
+    seconds
+        .as_i64()
+        .map(Some)
+        .ok_or_else(|| "masque `xmux.hKeepAlivePeriod` is not an integer".to_owned())
 }
 
 fn remote_dns(settings: &Json) -> Result<Vec<IpAddr>, String> {
@@ -1399,6 +1477,7 @@ fn io(
     lane: Lane,
     sock: &Datagram,
     local: SocketAddr,
+    keepalive: Option<Duration>,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: UdpRoutes,
@@ -1414,7 +1493,10 @@ fn io(
         ..Stream::default()
     };
     let mut unsent: Option<Vec<u8>> = None;
+    let mut keepalive_at = keepalive.map(|period| Instant::now() + period);
     loop {
+        let sent_before = conn.stats().sent;
+        let recv_before = conn.stats().recv;
         while let Some(packet) = unsent.take().or_else(|| from_tunnel.try_recv().ok()) {
             match send_datagram(&mut conn, stream, &packet) {
                 Emission::Queued => {}
@@ -1459,6 +1541,16 @@ fn io(
             }
             let offset = datagram.len() - packet.len();
             deliver_owned(&to_stack, &routes, datagram, offset);
+        }
+        if let Some(period) = keepalive {
+            let now = Instant::now();
+            if conn.stats().sent != sent_before || conn.stats().recv != recv_before {
+                keepalive_at = Some(now + period);
+            }
+            if keepalive_at.is_some_and(|at| now >= at) {
+                let _ = conn.send_ack_eliciting();
+                keepalive_at = Some(now + period);
+            }
         }
         quic::flush_egress(&mut conn, sock);
     }
@@ -1775,8 +1867,7 @@ impl ServerSpec {
             .and_then(|settings| settings.get("path"))
             .and_then(Json::as_str)
             .filter(|path| !path.is_empty())
-            .unwrap_or(DEFAULT_PATH)
-            .to_owned();
+            .map_or_else(|| DEFAULT_PATH.to_owned(), expand_path);
         let mtu = settings
             .get("mtu")
             .and_then(Json::as_u32)
@@ -2887,6 +2978,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            keepalive: None,
         };
         let mut config = client_config(&spec).expect("config");
         let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
@@ -3723,6 +3815,97 @@ mod tests {
     }
 
     #[test]
+    fn the_reference_user_and_pass_write_the_basic_header() {
+        let outbound = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"user":"u","pass":"p:q","headers":{"X-Token":"a"}}}}"#,
+        )
+        .expect("the reference outbound");
+        let spec = ClientSpec::from(&outbound).expect("the reference spec");
+        assert!(spec
+            .headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && value == "Basic dTpwOnE="));
+        assert!(spec
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-token" && value == "a"));
+        let conflict = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"user":"u","pass":"p","headers":{"Authorization":"Bearer x"}}}}"#,
+        )
+        .expect("the conflicting outbound");
+        assert!(ClientSpec::from(&conflict).is_err());
+    }
+
+    #[test]
+    fn the_reference_path_variables_become_the_wildcards() {
+        let outbound = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"path":"/masque/ip/{target}/{ipproto}/"}}}"#,
+        )
+        .expect("the reference outbound");
+        let spec = ClientSpec::from(&outbound).expect("the reference spec");
+        assert_eq!(spec.path, "/masque/ip/*/*/");
+        let query = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"path":"/masque/ip{?target,ipproto}"}}}"#,
+        )
+        .expect("the query outbound");
+        let query = ClientSpec::from(&query).expect("the query spec");
+        assert_eq!(query.path, "/masque/ip?target=*&ipproto=*");
+        let server = ServerSpec::from(&inbound(
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
+        ))
+        .expect("a server spec");
+        assert_eq!(server.path, DEFAULT_PATH);
+        let server = crate::json::parse(
+            r#"{"settings":{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]},"streamSettings":{"masqueSettings":{"path":"/masque/ip{&target,ipproto}"}}}"#,
+        )
+        .expect("a templated inbound");
+        let server = ServerSpec::from(&server).expect("a templated server spec");
+        assert_eq!(server.path, "/masque/ip&target=*&ipproto=*");
+    }
+
+    #[test]
+    fn the_reference_keepalive_period_reaches_the_carrier() {
+        let plain = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the default outbound");
+        let plain = ClientSpec::from(&plain).expect("the default spec");
+        assert_eq!(plain.keepalive(H3_KEEPALIVE), Some(H3_KEEPALIVE));
+        assert_eq!(plain.keepalive(H2_KEEPALIVE), Some(H2_KEEPALIVE));
+        let set = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"xmux":{"hKeepAlivePeriod":20}}}}"#,
+        )
+        .expect("the xmux outbound");
+        let set = ClientSpec::from(&set).expect("the xmux spec");
+        assert_eq!(set.keepalive(H3_KEEPALIVE), Some(Duration::from_secs(20)));
+        let off = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"xmux":{"hKeepAlivePeriod":-1}}}}"#,
+        )
+        .expect("the disabled outbound");
+        let off = ClientSpec::from(&off).expect("the disabled spec");
+        assert_eq!(off.keepalive(H3_KEEPALIVE), None);
+    }
+
+    #[test]
+    fn a_warp_client_refuses_the_credentials_it_would_not_send() {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let private = ferrox_core::b64::encode(&key.serialize_der());
+        let public =
+            ferrox_core::b64::encode(&warp_key(&key.public_key_pem()).expect("the public key"));
+        let text = format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":8443}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true}},"masqueSettings":{{"warp":{{"privateKey":"{private}","publicKey":"{public}","address":["172.16.0.2/32"]}}}}}}}}"#
+        );
+        let outbound = crate::json::parse(&text).expect("the warp outbound");
+        ClientSpec::from(&outbound).expect("the warp spec");
+        for credentials in [r#""user":"u""#, r#""pass":"p""#] {
+            let text = text.replace(r#""warp""#, &format!(r#"{credentials},"warp""#));
+            let outbound = crate::json::parse(&text).expect("the conflicting outbound");
+            let error = ClientSpec::from(&outbound).expect_err("the refused credentials");
+            assert!(error.contains("warp"), "{error}");
+        }
+    }
+
+    #[test]
     fn the_reference_settings_spellings_read_the_same_edge() {
         let flat = crate::json::parse(
             r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"network":"masque","security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
@@ -3943,6 +4126,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            keepalive: None,
         };
         let mut client_config = client_config(&spec).expect("client config");
         let server_lane = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));
