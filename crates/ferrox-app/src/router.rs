@@ -3303,6 +3303,9 @@ fn add_geoip(
     if code.is_empty() {
         return Err(format!("ip rule `{file}:` names an empty code"));
     }
+    if file.eq_ignore_ascii_case("geoip.dat") && code.eq_ignore_ascii_case("private") {
+        return add_private(positive, negative, reverse);
+    }
     let target = if reverse { negative } else { positive };
     for (ip, prefix) in assets.ip(file, code)?.iter() {
         target.add(*ip, *prefix)?;

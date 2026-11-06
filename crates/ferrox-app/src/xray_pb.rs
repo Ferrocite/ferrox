@@ -3830,8 +3830,8 @@ fn freedom_fragment(bytes: &[u8]) -> Result<Json, String> {
         }
     }
     let packets = match (fields[0], fields[1]) {
-        (0, 0) => String::new(),
         (0, 1) => "tlshello".to_owned(),
+        (0, _) => String::new(),
         (from, to) => freedom_range_text(from, to),
     };
     Ok(object(vec![
@@ -5108,6 +5108,30 @@ mod tests {
         assert_eq!(fragment.get("length").and_then(Json::as_str), Some("10-20"));
         assert_eq!(fragment.get("interval").and_then(Json::as_str), Some("1-2"));
         assert_eq!(fragment.get("maxSplit").and_then(Json::as_str), Some("4"));
+    }
+
+    #[test]
+    fn a_zero_start_fragment_after_one_is_all_writes() {
+        let fragment = message(&[varint_field(1, 0), varint_field(2, 2)]);
+        let settings = bytes_field(5, &fragment);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.freedom.Config", &settings),
+        )]);
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, None), &[]),
+            &outbound,
+        ))
+        .expect("freedom fragment decodes");
+        let packets = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .and_then(|outbounds| outbounds.first())
+            .and_then(|outbound| outbound.get("settings"))
+            .and_then(|settings| settings.get("fragment"))
+            .and_then(|fragment| fragment.get("packets"))
+            .and_then(Json::as_str);
+        assert_eq!(packets, Some(""));
     }
 
     #[test]

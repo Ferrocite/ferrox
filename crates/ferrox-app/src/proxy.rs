@@ -3508,6 +3508,9 @@ impl FreedomFinalRule {
     }
 }
 
+const UDP_NOISE_MAX_V4: u64 = 65_507;
+const UDP_NOISE_MAX_V6: u64 = 65_527;
+
 /// One `noises` entry: a fixed packet or one drawn at the configured length, sent before the
 /// first datagram of a UDP flow and followed by the configured wait.
 #[derive(Debug, Clone)]
@@ -20831,7 +20834,10 @@ fn freedom_blackhole(client: &Connection, rule: &FreedomFinalRule) {
         let _ = client.shutdown(Shutdown::Both);
         return;
     }
-    let until = Instant::now() + delay;
+    let Some(until) = Instant::now().checked_add(delay) else {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    };
     let Ok(mut drain) = client.try_clone() else {
         thread::sleep(delay);
         return;
@@ -20851,11 +20857,16 @@ fn freedom_blackhole(client: &Connection, rule: &FreedomFinalRule) {
 
 /// The decoys a UDP destination receives before its first real datagram; a DNS redirect keeps its
 /// one packet clean, and a failed write ends the flow the way the reference's writer does.
-fn send_freedom_noises(freedom: &FreedomOut, socket: &UdpSocket, dest: SocketAddr) -> bool {
-    if freedom.noises.is_empty() || freedom.override_port() == 53 {
+fn send_freedom_noises(
+    noises: &[FreedomNoise],
+    skip_dns: bool,
+    socket: &UdpSocket,
+    dest: SocketAddr,
+) -> bool {
+    if noises.is_empty() || skip_dns {
         return true;
     }
-    for noise in &freedom.noises {
+    for noise in noises {
         if !noise.applies_to(dest.ip()) {
             continue;
         }
@@ -20871,6 +20882,15 @@ fn send_freedom_noises(freedom: &FreedomOut, socket: &UdpSocket, dest: SocketAdd
         }
     }
     true
+}
+
+/// The first payload waits behind its destination's decoys without stalling the association's
+/// other lanes; the starter drains this queue once the last decoy has gone out.
+#[derive(Default)]
+struct FreedomNoiseGate {
+    ready: bool,
+    failed: bool,
+    pending: Vec<Vec<u8>>,
 }
 
 /// The socket a freedom flow dials: its redirect first, then the family the strategy names.
@@ -23270,7 +23290,7 @@ fn serve_socks_udp_freedom(
 ) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let replies = Arc::new(AtomicU64::new(0));
-    let mut uplinks: HashMap<SocketAddr, (UdpSocket, thread::JoinHandle<()>)> = HashMap::new();
+    let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
     let mut seen = 0u64;
     loop {
@@ -23305,9 +23325,21 @@ fn serve_socks_udp_freedom(
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
-        if uplinks.contains_key(&dest) {
-            if !blocked {
-                let _ = uplinks[&dest].0.send(payload);
+        if let Some((socket, _, gate)) = uplinks.get(&dest) {
+            if blocked {
+                continue;
+            }
+            let mut gate = gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if gate.failed {
+                continue;
+            }
+            if gate.ready {
+                drop(gate);
+                let _ = socket.send(payload);
+            } else {
+                gate.pending.push(payload.to_vec());
             }
             continue;
         }
@@ -23317,42 +23349,99 @@ fn serve_socks_udp_freedom(
         let Some(up) = datagram_uplink(dest, local, sockopts) else {
             continue;
         };
-        if !send_freedom_noises(freedom, &up, dest) {
-            continue;
-        }
         let Ok(writer) = up.try_clone() else {
             continue;
         };
-        let peer = source.clone();
-        let answered = Arc::clone(&replies);
+        let Ok(noise_socket) = up.try_clone() else {
+            continue;
+        };
+        let gate = Arc::new(Mutex::new(FreedomNoiseGate {
+            ready: false,
+            failed: false,
+            pending: if blocked {
+                Vec::new()
+            } else {
+                vec![payload.to_vec()]
+            },
+        }));
+        start_freedom_noises(
+            freedom.noises.clone(),
+            freedom.override_port() == 53,
+            noise_socket,
+            dest,
+            Arc::clone(&gate),
+        );
         let Ok(relay_write) = relay.try_clone() else {
             continue;
         };
-        let done = thread::spawn(move || {
-            let mut back = udp_buffer();
-            let writer = up;
-            let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
-            while let Ok(read) = writer.recv(&mut back) {
-                let Some(source) = peer.lock().ok().and_then(|slot| *slot) else {
-                    continue;
-                };
-                let out = socks_udp_frame(&mut framed, None, &dest, &back[..read]);
-                if relay_write.send_to(out, source).is_err() {
-                    break;
-                }
-                answered.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        uplinks.insert(dest, (writer, done));
-        if !blocked {
-            // The datagram that opened the destination is its first payload; a hop must not drop it.
-            let _ = uplinks[&dest].0.send(payload);
-        }
+        let done = freedom_reader(
+            up,
+            Arc::clone(&source),
+            relay_write,
+            Arc::clone(&replies),
+            dest,
+        );
+        uplinks.insert(dest, (writer, done, gate));
     }
-    for (_, (_, handle)) in uplinks {
+    for (_, (_, handle, _)) in uplinks {
         // The relayed datagrams are on their own sockets, so this exit is their idle timeout.
         let _ = handle.join();
     }
+}
+
+type FreedomUplink = (
+    UdpSocket,
+    thread::JoinHandle<()>,
+    Arc<Mutex<FreedomNoiseGate>>,
+);
+
+/// The decoys run on their own thread so one new destination's wait does not stall the rest.
+fn start_freedom_noises(
+    noises: Vec<FreedomNoise>,
+    skip_dns: bool,
+    socket: UdpSocket,
+    dest: SocketAddr,
+    gate: Arc<Mutex<FreedomNoiseGate>>,
+) {
+    thread::spawn(move || {
+        let sent = send_freedom_noises(&noises, skip_dns, &socket, dest);
+        let mut gate = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sent {
+            gate.failed = true;
+            gate.pending.clear();
+            return;
+        }
+        for packet in gate.pending.drain(..) {
+            let _ = socket.send(&packet);
+        }
+        gate.ready = true;
+    });
+}
+
+/// One destination's replies, framed back to whichever client datagram most recently named it.
+fn freedom_reader(
+    socket: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    relay: UdpSocket,
+    replies: Arc<AtomicU64>,
+    dest: SocketAddr,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut back = udp_buffer();
+        let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
+        while let Ok(read) = socket.recv(&mut back) {
+            let Some(source) = source.lock().ok().and_then(|slot| *slot) else {
+                continue;
+            };
+            let out = socks_udp_frame(&mut framed, None, &dest, &back[..read]);
+            if relay.send_to(out, source).is_err() {
+                break;
+            }
+            replies.fetch_add(1, Ordering::Relaxed);
+        }
+    })
 }
 
 /// The association's control socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
@@ -33030,8 +33119,8 @@ fn parse_freedom_noises(settings: &Json) -> Result<Vec<FreedomNoise>, String> {
             "rand" => {
                 let (min, max) = freedom_range_text(text)
                     .ok_or_else(|| format!("freedom: rand noise length `{text}` is not a range"))?;
-                if min <= 0 {
-                    return Err("freedom: rand noise lengthMin cannot be 0".to_owned());
+                if min <= 0 || max <= 0 {
+                    return Err("freedom: rand noise length must be positive".to_owned());
                 }
                 (min as u64, max as u64, None)
             }
@@ -33073,6 +33162,24 @@ fn parse_freedom_noises(settings: &Json) -> Result<Vec<FreedomNoise>, String> {
                 ));
             }
         };
+        if packet.is_none() {
+            let (low, high) = if length_min <= length_max {
+                (length_min, length_max)
+            } else {
+                (length_max, length_min)
+            };
+            let largest = if low == high { high } else { high - 1 };
+            let ceiling = if apply_to == FreedomNoiseApply::Ipv6 {
+                UDP_NOISE_MAX_V6
+            } else {
+                UDP_NOISE_MAX_V4
+            };
+            if largest > ceiling {
+                return Err(format!(
+                    "freedom: rand noise length `{text}` can exceed the UDP payload limit"
+                ));
+            }
+        }
         noises.push(FreedomNoise {
             length_min,
             length_max,
@@ -33234,6 +33341,9 @@ fn freedom_ports(value: &Json) -> Result<Option<Vec<(u16, u16)>>, String> {
         };
         let from = freedom_port(from)?;
         let to = freedom_port(to)?;
+        if from > to {
+            return Err(format!("freedom: port range `{piece}` is reversed"));
+        }
         ranges.push((from, to));
     }
     // An empty port list is the reference's "all ports", the same as an absent one.
@@ -61583,6 +61693,75 @@ mod tests {
         };
         assert!(!freedom.blocks(crate::router::Network::Udp, public, 53));
         assert!(freedom.blocks(crate::router::Network::Udp, public, 54));
+    }
+
+    /// A reversed port range can never match, so the parser refuses it like the reference does.
+    #[test]
+    fn a_freedom_reversed_port_range_is_refused() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"block","port":"90-80"}]}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_outbound(&root).is_err());
+    }
+
+    /// A random noise length above what the destination family can send is refused before the
+    /// generator allocates it; IPv6 may draw the larger datagram IPv4 cannot carry.
+    #[test]
+    fn a_freedom_rand_noise_length_must_fit_the_udp_payload() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[{"type":"rand","packet":"1-99999999999"}]}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_outbound(&root).is_err());
+
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[{"type":"rand","packet":"65508","applyTo":"ipv4"}]}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_outbound(&root).is_err());
+
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[{"type":"rand","packet":"65527","applyTo":"ipv6"}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert_eq!(freedom.noises[0].length_max, 65_527);
+    }
+
+    /// A reversed private selector is the built-in set, not a missing `geoip.dat`.
+    #[test]
+    fn a_freedom_reversed_private_selector_uses_the_builtin_set() {
+        for selector in ["geoip:!private", "ext:geoip.dat:!private"] {
+            let out = freedom_out(&format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"finalRules":[{{"action":"block","ip":["{selector}"]}}]}}}}]}}"#
+            ));
+            let Outbound::Freedom(freedom) = out else {
+                panic!("a freedom outbound");
+            };
+            let private: IpAddr = "127.0.0.1".parse().expect("private");
+            let public: IpAddr = IpAddr::from([1, 1, 1, 1]);
+            assert!(!freedom.blocks(crate::router::Network::Tcp, private, 443));
+            assert!(freedom.blocks(crate::router::Network::Tcp, public, 443));
+        }
+    }
+
+    /// A wait too large for `Instant` closes the blocked client instead of panicking.
+    #[cfg(unix)]
+    #[test]
+    fn a_freedom_blackhole_delay_that_cannot_be_added_closes_at_once() {
+        let (client, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let rule = FreedomFinalRule {
+            action: FreedomRuleAction::Block,
+            networks: None,
+            ports: None,
+            ips: None,
+            block_delay: Some((u64::MAX, u64::MAX)),
+        };
+        let started = Instant::now();
+        freedom_blackhole(&Connection::from(client), &rule);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// The noise list keeps a fixed packet, a hex packet and its family filter; the removed
