@@ -116,6 +116,7 @@ impl Hello {
         self.msg = self.encode(None);
     }
 
+    /// The list this hello puts on the wire: the config's, else the profile's.
     fn cipher_table(&self) -> &[u16] {
         self.ciphers.as_deref().unwrap_or(self.profile.ciphers)
     }

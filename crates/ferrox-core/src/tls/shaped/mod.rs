@@ -487,10 +487,6 @@ pub(crate) static GO_STOCK: Profile = Profile {
     ],
 };
 
-pub(crate) fn stock_profile() -> &'static Profile {
-    &GO_STOCK
-}
-
 /// Whether a list names an id neither ring nor `BoringSSL` carries, so only the stock shaped
 /// hello can put it on the wire and negotiate it.
 pub(crate) fn needs_stock_hello(ids: &[u16]) -> bool {
@@ -514,7 +510,7 @@ mod tests {
             ids,
             vec![0xc012, 0x003c, 0xc007, 0xc011, 0x0005, 0x1301, 0x1302, 0x1303]
         );
-        let mut hello = hello::Hello::build(stock_profile(), "example.com", &[], false, &[], None)
+        let mut hello = hello::Hello::build(&GO_STOCK, "example.com", &[], false, &[], None)
             .expect("the stock hello builds");
         hello.set_ciphers(&ids);
         let msg = &hello.msg;

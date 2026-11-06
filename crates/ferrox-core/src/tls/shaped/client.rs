@@ -155,9 +155,10 @@ impl<S: Stream> Session<S> {
     /// The stock hello a config's `cipherSuites` rides when ring and `BoringSSL` carry none of it:
     /// Go's own extension table, with the config's list in place of a preset's.
     pub(crate) fn connect_stock(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
-        Self::with_profile(super::stock_profile(), cfg, io, true)
+        Self::with_profile(&super::GO_STOCK, cfg, io, true)
     }
 
+    /// The one builder both the preset and the stock hellos share.
     fn with_profile(
         profile: &'static Profile,
         cfg: &TlsConfig,
