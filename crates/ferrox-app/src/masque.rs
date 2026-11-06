@@ -513,22 +513,7 @@ impl ClientSpec {
             .map(str::to_owned)
             .or_else(|| warp.as_ref().map(|_| WARP_HOST.to_owned()));
         let mut headers = client_headers(transport);
-        if !user.is_empty() || !pass.is_empty() {
-            if user.contains(':') {
-                return Err("masque `user` contains a colon".to_owned());
-            }
-            if headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            {
-                return Err(
-                    "masque `headers` cannot contain `authorization` when `user` or `pass` is set"
-                        .to_owned(),
-                );
-            }
-            let token = ferrox_core::b64::encode(format!("{user}:{pass}").as_bytes());
-            headers.push(("authorization".to_owned(), format!("Basic {token}")));
-        }
+        credentials(user, pass, &mut headers)?;
         let keepalive = keepalive(transport)?;
         let remote_dns = remote_dns(settings)?;
         Ok(Self {
@@ -553,6 +538,28 @@ impl ClientSpec {
             Some(_) => None,
         }
     }
+}
+
+/// The Basic header xray writes for `user`/`pass`, and the headers it refuses beside them.
+fn credentials(user: &str, pass: &str, headers: &mut Vec<(String, String)>) -> Result<(), String> {
+    if user.is_empty() && pass.is_empty() {
+        return Ok(());
+    }
+    if user.contains(':') {
+        return Err("masque `user` contains a colon".to_owned());
+    }
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    {
+        return Err(
+            "masque `headers` cannot contain `authorization` when `user` or `pass` is set"
+                .to_owned(),
+        );
+    }
+    let token = ferrox_core::b64::encode(format!("{user}:{pass}").as_bytes());
+    headers.push(("authorization".to_owned(), format!("Basic {token}")));
+    Ok(())
 }
 
 /// The path templates xray accepts resolve to the wildcard query it sends.
