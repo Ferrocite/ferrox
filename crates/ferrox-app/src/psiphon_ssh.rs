@@ -1550,13 +1550,11 @@ fn ssh_keepalive(inner: &Weak<Inner>, config: KeepAlive) {
             inner.close();
             return;
         }
-        match wait.recv_timeout(config.timeout) {
-            Ok(true) => {}
-            _ => {
-                let _ = lock(&inner.pending_request).take();
-                inner.close();
-                return;
-            }
+        if let Ok(true) = wait.recv_timeout(config.timeout) {
+        } else {
+            let _ = lock(&inner.pending_request).take();
+            inner.close();
+            return;
         }
     }
 }
