@@ -16,7 +16,7 @@ graph TD
     F --> E["carry on TlsConfig.cipher_suites"]
     E --> S{"an id ring has not?"}
     S -->|no| B["rustls provider sorted to<br/>the crafted order"]
-    S -->|yes| L["BoringSSL cipher list in<br/>the config's order"]
+    S -->|yes| L["BoringSSL cipher list in<br/>the config's order, capped at<br/>1.2 when no TLS 1.3 id is named"]
     E --> X{"listener names a<br/>shaped-only id?"}
     X -->|no| B
     X -->|yes| Y{"ClientHello offers<br/>TLS 1.3?"}
@@ -112,15 +112,18 @@ are reachable.
   `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` to every hello that offers TLS 1.2; Go only ever *reads*
   that id on a server. BoringSSL appends no SCSV, so the legacy lane is free of it.
   `a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire` asserts the rustls split, so the
-  claim cannot drift into a whole-field one. Nor is the id-for-id claim unconditional: a dial
-  whose config names `maxVersion` 1.2 still offers TLS 1.3 here, because `TlsConfig` carries no
-  version bound, where the reference drops the trio — so a capped list differs by the trio too.
-  Only a list that offers TLS 1.3 on both sides matches id-for-id.
-- **Hello order on the legacy lane.** BoringSSL writes its TLS 1.3 trio before the TLS 1.2 list,
-  where `crypto/tls` appends that trio after the list. The legacy lane therefore matches the
-  reference id-for-id and order-for-order inside the TLS 1.2 ids, and differs in where the trio
-  sits. `a_legacy_dial_offers_the_reference_cipher_ids_in_order` asserts the actual field, not a
-  hoped-for one.
+  claim cannot drift into a whole-field one. Nor is the id-for-id claim unconditional: on this
+  rustls lane a dial whose config names `maxVersion` 1.2 still offers TLS 1.3, because `TlsConfig`
+  carries no version bound, where the reference drops the trio — so a capped list differs by the
+  trio too. The legacy lane applies the cap from the list itself. Only a list that offers TLS 1.3
+  on both sides matches id-for-id on the rustls lane.
+- **Hello order on the legacy lane.** A list that offers no TLS 1.3 id is the reference's max
+  below 1.3, so the lane caps BoringSSL at TLS 1.2: its fixed trio is absent and the field is
+  the config's TLS 1.2 ids in the reference's order, byte for byte
+  (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`). A list that does offer TLS 1.3
+  keeps BoringSSL's own hello, which writes its trio before the TLS 1.2 ids where `crypto/tls`
+  appends it after, so that mixed field is exact only inside the 1.2 ids
+  (`a_legacy_mixed_list_keeps_boringssls_trio_before_the_tls12_ids`).
 - **Two named limits on the legacy lane.** An ECH config keeps the rustls lane (ECH is stronger
   than the suite list), so a config naming both does not advertise its CBC ids; and the lane
   keeps no session cache, so `enableSessionResumption` does not carry there. Neither is a
@@ -130,9 +133,9 @@ are reachable.
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
 
 Not done, deliberately and with the cost named: the five ids on the *dialer's* negotiated path
-when the peer offers TLS 1.3, an exact whole-field hello on the legacy lane, ECH together with
-CBC, and resumption on that lane. Each is a ceiling of the dispatch rule or a linked backend
-rather than a rewrite of this derivation.
+when the peer offers TLS 1.3, a mixed TLS 1.2 + TLS 1.3 list on the legacy lane keeps BoringSSL's
+trio position, ECH together with CBC, and resumption on that lane. Each is a ceiling of the
+dispatch rule or a linked backend rather than a rewrite of this derivation.
 
 ## What we removed
 
