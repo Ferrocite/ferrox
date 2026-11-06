@@ -1860,6 +1860,11 @@ struct Session {
     id: String,
 }
 
+struct DeferredResponse {
+    at: std::time::Instant,
+    write: Box<dyn FnOnce() + Send>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct SessionState {
     upload: Option<Box<dyn Read + Send>>,
@@ -1872,7 +1877,7 @@ struct SessionState {
     downlink: bool,
     last_seen: std::time::Instant,
     /// The 200 a plain H1 POST owed, written by whichever half ends the session.
-    response: Option<Box<dyn FnOnce() + Send>>,
+    response: Option<DeferredResponse>,
 }
 
 type Sessions = Mutex<HashMap<String, Arc<Session>>>;
@@ -1880,6 +1885,90 @@ type Sessions = Mutex<HashMap<String, Arc<Session>>>;
 fn sessions() -> &'static Sessions {
     static CELL: LazyLock<Sessions> = LazyLock::new(|| Mutex::new(HashMap::new()));
     &CELL
+}
+
+struct Expiry {
+    generation: Mutex<u64>,
+    cv: Condvar,
+}
+
+fn expiry() -> &'static Expiry {
+    static CELL: LazyLock<Expiry> = LazyLock::new(|| Expiry {
+        generation: Mutex::new(0),
+        cv: Condvar::new(),
+    });
+    &CELL
+}
+
+fn ensure_expiry_worker() {
+    static CELL: OnceLock<()> = OnceLock::new();
+    CELL.get_or_init(|| crate::proxy::spawn_carried(expiry_loop));
+}
+
+fn wake_expiry() {
+    let mut generation = expiry().generation.lock().expect("expiry lock");
+    *generation = generation.wrapping_add(1);
+    expiry().cv.notify_one();
+}
+
+fn expiry_loop() {
+    let mut seen = 0u64;
+    loop {
+        let (expired, next) = sweep_expiring();
+        for session in expired {
+            close_session(&session);
+        }
+        let mut generation = expiry().generation.lock().expect("expiry lock");
+        if *generation != seen {
+            seen = *generation;
+            drop(generation);
+            continue;
+        }
+        generation = match next {
+            Some(deadline) => {
+                expiry()
+                    .cv
+                    .wait_timeout(
+                        generation,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    )
+                    .expect("expiry lock")
+                    .0
+            }
+            None => expiry().cv.wait(generation).expect("expiry lock"),
+        };
+        seen = *generation;
+    }
+}
+
+fn sweep_expiring() -> (Vec<Arc<Session>>, Option<std::time::Instant>) {
+    let now = std::time::Instant::now();
+    let mut map = sessions().lock().expect("sessions lock");
+    let mut due = Vec::new();
+    let mut next = None;
+    let mut remove = Vec::new();
+    for (id, session) in map.iter() {
+        let state = session.state.lock().expect("session lock");
+        if state.ended || state.downlink {
+            continue;
+        }
+        let Some(response) = state.response.as_ref() else {
+            continue;
+        };
+        if response.at <= now {
+            remove.push(id.clone());
+        } else {
+            next = Some(next.map_or(response.at, |next: std::time::Instant| {
+                next.min(response.at)
+            }));
+        }
+    }
+    for id in remove {
+        if let Some(session) = map.remove(&id) {
+            due.push(session);
+        }
+    }
+    (due, next)
 }
 
 fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<Session>> {
@@ -1938,7 +2027,7 @@ fn close_session(s: &Arc<Session>) {
         st.response.take()
     };
     if let Some(response) = response {
-        response();
+        (response.write)();
     }
 }
 
@@ -2019,43 +2108,38 @@ impl Session {
     }
     /// The 200 an H1 POST owes: written by whichever half ends the session, so the POST keeps no thread.
     fn defer_response(&self, response: Box<dyn FnOnce() + Send>) {
-        let mut response = Some(response);
-        {
+        let deadline = std::time::Instant::now()
+            .checked_add(crate::budgets::relay_stall())
+            .unwrap_or_else(std::time::Instant::now);
+        let mut response = Some(DeferredResponse {
+            at: deadline,
+            write: response,
+        });
+        let stored = {
             let mut st = self.state.lock().expect("session lock");
-            if !st.ended {
+            if st.ended {
+                false
+            } else {
                 st.response = response.take();
+                true
             }
-        }
-        if let Some(response) = response {
-            response();
+        };
+        if stored {
+            ensure_expiry_worker();
+            wake_expiry();
+        } else if let Some(response) = response {
+            (response.write)();
         }
     }
     fn wait_ended(&self) {
         self.wait_ended_for(crate::budgets::relay_stall());
     }
     fn wait_ended_for(&self, idle: std::time::Duration) {
-        if let Some(response) = self.wait_session(idle, false) {
-            response();
-        }
-    }
-    fn expire_without_downlink(&self, idle: std::time::Duration) {
-        if let Some(response) = self.wait_session(idle, true) {
-            response();
-        }
-    }
-    fn wait_session(
-        &self,
-        idle: std::time::Duration,
-        stop_on_downlink: bool,
-    ) -> Option<Box<dyn FnOnce() + Send>> {
         let started = std::time::Instant::now();
         let mut expired = false;
         let mut st = self.state.lock().expect("session lock");
         while !st.ended {
             if st.downlink {
-                if stop_on_downlink {
-                    return None;
-                }
                 st = self.cv.wait(st).expect("session lock");
                 continue;
             }
@@ -2075,12 +2159,14 @@ impl Session {
                 break;
             }
         }
-        let response = st.response.take();
+        let response = st.response.take().map(|response| response.write);
         drop(st);
         if expired {
             remove_session_if_owned(&self.id, self);
         }
-        response
+        if let Some(response) = response {
+            response();
+        }
     }
 }
 
@@ -2757,10 +2843,6 @@ pub(crate) fn accept_core<
             if h2.is_none() && settings.mode == XhttpMode::StreamUp {
                 let settings = settings.clone();
                 session.defer_response(Box::new(move || plain_ok(&mut write, &settings, &padded)));
-                let waiter = Arc::clone(&session);
-                crate::proxy::spawn_carried(move || {
-                    waiter.expire_without_downlink(crate::budgets::relay_stall());
-                });
                 return Served::Closed;
             }
             session.wait_ended();
@@ -5429,19 +5511,18 @@ mod tests {
 
     #[test]
     fn a_stream_up_session_with_no_downlink_writes_its_deferred_answer() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_millis(100)),
+            ..Default::default()
+        });
         let session = get_or_create_session("post-only-answer");
         let (sent_tx, sent_rx) = std::sync::mpsc::channel();
         session.defer_response(Box::new(move || {
             let _ = sent_tx.send(());
         }));
-        let waiter = Arc::clone(&session);
-        let worker = thread::spawn(move || {
-            waiter.expire_without_downlink(std::time::Duration::from_millis(100));
-        });
         sent_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the deferred answer is written when the session expires");
-        worker.join().expect("joins");
         assert!(
             !sessions()
                 .lock()
@@ -5449,6 +5530,7 @@ mod tests {
                 .contains_key("post-only-answer"),
             "the idle session is removed"
         );
+        crate::budgets::clear();
     }
 
     #[test]
