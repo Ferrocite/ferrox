@@ -50,12 +50,14 @@ pub(crate) struct KeepAlive {
 }
 
 impl KeepAlive {
+    /// A period drawn uniformly from the configured window.
     fn period(&self) -> Duration {
         let span = self.period_max.saturating_sub(self.period_min);
         let unit = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
         self.period_min + span.mul_f64(unit)
     }
 
+    /// A padding length drawn uniformly from the configured range.
     fn padding(&self) -> usize {
         let span = self.padding_max.saturating_sub(self.padding_min);
         self.padding_min + usize::from(u16::from_be_bytes(random::<2>())) % (span + 1)
@@ -1632,6 +1634,7 @@ impl Inner {
         self.last_read.store(now, Ordering::Relaxed);
     }
 
+    /// Time since the last packet read, measured from session open.
     fn idle(&self) -> Duration {
         let now = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         Duration::from_millis(now.saturating_sub(self.last_read.load(Ordering::Relaxed)))
@@ -4475,6 +4478,7 @@ mod tests {
     }
 
     #[test]
+    /// Every drawn period and padding stays inside the configured bounds.
     fn the_keepalive_window_stays_inside_its_bounds() {
         let keepalive = KeepAlive {
             period_min: Duration::from_millis(1),
