@@ -9,53 +9,72 @@ pub(crate) const AEAD_AES_128_GCM: u16 = 0x0001;
 pub(crate) const AEAD_AES_256_GCM: u16 = 0x0002;
 pub(crate) const AEAD_CHACHA20_POLY1305: u16 = 0x0003;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Config {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Config<'a> {
     pub(crate) id: u8,
     pub(crate) kem_id: u16,
-    pub(crate) public_key: Vec<u8>,
-    pub(crate) cipher_suites: Vec<(u16, u16)>,
+    pub(crate) public_key: &'a [u8],
+    pub(crate) cipher_suites: &'a [u8],
     pub(crate) maximum_name_length: u8,
-    pub(crate) public_name: Vec<u8>,
-    pub(crate) extensions: Vec<u8>,
+    pub(crate) public_name: &'a [u8],
+    pub(crate) extensions: &'a [u8],
 }
 
-impl Config {
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        let suites = self.cipher_suites.len() * 4;
+impl<'a> Config<'a> {
+    /// The config's encoded length, header included.
+    pub(crate) fn encoded_len(&self) -> usize {
         let contents = 1
             + 2
             + 2
             + self.public_key.len()
             + 2
-            + suites
+            + self.cipher_suites.len()
             + 1
             + 1
             + self.public_name.len()
             + 2
             + self.extensions.len();
+        4 + contents
+    }
+
+    /// The config in one buffer reserved to its exact length.
+    #[cfg(test)]
+    pub(crate) fn encode(&self) -> Vec<u8> {
         // The length is known before the first byte, so the config lands in one buffer and no contents copy.
-        let mut out = Vec::with_capacity(4 + contents);
+        let mut out = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the config, header included, to `out`.
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        let contents = self.encoded_len() - 4;
         out.extend_from_slice(&VERSION.to_be_bytes());
         out.extend_from_slice(&(contents as u16).to_be_bytes());
         out.push(self.id);
         out.extend_from_slice(&self.kem_id.to_be_bytes());
         out.extend_from_slice(&(self.public_key.len() as u16).to_be_bytes());
-        out.extend_from_slice(&self.public_key);
-        out.extend_from_slice(&(suites as u16).to_be_bytes());
-        for (kdf, aead) in &self.cipher_suites {
-            out.extend_from_slice(&kdf.to_be_bytes());
-            out.extend_from_slice(&aead.to_be_bytes());
-        }
+        out.extend_from_slice(self.public_key);
+        out.extend_from_slice(&(self.cipher_suites.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.cipher_suites);
         out.push(self.maximum_name_length);
         out.push(self.public_name.len() as u8);
-        out.extend_from_slice(&self.public_name);
+        out.extend_from_slice(self.public_name);
         out.extend_from_slice(&(self.extensions.len() as u16).to_be_bytes());
-        out.extend_from_slice(&self.extensions);
-        out
+        out.extend_from_slice(self.extensions);
     }
 
-    fn decode_at(bytes: &[u8], at: &mut usize, end: usize) -> Result<Self, String> {
+    /// The four-byte cipher suite entries as `(kdf, aead)` pairs.
+    pub(crate) fn suites(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.cipher_suites.as_chunks::<4>().0.iter().map(|suite| {
+            (
+                u16::from_be_bytes([suite[0], suite[1]]),
+                u16::from_be_bytes([suite[2], suite[3]]),
+            )
+        })
+    }
+
+    fn decode_at(bytes: &'a [u8], at: &mut usize, end: usize) -> Result<Config<'a>, String> {
         let version = take_u16(bytes, at, end)?;
         if version != VERSION {
             return Err(format!("ech: unsupported version {version:#06x}"));
@@ -65,27 +84,27 @@ impl Config {
             .checked_add(length)
             .filter(|config_end| *config_end <= end)
             .ok_or("ech: config length past the end")?;
+        Self::decode_contents(bytes, at, config_end)
+    }
+
+    /// Parses one config body whose version and length header the caller has read.
+    fn decode_contents(
+        bytes: &'a [u8],
+        at: &mut usize,
+        config_end: usize,
+    ) -> Result<Config<'a>, String> {
         let id = take_u8(bytes, at, config_end)?;
         let kem_id = take_u16(bytes, at, config_end)?;
-        let public_key = take_vec16(bytes, at, config_end)?;
+        let public_key = take_len16(bytes, at, config_end)?;
         let suites_len = usize::from(take_u16(bytes, at, config_end)?);
         if suites_len % 4 != 0 {
             return Err("ech: cipher suite list is not four-byte entries".to_owned());
         }
-        let suites_end = at
-            .checked_add(suites_len)
-            .filter(|suites_end| *suites_end <= config_end)
-            .ok_or("ech: cipher suite list past the end")?;
-        let mut cipher_suites = Vec::with_capacity(suites_len / 4);
-        while *at < suites_end {
-            let kdf = take_u16(bytes, at, suites_end)?;
-            let aead = take_u16(bytes, at, suites_end)?;
-            cipher_suites.push((kdf, aead));
-        }
+        let cipher_suites = take(bytes, at, suites_len, config_end)?;
         let maximum_name_length = take_u8(bytes, at, config_end)?;
         let name_len = usize::from(take_u8(bytes, at, config_end)?);
-        let public_name = take(bytes, at, name_len, config_end)?.to_vec();
-        let extensions = take_vec16(bytes, at, config_end)?;
+        let public_name = take(bytes, at, name_len, config_end)?;
+        let extensions = take_len16(bytes, at, config_end)?;
         if *at != config_end {
             return Err("ech: trailing bytes in config".to_owned());
         }
@@ -120,7 +139,7 @@ impl Config {
         false
     }
 
-    fn single(bytes: &[u8]) -> Result<Self, String> {
+    fn single(bytes: &'a [u8]) -> Result<Config<'a>, String> {
         let mut at = 0;
         let config = Self::decode_at(bytes, &mut at, bytes.len())?;
         if at != bytes.len() {
@@ -130,7 +149,7 @@ impl Config {
     }
 }
 
-pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Vec<Config>, String> {
+pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Vec<Config<'_>>, String> {
     let mut at = 0;
     let length = usize::from(take_u16(bytes, &mut at, bytes.len())?);
     let end = at
@@ -152,7 +171,8 @@ pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Vec<Config>, String> {
             .filter(|config_end| *config_end <= end)
             .ok_or("ech: config length past the end")?;
         if version == VERSION {
-            configs.push(Config::decode_at(bytes, &mut at, end)?);
+            at += 4;
+            configs.push(Config::decode_contents(bytes, &mut at, config_end)?);
         } else {
             at = config_end;
         }
@@ -201,15 +221,15 @@ pub(crate) fn parse_server_keys(bytes: &[u8]) -> Result<Vec<ServerKey>, String> 
     let mut keys = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
-        let private_key = take_vec16(bytes, &mut at, bytes.len())?;
-        let config = take_vec16(bytes, &mut at, bytes.len())?;
+        let private_key = take_len16(bytes, &mut at, bytes.len())?;
+        let config = take_len16(bytes, &mut at, bytes.len())?;
         if private_key.len() != 32 {
             return Err("ech: server key is not a 32-byte X25519 secret".to_owned());
         }
-        Config::single(&config)?;
+        Config::single(config)?;
         keys.push(ServerKey {
-            private_key,
-            config,
+            private_key: private_key.to_vec(),
+            config: config.to_vec(),
         });
     }
     if keys.is_empty() {
@@ -255,14 +275,19 @@ pub(crate) fn generate_with_suites(
     let mut private = [0u8; 32];
     getrandom::fill(&mut private).map_err(|_| "ech: no randomness")?;
     let public = PublicKey::from(&StaticSecret::from(private)).to_bytes();
+    let mut suites = Vec::with_capacity(cipher_suites.len() * 4);
+    for (kdf, aead) in cipher_suites {
+        suites.extend_from_slice(&kdf.to_be_bytes());
+        suites.extend_from_slice(&aead.to_be_bytes());
+    }
     let config = Config {
         id: config_id,
         kem_id: KEM_X25519,
-        public_key: public.to_vec(),
-        cipher_suites: cipher_suites.to_vec(),
+        public_key: &public,
+        cipher_suites: &suites,
         maximum_name_length: 0,
-        public_name: public_name.as_bytes().to_vec(),
-        extensions: Vec::new(),
+        public_name: public_name.as_bytes(),
+        extensions: &[],
     };
     let config_bytes = config.encode();
     let list = encode_config_list(&[config]);
@@ -316,9 +341,9 @@ fn take_u16(bytes: &[u8], at: &mut usize, end: usize) -> Result<u16, String> {
     Ok(u16::from_be_bytes([field[0], field[1]]))
 }
 
-fn take_vec16(bytes: &[u8], at: &mut usize, end: usize) -> Result<Vec<u8>, String> {
+fn take_len16<'a>(bytes: &'a [u8], at: &mut usize, end: usize) -> Result<&'a [u8], String> {
     let len = usize::from(take_u16(bytes, at, end)?);
-    Ok(take(bytes, at, len, end)?.to_vec())
+    take(bytes, at, len, end)
 }
 
 #[cfg(test)]

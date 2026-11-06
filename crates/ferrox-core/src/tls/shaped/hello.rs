@@ -40,7 +40,6 @@ struct EchOffer {
     sealer: Sealer,
     inner_random: [u8; 32],
     inner_name: Option<String>,
-    public_name: String,
     transcript: Vec<u8>,
     maximum_name_length: usize,
 }
@@ -115,14 +114,14 @@ impl Hello {
             if config.kem_id != ech::KEM_X25519 || config.has_unknown_mandatory_extension() {
                 return None;
             }
-            let name = std::str::from_utf8(&config.public_name).ok()?;
+            let name = std::str::from_utf8(config.public_name).ok()?;
             if name.is_empty()
                 || name.parse::<std::net::IpAddr>().is_ok()
                 || rustls::pki_types::DnsName::try_from(name.to_owned()).is_err()
             {
                 return None;
             }
-            config.cipher_suites.iter().find_map(|&suite| match suite {
+            config.suites().find_map(|suite| match suite {
                 (ech::KDF_SHA256, ech::AEAD_AES_128_GCM) => {
                     Some((config, suite, &crate::tls::hpke::AES128_GCM))
                 }
@@ -137,16 +136,14 @@ impl Hello {
         });
         let (config, suite, hpke) =
             picked.ok_or_else(|| TlsError::Other("ech: no supported config".to_owned()))?;
-        let public_name = std::str::from_utf8(&config.public_name)
+        let public_name = std::str::from_utf8(config.public_name)
             .map_err(|_| TlsError::Other("ech: public name is not utf-8".to_owned()))?
             .to_owned();
-        let encoded = config.encode();
-        let mut info = Vec::with_capacity(8 + encoded.len());
+        let mut info = Vec::with_capacity(8 + config.encoded_len());
         info.extend_from_slice(b"tls ech\0");
-        info.extend_from_slice(&encoded);
+        config.encode_into(&mut info);
         let public_key: [u8; 32] = config
             .public_key
-            .as_slice()
             .try_into()
             .map_err(|_| TlsError::Other("ech: public key is not 32 bytes".to_owned()))?;
         let (enc, sealer) = hpke
@@ -161,7 +158,6 @@ impl Hello {
             sealer,
             inner_random,
             inner_name: self.sni.clone(),
-            public_name: public_name.clone(),
             transcript: Vec::new(),
             maximum_name_length: match config.maximum_name_length {
                 0 => 255,
@@ -175,6 +171,7 @@ impl Hello {
         Ok(())
     }
 
+    /// Seals the inner hello into the outer cover and returns the framed outer hello.
     fn seal_offer(
         &self,
         offer: &mut EchOffer,
@@ -183,11 +180,16 @@ impl Hello {
         retry: bool,
     ) -> Result<Vec<u8>, TlsError> {
         let (encoded, transcript) = self.inner_hello(offer, shares, cookie);
-        offer.transcript = handshake(1, &transcript);
+        offer.transcript = transcript;
         let enc: &[u8] = if retry { &[] } else { &offer.enc };
         let cover = ech_cover(offer.suite, offer.config_id, enc, encoded.len() + 16);
         let entries =
             self.extension_entries(shares, cookie, self.sni.as_deref(), Some(&cover), true);
+        if entries.last().map(|entry| entry.kind) != Some(0xfe0d) {
+            return Err(TlsError::Other(
+                "ech: profile has no ECH payload".to_owned(),
+            ));
+        }
         let mut outer = self.encode_body(
             TLS12,
             &self.random,
@@ -198,16 +200,17 @@ impl Hello {
         );
         let ciphertext = offer
             .sealer
-            .seal(&outer, &encoded)
+            .seal(&outer[4..], &encoded)
             .map_err(|e| TlsError::Other(format!("ech: seal: {e}")))?;
-        let (at, len) = ech_payload(&outer);
-        if len != ciphertext.len() {
-            return Err(TlsError::Other("ech: payload length moved".to_owned()));
-        }
-        outer[at..at + len].copy_from_slice(&ciphertext);
-        Ok(handshake(1, &outer))
+        let at = outer
+            .len()
+            .checked_sub(ciphertext.len())
+            .ok_or_else(|| TlsError::Other("ech: payload length moved".to_owned()))?;
+        outer[at..].copy_from_slice(&ciphertext);
+        Ok(outer)
     }
 
+    /// The inner hello and its transcript, both framed where they are written.
     fn inner_hello(
         &self,
         offer: &EchOffer,
@@ -242,19 +245,21 @@ impl Hello {
         let head = Prepared {
             version: TLS12,
             random: &offer.inner_random,
-            session_id: &self.session_id,
+            session_id: &[],
             ciphers: &ciphers,
             message_len,
             shares,
         };
-        let transcript = self.encode_prepared(head, &entries);
-        let mut encoded = self.encode_prepared(
+        let transcript = self.encode_prepared(
             Prepared {
-                session_id: &[],
+                session_id: &self.session_id,
+                message_len: message_len + self.session_id.len(),
                 ..head
             },
             &entries,
+            true,
         );
+        let mut encoded = self.encode_prepared(head, &entries, false);
         let name_pad = match offer.inner_name.as_deref() {
             Some(name) => offer.maximum_name_length.saturating_sub(name.len()),
             None => offer.maximum_name_length + 9,
@@ -407,8 +412,10 @@ impl Hello {
         self.offer.as_ref().map(|offer| offer.inner_random)
     }
 
+    /// The public name a real offer sends in the outer hello.
     pub(crate) fn ech_public_name(&self) -> Option<&str> {
-        self.offer.as_ref().map(|offer| offer.public_name.as_str())
+        self.offer.as_ref()?;
+        self.sni.as_deref()
     }
 
     fn encode(&self, cookie: Option<&[u8]>) -> Vec<u8> {
@@ -487,12 +494,21 @@ impl Hello {
             message_len,
             shares,
         };
-        self.encode_prepared(head, &entries)
+        self.encode_prepared(head, &entries, true)
     }
 
-    fn encode_prepared(&self, head: Prepared<'_>, entries: &[Entry]) -> Vec<u8> {
+    /// The hello body, or the framed handshake message when `frame` is set: the header is reserved
+    /// before the first body byte, so the caller's message is never copied behind a new one.
+    fn encode_prepared(&self, head: Prepared<'_>, entries: &[Entry], frame: bool) -> Vec<u8> {
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
-        let mut body = Vec::with_capacity(head.message_len - 4);
+        let mut body = Vec::with_capacity(if frame {
+            head.message_len
+        } else {
+            head.message_len - 4
+        });
+        if frame {
+            body.resize(4, 0);
+        }
         body.extend_from_slice(&head.version.to_be_bytes());
         body.extend_from_slice(head.random);
         body.push(head.session_id.len() as u8);
@@ -508,6 +524,11 @@ impl Hello {
             body.extend_from_slice(&entry.kind.to_be_bytes());
             body.extend_from_slice(&(entry.len as u16).to_be_bytes());
             self.write_body(&entry.source, head.shares, &mut body);
+        }
+        if frame {
+            let length = (body.len() - 4) as u32;
+            body[0] = 1;
+            body[1..4].copy_from_slice(&length.to_be_bytes()[1..]);
         }
         body
     }
@@ -892,6 +913,7 @@ fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<&'static [&'static
     }
 }
 
+#[cfg(test)]
 fn handshake(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(body.len() + 4);
     msg.push(kind);
@@ -912,29 +934,6 @@ fn ech_cover(suite: (u16, u16), config_id: u8, enc: &[u8], payload_len: usize) -
     body.extend_from_slice(&(payload_len as u16).to_be_bytes());
     body.resize(body.len() + payload_len, 0);
     body
-}
-
-/// The ECH payload range inside an encoded `ClientHelloOuter` body.
-fn ech_payload(body: &[u8]) -> (usize, usize) {
-    let mut at = 2 + 32;
-    at += 1 + usize::from(body[at]);
-    at += 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
-    at += 1 + usize::from(body[at]);
-    let end = at + 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
-    at += 2;
-    while at < end {
-        let kind = u16::from_be_bytes([body[at], body[at + 1]]);
-        let len = usize::from(body[at + 2]) << 8 | usize::from(body[at + 3]);
-        if kind == 0xfe0d {
-            let mut inner = at + 4 + 1 + 4 + 1;
-            let enc_len = usize::from(body[inner]) << 8 | usize::from(body[inner + 1]);
-            inner += 2 + enc_len;
-            let payload_len = usize::from(body[inner]) << 8 | usize::from(body[inner + 1]);
-            return (inner + 2, payload_len);
-        }
-        at += 4 + len;
-    }
-    (0, 0)
 }
 
 /// uTLS's GREASE ECH cover: the picked suite, a random config id, 32 bytes of
@@ -1160,21 +1159,36 @@ mod tests {
         .expect("opens")
     }
 
-    /// A real `enable_ech` offer is one allocation the cover's own buffer now costs, beside the parsing and hello work the measured window already prices.
+    /// A real `enable_ech` offer parses the list in place, builds the HPKE info and both hello
+    /// frames where they are written, and stages only the cover's payload and the sealed bytes.
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
-    fn an_enable_ech_offer_allocates_only_the_cover_buffer() {
+    fn an_enable_ech_offer_parses_in_place() {
         let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
         let profile = Fingerprint::default().profile().expect("profile");
         let mut hello =
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 25, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 17, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
         );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_profile_without_an_ech_slot_is_refused() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::resolve("hellochrome_58")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
+        hello.set_padding(0x3000);
+        assert!(hello.enable_ech(&list).is_err());
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
