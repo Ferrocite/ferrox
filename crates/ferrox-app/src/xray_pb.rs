@@ -3757,19 +3757,239 @@ fn socks_account(bytes: &[u8]) -> Result<(String, String), String> {
 fn freedom_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.freedom.Config");
     let mut redirect = None;
+    let mut domain = None;
+    let mut fragment = None;
+    let mut proxy_protocol = None;
+    let mut noises = Vec::new();
+    let mut rules = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 0) => return Err(reader.uncarried("domain_strategy")),
+            (1, 0) => domain = Some(freedom_domain_strategy(reader.varint()?)?),
             (3, 2) => redirect = destination_override(reader.bytes()?)?,
             (4, 0) => return Err(reader.uncarried("user_level")),
-            (5, 2) => return Err(reader.uncarried("fragment (README row 158)")),
-            (6, 0) => return Err(reader.uncarried("proxy_protocol (README row 155)")),
-            (7, 2) => return Err(reader.uncarried("noises")),
-            (8, 2) => final_rules(reader.bytes()?)?,
+            (5, 2) => fragment = Some(freedom_fragment(reader.bytes()?)?),
+            (6, 0) => {
+                proxy_protocol = Some(u32_value(
+                    reader.varint()?,
+                    "xray.proxy.freedom.Config: proxy_protocol",
+                )?);
+            }
+            (7, 2) => noises.push(freedom_noise(reader.bytes()?)?),
+            (8, 2) => rules.push(freedom_final_rule(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(redirect.map(|redirect| object(vec![("redirect", Json::Str(redirect))])))
+    let mut pairs = Vec::new();
+    if let Some(redirect) = redirect {
+        pairs.push(("redirect", Json::Str(redirect)));
+    }
+    if let Some(domain) = domain {
+        pairs.push(("domainStrategy", Json::Str(domain.to_owned())));
+    }
+    if let Some(proxy_protocol) = proxy_protocol {
+        pairs.push(("proxyProtocol", Json::Num(f64::from(proxy_protocol))));
+    }
+    if let Some(fragment) = fragment {
+        pairs.push(("fragment", fragment));
+    }
+    if !noises.is_empty() {
+        pairs.push(("noises", Json::Arr(noises)));
+    }
+    if !rules.is_empty() {
+        pairs.push(("finalRules", Json::Arr(rules)));
+    }
+    Ok((!pairs.is_empty()).then(|| object(pairs)))
+}
+
+fn freedom_domain_strategy(value: u64) -> Result<&'static str, String> {
+    match value {
+        0 => Ok("AsIs"),
+        1 => Ok("UseIP"),
+        2 => Ok("UseIPv4"),
+        3 => Ok("UseIPv6"),
+        4 => Ok("UseIPv4v6"),
+        5 => Ok("UseIPv6v4"),
+        6 => Ok("ForceIP"),
+        7 => Ok("ForceIPv4"),
+        8 => Ok("ForceIPv6"),
+        9 => Ok("ForceIPv4v6"),
+        10 => Ok("ForceIPv6v4"),
+        other => Err(format!(
+            "xray.transport.internet.DomainStrategy: strategy {other} is not carried"
+        )),
+    }
+}
+
+fn freedom_fragment(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.freedom.Fragment");
+    let mut fields = [0u64; 8];
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1..=8, 0) => fields[field as usize - 1] = reader.varint()?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let packets = match (fields[0], fields[1]) {
+        (0, 0) => String::new(),
+        (0, 1) => "tlshello".to_owned(),
+        (from, to) => freedom_range_text(from, to),
+    };
+    Ok(object(vec![
+        ("packets", Json::Str(packets)),
+        (
+            "length",
+            Json::Str(freedom_range_text(fields[2], fields[3])),
+        ),
+        (
+            "interval",
+            Json::Str(freedom_range_text(fields[4], fields[5])),
+        ),
+        (
+            "maxSplit",
+            Json::Str(freedom_range_text(fields[6], fields[7])),
+        ),
+    ]))
+}
+
+fn freedom_range_text(from: u64, to: u64) -> String {
+    if from == to {
+        from.to_string()
+    } else {
+        format!("{from}-{to}")
+    }
+}
+
+fn freedom_noise(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.freedom.Noise");
+    let mut length = (0u64, 0u64);
+    let mut delay = (0u64, 0u64);
+    let mut packet = None;
+    let mut apply_to = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => length.0 = reader.varint()?,
+            (2, 0) => length.1 = reader.varint()?,
+            (3, 0) => delay.0 = reader.varint()?,
+            (4, 0) => delay.1 = reader.varint()?,
+            (5, 2) => packet = Some(reader.bytes()?),
+            (6, 2) => {
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.proxy.freedom.Noise: apply_to is not utf-8".to_owned())?
+                    .clone_into(&mut apply_to);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    // An explicit packet wins even when empty; otherwise zero length is empty and a range draws bytes.
+    let (kind, text) = match packet {
+        Some(packet) => ("hex", hex(packet)),
+        None if length == (0, 0) => ("str", String::new()),
+        None => ("rand", freedom_range_text(length.0, length.1)),
+    };
+    Ok(object(vec![
+        ("type", Json::Str(kind.to_owned())),
+        ("packet", Json::Str(text)),
+        ("delay", Json::Str(freedom_range_text(delay.0, delay.1))),
+        ("applyTo", Json::Str(apply_to)),
+    ]))
+}
+
+fn freedom_final_rule(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.freedom.FinalRuleConfig");
+    let mut action = "allow";
+    let mut networks = Vec::new();
+    let mut ports = None;
+    let mut ips = Vec::new();
+    let mut block_delay = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => {
+                action = match reader.varint()? {
+                    0 => "allow",
+                    1 => "block",
+                    other => {
+                        return Err(format!(
+                            "xray.proxy.freedom.FinalRuleConfig: action {other} is not carried"
+                        ));
+                    }
+                };
+            }
+            (2, 0) => networks.push(freedom_network(reader.varint()?)),
+            (2, 2) => {
+                let mut packed = Reader::new(reader.bytes()?, "xray.common.net.Network");
+                while packed.more() {
+                    networks.push(freedom_network(packed.varint()?));
+                }
+            }
+            (3, 2) => ports = Some(freedom_port_selector(reader.bytes()?)?),
+            (4, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
+            (5, 2) => {
+                let (min, max) = freedom_range(reader.bytes()?)?;
+                block_delay = Some(Json::Str(freedom_range_text(min, max)));
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![("action", Json::Str(action.to_owned()))];
+    if !networks.is_empty() {
+        pairs.push((
+            "network",
+            Json::Arr(
+                networks
+                    .into_iter()
+                    .map(|network| Json::Str(network.to_owned()))
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(ports) = ports {
+        pairs.push(("port", Json::Str(ports)));
+    }
+    if !ips.is_empty() {
+        pairs.push(("ip", Json::Arr(ips)));
+    }
+    if let Some(block_delay) = block_delay {
+        pairs.push(("blockDelay", block_delay));
+    }
+    Ok(object(pairs))
+}
+
+fn freedom_network(value: u64) -> &'static str {
+    match value {
+        2 => "tcp",
+        3 => "udp",
+        4 => "unix",
+        _ => "unknown",
+    }
+}
+
+fn freedom_port_selector(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.net.PortList");
+    let mut parts = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let (from, to) = port_range(reader.bytes()?)?;
+                parts.push(freedom_range_text(u64::from(from), u64::from(to)));
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(parts.join(","))
+}
+
+fn freedom_range(bytes: &[u8]) -> Result<(u64, u64), String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.freedom.Range");
+    let mut min = 0;
+    let mut max = 0;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => min = reader.varint()?,
+            (2, 0) => max = reader.varint()?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((min, max))
 }
 
 /// The reference's freedom rewrite: an address, a port, or both, with the omitted half kept from
@@ -3812,26 +4032,6 @@ fn override_endpoint(bytes: &[u8]) -> Result<(String, u16), String> {
         }
     }
     Ok((address.unwrap_or_default(), port.unwrap_or(0)))
-}
-
-/// Freedom dials directly unless a final rule says otherwise; an allow rule is
-/// that same direct dial, and any other action is a policy this tree has not
-/// implemented.
-fn final_rules(bytes: &[u8]) -> Result<(), String> {
-    let mut reader = Reader::new(bytes, "xray.proxy.freedom.FinalRuleConfig");
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 0) => {
-                let action = reader.varint()?;
-                if action != 0 {
-                    return Err(reader.uncarried(&format!("final rule action {action}")));
-                }
-            }
-            // Networks, ip, port and block delay scope a rule; a scoped rule is one this tree cannot yet honor.
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    Ok(())
 }
 
 fn object(pairs: Vec<(&str, Json)>) -> Json {
@@ -4817,12 +5017,125 @@ mod tests {
     }
 
     #[test]
-    fn a_scoped_freedom_rule_is_refused() {
-        let rules = bytes_field(8, &varint_field(1, 1));
+    fn a_scoped_freedom_rule_becomes_a_final_rule() {
+        let range = message(&[varint_field(1, 443), varint_field(2, 443)]);
+        let ports = message(&[bytes_field(1, &range)]);
+        let geoip = message(&[bytes_field(2, b"private")]);
+        let ip = message(&[bytes_field(1, &geoip)]);
+        let delay = message(&[varint_field(1, 0), varint_field(2, 0)]);
+        let networks = [varint(2), varint(3)].concat();
+        let rule = message(&[
+            varint_field(1, 1),
+            bytes_field(2, &networks),
+            bytes_field(3, &ports),
+            bytes_field(4, &ip),
+            bytes_field(5, &delay),
+        ]);
+        let rules = bytes_field(8, &rule);
         let outbound = message(&[bytes_field(3, &typed("xray.proxy.freedom.Config", &rules))]);
-        let bytes = config(&http_inbound(&receiver(5000, None), &[]), &outbound);
-        let error = to_json(&bytes).expect_err("refused");
-        assert!(error.contains("action 1"), "{error}");
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, None), &[]),
+            &outbound,
+        ))
+        .expect("freedom final rule decodes");
+        let rule = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .and_then(|outbounds| outbounds.first())
+            .and_then(|outbound| outbound.get("settings"))
+            .and_then(|settings| settings.get("finalRules"))
+            .and_then(Json::as_arr)
+            .and_then(|rules| rules.first())
+            .expect("the final rule");
+        assert_eq!(rule.get("action").and_then(Json::as_str), Some("block"));
+        assert_eq!(
+            rule.get("network").and_then(Json::as_arr),
+            Some(&[Json::Str("tcp".to_owned()), Json::Str("udp".to_owned())][..])
+        );
+        assert_eq!(rule.get("port").and_then(Json::as_str), Some("443"));
+        assert_eq!(
+            rule.get("ip").and_then(Json::as_arr),
+            Some(&[Json::Str("geoip:private".to_owned())][..])
+        );
+        assert_eq!(rule.get("blockDelay").and_then(Json::as_str), Some("0"));
+    }
+
+    #[test]
+    fn freedom_fragment_domain_and_proxy_protocol_are_carried() {
+        let fragment = message(&[
+            varint_field(1, 0),
+            varint_field(2, 1),
+            varint_field(3, 10),
+            varint_field(4, 20),
+            varint_field(5, 1),
+            varint_field(6, 2),
+            varint_field(7, 4),
+            varint_field(8, 4),
+        ]);
+        let settings = message(&[
+            varint_field(1, 2),
+            bytes_field(5, &fragment),
+            varint_field(6, 2),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.freedom.Config", &settings),
+        )]);
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, None), &[]),
+            &outbound,
+        ))
+        .expect("freedom options decode");
+        let settings = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .and_then(|outbounds| outbounds.first())
+            .and_then(|outbound| outbound.get("settings"))
+            .expect("settings");
+        assert_eq!(
+            settings.get("domainStrategy").and_then(Json::as_str),
+            Some("UseIPv4")
+        );
+        assert_eq!(
+            settings.get("proxyProtocol").and_then(Json::as_u32),
+            Some(2)
+        );
+        let fragment = settings.get("fragment").expect("fragment");
+        assert_eq!(
+            fragment.get("packets").and_then(Json::as_str),
+            Some("tlshello")
+        );
+        assert_eq!(fragment.get("length").and_then(Json::as_str), Some("10-20"));
+        assert_eq!(fragment.get("interval").and_then(Json::as_str), Some("1-2"));
+        assert_eq!(fragment.get("maxSplit").and_then(Json::as_str), Some("4"));
+    }
+
+    #[test]
+    fn a_freedom_noise_becomes_a_noise_entry() {
+        let noise = message(&[bytes_field(5, &[0, 0xff]), bytes_field(6, b"ipv4")]);
+        let settings = bytes_field(7, &noise);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.freedom.Config", &settings),
+        )]);
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, None), &[]),
+            &outbound,
+        ))
+        .expect("freedom noise decodes");
+        let noise = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .and_then(|outbounds| outbounds.first())
+            .and_then(|outbound| outbound.get("settings"))
+            .and_then(|settings| settings.get("noises"))
+            .and_then(Json::as_arr)
+            .and_then(|noises| noises.first())
+            .expect("the noise");
+        assert_eq!(noise.get("type").and_then(Json::as_str), Some("hex"));
+        assert_eq!(noise.get("packet").and_then(Json::as_str), Some("00ff"));
+        assert_eq!(noise.get("delay").and_then(Json::as_str), Some("0"));
+        assert_eq!(noise.get("applyTo").and_then(Json::as_str), Some("ipv4"));
     }
 
     #[test]

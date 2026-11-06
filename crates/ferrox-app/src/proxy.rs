@@ -3407,13 +3407,16 @@ impl VlessOut {
 }
 
 /// The freedom lane's own settings: where it redirects, how it resolves a name, whether it
-/// prefixes the dial with a PROXY header, and the fragment stage its carrier writes through.
+/// prefixes the dial with a PROXY header, the fragment stage its carrier writes through, the
+/// decoy datagrams a UDP flow opens with, and the final rules that refuse a destination.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FreedomOut {
     redirect: Option<FreedomRedirect>,
     domain: FreedomDomain,
     proxy_protocol: u8,
     fragment: Option<Arc<ferrox_core::finalmask::Chain>>,
+    noises: Vec<FreedomNoise>,
+    final_rules: Vec<FreedomFinalRule>,
 }
 
 impl FreedomOut {
@@ -3422,6 +3425,158 @@ impl FreedomOut {
             && self.domain == FreedomDomain::AsIs
             && self.proxy_protocol == 0
             && self.fragment.is_none()
+            && self.noises.is_empty()
+            && self.final_rules.is_empty()
+    }
+
+    /// The first final rule the destination matches; `Allow` and `Block` both stop the search.
+    fn final_rule(
+        &self,
+        network: crate::router::Network,
+        ip: IpAddr,
+        port: u16,
+    ) -> Option<&FreedomFinalRule> {
+        self.final_rules
+            .iter()
+            .find(|rule| rule.matches(network, ip, port))
+    }
+
+    fn blocks(&self, network: crate::router::Network, ip: IpAddr, port: u16) -> bool {
+        self.final_rule(network, ip, port)
+            .is_some_and(|rule| rule.action == FreedomRuleAction::Block)
+    }
+
+    /// The port a redirect rewrites to, or zero when it names none; the noise writer skips DNS on it.
+    fn override_port(&self) -> u16 {
+        match &self.redirect {
+            Some(FreedomRedirect::Address(_, port) | FreedomRedirect::Port(port)) if *port != 0 => {
+                *port
+            }
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreedomRuleAction {
+    Allow,
+    Block,
+}
+
+/// One `finalRules` entry, scoped the way the reference scopes it: a network mask, port ranges,
+/// address rules, and the wait a blocked connection is held for before it closes.
+#[derive(Debug, Clone)]
+struct FreedomFinalRule {
+    action: FreedomRuleAction,
+    /// `None` matches both networks; `Some` is `[tcp, udp]`.
+    networks: Option<[bool; 2]>,
+    ports: Option<Vec<(u16, u16)>>,
+    ips: Option<Arc<crate::router::IpMatcher>>,
+    block_delay: Option<(u64, u64)>,
+}
+
+impl FreedomFinalRule {
+    fn matches(&self, network: crate::router::Network, ip: IpAddr, port: u16) -> bool {
+        if let Some(networks) = self.networks {
+            let selected = match network {
+                crate::router::Network::Tcp => networks[0],
+                crate::router::Network::Udp => networks[1],
+                crate::router::Network::Other(_) => false,
+            };
+            if !selected {
+                return false;
+            }
+        }
+        if let Some(ports) = &self.ports {
+            if !ports.iter().any(|&(from, to)| from <= port && port <= to) {
+                return false;
+            }
+        }
+        self.ips.as_ref().is_none_or(|ips| ips.matches(ip))
+    }
+
+    fn delay(&self) -> Duration {
+        let (min, max) = self.block_delay.unwrap_or((30, 90));
+        let (min, max) = if min <= max { (min, max) } else { (max, min) };
+        let span = max.saturating_sub(min);
+        let seconds = if span == 0 {
+            min
+        } else {
+            min.saturating_add(freedom_roll(span.saturating_add(1)))
+        };
+        Duration::from_secs(seconds)
+    }
+}
+
+/// One `noises` entry: a fixed packet or one drawn at the configured length, sent before the
+/// first datagram of a UDP flow and followed by the configured wait.
+#[derive(Debug, Clone)]
+struct FreedomNoise {
+    length_min: u64,
+    length_max: u64,
+    packet: Option<Vec<u8>>,
+    delay_min: u64,
+    delay_max: u64,
+    apply_to: FreedomNoiseApply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreedomNoiseApply {
+    Ip,
+    Ipv4,
+    Ipv6,
+}
+
+impl FreedomNoise {
+    fn applies_to(&self, ip: IpAddr) -> bool {
+        match self.apply_to {
+            FreedomNoiseApply::Ip => true,
+            FreedomNoiseApply::Ipv4 => ip.is_ipv4(),
+            FreedomNoiseApply::Ipv6 => ip.is_ipv6(),
+        }
+    }
+
+    fn generate(&self) -> Option<Vec<u8>> {
+        if let Some(packet) = &self.packet {
+            return Some(packet.clone());
+        }
+        let length = freedom_between(self.length_min, self.length_max);
+        let length = usize::try_from(length).ok()?;
+        let mut packet = vec![0u8; length];
+        getrandom::fill(&mut packet).ok()?;
+        Some(packet)
+    }
+
+    fn delay(&self) -> Duration {
+        Duration::from_millis(freedom_between(self.delay_min, self.delay_max))
+    }
+}
+
+/// `crypto.RandBetween`: the upper end is exclusive, and a span of one returns the lower end.
+fn freedom_between(from: u64, to: u64) -> u64 {
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    let span = to.saturating_sub(from);
+    if span <= 1 {
+        return from;
+    }
+    from.saturating_add(freedom_roll(span))
+}
+
+/// A uniform value in `[0, bound)`, drawn from the OS with rejection so no modulo bias remains.
+fn freedom_roll(bound: u64) -> u64 {
+    if bound <= 1 {
+        return 0;
+    }
+    let limit = u64::MAX - (u64::MAX % bound);
+    loop {
+        let mut raw = [0u8; 8];
+        if getrandom::fill(&mut raw).is_err() {
+            return 0;
+        }
+        let value = u64::from_le_bytes(raw);
+        if value < limit {
+            return value % bound;
+        }
     }
 }
 
@@ -6770,6 +6925,9 @@ impl BridgeLane {
         let asked = target.destination();
         match self.pick(&asked, crate::router::Network::Tcp).as_deref() {
             Some(Outbound::Freedom(freedom)) => freedom_socket(freedom, &asked)
+                .filter(|address| {
+                    !freedom.blocks(crate::router::Network::Tcp, address.ip(), address.port())
+                })
                 .and_then(|address| dial_or_report(&address))
                 .map(|stream| stream.with_mask(freedom.fragment.as_deref())),
             Some(Outbound::Block(_)) => None,
@@ -20638,6 +20796,13 @@ fn serve_connect_freedom(
     let Some(target) = freedom_socket(freedom, asked) else {
         return;
     };
+    if let Some(rule) = freedom.final_rule(crate::router::Network::Tcp, target.ip(), target.port())
+    {
+        if rule.action == FreedomRuleAction::Block {
+            freedom_blackhole(client, rule);
+            return;
+        }
+    }
     let Some(mut upstream) = dial_or_report(&target) else {
         return;
     };
@@ -20657,6 +20822,55 @@ fn serve_connect_freedom(
         return;
     }
     relay_handoff(client, &upstream);
+}
+
+/// The reference's blocked target: the client is drained until the rule's wait ends, then closed.
+fn freedom_blackhole(client: &Connection, rule: &FreedomFinalRule) {
+    let delay = rule.delay();
+    if delay.is_zero() {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    }
+    let until = Instant::now() + delay;
+    let Ok(mut drain) = client.try_clone() else {
+        thread::sleep(delay);
+        return;
+    };
+    let mut buf = [0u8; 8192];
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        let _ = drain.set_read_timeout(Some(left.min(Duration::from_secs(1))));
+        match drain.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = drain.shutdown(Shutdown::Both);
+}
+
+/// The decoys a UDP destination receives before its first real datagram; a DNS redirect keeps its
+/// one packet clean, and a failed write ends the flow the way the reference's writer does.
+fn send_freedom_noises(freedom: &FreedomOut, socket: &UdpSocket, dest: SocketAddr) -> bool {
+    if freedom.noises.is_empty() || freedom.override_port() == 53 {
+        return true;
+    }
+    for noise in &freedom.noises {
+        if !noise.applies_to(dest.ip()) {
+            continue;
+        }
+        let Some(packet) = noise.generate() else {
+            return false;
+        };
+        if socket.send(&packet).is_err() {
+            return false;
+        }
+        let delay = noise.delay();
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+    true
 }
 
 /// The socket a freedom flow dials: its redirect first, then the family the strategy names.
@@ -23087,11 +23301,14 @@ fn serve_socks_udp_freedom(
         let Some(dest) = freedom_socket(freedom, &Destination::Address(dest)) else {
             continue;
         };
+        let blocked = freedom.blocks(crate::router::Network::Udp, dest.ip(), dest.port());
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
         if uplinks.contains_key(&dest) {
-            let _ = uplinks[&dest].0.send(payload);
+            if !blocked {
+                let _ = uplinks[&dest].0.send(payload);
+            }
             continue;
         }
         let Ok(local) = resolve_source(send_through) else {
@@ -23100,6 +23317,9 @@ fn serve_socks_udp_freedom(
         let Some(up) = datagram_uplink(dest, local, sockopts) else {
             continue;
         };
+        if !send_freedom_noises(freedom, &up, dest) {
+            continue;
+        }
         let Ok(writer) = up.try_clone() else {
             continue;
         };
@@ -23124,8 +23344,10 @@ fn serve_socks_udp_freedom(
             }
         });
         uplinks.insert(dest, (writer, done));
-        // The datagram that opened the destination is its first payload; a hop must not drop it.
-        let _ = uplinks[&dest].0.send(payload);
+        if !blocked {
+            // The datagram that opened the destination is its first payload; a hop must not drop it.
+            let _ = uplinks[&dest].0.send(payload);
+        }
     }
     for (_, (_, handle)) in uplinks {
         // The relayed datagrams are on their own sockets, so this exit is their idle timeout.
@@ -32742,7 +32964,10 @@ pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, S
                 );
             }
         }
-        if let Some(conf) = settings.and_then(|s| s.get("fragment")) {
+        if let Some(conf) = settings
+            .and_then(|s| s.get("fragment"))
+            .filter(|conf| !matches!(conf, Json::Null))
+        {
             let stage = crate::config::fragment(Some(conf)).ok_or_else(|| {
                 "freedom fragment cannot be driven: check packets, length, interval and maxSplit"
                     .to_owned()
@@ -32751,17 +32976,319 @@ pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, S
             chain.push(stage);
             freedom.fragment = Some(Arc::new(chain));
         }
-        for field in ["noise", "noises", "ipsBlocked", "finalRules", "userLevel"] {
-            if settings
-                .and_then(|s| s.get(field))
-                .is_some_and(|value| !matches!(value, Json::Null))
-            {
-                eprintln!("freedom: {field} is not carried; the dial keeps its own behaviour");
-            }
+        let settings = settings.unwrap_or(&Json::Null);
+        if settings
+            .get("noise")
+            .is_some_and(|value| !matches!(value, Json::Null))
+        {
+            return Err("freedom: `noise` is removed; use `noises`".to_owned());
+        }
+        freedom.noises = parse_freedom_noises(settings)?;
+        freedom.final_rules = parse_freedom_final_rules(settings)?;
+        if settings
+            .get("ipsBlocked")
+            .is_some_and(|value| !matches!(value, Json::Null))
+        {
+            eprintln!(
+                "freedom: `ipsBlocked` is removed and migrated to finalRules; it is not read"
+            );
+        }
+        if settings
+            .get("userLevel")
+            .is_some_and(|value| !matches!(value, Json::Null))
+        {
+            eprintln!("freedom: userLevel is not carried; the flow keeps its own policy");
         }
         return Ok(Some(freedom));
     }
     Ok(None)
+}
+
+/// The reference's `noises`: each entry writes one datagram before a UDP flow's first payload.
+fn parse_freedom_noises(settings: &Json) -> Result<Vec<FreedomNoise>, String> {
+    let Some(value) = settings.get("noises") else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Json::Null) {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_arr()
+        .ok_or_else(|| "freedom: noises is not a list".to_owned())?;
+    let mut noises = Vec::with_capacity(items.len());
+    for item in items {
+        let kind = item
+            .get("type")
+            .and_then(Json::as_str)
+            .ok_or_else(|| "freedom: a noise entry has no type".to_owned())?;
+        let text = item
+            .get("packet")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .trim();
+        let (length_min, length_max, packet) = match kind {
+            "rand" => {
+                let (min, max) = freedom_range_text(text)
+                    .ok_or_else(|| format!("freedom: rand noise length `{text}` is not a range"))?;
+                if min <= 0 {
+                    return Err("freedom: rand noise lengthMin cannot be 0".to_owned());
+                }
+                (min as u64, max as u64, None)
+            }
+            "str" => (0, 0, Some(text.as_bytes().to_vec())),
+            "hex" => (0, 0, Some(freedom_hex(text)?)),
+            "base64" => {
+                let text = text.replace('+', "-").replace('/', "_").replace('=', "");
+                let bytes = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    ferrox_core::b64::decode(text.as_bytes())
+                        .ok_or_else(|| "freedom: base64 noise is not decodable".to_owned())?
+                };
+                (0, 0, Some(bytes))
+            }
+            other => {
+                return Err(format!(
+                    "freedom: noise type `{other}` is not rand/str/hex/base64"
+                ));
+            }
+        };
+        let delay = match item.get("delay") {
+            None | Some(Json::Null) => (0, 0),
+            Some(value) => freedom_u64_range(value, "noise delay")?.unwrap_or((0, 0)),
+        };
+        let apply_to = match item
+            .get("applyTo")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "ip" | "all" => FreedomNoiseApply::Ip,
+            "ipv4" => FreedomNoiseApply::Ipv4,
+            "ipv6" => FreedomNoiseApply::Ipv6,
+            other => {
+                return Err(format!(
+                    "freedom: noise applyTo `{other}` is not ip/ipv4/ipv6"
+                ));
+            }
+        };
+        noises.push(FreedomNoise {
+            length_min,
+            length_max,
+            packet,
+            delay_min: delay.0,
+            delay_max: delay.1,
+            apply_to,
+        });
+    }
+    Ok(noises)
+}
+
+fn freedom_hex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err("freedom: hex noise has an odd number of digits".to_owned());
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().as_chunks::<2>().0 {
+        let high = freedom_hex_digit(pair[0])?;
+        let low = freedom_hex_digit(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn freedom_hex_digit(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("freedom: hex noise is not hexadecimal".to_owned()),
+    }
+}
+
+/// The reference's `finalRules`, read in order: the first rule a destination matches decides.
+fn parse_freedom_final_rules(settings: &Json) -> Result<Vec<FreedomFinalRule>, String> {
+    let Some(value) = settings.get("finalRules") else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Json::Null) {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_arr()
+        .ok_or_else(|| "freedom: finalRules is not a list".to_owned())?;
+    let mut rules = Vec::with_capacity(items.len());
+    for item in items {
+        let action = match item
+            .get("action")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "allow" => FreedomRuleAction::Allow,
+            "block" => FreedomRuleAction::Block,
+            other => {
+                return Err(format!("freedom: unknown final rule action `{other}`"));
+            }
+        };
+        let networks = match item.get("network") {
+            None | Some(Json::Null) => None,
+            Some(value) => freedom_networks(value)?,
+        };
+        let ports = item
+            .get("port")
+            .filter(|value| !matches!(value, Json::Null))
+            .map(freedom_ports)
+            .transpose()?
+            .flatten();
+        let ips = item
+            .get("ip")
+            .filter(|value| !matches!(value, Json::Null))
+            .map(freedom_ips)
+            .transpose()?
+            .flatten();
+        let block_delay = item
+            .get("blockDelay")
+            .filter(|value| !matches!(value, Json::Null))
+            .map(|value| freedom_u64_range(value, "blockDelay"))
+            .transpose()?
+            .flatten();
+        rules.push(FreedomFinalRule {
+            action,
+            networks,
+            ports,
+            ips,
+            block_delay,
+        });
+    }
+    Ok(rules)
+}
+
+fn freedom_networks(value: &Json) -> Result<Option<[bool; 2]>, String> {
+    let mut networks = [false, false];
+    let mut add = |name: &str| {
+        if name.eq_ignore_ascii_case("tcp") {
+            networks[0] = true;
+        } else if name.eq_ignore_ascii_case("udp") {
+            networks[1] = true;
+        }
+    };
+    match value {
+        Json::Str(text) => {
+            for name in text.split(',') {
+                add(name);
+            }
+        }
+        Json::Arr(items) => {
+            // An empty list builds no network entries, which the reference treats as absent.
+            if items.is_empty() {
+                return Ok(None);
+            }
+            for item in items {
+                let name = item.as_str().ok_or_else(|| {
+                    "freedom: network has a value that is not a string".to_owned()
+                })?;
+                add(name);
+            }
+        }
+        _ => return Err("freedom: network is not a string or array".to_owned()),
+    }
+    Ok(Some(networks))
+}
+
+fn freedom_ports(value: &Json) -> Result<Option<Vec<(u16, u16)>>, String> {
+    let pieces: Vec<String> = match value {
+        Json::Str(text) => text.split(',').map(str::to_owned).collect(),
+        Json::Arr(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "freedom: port has a value that is not a string".to_owned())
+            })
+            .collect::<Result<_, _>>()?,
+        Json::Num(_) => {
+            let port = value
+                .as_port()
+                .ok_or_else(|| "freedom: port is not between 0 and 65535".to_owned())?;
+            return Ok((port != 0).then(|| vec![(port, port)]));
+        }
+        _ => return Err("freedom: port is not a string, number or array".to_owned()),
+    };
+    let mut ranges = Vec::new();
+    for piece in pieces {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let piece = match piece.strip_prefix("env:") {
+            Some(name) => std::env::var(name)
+                .map_err(|_| format!("freedom: env `{name}` in a port is unset"))?,
+            None => piece.to_owned(),
+        };
+        let (from, to) = match piece.split_once('-') {
+            Some((from, to)) => (from, to),
+            None => (piece.as_str(), piece.as_str()),
+        };
+        let from = freedom_port(from)?;
+        let to = freedom_port(to)?;
+        ranges.push((from, to));
+    }
+    // An empty port list is the reference's "all ports", the same as an absent one.
+    Ok((!ranges.is_empty()).then_some(ranges))
+}
+
+fn freedom_port(text: &str) -> Result<u16, String> {
+    text.parse::<u16>()
+        .map_err(|_| format!("freedom: port `{text}` is not between 0 and 65535"))
+}
+
+fn freedom_ips(value: &Json) -> Result<Option<Arc<crate::router::IpMatcher>>, String> {
+    if matches!(value, Json::Arr(items) if items.is_empty()) {
+        return Ok(None);
+    }
+    let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
+    crate::router::ip_matcher(value, &mut assets, "freedom finalRules ip")
+        .map(|matcher| Some(Arc::new(matcher)))
+}
+
+fn freedom_u64_range(value: &Json, field: &str) -> Result<Option<(u64, u64)>, String> {
+    let (min, max) = match value {
+        Json::Num(_) => {
+            let number = value.as_u32().ok_or_else(|| {
+                format!("freedom: {field} is not a number between 0 and 4294967295")
+            })?;
+            (i64::from(number), i64::from(number))
+        }
+        Json::Str(text) => freedom_range_text(text)
+            .ok_or_else(|| format!("freedom: {field} `{text}` is not a range"))?,
+        _ => return Err(format!("freedom: {field} is not a number or string")),
+    };
+    if min < 0 || max < 0 {
+        return Err(format!("freedom: {field} cannot be negative"));
+    }
+    Ok(Some((min as u64, max as u64)))
+}
+
+/// `ParseRangeString`: a number, an empty string as zero, or `a-b`; the leading dash of a
+/// negative lower end belongs to it, so `-114-514` splits after its second number.
+fn freedom_range_text(text: &str) -> Option<(i64, i64)> {
+    if let Ok(single) = text.parse::<i64>() {
+        return Some((single, single));
+    }
+    if text.is_empty() {
+        return Some((0, 0));
+    }
+    let leading = text.starts_with('-');
+    let (left, right) = text.strip_prefix('-').unwrap_or(text).split_once('-')?;
+    let left = if leading {
+        format!("-{left}")
+    } else {
+        left.to_owned()
+    };
+    Some((left.parse().ok()?, right.parse().ok()?))
 }
 
 fn parse_freedom_redirect(text: &str) -> Result<FreedomRedirect, String> {
@@ -51028,6 +51555,62 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    /// A blocked UDP destination still receives the decoy before the final rule drops the payload,
+    /// and the socket stays open, as the reference's noise writer runs ahead of its rule check.
+    #[test]
+    fn a_freedom_noise_precedes_a_blocked_udp_payload() {
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        target
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target_port = target.local_addr().expect("addr").port();
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{
+                "noises":[{"type":"str","packet":"hello"}],"finalRules":[{"action":"block"}]}}]}"#,
+        );
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        let relay = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut datagram,
+            &format!("127.0.0.1:{target_port}").parse().expect("addr"),
+        );
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut buf = vec![0u8; UDP_BUF];
+        let (n, _) = target.recv_from(&mut buf).expect("noise");
+        assert_eq!(&buf[..n], b"hello");
+        target
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        assert!(
+            target.recv_from(&mut buf).is_err(),
+            "the blocked payload must not reach the destination"
+        );
+    }
+
     /// A non-route UDP outbound still takes the sniffed lane: bittorrent has no domain to override,
     /// so the original destination and the echo reply must come back untouched.
     #[test]
@@ -60959,6 +61542,88 @@ mod tests {
             panic!("a freedom outbound");
         };
         assert!(freedom.fragment.is_some(), "the fragment stage is kept");
+    }
+
+    /// A final rule is scoped by network, port, address and wait; an absent scope matches all and
+    /// an empty port list matches every port, as the reference's own `PortList` does.
+    #[test]
+    fn a_freedom_final_rule_matches_its_scopes() {
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"finalRules":[
+                {"action":"block","network":"tcp","port":"443,8443-8444","ip":["geoip:private"],"blockDelay":"0-0"}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        let private: IpAddr = "127.0.0.1".parse().expect("private");
+        let public: IpAddr = IpAddr::from([1, 1, 1, 1]);
+        assert!(freedom.blocks(crate::router::Network::Tcp, private, 443));
+        assert!(!freedom.blocks(crate::router::Network::Udp, private, 443));
+        assert!(!freedom.blocks(crate::router::Network::Tcp, public, 443));
+        assert!(!freedom.blocks(crate::router::Network::Tcp, private, 80));
+        assert!(freedom.final_rules[0].delay().is_zero());
+
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"block","port":""}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert!(
+            freedom.blocks(crate::router::Network::Tcp, public, 80),
+            "a present but empty port list matches every port, as the reference's empty list does"
+        );
+
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"finalRules":[
+                {"action":"allow","port":"53"},{"action":"block"}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert!(!freedom.blocks(crate::router::Network::Udp, public, 53));
+        assert!(freedom.blocks(crate::router::Network::Udp, public, 54));
+    }
+
+    /// The noise list keeps a fixed packet, a hex packet and its family filter; the removed
+    /// singular spelling is a startup refusal.
+    #[test]
+    fn a_freedom_noise_keeps_its_packet_and_family() {
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[
+                {"type":"str","packet":"hello","applyTo":"ipv4"},
+                {"type":"hex","packet":"00ff","delay":"0-0"}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert_eq!(freedom.noises.len(), 2);
+        assert_eq!(
+            freedom.noises[0].packet.as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert!(freedom.noises[0].applies_to("127.0.0.1".parse().expect("v4")));
+        assert!(!freedom.noises[0].applies_to("::1".parse().expect("v6")));
+        assert_eq!(freedom.noises[1].packet.as_deref(), Some(&[0, 0xff][..]));
+
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noise":{"type":"str"}}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            find_outbound(&root).is_err(),
+            "the singular spelling is removed"
+        );
+    }
+
+    /// `RandBetween`'s bounds are the reference's: a one-wide span returns the lower end, and a
+    /// two-wide span can return only those two ends.
+    #[test]
+    fn a_freedom_range_keeps_the_reference_bounds() {
+        assert_eq!(freedom_between(5, 5), 5);
+        assert_eq!(freedom_between(5, 6), 5);
+        assert!((5..7).contains(&freedom_between(5, 7)));
+        assert!((5..7).contains(&freedom_between(7, 5)));
     }
 
     /// An unknown strategy is refused by name rather than dialled as `AsIs`.
