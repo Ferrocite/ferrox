@@ -33,6 +33,7 @@ graph TD
     K --> I
     L["LocalHttpProxyPort listener"] --> M["CONNECT only; 407 when a credential<br/>is configured and the request is not authorized"]
     M --> I
+    M --> I2
     N["conduit: tactics specs, broker fronts,<br/>Noise XK + ClientOfferRequest"] --> O["WebRtc::offer: host candidate,<br/>STUN XOR-MAPPED, str0m SDP"]
     O --> Q["client_offer: answer SDP,<br/>connectionID, relay packet"]
     Q --> R["persistent data channel: DTLS/SCTP<br/>over direct UDP, 16 KiB writes"]

@@ -740,14 +740,16 @@ impl Inner {
 
     fn split_remember(&self, key: &str) {
         let mut cache = lock(&self.split_untunneled);
-        if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX {
+        if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX && !cache.contains_key(key) {
             cache.retain(|_, at| at.elapsed() < SPLIT_TUNNEL_CLASSIFICATION_TTL);
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
+            if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                }
             }
         }
         cache.insert(key.to_owned(), Instant::now());

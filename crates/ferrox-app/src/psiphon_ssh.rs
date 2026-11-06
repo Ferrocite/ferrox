@@ -959,6 +959,16 @@ impl Proxy {
         port: u16,
         timeout: Duration,
     ) -> Result<TcpStream, String> {
+        if host.is_empty()
+            || host.bytes().any(|byte| {
+                byte.is_ascii_control()
+                    || byte.is_ascii_whitespace()
+                    || byte == b'/'
+                    || byte == b'@'
+            })
+        {
+            return Err("psiphon: upstream proxy host name is not valid".to_owned());
+        }
         let mut last = String::new();
         for address in crate::psiphon_dns::resolve(&self.host, self.port, &self.dns)
             .map_err(|error| format!("psiphon: upstream proxy resolve {}: {error}", self.host))?

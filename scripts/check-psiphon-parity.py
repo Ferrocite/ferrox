@@ -9,6 +9,7 @@ neither place is an unclassified gap, so a new pin cannot add one silently.
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -16,6 +17,7 @@ CONFIG = "upstream/psiphon-tunnel-core/psiphon/config.go"
 SOURCE = "crates/ferrox-app/src/psiphon.rs"
 DOC = "docs/psiphon-parity.md"
 PINS = "upstream/pins.toml"
+GIT = shutil.which("git")
 
 CLASSES = {
     "client-front", "client-api", "client-core", "client-replay",
@@ -35,6 +37,43 @@ def between(text, begin, end, fails, label):
         fails.append(f"{DOC}: no {label} between {begin} and {end}")
         return ""
     return text[start + len(begin):stop]
+
+
+def without_comment(line, in_block):
+    out = []
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        if in_block:
+            end = line.find("*/", index)
+            if end < 0:
+                return "".join(out), True
+            index = end + 2
+            in_block = False
+            continue
+        char = line[index]
+        if quote is not None:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "`":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ('"', "'", '`'):
+            quote = char
+            out.append(char)
+        elif char == "/" and line[index:index + 2] == "//":
+            break
+        elif char == "/" and line[index:index + 2] == "/*":
+            in_block = True
+            index += 2
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out), in_block
 
 
 def upstream_fields(root):
@@ -59,14 +98,21 @@ def upstream_fields(root):
                 break
     body = text[start + len(marker):end]
     fields = []
+    depth = 0
+    in_block = False
     for line in body.splitlines():
+        line, in_block = without_comment(line, in_block)
         line = line.strip()
-        if not line or line.startswith("//"):
+        top = depth == 0
+        depth += line.count("{") - line.count("}")
+        if not top or not line:
             continue
-        match = re.match(r"^([A-Z]\w*)\s+[^`]+`([^`]*)`", line)
+        match = re.match(r"^([A-Z]\w*)\s+[^`]*(?:`([^`]*)`)?", line)
         if not match:
             continue
-        tag = re.search(r'json:"([^"]*)"', match.group(2))
+        tag = re.search(r'json:"([^"]*)"', match.group(2) or "")
+        if tag and tag.group(1) == "-":
+            continue
         name = tag.group(1).split(",")[0] if tag else ""
         fields.append(name or match.group(1))
     return fields
@@ -86,6 +132,24 @@ def known_settings(root):
     if end < 0:
         return None
     return re.findall(r'"([^"]+)"', text[start:end])
+
+
+def git_run(*args, check=False, **kwargs):
+    if GIT is None:
+        raise RuntimeError("git is not on PATH")
+    return subprocess.run([GIT, *args], check=check, **kwargs)
+
+
+def checkout_rev(root):
+    path = os.path.join(root, "upstream/psiphon-tunnel-core")
+    try:
+        out = git_run(
+            "-C", path, "rev-parse", "HEAD",
+            capture_output=True, text=True, check=True,
+        )
+    except (OSError, RuntimeError, subprocess.CalledProcessError):
+        return None
+    return out.stdout.strip() or None
 
 
 def pin_rev(root):
@@ -214,6 +278,13 @@ def run_check(root):
     if rev is None:
         fails.append(f"{PINS}: no psiphon-tunnel-core rev")
     else:
+        checkout = checkout_rev(root)
+        if checkout is None:
+            fails.append(f"{CONFIG}: cannot read the checkout revision")
+        elif checkout != rev:
+            fails.append(
+                f"{CONFIG}: checkout is at {checkout[:7]}, not the pinned {rev[:7]}"
+            )
         path = os.path.join(root, DOC)
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as f:
@@ -249,6 +320,23 @@ def selftest():
                 "\tC string `json:\",omitempty\"`\n"
                 "}\n"
             )
+        git_run(
+            "init", "-q", os.path.join(root, "upstream/psiphon-tunnel-core"),
+            check=True,
+        )
+        git_run(
+            "-C", os.path.join(root, "upstream/psiphon-tunnel-core"),
+            "add", "psiphon/config.go",
+            check=True,
+        )
+        git_run(
+            "-C", os.path.join(root, "upstream/psiphon-tunnel-core"),
+            "-c", "user.name=parity", "-c", "user.email=parity@test",
+            "commit", "--no-gpg-sign", "-q", "-m", "fixture",
+            check=True,
+        )
+        rev = checkout_rev(root)
+        assert rev is not None
         with open(source, "w", encoding="utf-8") as f:
             f.write(
                 "const KNOWN_SETTINGS: &[&str] = &[\n"
@@ -257,10 +345,10 @@ def selftest():
         with open(pins, "w", encoding="utf-8") as f:
             f.write(
                 "[sources.psiphon-tunnel-core]\n"
-                'rev = "0123456789abcdef"\n'
+                f'rev = "{rev}"\n'
             )
         good = (
-            "pinned @ `0123456`\n"
+            f"pinned @ `{rev[:7]}`\n"
             "<!-- parity:begin -->\n"
             "| class | state | fields |\n"
             "| --- | --- | --- |\n"
@@ -318,8 +406,8 @@ def selftest():
                  "| `client-core` | `not-a-client-lane` |")),
             ("alias drift", "alias spelling(s) not in the map: alias",
              lambda text: text.replace("`alias`\n", "")),
-            ("rev drift", "does not cite the pinned rev 0123456",
-             lambda text: text.replace("`0123456`", "`fedcba9`")),
+            ("rev drift", "does not cite the pinned rev " + rev[:7],
+             lambda text: text.replace(f"`{rev[:7]}`", "`fedcba9`")),
         ]
         for label, want, edit in cases:
             if not expect(label, want, edit):
@@ -335,14 +423,20 @@ def selftest():
                 "\tB string `json:\",omitempty\"`\n"
                 "\tC string `json:\",omitempty\"`\n"
                 "\tD string `json:\",omitempty\"`\n"
+                "\t// {\n"
+                "\tE bool\n"
+                "\t/* } */ F string `json:\"-\"`\n"
                 "}\n"
             )
         fails, _ = run_check(root)
-        if not any("unclassified upstream field(s): D" in line
+        if not any("unclassified upstream field(s): D, E" in line
                    for line in fails):
-            print("check-psiphon-parity: self-test new pin field still passes")
+            print("check-psiphon-parity: self-test untagged field still passes")
             return 1
-        print("check-psiphon-parity: self-test passed (nine mutations refused)")
+        if any("F" in line for line in fails):
+            print("check-psiphon-parity: self-test json:\"-\" field is listed")
+            return 1
+        print("check-psiphon-parity: self-test passed (ten mutations refused)")
         return 0
     finally:
         shutil.rmtree(root, ignore_errors=True)
