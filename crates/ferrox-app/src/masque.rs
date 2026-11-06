@@ -391,6 +391,7 @@ fn assemble(
     let routes: UdpRoutes = Arc::default();
     let stack_config = Arc::clone(&config);
     let stack_tunnel = to_tunnel.clone();
+    let stack_routes = Arc::clone(&routes);
     std::thread::spawn(move || {
         wg_stack::client(
             (*stack_config).clone(),
@@ -398,6 +399,7 @@ fn assemble(
             packets_rx,
             flow_rx,
             0,
+            stack_routes,
             None,
         );
     });
@@ -3243,6 +3245,33 @@ mod tests {
         );
     }
 
+    /// A first IPv4 UDP fragment goes to the stack, not the datagram lane.
+    #[test]
+    fn an_ipv4_udp_fragment_reaches_the_stack() {
+        let (to_stack, stack_rx) = mpsc::channel();
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let payload = vec![0x5a; 3000];
+        let datagram = connectip::UdpDatagram {
+            source: &[10, 14, 0, 2],
+            destination: &[192, 0, 2, 1],
+            source_port: 1234,
+            destination_port: 4321,
+            payload: &payload,
+        };
+        let mut packet = Vec::new();
+        assert!(connectip::udp_datagram(&datagram, &mut packet));
+        let piece = 1_344usize - 20;
+        packet[2..4].copy_from_slice(&((20 + piece) as u16).to_be_bytes());
+        packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        packet[10..12].fill(0);
+        let header = ferrox_core::foxy::connectip::ipv4_checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header.to_be_bytes());
+        packet.truncate(20 + piece);
+        deliver(&to_stack, &routes, &packet);
+        let delivered = stack_rx.recv().expect("the fragment reaches the stack");
+        assert_eq!(delivered.bytes, packet);
+    }
+
     #[test]
     fn an_ipv6_fragment_reaches_the_stack() {
         let (to_stack, stack_rx) = mpsc::channel();
@@ -3911,6 +3940,7 @@ mod tests {
         assert_eq!(server.path, "/masque/ip&target=*&ipproto=*");
     }
 
+    /// `largeSegments` is off unless the outbound names it.
     #[test]
     fn large_segments_are_opt_in_for_masque() {
         let plain = ClientSpec::from(&outbound(8443)).expect("the default spec");

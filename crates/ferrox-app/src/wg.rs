@@ -265,6 +265,7 @@ impl WireGuardOut {
         });
         let stack_config = config.clone();
         let stack_tunnel = to_tunnel.clone();
+        let stack_routes = Arc::clone(&routes);
         std::thread::spawn(move || {
             wg_stack::client(
                 stack_config,
@@ -272,6 +273,7 @@ impl WireGuardOut {
                 packets_rx,
                 flow_rx,
                 WG_HEADER_SIZE,
+                stack_routes,
                 Some(recycle),
             );
         });

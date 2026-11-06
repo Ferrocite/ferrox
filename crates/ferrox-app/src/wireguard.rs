@@ -460,6 +460,7 @@ mod tests {
         assert!(!both.no_kernel_tun);
     }
 
+    /// `largeSegments` is off unless the config names it.
     #[test]
     fn large_segments_are_opt_in() {
         let base = r#""secretKey":"0000000000000000000000000000000000000000000000000000000000000001",

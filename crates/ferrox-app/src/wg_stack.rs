@@ -1111,6 +1111,10 @@ fn receive_client(stack: &mut ClientStack, packet: Packet) {
         stack.device.push(bytes, at);
         return;
     }
+    if stack.deliver_udp(&bytes[at..]) {
+        stack.device.recycle(bytes, at);
+        return;
+    }
     if !stack.answer_echo(&bytes[at..]) {
         stack.absorb(packet.peer, &bytes[at..]);
     }
@@ -1125,9 +1129,11 @@ pub(crate) fn client(
     packets: Packets,
     flows: Receiver<ClientFlow>,
     headroom: usize,
+    routes: UdpRoutes,
     recycle: Option<Sender<Vec<u8>>>,
 ) {
     let mut stack = ClientStack::new(&config, to_tunnel, headroom);
+    stack.routes = routes;
     stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -1254,6 +1260,7 @@ struct ClientStack {
     peers: Vec<PeerConfig>,
     reassembly: Reassembly,
     fragment: usize,
+    routes: UdpRoutes,
     started: StdInstant,
 }
 
@@ -1293,8 +1300,26 @@ impl ClientStack {
             } else {
                 config.mtu
             },
+            routes: Arc::default(),
             started: StdInstant::now(),
         }
+    }
+
+    /// Hand a complete UDP packet to the lane waiting on its destination port.
+    fn deliver_udp(&self, packet: &[u8]) -> bool {
+        let Some(datagram) = udp_from_packet(packet) else {
+            return false;
+        };
+        if !datagram.verified {
+            return false;
+        }
+        let Ok(table) = self.routes.lock() else {
+            return false;
+        };
+        let Some(lane) = table.get(&datagram.destination_port) else {
+            return false;
+        };
+        lane.send(packet.to_vec()).is_ok()
     }
 
     /// Answer an echo aimed at one of the client's own tunnel addresses.
@@ -2006,9 +2031,22 @@ pub(crate) fn inner_protocol(packet: &[u8]) -> Option<u8> {
 pub(crate) fn stack_packet(packet: &[u8]) -> bool {
     match inner_protocol(packet) {
         Some(PROTOCOL_TCP) => true,
+        Some(PROTOCOL_UDP) => ipv4_fragment(packet),
         Some(44) => packet.first().is_some_and(|byte| byte >> 4 == 6),
         _ => false,
     }
+}
+
+/// Whether the packet is an IPv4 fragment rather than a complete datagram.
+fn ipv4_fragment(packet: &[u8]) -> bool {
+    if packet.first().is_none_or(|byte| byte >> 4 != 4) {
+        return false;
+    }
+    let Some(fields) = packet.get(6..8) else {
+        return false;
+    };
+    let fields = u16::from_be_bytes([fields[0], fields[1]]);
+    fields & 0x3fff != 0
 }
 
 /// The inner source and destination addresses of an IPv4 or IPv6 packet.
@@ -3856,6 +3894,7 @@ mod tests {
         drop(app);
     }
 
+    /// Without the opt-in the client advertises the configured tunnel MSS.
     #[test]
     fn the_client_keeps_the_tunnel_mss_without_large_segments() {
         let (app, proxy) = loopback().expect("pair");
@@ -3901,6 +3940,57 @@ mod tests {
             .expect("the SYN-ACK");
         assert_eq!(tcp_mss(&answer), 1380);
         assert!(tcp_checksum_verifies(&answer));
+    }
+
+    /// A completed fragment is handed to the lane that asked for the datagram.
+    #[test]
+    fn a_fragmented_udp_reply_reaches_its_lane() {
+        let payload = vec![0x5a; 3000];
+        for ipv6 in [false, true] {
+            let (to_tunnel, _) = std::sync::mpsc::channel();
+            let addresses: &[&str] = if ipv6 {
+                &["10.0.0.2", "fd00::2"]
+            } else {
+                &["10.0.0.2"]
+            };
+            let mut stack = ClientStack::new(&device(addresses, true), to_tunnel, 0);
+            let (lane, replies) = std::sync::mpsc::channel();
+            stack.routes.lock().expect("routes").insert(4321, lane);
+            let (source, destination): (&[u8], &[u8]) = if ipv6 {
+                (
+                    &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                    &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                )
+            } else {
+                (&[10, 0, 0, 2], &[192, 0, 2, 1])
+            };
+            let mut packet = Vec::new();
+            let datagram = UdpDatagram {
+                source,
+                destination,
+                source_port: 53,
+                destination_port: 4321,
+                payload: &payload,
+            };
+            assert!(udp_datagram(&datagram, &mut packet));
+            let fragments =
+                fragment_packet(&packet, 0, TUNNEL_FRAGMENT).expect("a fragmented datagram");
+            assert!(fragments.len() > 1);
+            for fragment in fragments {
+                receive_client(
+                    &mut stack,
+                    Packet {
+                        peer: [0u8; 32],
+                        bytes: fragment,
+                        at: 0,
+                    },
+                );
+            }
+            let reply = replies
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the completed datagram reaches its lane");
+            assert_eq!(reply, packet);
+        }
     }
 
     #[test]
