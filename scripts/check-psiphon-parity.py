@@ -17,6 +17,7 @@ CONFIG = "upstream/psiphon-tunnel-core/psiphon/config.go"
 SOURCE = "crates/ferrox-app/src/psiphon.rs"
 DOC = "docs/psiphon-parity.md"
 PINS = "upstream/pins.toml"
+GIT = shutil.which("git")
 
 CLASSES = {
     "client-front", "client-api", "client-core", "client-replay",
@@ -36,6 +37,43 @@ def between(text, begin, end, fails, label):
         fails.append(f"{DOC}: no {label} between {begin} and {end}")
         return ""
     return text[start + len(begin):stop]
+
+
+def without_comment(line, in_block):
+    out = []
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        if in_block:
+            end = line.find("*/", index)
+            if end < 0:
+                return "".join(out), True
+            index = end + 2
+            in_block = False
+            continue
+        char = line[index]
+        if quote is not None:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "`":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ('"', "'", '`'):
+            quote = char
+            out.append(char)
+        elif char == "/" and line[index:index + 2] == "//":
+            break
+        elif char == "/" and line[index:index + 2] == "/*":
+            in_block = True
+            index += 2
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out), in_block
 
 
 def upstream_fields(root):
@@ -61,11 +99,13 @@ def upstream_fields(root):
     body = text[start + len(marker):end]
     fields = []
     depth = 0
+    in_block = False
     for line in body.splitlines():
+        line, in_block = without_comment(line, in_block)
         line = line.strip()
         top = depth == 0
         depth += line.count("{") - line.count("}")
-        if not top or not line or line.startswith("//"):
+        if not top or not line:
             continue
         match = re.match(r"^([A-Z]\w*)\s+[^`]*(?:`([^`]*)`)?", line)
         if not match:
@@ -94,14 +134,20 @@ def known_settings(root):
     return re.findall(r'"([^"]+)"', text[start:end])
 
 
+def git_run(*args, check=False, **kwargs):
+    if GIT is None:
+        raise RuntimeError("git is not on PATH")
+    return subprocess.run([GIT, *args], check=check, **kwargs)
+
+
 def checkout_rev(root):
     path = os.path.join(root, "upstream/psiphon-tunnel-core")
     try:
-        out = subprocess.run(
-            ["git", "-C", path, "rev-parse", "HEAD"],
+        out = git_run(
+            "-C", path, "rev-parse", "HEAD",
             capture_output=True, text=True, check=True,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, RuntimeError, subprocess.CalledProcessError):
         return None
     return out.stdout.strip() or None
 
@@ -274,19 +320,19 @@ def selftest():
                 "\tC string `json:\",omitempty\"`\n"
                 "}\n"
             )
-        subprocess.run(
-            ["git", "init", "-q", os.path.join(root, "upstream/psiphon-tunnel-core")],
+        git_run(
+            "init", "-q", os.path.join(root, "upstream/psiphon-tunnel-core"),
             check=True,
         )
-        subprocess.run(
-            ["git", "-C", os.path.join(root, "upstream/psiphon-tunnel-core"),
-             "add", "psiphon/config.go"],
+        git_run(
+            "-C", os.path.join(root, "upstream/psiphon-tunnel-core"),
+            "add", "psiphon/config.go",
             check=True,
         )
-        subprocess.run(
-            ["git", "-C", os.path.join(root, "upstream/psiphon-tunnel-core"),
-             "-c", "user.name=parity", "-c", "user.email=parity@test",
-             "commit", "-q", "-m", "fixture"],
+        git_run(
+            "-C", os.path.join(root, "upstream/psiphon-tunnel-core"),
+            "-c", "user.name=parity", "-c", "user.email=parity@test",
+            "commit", "--no-gpg-sign", "-q", "-m", "fixture",
             check=True,
         )
         rev = checkout_rev(root)
@@ -377,8 +423,9 @@ def selftest():
                 "\tB string `json:\",omitempty\"`\n"
                 "\tC string `json:\",omitempty\"`\n"
                 "\tD string `json:\",omitempty\"`\n"
+                "\t// {\n"
                 "\tE bool\n"
-                "\tF string `json:\"-\"`\n"
+                "\t/* } */ F string `json:\"-\"`\n"
                 "}\n"
             )
         fails, _ = run_check(root)
