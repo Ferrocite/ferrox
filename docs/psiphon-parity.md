@@ -26,7 +26,6 @@ the gap count is complete, not so a client lane should implement them.
 <!-- parity:begin -->
 | class | state | fields |
 | --- | --- | --- |
-| `client-front` | `missing` | `DisableLocalSocksProxy` |
 | `client-api` | `missing` | `Authorizations`, `ClientAPILevel`, `DisableApi`, `SessionID`, `TargetAPIEncoding`, `TargetAPIProtocol` |
 | `client-core` | `missing` | `LimitCPUThreads`, `RateLimits` |
 | `client-replay` | `missing` | `DisableReplay`, `FrontedHTTPClientReplayDialParametersProbability`, `FrontedHTTPClientReplayDialParametersTTLSeconds`, `FrontedHTTPClientReplayRetainFailedProbability`, `FrontedHTTPClientReplayUpdateFrequencySeconds`, `InproxyReplayBrokerDialParametersProbability`, `InproxyReplayBrokerDialParametersTTLSeconds`, `InproxyReplayBrokerRetainFailedProbability`, `InproxyReplayBrokerUpdateFrequencySeconds`, `InproxyReplayRetainFailedProbability`, `ReplayCandidateCount`, `ReplayDialParametersTTLSeconds`, `ReplayIgnoreChangedConfigStateProbability`, `ReplayLaterRoundMoveToFrontProbability`, `ReplayRetainFailedProbability`, `ReplayTargetDownstreamBytes`, `ReplayTargetTunnelDurationSeconds`, `ReplayTargetUpstreamBytes` |
