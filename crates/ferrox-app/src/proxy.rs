@@ -3853,7 +3853,17 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
                 .with_meter(crate::stats::inbound(tag))
                 .with_policy(Some(crate::policy::flow(0)));
             let stream = with_account(stream, role.account(), false);
-            role.serve_polled_tls(stream, sniffing);
+            // The ClientHello peek runs on a setup lane, so a stalled hello cannot hold the accept loop.
+            let mut work = Some((role, stream, sniffing));
+            lane_pool::submit_setup(
+                Box::new(move || {
+                    if let Some((role, stream, sniffing)) = work.take() {
+                        role.serve_polled_tls(stream, sniffing);
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
             continue;
         }
         let tag = tag.map(str::to_owned);

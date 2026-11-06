@@ -701,6 +701,14 @@ pub(crate) fn tls_identity_from_settings(
         .and_then(Json::as_bool)
         .unwrap_or(false);
     identity.ech_server_keys = ech;
+    if identity.ech_server_keys.is_some()
+        && identity.max_version.is_some_and(|version| version < 0x0304)
+    {
+        eprintln!(
+            "ech: an ECH listener cannot cap its maximum below TLS 1.3; the inbound is refused, not served without it"
+        );
+        return None;
+    }
     identity.master_key_log = tls_master_key_log(tls);
     let identity = Arc::new(identity);
     start_cert_ticker(&identity);

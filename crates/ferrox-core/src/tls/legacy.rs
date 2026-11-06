@@ -57,7 +57,7 @@ pub(crate) fn cipher_list(ids: &[u16]) -> String {
     list
 }
 
-fn version(value: u16) -> Result<SslVersion, TlsError> {
+pub(crate) fn version(value: u16) -> Result<SslVersion, TlsError> {
     match value {
         0x0303 => Ok(SslVersion::TLS1_2),
         0x0304 => Ok(SslVersion::TLS1_3),

@@ -1969,7 +1969,16 @@ pub(crate) fn ech_server_context_builder(
     cfg: &super::TlsServerConfig,
     keys: &[u8],
 ) -> Result<boring::ssl::SslContextBuilder, TlsError> {
-    let builder = server_identity_builder(cfg)?;
+    let mut builder = server_identity_builder(cfg)?;
+    let ceiling = cfg.max_version.unwrap_or(0x0304).min(0x0304);
+    if ceiling < 0x0304 {
+        return Err(TlsError::Other(
+            "an ECH listener cannot cap its maximum below TLS 1.3".to_owned(),
+        ));
+    }
+    builder
+        .set_max_proto_version(Some(crate::tls::legacy::version(ceiling)?))
+        .map_err(|error| boring_error(&error))?;
     let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
     let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
     for key in parsed {
@@ -3256,6 +3265,178 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{preset} at {suite:#06x} could not open a frame: {e}"));
             assert_eq!(&buf, b"ping", "one frame each way behind {suite:#06x}");
         }
+    }
+
+    /// One shaped listener and one shaped dial over a pair of queues, so a poll quantum can be
+    /// injected on either side of the listener's handshake without a socket.
+    struct Wire {
+        to_server: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        to_client: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        write_budget: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+        read_budget: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+        fired: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Read for Wire {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut queued = self.to_server.borrow_mut();
+            if queued.is_empty() {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let mut take = queued.len().min(buf.len());
+            if let Some(left) = self.read_budget.get() {
+                if left == 0 {
+                    self.read_budget.set(None);
+                    self.fired.set(true);
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                take = take.min(left);
+                self.read_budget.set(Some(left - take));
+            }
+            buf[..take].copy_from_slice(&queued[..take]);
+            queued.drain(..take);
+            Ok(take)
+        }
+    }
+
+    impl Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut take = buf.len();
+            if let Some(left) = self.write_budget.get() {
+                if left == 0 {
+                    self.write_budget.set(None);
+                    self.fired.set(true);
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                take = take.min(left);
+                self.write_budget.set(Some(left - take));
+            }
+            self.to_client.borrow_mut().extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ClientWire {
+        to_server: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        to_client: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        server: crate::tls::shaped::server::Server<Wire>,
+    }
+
+    impl ClientWire {
+        fn drive(&mut self) {
+            let _ = self.server.handshake();
+        }
+    }
+
+    impl Read for ClientWire {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let to_client = std::rc::Rc::clone(&self.to_client);
+            if to_client.borrow().is_empty() {
+                self.drive();
+            }
+            let mut queued = to_client.borrow_mut();
+            if queued.is_empty() {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let take = queued.len().min(buf.len());
+            buf[..take].copy_from_slice(&queued[..take]);
+            queued.drain(..take);
+            Ok(take)
+        }
+    }
+
+    impl Write for ClientWire {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.to_server.borrow_mut().extend_from_slice(buf);
+            self.drive();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn shaped_listener() -> crate::tls::TlsServerConfig {
+        crate::tls::TlsServerConfig {
+            certs: vec![crate::tls::CertEntry {
+                cert_chain: vec![ANCHOR.to_vec()],
+                key_der: ANCHOR_KEY.to_vec(),
+                key_kind: crate::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: vec![0xc02b],
+            send_tickets: false,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        }
+    }
+
+    fn shaped_dial(
+        write: Option<usize>,
+        read: Option<usize>,
+    ) -> (ClientWire, std::rc::Rc<std::cell::Cell<bool>>) {
+        let to_server = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let to_client = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let write_budget = std::rc::Rc::new(std::cell::Cell::new(write));
+        let read_budget = std::rc::Rc::new(std::cell::Cell::new(read));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let wire = Wire {
+            to_server: std::rc::Rc::clone(&to_server),
+            to_client: std::rc::Rc::clone(&to_client),
+            write_budget: std::rc::Rc::clone(&write_budget),
+            read_budget: std::rc::Rc::clone(&read_budget),
+            fired: std::rc::Rc::clone(&fired),
+        };
+        let server = crate::tls::shaped::server::Server::new(shaped_listener(), wire);
+        let client = ClientWire {
+            to_server,
+            to_client,
+            server,
+        };
+        (client, fired)
+    }
+
+    fn shaped_session(client: ClientWire) -> crate::tls::shaped::Session<ClientWire> {
+        let mut cfg = shaped_client_config();
+        cfg.fingerprint = Some(crate::tls::Fingerprint::resolve("chrome").expect("chrome"));
+        crate::tls::shaped::Session::connect(&cfg, client).expect("connects")
+    }
+
+    fn shaped_client_config() -> TlsConfig {
+        client("tls.test", &[])
+    }
+
+    #[cfg_attr(miri, ignore = "assembles real handshake bytes through ring")]
+    #[test]
+    fn a_shaped_handshake_resumes_after_a_partial_flight_write() {
+        let (client, fired) = shaped_dial(Some(20), None);
+        let mut session = shaped_session(client);
+        session
+            .handshake()
+            .expect("resumes after the write timeout");
+        assert!(fired.get(), "the write budget must have fired");
+        assert_eq!(session.peer_leaf(), Some(ANCHOR));
+    }
+
+    #[cfg_attr(miri, ignore = "assembles real handshake bytes through ring")]
+    #[test]
+    fn a_shaped_handshake_resumes_after_a_partial_flight_read() {
+        let (client, fired) = shaped_dial(None, Some(10));
+        // The first read the listener makes is the ClientHello; stop it mid-record.
+        let mut session = shaped_session(client);
+        session.handshake().expect("resumes after the read timeout");
+        assert!(fired.get(), "the read budget must have fired");
+        assert_eq!(session.peer_leaf(), Some(ANCHOR));
     }
 
     #[cfg_attr(

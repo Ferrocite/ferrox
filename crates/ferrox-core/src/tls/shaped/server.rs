@@ -133,23 +133,30 @@ impl Hello {
     }
 }
 
+/// The pre-master secret a TLS 1.2 RSA key exchange always carries.
+const PRE_MASTER: usize = 48;
+
+/// The raw records a hello may occupy before the peek hands the connection to the other engine.
+const MAX_PEEK: usize = MAX_HANDSHAKE + 5 * MAX_RECORD;
+
 /// The raw records that carried the `ClientHello`, and whether it offers a version newer than TLS 1.2.
 /// A listener that also offers TLS 1.3 replays those bytes to the other engine; a hello this peek
 /// cannot read is replayed too, so the engine that owned the connection before still answers it.
-pub(crate) fn peek_hello<R: Read>(io: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
+pub(crate) fn peek_hello<R: Read>(io: &mut R) -> Result<(Vec<u8>, bool), TlsError> {
+    let until = Some(super::client::handshake_deadline());
     let mut raw = Vec::new();
     let mut handshake = Vec::new();
     loop {
         let mut header = [0u8; 5];
-        io.read_exact(&mut header)?;
+        super::client::exact_until(io, &mut header, until)?;
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
         let at = raw.len();
         raw.extend_from_slice(&header);
-        if header[0] != HANDSHAKE || len > MAX_RECORD {
+        if header[0] != HANDSHAKE || len > MAX_RECORD || raw.len() + len > MAX_PEEK {
             return Ok((raw, true));
         }
         raw.resize(at + 5 + len, 0);
-        io.read_exact(&mut raw[at + 5..])?;
+        super::client::exact_until(io, &mut raw[at + 5..], until)?;
         handshake.extend_from_slice(&raw[at + 5..]);
         if handshake.len() < 4 {
             continue;
@@ -165,14 +172,26 @@ pub(crate) fn peek_hello<R: Read>(io: &mut R) -> std::io::Result<(Vec<u8>, bool)
             Ok(hello) => Ok((
                 raw,
                 hello.version >= 0x0304
-                    || hello
-                        .versions
-                        .as_ref()
-                        .is_some_and(|versions| versions.iter().any(|&id| id >= 0x0304)),
+                    || hello.versions.as_ref().is_some_and(|versions| {
+                        versions.iter().any(|&id| {
+                            id >= 0x0304 && !(id & 0x0f0f == 0x0a0a && id >> 8 == id & 0x00ff)
+                        })
+                    }),
             )),
             Err(_) => Ok((raw, true)),
         };
     }
+}
+
+/// Where a shaped handshake stands, so a poll timeout resumes it instead of starting over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Hello,
+    KeyExchange,
+    Ccs,
+    Finished,
+    ServerFinished,
+    Done,
 }
 
 /// One listener session: the handshake is driven on the first read or write, then every
@@ -187,15 +206,24 @@ pub(crate) struct Server<S: Stream> {
     key: Option<PKey<Private>>,
     transcript: Vec<u8>,
     rec: Vec<u8>,
+    rec_have: usize,
     hs: Vec<u8>,
     hs_at: usize,
     plain_at: usize,
     plain_end: usize,
     out: Vec<u8>,
+    pending: Vec<u8>,
+    pending_at: usize,
     eof: bool,
     sni: Option<Vec<u8>>,
     alpn: Option<Vec<u8>>,
     suite: Option<u16>,
+    phase: Phase,
+    client_random: [u8; 32],
+    ems: bool,
+    own_random: [u8; 32],
+    share: Option<keys::Share>,
+    master: Option<Vec<u8>>,
 }
 
 impl<S: Stream> Server<S> {
@@ -210,15 +238,24 @@ impl<S: Stream> Server<S> {
             key: None,
             transcript: Vec::new(),
             rec: Vec::new(),
+            rec_have: 0,
             hs: Vec::new(),
             hs_at: 0,
             plain_at: 0,
             plain_end: 0,
             out: Vec::new(),
+            pending: Vec::new(),
+            pending_at: 0,
             eof: false,
             sni: None,
             alpn: None,
             suite: None,
+            phase: Phase::Hello,
+            client_random: [0u8; 32],
+            ems: false,
+            own_random: [0u8; 32],
+            share: None,
+            master: None,
         }
     }
 
@@ -234,6 +271,8 @@ impl<S: Stream> Server<S> {
                 self.done = true;
                 Ok(())
             }
+            // A poll quantum is not a failure; the record buffer keeps the partial read.
+            Err(TlsError::Timeout) => Err(TlsError::Timeout),
             Err(error) => {
                 self.failure = Some(error.to_string());
                 Err(error)
@@ -242,10 +281,30 @@ impl<S: Stream> Server<S> {
     }
 
     fn run(&mut self) -> Result<(), TlsError> {
+        self.flush()?;
+        if self.phase == Phase::Hello {
+            self.run_hello()?;
+        }
+        if self.phase == Phase::KeyExchange {
+            self.run_key_exchange()?;
+        }
+        if self.phase == Phase::Ccs {
+            self.expect_ccs()?;
+            self.phase = Phase::Finished;
+        }
+        if self.phase == Phase::Finished {
+            self.run_finished()?;
+        }
+        if self.phase == Phase::ServerFinished {
+            self.run_server_finished()?;
+        }
+        Ok(())
+    }
+
+    fn run_hello(&mut self) -> Result<(), TlsError> {
         let hello_message = self.next_plain(1)?;
         let hello = Hello::parse(&hello_message[4..])?;
         hello.tls12()?;
-        self.transcript.extend_from_slice(&hello_message);
         self.sni = hello.sni.as_ref().map(|name| name.as_bytes().to_vec());
 
         let cert = self.pick_cert(hello.sni.as_deref())?;
@@ -285,23 +344,39 @@ impl<S: Stream> Server<S> {
         };
 
         let mut flight = self.server_hello(&hello, suite_id, &random, share.is_some());
-        self.transcript.extend_from_slice(&flight);
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(&hello_message);
+        transcript.extend_from_slice(&flight);
         let certificate = certificate_message(&self.cfg.certs[cert].cert_chain);
-        self.transcript.extend_from_slice(&certificate);
+        transcript.extend_from_slice(&certificate);
         flight.extend_from_slice(&certificate);
         if let Some(share) = &share {
             let exchange = self.key_exchange(&hello, share, &random)?;
-            self.transcript.extend_from_slice(&exchange);
+            transcript.extend_from_slice(&exchange);
             flight.extend_from_slice(&exchange);
         }
         let done = message(14, &[]);
-        self.transcript.extend_from_slice(&done);
+        transcript.extend_from_slice(&done);
         flight.extend_from_slice(&done);
-        self.write_plain(HANDSHAKE, &flight)?;
+        self.queue_plain(HANDSHAKE, &flight);
 
+        self.transcript = transcript;
+        self.client_random = hello.random;
+        self.ems = hello.ems;
+        self.own_random = random;
+        self.share = share;
+        self.phase = Phase::KeyExchange;
+        self.flush()
+    }
+
+    fn run_key_exchange(&mut self) -> Result<(), TlsError> {
+        let suite = self
+            .suite
+            .and_then(Suite::from_id)
+            .ok_or(TlsError::NoSharedCipher)?;
         let cke = self.next_plain(16)?;
         self.transcript.extend_from_slice(&cke);
-        let pre_master = match share {
+        let pre_master = match self.share.take() {
             Some(share) => {
                 let mut r = Reader::new(&cke[4..]);
                 let peer = r.vec8()?;
@@ -311,34 +386,63 @@ impl<S: Stream> Server<S> {
             }
             None => self.rsa_pre_master(&cke[4..])?,
         };
-        let session_hash = hello.ems.then(|| suite.hash().hash(&self.transcript));
+        let session_hash = self.ems.then(|| suite.hash().hash(&self.transcript));
         let (master, directions) = tls12::keys(
             suite,
             &pre_master,
-            &hello.random,
-            &random,
+            &self.client_random,
+            &self.own_random,
             session_hash.as_deref(),
         );
         if let Some(log) = &self.cfg.master_key_log {
-            rustls::KeyLog::log(log.as_ref(), "CLIENT_RANDOM", &hello.random, &master);
+            rustls::KeyLog::log(log.as_ref(), "CLIENT_RANDOM", &self.client_random, &master);
         }
         self.read = Some(directions.client);
         self.write = Some(directions.server);
+        self.master = Some(master);
+        self.phase = Phase::Ccs;
+        Ok(())
+    }
 
-        self.expect_ccs()?;
+    fn run_finished(&mut self) -> Result<(), TlsError> {
         let finished = self.next_encrypted(20)?;
-        let expected = tls12::finished(suite, &master, b"client finished", &self.transcript);
+        let expected = {
+            let suite = self
+                .suite
+                .and_then(Suite::from_id)
+                .ok_or(TlsError::NoSharedCipher)?;
+            let master = self
+                .master
+                .as_ref()
+                .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
+            tls12::finished(suite, master, b"client finished", &self.transcript)
+        };
         if finished[4..] != expected[..] {
             return Err(TlsError::Other("client Finished did not verify".to_owned()));
         }
         self.transcript.extend_from_slice(&finished);
-
-        self.write_plain(CCS, &[1])?;
-        let verify = tls12::finished(suite, &master, b"server finished", &self.transcript);
-        let done = message(20, &verify);
-        self.write_encrypted(HANDSHAKE, &done)?;
-        self.transcript.extend_from_slice(&done);
+        self.phase = Phase::ServerFinished;
         Ok(())
+    }
+
+    fn run_server_finished(&mut self) -> Result<(), TlsError> {
+        let verify = {
+            let suite = self
+                .suite
+                .and_then(Suite::from_id)
+                .ok_or(TlsError::NoSharedCipher)?;
+            let master = self
+                .master
+                .as_ref()
+                .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
+            tls12::finished(suite, master, b"server finished", &self.transcript)
+        };
+        self.queue_plain(CCS, &[1]);
+        let done = message(20, &verify);
+        self.queue_encrypted(HANDSHAKE, &done)?;
+        self.transcript.extend_from_slice(&done);
+        self.phase = Phase::Done;
+        self.flush()
     }
 
     fn pick_cert(&self, sni: Option<&str>) -> Result<usize, TlsError> {
@@ -438,21 +542,22 @@ impl<S: Stream> Server<S> {
         let rsa = key
             .rsa()
             .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
-        let mut out = vec![0u8; rsa.size() as usize];
-        let secret = rsa
-            .private_decrypt(encrypted, &mut out, Padding::PKCS1)
-            .ok()
-            .map(|len| {
-                out.truncate(len);
-                out
-            })
-            .filter(|secret| secret.len() == 48)
-            .unwrap_or_else(|| {
-                let mut fallback = vec![0u8; 48];
-                let _ = SystemRandom::new().fill(&mut fallback);
-                fallback
-            });
-        Ok(secret)
+        let mut fallback = [0u8; PRE_MASTER];
+        SystemRandom::new()
+            .fill(&mut fallback)
+            .map_err(|_| TlsError::Other("rsa fallback".to_owned()))?;
+        let size = rsa.size() as usize;
+        if encrypted.len() != size {
+            return Ok(fallback.to_vec());
+        }
+        let mut out = vec![0u8; size];
+        if rsa
+            .private_decrypt(encrypted, &mut out, Padding::NONE)
+            .is_err()
+        {
+            return Ok(fallback.to_vec());
+        }
+        Ok(pkcs1_pre_master(&out, &fallback))
     }
 
     fn next_plain(&mut self, want: u8) -> Result<Vec<u8>, TlsError> {
@@ -550,38 +655,77 @@ impl<S: Stream> Server<S> {
     }
 
     fn fill_record(&mut self) -> Result<u8, TlsError> {
-        self.rec.clear();
-        self.rec.resize(5, 0);
-        self.io.read_exact(&mut self.rec)?;
+        if self.rec_have < 5 {
+            self.rec.resize(5, 0);
+            while self.rec_have < 5 {
+                let read = match self.io.read(&mut self.rec[self.rec_have..5]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if read == 0 {
+                    return Err(TlsError::Closed);
+                }
+                self.rec_have += read;
+            }
+        }
         let len = usize::from(u16::from_be_bytes([self.rec[3], self.rec[4]]));
         if len > MAX_RECORD {
+            self.rec_have = 0;
             return Err(TlsError::Other(
                 "record exceeds the maximum length".to_owned(),
             ));
         }
         self.rec.resize(5 + len, 0);
-        self.io.read_exact(&mut self.rec[5..])?;
+        while self.rec_have < self.rec.len() {
+            let read = match self.io.read(&mut self.rec[self.rec_have..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if read == 0 {
+                return Err(TlsError::Closed);
+            }
+            self.rec_have += read;
+        }
+        self.rec_have = 0;
         Ok(self.rec[0])
     }
 
-    fn write_plain(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
-        let mut out = Vec::with_capacity(5 + body.len());
-        out.push(kind);
-        out.extend_from_slice(&[0x03, 0x03]);
-        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-        out.extend_from_slice(body);
-        self.io.write_all(&out)?;
-        Ok(())
+    fn queue_plain(&mut self, kind: u8, body: &[u8]) {
+        self.pending.push(kind);
+        self.pending.extend_from_slice(&[0x03, 0x03]);
+        self.pending
+            .extend_from_slice(&(body.len() as u16).to_be_bytes());
+        self.pending.extend_from_slice(body);
     }
 
-    fn write_encrypted(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
+    fn queue_encrypted(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
         let keys = self
             .write
             .as_mut()
             .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-        let mut out = Vec::with_capacity(5 + body.len() + 32);
-        record::seal12(keys, kind, body, &mut out)?;
-        self.io.write_all(&out)?;
+        record::seal12(keys, kind, body, &mut self.pending)?;
+        Ok(())
+    }
+
+    /// Writes the queued flight from where a timeout left it, so a partial write is resumed rather
+    /// than reframed, and the phase that produced it is never replayed.
+    fn flush(&mut self) -> Result<(), TlsError> {
+        while self.pending_at < self.pending.len() {
+            match self.io.write(&self.pending[self.pending_at..]) {
+                Ok(0) => return Err(TlsError::Closed),
+                Ok(written) => self.pending_at += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(TlsError::Timeout);
+                }
+                Err(error) => return Err(TlsError::from(error)),
+            }
+        }
+        self.pending.clear();
+        self.pending_at = 0;
         Ok(())
     }
 
@@ -635,6 +779,28 @@ impl<S: Stream> Server<S> {
     pub(crate) fn suite(&self) -> Option<u16> {
         self.suite
     }
+}
+
+/// RFC 5246's `EM = 0x00 || 0x02 || PS || 0x00 || M`, with `M` always 48 bytes: the last 48 bytes
+/// are the premaster only when the prefix, a non-empty `PS` and the separator all check out. The
+/// checks and the fallback selection are branchless, so a bad padding looks like a good one.
+fn pkcs1_pre_master(block: &[u8], fallback: &[u8; PRE_MASTER]) -> Vec<u8> {
+    if block.len() < PRE_MASTER + 11 {
+        return fallback.to_vec();
+    }
+    let separator = block.len() - PRE_MASTER - 1;
+    let mut good =
+        u8::from(block[0] == 0) & u8::from(block[1] == 2) & u8::from(block[separator] == 0);
+    for &byte in &block[2..separator] {
+        good &= u8::from(byte != 0);
+    }
+    let mask = 0u8.wrapping_sub(good);
+    let message = &block[block.len() - PRE_MASTER..];
+    let mut secret = Vec::with_capacity(PRE_MASTER);
+    for at in 0..PRE_MASTER {
+        secret.push((message[at] & mask) | (fallback[at] & !mask));
+    }
+    secret
 }
 
 impl<S: Stream> Read for Server<S> {
@@ -728,7 +894,7 @@ fn seal_parts(keys: &mut Direction, parts: &[&[u8]], out: &mut Vec<u8>) -> Resul
 fn ecdsa(id: u16) -> bool {
     matches!(
         id,
-        0xc007 | 0xc009 | 0xc00a | 0xc023 | 0xc027 | 0xcca9 | 0xc02b | 0xc02c
+        0xc007 | 0xc009 | 0xc00a | 0xc023 | 0xcca9 | 0xc02b | 0xc02c
     )
 }
 
@@ -827,6 +993,7 @@ fn alert(body: &[u8]) -> TlsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn hello(bytes: &[u8]) -> Hello {
         Hello::parse(bytes).expect("hello")
@@ -871,6 +1038,163 @@ mod tests {
         assert!(matches!(
             hello(&body).tls12(),
             Err(TlsError::NoSharedCipher)
+        ));
+    }
+
+    fn client_hello(versions: &[u16]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x33; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x3c]);
+        body.push(1);
+        body.push(0);
+        let mut list = Vec::with_capacity(1 + versions.len() * 2);
+        list.push((versions.len() * 2) as u8);
+        for id in versions {
+            list.extend_from_slice(&id.to_be_bytes());
+        }
+        let mut ext = Vec::new();
+        extension(&mut ext, 0x002b, &list);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut message = vec![1];
+        u24_push(&mut message, body.len());
+        message.extend_from_slice(&body);
+        let mut record = vec![HANDSHAKE, 3, 3];
+        record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        record.extend_from_slice(&message);
+        record
+    }
+
+    #[test]
+    fn a_grease_version_does_not_delegate_a_tls12_hello() {
+        let mut io = std::io::Cursor::new(client_hello(&[0x0a0a, 0x0303]));
+        let (_, delegate) = peek_hello(&mut io).expect("peek");
+        assert!(!delegate);
+        let mut io = std::io::Cursor::new(client_hello(&[0x0a0a, 0x0304, 0x0303]));
+        let (_, delegate) = peek_hello(&mut io).expect("peek");
+        assert!(delegate);
+    }
+
+    enum Step {
+        Bytes(Vec<u8>),
+        WouldBlock,
+    }
+
+    struct Trickle {
+        steps: Vec<Step>,
+        at: usize,
+    }
+
+    impl Trickle {
+        fn new(steps: Vec<Step>) -> Self {
+            Self { steps, at: 0 }
+        }
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                match self.steps.get_mut(self.at) {
+                    None => return Ok(0),
+                    Some(Step::Bytes(bytes)) => {
+                        if bytes.is_empty() {
+                            self.at += 1;
+                            continue;
+                        }
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        bytes.drain(..n);
+                        return Ok(n);
+                    }
+                    Some(Step::WouldBlock) => {
+                        self.at += 1;
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                }
+            }
+        }
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn empty_config() -> TlsServerConfig {
+        TlsServerConfig {
+            certs: Vec::new(),
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            send_tickets: false,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        }
+    }
+
+    #[test]
+    fn a_record_read_resumes_after_a_timeout() {
+        let record = [APPLICATION, 3, 3, 0, 2, 0xaa, 0xbb];
+        let io = Trickle::new(vec![
+            Step::Bytes(vec![APPLICATION, 3]),
+            Step::WouldBlock,
+            Step::Bytes(vec![3, 0, 2, 0xaa, 0xbb]),
+        ]);
+        let mut server = Server::new(empty_config(), io);
+        assert!(matches!(server.fill_record(), Err(TlsError::Timeout)));
+        assert_eq!(server.fill_record().expect("resumes"), APPLICATION);
+        assert_eq!(server.rec, record);
+    }
+
+    #[test]
+    fn a_pkcs1_premaster_is_only_taken_from_the_fixed_tail() {
+        let fallback = [0x77; PRE_MASTER];
+        let mut block = vec![0x11u8; 256];
+        block[0] = 0;
+        block[1] = 2;
+        block[256 - PRE_MASTER - 1] = 0;
+        let message: Vec<u8> = (0..PRE_MASTER as u8).collect();
+        block[256 - PRE_MASTER..].copy_from_slice(&message);
+        assert_eq!(pkcs1_pre_master(&block, &fallback), message);
+
+        let mut bad = block.clone();
+        bad[2] = 0;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+
+        let mut bad = block.clone();
+        bad[256 - PRE_MASTER - 1] = 1;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+
+        let mut bad = block;
+        bad[1] = 3;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+    }
+
+    #[test]
+    fn a_handshake_resumes_after_a_timeout_in_the_client_hello() {
+        let hello = client_hello(&[0x0303]);
+        let (head, tail) = hello.split_at(7);
+        let io = Trickle::new(vec![
+            Step::Bytes(head.to_vec()),
+            Step::WouldBlock,
+            Step::Bytes(tail.to_vec()),
+        ]);
+        let mut server = Server::new(empty_config(), io);
+        assert!(matches!(server.handshake(), Err(TlsError::Timeout)));
+        assert!(matches!(
+            server.handshake(),
+            Err(TlsError::Other(why)) if why.contains("identity")
         ));
     }
 }

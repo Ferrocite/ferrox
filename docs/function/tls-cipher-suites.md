@@ -90,7 +90,9 @@ are reachable.
 - **Five ids by neither, served by the shaped lane.** RC4 (`0x0005`, `0xc007`, `0xc011`),
   ECDHE-3DES (`0xc012`) and static-RSA AES-128-CBC-SHA256 (`0x003c`): BoringSSL 5.4 no longer
   compiles them, and ring never had them. `set_cipher_list` silently drops such a name, so
-  `needed` refuses to route a list of only those ids and the rustls lane keeps the stock field.
+  `needed` refuses to route a list of only those ids; without ECH and without a fingerprint
+  profile, `shaped::needs_stock_hello` sends it to the stock-shaped client, whose hello carries
+  the configured ids.
   A listener whose `minVersion` leaves TLS 1.2 reachable and whose list names one of the five now
   runs the shaped engine on the server side too: it reads the hello in place, picks the suite in
   `crypto/tls`'s global preference order restricted to the configured list, gates it on the
@@ -100,8 +102,11 @@ are reachable.
   ECDSA leaf, the other four a RSA one. When the listener also offers TLS 1.3, `tls::accept`
   peeks the ClientHello through the record limiter: a hello that offers `0x0304` is replayed to
   the engine that carries TLS 1.3, and a TLS 1.2-only hello is replayed to the shaped engine.
-  `a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine` pins both verdicts, the five
-  on the 1.2 side and `suite()` absent on the delegated 1.3 side. A Go client against this
+  A listener that sets `echServerKeys` is the exception: `accept_decided` selects BoringSSL
+  before this path, and that context pins its floor at TLS 1.3 and honors `maxVersion`, so a
+  listener whose maximum is below TLS 1.3 is refused instead of silently negotiating TLS 1.3.
+  `a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine` pins both verdicts,
+  the five on the 1.2 side and `suite()` absent on the delegated 1.3 side. A Go client against this
   listener is a CI/conformance question, not a local gate.
 - **One id rustls adds that `crypto/tls` never sends: `0x00ff`.** rustls appends
   `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` to every hello that offers TLS 1.2; Go only ever *reads*
