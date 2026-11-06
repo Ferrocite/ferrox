@@ -1737,24 +1737,26 @@ fn deliver_data(
         return;
     }
     if let Some(routes) = routes {
-        if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
-            .map(|datagram| datagram.destination_port)
-        {
-            if let Ok(table) = routes.lock() {
-                if let Some(lane) = table.get(&port) {
-                    let payload = if at == 0 {
-                        inner
-                    } else {
-                        let payload = inner[at..].to_vec();
-                        recycle_slot(inner, at, recycle);
-                        payload
-                    };
-                    let _ = lane.send(payload);
-                    return;
+        if !wg_stack::ipv4_fragment(&inner[at..]) {
+            if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
+                .map(|datagram| datagram.destination_port)
+            {
+                if let Ok(table) = routes.lock() {
+                    if let Some(lane) = table.get(&port) {
+                        let payload = if at == 0 {
+                            inner
+                        } else {
+                            let payload = inner[at..].to_vec();
+                            recycle_slot(inner, at, recycle);
+                            payload
+                        };
+                        let _ = lane.send(payload);
+                        return;
+                    }
                 }
+                recycle_slot(inner, at, recycle);
+                return;
             }
-            recycle_slot(inner, at, recycle);
-            return;
         }
     }
     let _ = to_stack.send(Packet {

@@ -1576,6 +1576,9 @@ enum Delivery {
 }
 
 fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
+    if wg_stack::ipv4_fragment(packet) {
+        return Some(Delivery::Stack);
+    }
     if let Some(datagram) = connectip::udp_from_packet(packet) {
         if !datagram.verified {
             return None;
@@ -3270,6 +3273,11 @@ mod tests {
         deliver(&to_stack, &routes, &packet);
         let delivered = stack_rx.recv().expect("the fragment reaches the stack");
         assert_eq!(delivered.bytes, packet);
+        let mut later = packet.clone();
+        later[6..8].copy_from_slice(&((piece / 8) as u16).to_be_bytes());
+        deliver(&to_stack, &routes, &later);
+        let delivered = stack_rx.recv().expect("a later fragment reaches the stack");
+        assert_eq!(delivered.bytes, later);
     }
 
     #[test]

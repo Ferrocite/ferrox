@@ -2038,7 +2038,7 @@ pub(crate) fn stack_packet(packet: &[u8]) -> bool {
 }
 
 /// Whether the packet is an IPv4 fragment rather than a complete datagram.
-fn ipv4_fragment(packet: &[u8]) -> bool {
+pub(crate) fn ipv4_fragment(packet: &[u8]) -> bool {
     if packet.first().is_none_or(|byte| byte >> 4 != 4) {
         return false;
     }
