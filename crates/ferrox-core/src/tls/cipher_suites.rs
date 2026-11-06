@@ -151,10 +151,15 @@ pub(crate) fn shaped_only(id: u16) -> bool {
     SHAPED_ONLY.contains(&id)
 }
 
+/// Whether a listener's configured list names an id only the shaped engine carries.
+pub(crate) fn shaped_listener(ids: &[u16], min: Option<u16>) -> bool {
+    min.unwrap_or(V12) <= V12 && ids.iter().any(|&id| shaped_only(id))
+}
+
 /// Whether a listener's derived suite list and version window leave the shaped engine the only
 /// one that can serve: a shaped-only id, and a ceiling the reference would keep at TLS 1.2.
 pub(crate) fn shaped_server(ids: &[u16], min: Option<u16>, max: Option<u16>) -> bool {
-    min.unwrap_or(V12) <= V12 && max.unwrap_or(V13) <= V12 && ids.iter().any(|&id| shaped_only(id))
+    shaped_listener(ids, min) && max.unwrap_or(V13) <= V12
 }
 
 /// `crypto/tls`'s `aesgcmPreferred`: the `AES-GCM` flag of the first known suite the client lists,

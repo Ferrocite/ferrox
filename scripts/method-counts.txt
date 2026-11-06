@@ -565,6 +565,7 @@ tls-cipher-suites tls12-list-ids-equal-reference-in-order 1 ferrox-core-tls::rus
 tls-cipher-suites tls12-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite
 tls-cipher-suites tls12-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation
 tls-cipher-suites shaped-listener-negotiates-the-five-unreachable-ids 5 ferrox-core-tls::rustls_backend::tests::a_shaped_listener_serves_the_five_ids_neither_backend_has
+tls-cipher-suites mixed-max-hellos-routed-by-the-peek 2 ferrox-core-tls::rustls_backend::tests::a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine
 tls-cipher-suites legacy-dial-tls12-ids-equal-reference-in-order 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_offers_the_reference_cipher_ids_in_order
 tls-cipher-suites legacy-cbc-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_negotiates_a_cbc_suite
 tls-cipher-suites legacy-static-rsa-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_legacy_listener_negotiates_static_rsa

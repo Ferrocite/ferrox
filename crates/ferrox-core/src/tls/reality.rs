@@ -466,6 +466,8 @@ pub struct RecordLimiter<S> {
     payload_remaining: usize,
     align: bool,
     track: bool,
+    prefix: Vec<u8>,
+    at: usize,
 }
 
 impl<S> std::fmt::Debug for RecordLimiter<S> {
@@ -487,6 +489,8 @@ impl<S> RecordLimiter<S> {
             payload_remaining: 0,
             align: true,
             track: true,
+            prefix: Vec::new(),
+            at: 0,
         }
     }
 
@@ -498,7 +502,15 @@ impl<S> RecordLimiter<S> {
             payload_remaining: 0,
             align: false,
             track: true,
+            prefix: Vec::new(),
+            at: 0,
         }
+    }
+
+    /// The bytes a peek already read, replayed before the socket so the engine sees the whole hello.
+    pub fn set_prefix(&mut self, bytes: Vec<u8>) {
+        self.prefix = bytes;
+        self.at = 0;
     }
 
     fn into_inner(self) -> S {
@@ -523,16 +535,25 @@ impl<S: Read> Read for RecordLimiter<S> {
         if buf.is_empty() {
             return Ok(0);
         }
-        if !self.track {
-            return self.io.read(buf);
-        }
-        let limit = if !self.align {
+        let limit = if !self.track || !self.align {
             buf.len()
         } else if self.header_len < self.header.len() {
             buf.len().min(self.header.len() - self.header_len)
         } else {
             buf.len().min(self.payload_remaining)
         };
+        if self.at < self.prefix.len() {
+            let n = (self.prefix.len() - self.at).min(limit);
+            buf[..n].copy_from_slice(&self.prefix[self.at..self.at + n]);
+            self.at += n;
+            if self.track {
+                self.observe(&buf[..n]);
+            }
+            return Ok(n);
+        }
+        if !self.track {
+            return self.io.read(buf);
+        }
         let n = self.io.read(&mut buf[..limit])?;
         self.observe(&buf[..n]);
         Ok(n)
