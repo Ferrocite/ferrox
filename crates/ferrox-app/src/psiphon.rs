@@ -2502,6 +2502,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ListenInterface",
     "LocalHttpProxyPort",
     "shareProxyOnNetworkHttpPort",
+    "DisableLocalSocksProxy",
     "DisableLocalHTTPProxy",
     "EgressRegion",
     "DataRootDirectory",
@@ -2769,6 +2770,11 @@ fn default_state() -> PathBuf {
 
 fn listen_address(settings: Option<&Json>) -> Result<SocketAddr, String> {
     let share = flag(settings, "shareProxyOnNetwork", "AETHER_PSIPHON_SHARE");
+    let private = flag(
+        settings,
+        "DisableLocalSocksProxy",
+        "AETHER_PSIPHON_DISABLE_SOCKS_PROXY",
+    );
     let explicit = text(settings, "listen").is_some() || env("AETHER_PSIPHON_BIND").is_some();
     let interface = text(settings, "ListenInterface");
     let text = text(settings, "listen")
@@ -2807,7 +2813,10 @@ fn listen_address(settings: Option<&Json>) -> Result<SocketAddr, String> {
     let address = text
         .parse::<SocketAddr>()
         .map_err(|_| format!("psiphon: listen {text:?} is not an address and a port"))?;
-    let address = if explicit {
+    let address = if private {
+        // The flag removes the reference's local SOCKS listener, but the embedded lane keeps an ephemeral loopback edge for its own outbound.
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    } else if explicit {
         address
     } else if let Some(interface) = interface {
         SocketAddr::new(interface_ip(&interface, address.ip()), address.port())
@@ -7731,6 +7740,30 @@ mod tests {
             listen_address(Some(&named)).expect("listen").to_string(),
             "192.0.2.7:1821"
         );
+    }
+
+    #[test]
+    fn a_disabled_local_socks_proxy_keeps_the_edge_private() {
+        let settings = json::parse(
+            r#"{"DisableLocalSocksProxy":true,"shareProxyOnNetwork":true,"listen":"0.0.0.0:1821"}"#,
+        )
+        .expect("settings");
+        let edge = listen_address(Some(&settings)).expect("listen");
+        assert!(edge.ip().is_loopback());
+        assert_ne!(edge.port(), 1821);
+    }
+
+    #[test]
+    fn a_disabled_local_socks_proxy_lane_binds_only_loopback() {
+        let entry = r#"{"ipAddress":"127.0.0.1","sshPort":1,"sshUsername":"u","sshPassword":"p","sshHostKey":"AAAA"}"#;
+        let settings = json::parse(&format!(
+            r#"{{"listen":"0.0.0.0:0","DisableLocalSocksProxy":true,"TargetServerEntry":"{}","DisableRemoteServerListFetcher":true}}"#,
+            hex(format!("0 0 0 0 {entry}").as_bytes())
+        ))
+        .expect("settings");
+        let lane = PsiphonOut::new(Some(&settings)).expect("a refused dial is not a refused start");
+        assert!(lane.endpoint().ip().is_loopback());
+        TcpStream::connect(lane.endpoint()).expect("the private edge answers");
     }
 
     #[test]
