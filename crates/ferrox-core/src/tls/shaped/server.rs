@@ -212,6 +212,8 @@ pub(crate) struct Server<S: Stream> {
     plain_at: usize,
     plain_end: usize,
     out: Vec<u8>,
+    pending: Vec<u8>,
+    pending_at: usize,
     eof: bool,
     sni: Option<Vec<u8>>,
     alpn: Option<Vec<u8>>,
@@ -242,6 +244,8 @@ impl<S: Stream> Server<S> {
             plain_at: 0,
             plain_end: 0,
             out: Vec::new(),
+            pending: Vec::new(),
+            pending_at: 0,
             eof: false,
             sni: None,
             alpn: None,
@@ -277,6 +281,7 @@ impl<S: Stream> Server<S> {
     }
 
     fn run(&mut self) -> Result<(), TlsError> {
+        self.flush()?;
         if self.phase == Phase::Hello {
             self.run_hello()?;
         }
@@ -353,7 +358,7 @@ impl<S: Stream> Server<S> {
         let done = message(14, &[]);
         transcript.extend_from_slice(&done);
         flight.extend_from_slice(&done);
-        self.write_plain(HANDSHAKE, &flight)?;
+        self.queue_plain(HANDSHAKE, &flight);
 
         self.transcript = transcript;
         self.client_random = hello.random;
@@ -361,7 +366,7 @@ impl<S: Stream> Server<S> {
         self.own_random = random;
         self.share = share;
         self.phase = Phase::KeyExchange;
-        Ok(())
+        self.flush()
     }
 
     fn run_key_exchange(&mut self) -> Result<(), TlsError> {
@@ -432,12 +437,12 @@ impl<S: Stream> Server<S> {
                 .ok_or_else(|| TlsError::Other("no master secret".to_owned()))?;
             tls12::finished(suite, master, b"server finished", &self.transcript)
         };
-        self.write_plain(CCS, &[1])?;
+        self.queue_plain(CCS, &[1]);
         let done = message(20, &verify);
-        self.write_encrypted(HANDSHAKE, &done)?;
+        self.queue_encrypted(HANDSHAKE, &done)?;
         self.transcript.extend_from_slice(&done);
         self.phase = Phase::Done;
-        Ok(())
+        self.flush()
     }
 
     fn pick_cert(&self, sni: Option<&str>) -> Result<usize, TlsError> {
@@ -541,18 +546,18 @@ impl<S: Stream> Server<S> {
         SystemRandom::new()
             .fill(&mut fallback)
             .map_err(|_| TlsError::Other("rsa fallback".to_owned()))?;
-        let mut out = vec![0u8; rsa.size() as usize];
-        let len = rsa
-            .private_decrypt(encrypted, &mut out, Padding::PKCS1)
-            .unwrap_or(0);
-        // BoringSSL's PKCS#1 check is constant-time; select the fallback without a branch.
-        let diff = (len ^ PRE_MASTER) as u64;
-        let mask = (((diff | diff.wrapping_neg()) >> 63) as u8).wrapping_sub(1);
-        let mut secret = vec![0u8; PRE_MASTER];
-        for (i, slot) in secret.iter_mut().enumerate() {
-            *slot = (out.get(i).copied().unwrap_or(0) & mask) | (fallback[i] & !mask);
+        let size = rsa.size() as usize;
+        if encrypted.len() != size {
+            return Ok(fallback.to_vec());
         }
-        Ok(secret)
+        let mut out = vec![0u8; size];
+        if rsa
+            .private_decrypt(encrypted, &mut out, Padding::NONE)
+            .is_err()
+        {
+            return Ok(fallback.to_vec());
+        }
+        Ok(pkcs1_pre_master(&out, &fallback))
     }
 
     fn next_plain(&mut self, want: u8) -> Result<Vec<u8>, TlsError> {
@@ -685,24 +690,42 @@ impl<S: Stream> Server<S> {
         Ok(self.rec[0])
     }
 
-    fn write_plain(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
-        let mut out = Vec::with_capacity(5 + body.len());
-        out.push(kind);
-        out.extend_from_slice(&[0x03, 0x03]);
-        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-        out.extend_from_slice(body);
-        self.io.write_all(&out)?;
-        Ok(())
+    fn queue_plain(&mut self, kind: u8, body: &[u8]) {
+        self.pending.push(kind);
+        self.pending.extend_from_slice(&[0x03, 0x03]);
+        self.pending
+            .extend_from_slice(&(body.len() as u16).to_be_bytes());
+        self.pending.extend_from_slice(body);
     }
 
-    fn write_encrypted(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
+    fn queue_encrypted(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
         let keys = self
             .write
             .as_mut()
             .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-        let mut out = Vec::with_capacity(5 + body.len() + 32);
-        record::seal12(keys, kind, body, &mut out)?;
-        self.io.write_all(&out)?;
+        record::seal12(keys, kind, body, &mut self.pending)?;
+        Ok(())
+    }
+
+    /// Writes the queued flight from where a timeout left it, so a partial write is resumed rather
+    /// than reframed, and the phase that produced it is never replayed.
+    fn flush(&mut self) -> Result<(), TlsError> {
+        while self.pending_at < self.pending.len() {
+            match self.io.write(&self.pending[self.pending_at..]) {
+                Ok(0) => return Err(TlsError::Closed),
+                Ok(written) => self.pending_at += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(TlsError::Timeout);
+                }
+                Err(error) => return Err(TlsError::from(error)),
+            }
+        }
+        self.pending.clear();
+        self.pending_at = 0;
         Ok(())
     }
 
@@ -756,6 +779,28 @@ impl<S: Stream> Server<S> {
     pub(crate) fn suite(&self) -> Option<u16> {
         self.suite
     }
+}
+
+/// RFC 5246's `EM = 0x00 || 0x02 || PS || 0x00 || M`, with `M` always 48 bytes: the last 48 bytes
+/// are the premaster only when the prefix, a non-empty `PS` and the separator all check out. The
+/// checks and the fallback selection are branchless, so a bad padding looks like a good one.
+fn pkcs1_pre_master(block: &[u8], fallback: &[u8; PRE_MASTER]) -> Vec<u8> {
+    if block.len() < PRE_MASTER + 11 {
+        return fallback.to_vec();
+    }
+    let separator = block.len() - PRE_MASTER - 1;
+    let mut good =
+        u8::from(block[0] == 0) & u8::from(block[1] == 2) & u8::from(block[separator] == 0);
+    for &byte in &block[2..separator] {
+        good &= u8::from(byte != 0);
+    }
+    let mask = 0u8.wrapping_sub(good);
+    let message = &block[block.len() - PRE_MASTER..];
+    let mut secret = Vec::with_capacity(PRE_MASTER);
+    for at in 0..PRE_MASTER {
+        secret.push((message[at] & mask) | (fallback[at] & !mask));
+    }
+    secret
 }
 
 impl<S: Stream> Read for Server<S> {
@@ -1110,6 +1155,30 @@ mod tests {
         assert!(matches!(server.fill_record(), Err(TlsError::Timeout)));
         assert_eq!(server.fill_record().expect("resumes"), APPLICATION);
         assert_eq!(server.rec, record);
+    }
+
+    #[test]
+    fn a_pkcs1_premaster_is_only_taken_from_the_fixed_tail() {
+        let fallback = [0x77; PRE_MASTER];
+        let mut block = vec![0x11u8; 256];
+        block[0] = 0;
+        block[1] = 2;
+        block[256 - PRE_MASTER - 1] = 0;
+        let message: Vec<u8> = (0..PRE_MASTER as u8).collect();
+        block[256 - PRE_MASTER..].copy_from_slice(&message);
+        assert_eq!(pkcs1_pre_master(&block, &fallback), message);
+
+        let mut bad = block.clone();
+        bad[2] = 0;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+
+        let mut bad = block.clone();
+        bad[256 - PRE_MASTER - 1] = 1;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
+
+        let mut bad = block;
+        bad[1] = 3;
+        assert_eq!(pkcs1_pre_master(&bad, &fallback), fallback.to_vec());
     }
 
     #[test]
