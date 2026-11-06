@@ -62,6 +62,18 @@ pub(crate) fn gate_aesgcm() -> (Vec<Row>, Vec<Window>) {
     (rows, windows)
 }
 
+/// The rows the FRAMING REGRESSION gate judges. A source-seal row compares our seal
+/// against our own staging copy rather than a reference implementation, so its ratio
+/// is the runner's noise and no code change can move it. In-place rows stay judged.
+pub(crate) fn gated_rows(rows: &[Row]) -> Vec<&Row> {
+    rows.iter().filter(|r| !is_reported_source(r)).collect()
+}
+
+/// Source-seal rows measure staging versus spare capacity, not a reference engine.
+fn is_reported_source(row: &Row) -> bool {
+    row.name.contains("source seal")
+}
+
 fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     let key: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(5));
     let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(1));
