@@ -10,7 +10,7 @@ use crate::proxy::{Accepted, FrameWrite, Settle};
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
     F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
-    T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -272,6 +272,16 @@ impl GrpcReader<Connection> {
 impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for GrpcReader<R> {
     fn arm_relay_poll(&mut self) {
         self.read.arm_relay_poll();
+        self.poll = true;
+    }
+
+    /// Reads the next carrier control frame: `Some(true)` progressed, `Some(false)` timed out, `None` at the end.
+    fn pump_control(&mut self) -> Option<bool> {
+        match self.pump() {
+            Ok(Some(())) => Some(true),
+            Err(ref error) if crate::proxy::is_timeout(error) => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -1512,6 +1522,21 @@ impl GrpcWriter {
         take_window(&self.shared, need, true)
     }
 
+    /// The largest blocking batch a muxed peer's opening window pays for in one offer: the transport
+    /// takes a batch whole or not at all, so a batch past that window would wait for credit the peer
+    /// grants only for bytes it has already received.
+    fn hunk_cap(&self) -> u64 {
+        if !self.shared.muxed {
+            return u64::MAX;
+        }
+        let init = self
+            .shared
+            .init
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (*init).clamp(1, 65_535)
+    }
+
     /// Writes one message, splitting it only when it exceeds `max` bytes.
     fn message<'a>(&self, data: &'a [u8], max: usize, end: bool, batch: &mut Gather<'a>) -> bool {
         let mut prefix = [0u8; 16];
@@ -1524,6 +1549,13 @@ impl GrpcWriter {
             return false;
         }
         if total <= max {
+            if !reserved
+                && batch.credit > 0
+                && batch.credit + total as u64 > self.hunk_cap()
+                && !batch.flush_blocking(&self.shared)
+            {
+                return false;
+            }
             if !reserved && !self.credit(batch, total as u64) {
                 return false;
             }
@@ -2092,6 +2124,7 @@ impl GrpcService {
 }
 
 impl crate::xhttp_h2::H2Service for GrpcService {
+    /// Validates a VLESS gRPC request head and opens its reader and writer on the shared connection.
     fn open(
         &self,
         conn: &Arc<crate::xhttp_h2::H2Conn>,
@@ -2187,6 +2220,119 @@ pub(crate) fn serve_muxed_conn(
         }),
         Box::new(|| {}),
     );
+}
+
+/// The same connection, many gRPC streams, for `VMess`: each request block opens one stream and runs
+/// the `VMess` handler on its own reader and writer pair, so a client that shares one `ClientConn`
+/// across its flows is served concurrently instead of having the next stream refused.
+pub(crate) struct VmGrpcService {
+    path: String,
+    multi_path: String,
+    users: crate::vmess::UsersRef,
+    freedom: bool,
+    opened: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl VmGrpcService {
+    pub(crate) fn new(
+        settings: &GrpcSettings,
+        users: &crate::vmess::UsersRef,
+        freedom: bool,
+        opened: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            path: settings.path.clone(),
+            multi_path: settings.multi_path.clone(),
+            users: Arc::clone(users),
+            freedom,
+            opened,
+        }
+    }
+}
+
+impl crate::xhttp_h2::H2Service for VmGrpcService {
+    /// Validates a `VMess` gRPC request head and hands the stream to the multiplexed handler.
+    fn open(
+        &self,
+        conn: &Arc<crate::xhttp_h2::H2Conn>,
+        sid: u32,
+        block: &[u8],
+        end_stream: bool,
+    ) -> bool {
+        let mut gate = Gate::default();
+        if !conn.decode_block(block, |name, value| {
+            gate.take(name, value, &self.path, &self.multi_path);
+        }) || gate.served != Some(true)
+            || gate.posted != Some(true)
+            || gate.typed != Some(true)
+        {
+            conn.reset(sid);
+            return false;
+        }
+        let method = if gate.multi == Some(true) {
+            Method::MultiHunk
+        } else {
+            Method::Hunk
+        };
+        let Some((body, _head, out)) = conn.open(sid, end_stream) else {
+            return false;
+        };
+        if !conn.respond(
+            sid,
+            &[
+                (":status", "200"),
+                ("content-type", "application/grpc"),
+                ("grpc-encoding", "identity"),
+            ],
+        ) {
+            conn.reset(sid);
+            return false;
+        }
+        let (reader, writer) = mux_stream(conn, body, out, sid, method);
+        let users = Arc::clone(&self.users);
+        let freedom = self.freedom;
+        let opened = Arc::clone(&self.opened);
+        crate::proxy::lane_pool::submit_stream_setup(move || {
+            crate::vmess::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
+        });
+        // The head is not a request until the VMess header decodes: `serve_grpc_muxed` puts the clock away then.
+        false
+    }
+}
+
+/// Serves a `VMess` gRPC listener as one HTTP/2 connection: every request block opens a stream on the shared demux.
+pub(crate) fn serve_muxed_vmess<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &GrpcSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) {
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = VmGrpcService::new(settings, users, freedom, Arc::clone(&opened));
+    let until = std::time::Instant::now() + crate::budgets::handshake();
+    let mut step = crate::xhttp_h2::h2_lane(read, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    crate::proxy::lane_pool::submit_demux(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
+}
+
+/// `serve_muxed_vmess` over a plain connection, split into its read and write halves.
+pub(crate) fn serve_muxed_vmess_conn(
+    read: Connection,
+    write: Tail,
+    settings: &GrpcSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) {
+    serve_muxed_vmess(read, write, settings, users, freedom);
 }
 
 #[cfg(test)]
@@ -2513,10 +2659,6 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
         return None;
     }
     reader.set_handshake_budget(None);
-    // One stream per connection: GOAWAY tells the peer to open its next flow elsewhere.
-    let mut last = [0u8; 8];
-    last[..4].copy_from_slice(&reader.stream.to_be_bytes());
-    let _ = reader.emit(T_GOAWAY, 0, 0, &last);
     let writer = GrpcWriter {
         shared,
         stream: reader.stream,
@@ -4598,9 +4740,11 @@ mod tests {
     }
 
     /// The witness that the peer is asked for one stream per connection: its next flow opens a
-    /// fresh connection instead of hanging on this one.
+    /// fresh connection instead of hanging on this one, and a body sent after the headers still has
+    /// a stream to land on.
     #[test]
-    fn an_accepted_connection_asks_for_one_stream_at_a_time() {
+    fn an_accepted_connection_advertises_one_stream_at_a_time() {
+        use crate::h2::T_GOAWAY;
         let served = Arc::new(Mutex::new(Vec::new()));
         let mut wire = MAGIC.to_vec();
         wire.extend_from_slice(&frame(
@@ -4628,9 +4772,10 @@ mod tests {
         let mut last = [0u8; 8];
         last[..4].copy_from_slice(&1u32.to_be_bytes());
         assert!(
-            text.windows(17)
+            !text
+                .windows(17)
                 .any(|part| part == frame(T_GOAWAY, 0, 0, &last)),
-            "the first stream is the last this connection will take"
+            "the stream must outlive the headers for a peer that buffers its first body"
         );
     }
 
@@ -4927,6 +5072,7 @@ mod tests {
     struct EchoService;
 
     impl crate::xhttp_h2::H2Service for EchoService {
+        /// Answers every request head and echoes the body, for the muxed-connection tests.
         fn open(
             &self,
             conn: &Arc<crate::xhttp_h2::H2Conn>,

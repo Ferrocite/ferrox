@@ -302,6 +302,7 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
             "base": base,
             "leg": "server-cpu",
             "ratio": 0.0,
+            "unmeasured": True,
             "text": f"{base}: server CPU was not sampled on both legs; "
                     f"the server cost has no measurement, so it cannot be gated",
         })
@@ -334,6 +335,7 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
             "base": base,
             "leg": "server-threads",
             "ratio": 0.0,
+            "unmeasured": True,
             "text": f"{base}: server threads were not sampled on both legs; "
                     f"the server cost has no measurement, so it cannot be gated",
         })
@@ -392,6 +394,21 @@ def selftest():
         proc = run_self(cells)
         if proc.returncode == 0 or "server CPU was not sampled" not in proc.stderr:
             return f"an unsampled ferrox server passed the gate: {proc.stderr}"
+
+        # A filed row does not bless a leg it cannot measure.
+        for server, cpu, threads, throughput in (
+            ("xray-core", 100.0, 8.0, 1000.0),
+            ("ferrox", None, None, 1000.0),
+        ):
+            write_fixture(cells, server, cpu, threads, throughput)
+        baseline = cells / "leg-gaps.txt"
+        baseline.write_text(
+            "selftest-vless-raw-down-8|server-cpu|1.30|1\n"
+            "selftest-vless-raw-down-8|server-threads|1.30|1\n"
+        )
+        proc = run_self(cells, baseline)
+        if proc.returncode == 0:
+            return f"a filed row blessed an unmeasured server leg: {proc.stderr}"
 
         # A slower runner in the ferrox-server cell is not a server loss: the
         # ceiling measured in each cell is the common denominator.
@@ -558,7 +575,7 @@ def main():
     new, known, fixed = [], [], []
     for hole in holes:
         filed = baseline.get((hole["base"], hole["leg"]))
-        if filed is None:
+        if filed is None or hole.get("unmeasured"):
             new.append(hole)
         elif within_baseline(hole["leg"], filed_basis_ratio(hole, filed[2]), filed[0]):
             known.append((hole, filed[1]))

@@ -4854,6 +4854,11 @@ impl Carried for crate::ws::WsReader {
 /// A carrier a relay lane reads: its socket holds the relay quantum, so a step that finds nothing hands the wait back instead of pinning the worker.
 pub(crate) trait RelayPoll {
     fn arm_relay_poll(&mut self);
+
+    /// Reads and dispatches carrier control frames after the data half ends, so a write side still waiting on the peer's window keeps being fed; `None` when the carrier has no such frames.
+    fn pump_control(&mut self) -> Option<bool> {
+        None
+    }
 }
 
 impl RelayPoll for Connection {
@@ -11624,6 +11629,7 @@ fn dial_vmess_quic(client: &Connection, vmess: &VmessOut, target: &Destination) 
         send,
         recv,
         Some((response_key, response_iv, auth)),
+        None,
         Some(finish),
     );
 }
@@ -11685,6 +11691,7 @@ fn dial_vmess_hysteria(
         send,
         recv,
         Some((response_key, response_iv, auth)),
+        None,
         Some(finish),
     );
 }
@@ -11979,6 +11986,7 @@ fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination
         &close,
         send,
         recv,
+        None,
         None,
         Some(Arc::clone(&close)),
     );
@@ -12983,7 +12991,7 @@ fn serve_vmess_tls(
             );
         }
         Carrier::Grpc(settings) => {
-            crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
+            crate::vmess::serve_grpc_muxed_split(reader, writer, settings, users, freedom);
         }
         refused_carriers!() => {}
     }
@@ -13089,17 +13097,13 @@ fn serve_vmess_reality(
             });
         }
         Carrier::Grpc(settings) => {
-            let Ok(raw) = stream.try_clone() else { return };
-            let Ok(out) = raw.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    let _ = raw.shutdown(Shutdown::Both);
-                });
-                crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
+                crate::vmess::serve_grpc_muxed_split(reader, writer, settings, users, freedom);
             });
         }
         refused_carriers!() => {}
@@ -69567,7 +69571,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &users, freedom);
             }
             Carrier::Grpc(settings) => {
-                crate::vmess::serve_grpc_with(stream, &settings, &users, freedom);
+                crate::vmess::serve_grpc_muxed_with(stream, &settings, &users, freedom);
             }
             refused_carriers!() => {}
         },

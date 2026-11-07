@@ -875,6 +875,17 @@ pub(crate) fn write_frame(
     pad: &mut PadSource,
 ) -> bool {
     staging.clear();
+    write_frame_into(stream, send, plain, staging, pad)
+}
+
+/// Stages one `VMess` frame into `staging` and writes it, so the plaintext path can reuse its buffer.
+fn write_frame_into(
+    stream: &mut dyn Write,
+    send: &mut Flow,
+    plain: &[u8],
+    staging: &mut Vec<u8>,
+    pad: &mut PadSource,
+) -> bool {
     if !stage_frame(send, plain, staging, pad) {
         return false;
     }
@@ -932,6 +943,17 @@ fn stage_frames(
     pad: &mut PadSource,
 ) -> bool {
     staging.clear();
+    stage_frames_into(stream, send, plain, staging, pad)
+}
+
+/// Stages up to `FRAMES_PER_WRITE` frames of one read into `staging` and writes them together.
+fn stage_frames_into(
+    stream: &mut dyn Write,
+    send: &mut Flow,
+    plain: &[u8],
+    staging: &mut Vec<u8>,
+    pad: &mut PadSource,
+) -> bool {
     if plain.is_empty() {
         if !stage_frame(send, plain, staging, pad) {
             return false;
@@ -1156,6 +1178,14 @@ impl<R: Read> Wire<R> {
     /// The carrier before the first frame opens, where a response header waits for its bytes.
     fn carrier(&mut self) -> &mut R {
         &mut self.carrier
+    }
+
+    /// Keeps the carrier's control frames (window grants, pings) flowing after its data half ended, so the opposite lane's wait still finishes.
+    fn pump_control(&mut self) -> Option<bool>
+    where
+        R: crate::proxy::RelayPoll,
+    {
+        self.carrier.pump_control()
     }
 
     fn buffered(&self) -> usize {
@@ -1649,7 +1679,9 @@ where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    pump_relay_carried_with_finish(plain, reader, writer, close, send, recv, pending, None)
+    pump_relay_carried_with_finish(
+        plain, reader, writer, close, send, recv, pending, None, None,
+    )
 }
 
 /// The carried pump with the carrier's own write-side finish: a clean target EOF ends the request, and a markerless one under `NoTerminationSignal` leaves the carrier FIN as the only end the peer sees.
@@ -1662,6 +1694,7 @@ pub(crate) fn pump_relay_carried_with_finish<R, W>(
     send: Flow,
     recv: Flow,
     pending: Option<PendingResponse>,
+    head: Option<Vec<u8>>,
     finish: Option<Close>,
 ) -> Option<std::sync::Arc<crate::proxy::RelayFinish>>
 where
@@ -1678,6 +1711,7 @@ where
     let mut pad = PadSource::fresh();
     let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
     let mut buf = relay_window();
+    let mut head = head;
     let forward_flow = std::sync::Arc::clone(&flow);
     let forward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
@@ -1691,6 +1725,7 @@ where
                 &mut writer,
                 &mut send,
                 &mut staging,
+                &mut head,
                 pad,
                 &forward_close,
                 &forward_flow,
@@ -1755,6 +1790,7 @@ fn forward_step(
     writer: &mut dyn Write,
     send: &mut Flow,
     staging: &mut Vec<u8>,
+    head: &mut Option<Vec<u8>>,
     pad: &mut PadSource,
     close: &Close,
     flow: &crate::proxy::RelayFinish,
@@ -1762,7 +1798,15 @@ fn forward_step(
     match plain_read.read(buf) {
         Ok(0) => {
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
-            let clean = !send.end_marker || write_frame(writer, send, &[], staging, pad);
+            staging.clear();
+            if let Some(prefix) = head.take() {
+                staging.extend_from_slice(&prefix);
+            }
+            let clean = if send.end_marker {
+                write_frame_into(writer, send, &[], staging, pad)
+            } else {
+                staging.is_empty() || write_frames(writer, staging)
+            };
             if !clean {
                 close();
             }
@@ -1777,7 +1821,15 @@ fn forward_step(
             let mut ok = true;
             while at < read {
                 let end = (at + READ_PLAIN).min(read);
-                if !stage_frames(writer, send, &buf[at..end], staging, pad) {
+                let staged = match head.take() {
+                    Some(prefix) => {
+                        staging.clear();
+                        staging.extend_from_slice(&prefix);
+                        stage_frames_into(writer, send, &buf[at..end], staging, pad)
+                    }
+                    None => stage_frames(writer, send, &buf[at..end], staging, pad),
+                };
+                if !staged {
                     ok = false;
                     break;
                 }
@@ -1814,7 +1866,7 @@ fn forward_step(
 
 /// One step of the carrier leg: open the lazy server's response header first, then write what the
 /// frames it opens carry, and half-close on the peer's marker rather than on an EOF.
-fn backward_step<R: Read>(
+fn backward_step<R: Read + crate::proxy::RelayPoll>(
     reader: &mut Wire<R>,
     answer: &mut Option<Answer>,
     recv: &mut Flow,
@@ -1855,11 +1907,19 @@ fn backward_step<R: Read>(
                 // A frame that will not open ends both directions.
                 close();
                 let _ = out.shutdown(Shutdown::Both);
-            } else {
-                // A marker or a clean carrier FIN ends this direction only.
-                let _ = out.shutdown(Shutdown::Write);
+                return Next::Done;
             }
-            Next::Done
+            // A marker or a clean carrier FIN ends this direction only.
+            let _ = out.shutdown(Shutdown::Write);
+            if flow.ended() {
+                return Next::Done;
+            }
+            // The opposite lane may still be waiting on the peer's window, which only this half reads.
+            match reader.pump_control() {
+                Some(retry) if retry => Next::Retry,
+                Some(_) => Next::Idle,
+                None => Next::Done,
+            }
         }
         Opened::Batch { at, len } => {
             if crate::proxy::echo_trace_on() && *first {
@@ -1908,17 +1968,61 @@ pub(crate) fn serve_decoded<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    serve_decoded_with_finish(reader, writer, close, decoded, freedom, None);
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, false, None);
+}
+
+/// The gRPC carrier reads a hunk shorter than 2 KiB only at stream end, so the response header rides
+/// the first body write instead of leaving alone in a hunk the peer's reader would park on.
+pub(crate) fn serve_decoded_deferred<R, W>(
+    reader: R,
+    writer: W,
+    close: &Close,
+    decoded: Option<Accepted>,
+    freedom: bool,
+    abort: Option<Abort>,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, true, abort);
 }
 
 /// [`serve_decoded`] with the carrier's write-side finish for the clean EOF `NoTerminationSignal` leaves markerless.
 pub(crate) fn serve_decoded_with_finish<R, W>(
+    reader: R,
+    writer: W,
+    close: &Close,
+    decoded: Option<Accepted>,
+    freedom: bool,
+    finish: Option<Close>,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    serve_decoded_impl(reader, writer, close, decoded, freedom, finish, false, None);
+}
+
+/// A rejection frees the request stream before answering: a close alone leaves its queue registered for the connection's life.
+type Abort = Box<dyn FnOnce() + Send>;
+
+fn abandon(close: &Close, abort: &mut Option<Abort>) {
+    if let Some(abort) = abort.take() {
+        abort();
+    }
+    close();
+}
+
+/// Runs a decoded request over its uplink; `defer_prefix` holds the response head for the first body frame.
+#[allow(clippy::too_many_arguments)]
+fn serve_decoded_impl<R, W>(
     reader: R,
     mut writer: W,
     close: &Close,
     decoded: Option<Accepted>,
     freedom: bool,
     finish: Option<Close>,
+    defer_prefix: bool,
+    mut abort: Option<Abort>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
@@ -1932,30 +2036,37 @@ pub(crate) fn serve_decoded_with_finish<R, W>(
         user,
     }) = decoded
     else {
-        close();
+        abandon(close, &mut abort);
         return;
     };
     if !freedom || !matches!(cmd, 1 | 2) {
-        close();
+        abandon(close, &mut abort);
         return;
     }
     crate::accesslog::record_current(&target);
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-                close();
+                abandon(close, &mut abort);
                 return;
             };
             let uplink = uplink.with_meter(user.reversed());
-            if !write_prefix(&mut writer, &prefix) {
-                close();
-                return;
-            }
+            let head = if defer_prefix {
+                Some(prefix)
+            } else {
+                if !write_prefix(&mut writer, &prefix) {
+                    abandon(close, &mut abort);
+                    return;
+                }
+                None
+            };
             pump_relay_carried_with_finish(
-                &uplink, reader, writer, close, send, recv, None, finish,
+                &uplink, reader, writer, close, send, recv, None, head, finish,
             );
         }
-        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv, &user),
+        2 => serve_udp_carried(
+            reader, writer, close, &mut abort, &target, &prefix, send, recv, &user,
+        ),
         _ => {}
     }
 }
@@ -1969,6 +2080,7 @@ fn serve_udp_carried<R, W>(
     reader: R,
     mut writer: W,
     close: &Close,
+    abort: &mut Option<Abort>,
     target: &SocketAddr,
     prefix: &[u8],
     send: Flow,
@@ -1984,15 +2096,15 @@ fn serve_udp_carried<R, W>(
         "0.0.0.0:0"
     };
     let Ok(udp) = UdpSocket::bind(bind) else {
-        close();
+        abandon(close, abort);
         return;
     };
     if udp.connect(target).is_err() {
-        close();
+        abandon(close, abort);
         return;
     }
     if !write_prefix(&mut writer, prefix) {
-        close();
+        abandon(close, abort);
         return;
     }
     crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv, user);
@@ -2042,6 +2154,7 @@ pub(crate) fn serve_grpc(stream: Connection, path: &str, users: &Users, freedom:
     );
 }
 
+#[cfg(test)]
 pub(crate) fn serve_grpc_with(
     stream: Connection,
     settings: &crate::config::GrpcSettings,
@@ -2054,32 +2167,72 @@ pub(crate) fn serve_grpc_with(
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded(reader, writer, &close, decoded, freedom);
+    serve_decoded_deferred(reader, writer, &close, decoded, freedom, None);
 }
 
-pub(crate) fn serve_grpc_split<R, W>(
+/// Serves a TLS or REALITY gRPC listener as one muxed connection, arming the writer clock first.
+pub(crate) fn serve_grpc_muxed_split<R, W>(
     reader: R,
-    writer: W,
+    mut writer: W,
     settings: &crate::config::GrpcSettings,
-    users: &Users,
+    users: &crate::vmess::UsersRef,
     freedom: bool,
-    close: &Close,
 ) where
-    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
-    else {
+    crate::proxy::FrameWrite::arm_write(&mut writer, crate::budgets::RELAY_POLL);
+    crate::grpc::serve_muxed_vmess(reader, writer, settings, users, freedom);
+}
+
+/// Serves a plaintext gRPC listener as one muxed connection, with the socket read clock armed for the demux.
+pub(crate) fn serve_grpc_muxed_with(
+    stream: Connection,
+    settings: &crate::config::GrpcSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) {
+    let Ok(write) = stream.try_clone() else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, users);
+    let _ = stream.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+    crate::grpc::serve_muxed_vmess_conn(
+        stream,
+        crate::grpc::Tail::new(Box::new(write)),
+        settings,
+        users,
+        freedom,
+    );
+}
+
+/// One gRPC stream of a shared connection: the demux has already answered the HTTP/2 head, so this
+/// decodes the `VMess` header and runs the same codec and relay the single-stream carrier does, on
+/// its own reader and writer pair. Closing here sends the stream's end, never the connection's.
+pub(crate) fn serve_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    writer: crate::grpc::GrpcWriter,
+    users: &Users,
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
+    let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
+    if let Some(Accepted { cmd, .. }) = &decoded {
+        if freedom && matches!(*cmd, 1 | 2) {
+            opened.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let reset = reader.reset_handle();
     let closer = writer.clone();
-    let shutdown = std::sync::Arc::clone(close);
-    let close: Close = std::sync::Arc::new(move || {
-        closer.close();
-        shutdown();
-    });
-    serve_decoded(reader, writer, &close, decoded, freedom);
+    let close: Close = std::sync::Arc::new(move || closer.close());
+    serve_decoded_deferred(
+        reader,
+        writer,
+        &close,
+        decoded,
+        freedom,
+        Some(Box::new(reset)),
+    );
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
@@ -2814,12 +2967,6 @@ mod tests {
         .expect("request");
         assert!(writer.send(&request));
         let (response_key, response_iv) = response_material(&data_iv, &data_key);
-        assert!(read_response(
-            &mut reader,
-            &response_key,
-            &response_iv,
-            auth
-        ));
         let options = OPT_STREAM | OPT_MASK | OPT_PAD;
         let mut send =
             Flow::fresh(Cipher::Chacha, &data_key, &data_iv, options, &data_iv).expect("sends");
@@ -2840,6 +2987,13 @@ mod tests {
             b"ping",
             &mut staging,
             &mut pad
+        ));
+        // The header rides the first body hunk, so the upload opens the answer.
+        assert!(read_response(
+            &mut reader,
+            &response_key,
+            &response_iv,
+            auth
         ));
         let back = read_frame(&mut reader, &mut recv, &mut scratch).expect("reads");
         assert_eq!(back, b"ping");
@@ -4954,6 +5108,7 @@ mod tests {
             let mut pad = PadSource::fresh().expect("entropy");
             let mut writer = Collected(std::sync::Arc::clone(&out));
             let mut done = false;
+            let mut deferred = None;
             for _ in 0..4 {
                 let (next, _) = forward_step(
                     &mut plain,
@@ -4961,6 +5116,7 @@ mod tests {
                     &mut writer,
                     &mut send,
                     &mut staging,
+                    &mut deferred,
                     &mut pad,
                     &close,
                     &flow,
