@@ -581,15 +581,29 @@ impl FragmentSet {
     }
 }
 
+/// Merge adjacent or overlapping ranges in place.
 fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (start, finish) in ranges.drain(..) {
-        match merged.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(finish),
-            _ => merged.push((start, finish)),
+    if ranges.len() < 2 {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        let (start, finish) = ranges[read];
+        if start <= ranges[write].1 {
+            ranges[write].1 = ranges[write].1.max(finish);
+        } else {
+            write += 1;
+            ranges[write] = (start, finish);
         }
     }
-    *ranges = merged;
+    ranges.truncate(write + 1);
+}
+
+/// The set and byte counts one peer holds in `Reassembly::parts`.
+#[derive(Default)]
+struct PeerUsage {
+    sets: usize,
+    bytes: usize,
 }
 
 /// One inner packet, the fragments it may be split into, and the sets waiting
@@ -598,6 +612,7 @@ fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
 #[derive(Default)]
 struct Reassembly {
     parts: HashMap<FragmentKey, FragmentSet>,
+    peers: HashMap<[u8; 32], PeerUsage>,
     bytes: usize,
 }
 
@@ -636,21 +651,24 @@ impl Reassembly {
                     started: StdInstant::now(),
                 },
             );
+            self.peers.entry(key.peer()).or_default().sets += 1;
         }
         if self.parts.get(&key).is_some_and(|part| part.at != at) {
-            if let Some(part) = self.parts.remove(&key) {
-                self.bytes -= part.payload.len();
-            }
+            self.remove(&key);
             return Reassembled::Held;
         }
         let len = self.parts.get(&key).map_or(0, |part| part.payload.len());
         if end > len {
             let grow = end - len;
             if !self.make_growth_room(grow, &key) {
-                self.drop(&key);
+                self.remove(&key);
                 return Reassembled::Held;
             }
             self.bytes += grow;
+            self.peers
+                .get_mut(&key.peer())
+                .expect("the set has a peer row")
+                .bytes += grow;
             self.parts
                 .get_mut(&key)
                 .expect("the set was just admitted")
@@ -667,9 +685,7 @@ impl Reassembly {
             .iter()
             .any(|&(start, finish)| offset < finish && start < end)
         {
-            if let Some(part) = self.parts.remove(&key) {
-                self.bytes -= part.payload.len();
-            }
+            self.remove(&key);
             return Reassembled::Held;
         }
         if part
@@ -677,9 +693,7 @@ impl Reassembly {
             .is_some_and(|last| end > last || total.is_some_and(|next| next != last))
             || total.is_some_and(|last| part.ranges.iter().any(|&(_, finish)| finish > last))
         {
-            if let Some(part) = self.parts.remove(&key) {
-                self.bytes -= part.payload.len();
-            }
+            self.remove(&key);
             return Reassembled::Held;
         }
         part.payload[offset..end].copy_from_slice(&packet[payload_at..payload_at + (end - offset)]);
@@ -687,7 +701,7 @@ impl Reassembly {
         part.ranges.sort_unstable();
         merge_ranges(&mut part.ranges);
         if part.ranges.len() > REASSEMBLY_RANGES {
-            self.drop(&key);
+            self.remove(&key);
             return Reassembled::Held;
         }
         if let Some(total) = total {
@@ -706,8 +720,7 @@ impl Reassembly {
         if covered < total || part.header.is_empty() {
             return Reassembled::Held;
         }
-        let part = self.parts.remove(&key).expect("a complete set");
-        self.bytes -= part.payload.len();
+        let part = self.remove(&key).expect("a complete set");
         Reassembled::Complete(part.assemble(total))
     }
 
@@ -753,38 +766,46 @@ impl Reassembly {
         true
     }
 
+    /// The set and byte counts this peer holds.
     fn peer_usage(&self, peer: [u8; 32]) -> (usize, usize) {
-        self.parts
-            .iter()
-            .filter(|(key, _)| key.peer() == peer)
-            .fold((0, 0), |(sets, bytes), (_, part)| {
-                (sets + 1, bytes + part.payload.len())
-            })
+        self.peers
+            .get(&peer)
+            .map_or((0, 0), |usage| (usage.sets, usage.bytes))
     }
 
+    /// The peer with the most work and its oldest set, excluding the set being grown.
     fn fair_victim(&self, keep: Option<&FragmentKey>) -> Option<FragmentKey> {
-        let mut peers: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-        for (key, part) in &self.parts {
-            if Some(key) == keep {
+        let mut best: Option<([u8; 32], (usize, usize))> = None;
+        for (&peer, usage) in &self.peers {
+            let mut sets = usage.sets;
+            let mut bytes = usage.bytes;
+            if let Some(keep) = keep {
+                if keep.peer() == peer {
+                    sets = sets.saturating_sub(1);
+                    bytes -= self.parts.get(keep).map_or(0, |part| part.payload.len());
+                }
+            }
+            if sets == 0 {
                 continue;
             }
-            let entry = peers.entry(key.peer()).or_default();
-            entry.0 += 1;
-            entry.1 += part.payload.len();
+            let candidate = (sets, bytes);
+            if best.is_none_or(|(_, best)| candidate >= best) {
+                best = Some((peer, candidate));
+            }
         }
-        let (peer, usage) = peers
-            .iter()
-            .max_by_key(|(_, (sets, bytes))| (*sets, *bytes))?;
-        if usage.0 <= 1 {
+        let (peer, (sets, _)) = best?;
+        if sets <= 1 {
             return None;
         }
-        self.oldest_except(*peer, keep)
+        self.oldest_except(peer, keep)
     }
 
+    /// The oldest set for a peer.
     fn oldest(&self, peer: [u8; 32]) -> Option<FragmentKey> {
         self.oldest_except(peer, None)
     }
 
+    /// The oldest set for a peer, excluding one key.
     fn oldest_except(&self, peer: [u8; 32], keep: Option<&FragmentKey>) -> Option<FragmentKey> {
         self.parts
             .iter()
@@ -793,24 +814,49 @@ impl Reassembly {
             .map(|(key, _)| *key)
     }
 
+    /// Remove a set and its peer counts.
     fn drop(&mut self, key: &FragmentKey) {
-        if let Some(part) = self.parts.remove(key) {
-            self.bytes -= part.payload.len();
+        self.remove(key);
+    }
+
+    /// Remove a set and decrement its peer's counts.
+    fn remove(&mut self, key: &FragmentKey) -> Option<FragmentSet> {
+        let part = self.parts.remove(key)?;
+        self.bytes -= part.payload.len();
+        let peer = key.peer();
+        let empty = if let Some(usage) = self.peers.get_mut(&peer) {
+            usage.sets -= 1;
+            usage.bytes -= part.payload.len();
+            usage.sets == 0
+        } else {
+            false
+        };
+        if empty {
+            self.peers.remove(&peer);
+        }
+        Some(part)
+    }
+
+    /// Drop sets past the timeout and rebuild the peer table if any went.
+    fn expire(&mut self) {
+        let now = StdInstant::now();
+        let before = self.parts.len();
+        self.parts
+            .retain(|_, part| now.duration_since(part.started) <= REASSEMBLY_TIMEOUT);
+        if self.parts.len() != before {
+            self.rebuild_usage();
         }
     }
 
-    fn expire(&mut self) {
-        let now = StdInstant::now();
-        let stale: Vec<_> = self
-            .parts
-            .iter()
-            .filter(|(_, part)| now.duration_since(part.started) > REASSEMBLY_TIMEOUT)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in stale {
-            if let Some(part) = self.parts.remove(&key) {
-                self.bytes -= part.payload.len();
-            }
+    /// Recompute the peer table and byte total from the sets that remain.
+    fn rebuild_usage(&mut self) {
+        self.peers.clear();
+        self.bytes = 0;
+        for (key, part) in &self.parts {
+            self.bytes += part.payload.len();
+            let usage = self.peers.entry(key.peer()).or_default();
+            usage.sets += 1;
+            usage.bytes += part.payload.len();
         }
     }
 }
@@ -4102,6 +4148,72 @@ mod tests {
         packet
     }
 
+    /// The range list is merged where it lies: the old merge drained into a
+    /// second list, so every fragment allocated one, while the in-place pass
+    /// allocates none and leaves the same ranges.
+    #[test]
+    fn merging_fragment_ranges_reuses_the_list() {
+        let mut ranges = vec![(0, 8), (8, 16), (32, 40), (40, 48), (100, 108)];
+        let ((), new) = ferrox_core::alloc_count::measure(|| merge_ranges(&mut ranges));
+        assert_eq!(new.allocs, 0, "the in-place merge takes no heap: {new:?}");
+        assert_eq!(ranges, vec![(0, 16), (32, 48), (100, 108)]);
+
+        let mut old = vec![(0, 8), (8, 16), (32, 40), (40, 48), (100, 108)];
+        let ((), reference) = ferrox_core::alloc_count::measure(|| {
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(old.len());
+            for (start, finish) in old.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(finish),
+                    _ => merged.push((start, finish)),
+                }
+            }
+            old = merged;
+        });
+        assert_eq!(
+            reference.allocs, 1,
+            "the old merge allocated its second list: {reference:?}"
+        );
+        assert_eq!(old, ranges, "the in-place merge keeps the old ranges");
+    }
+
+    /// The peer table matches the sets after an eviction and an expiry, and the
+    /// byte total is the sum of its rows.
+    #[test]
+    fn the_peer_table_agrees_with_the_sets() {
+        let mut reassembly = Reassembly::default();
+        for peer in 0..16u8 {
+            for id in 0..REASSEMBLY_PEER_SETS as u16 {
+                reassembly.accept([peer; 32], &first_fragment([10, 0, 0, peer + 2], id), 0);
+            }
+        }
+        reassembly.accept([16u8; 32], &first_fragment([10, 0, 0, 18], 0), 0);
+        let expired = StdInstant::now()
+            .checked_sub(REASSEMBLY_TIMEOUT + Duration::from_secs(1))
+            .expect("instant");
+        reassembly.parts.values_mut().next().expect("a set").started = expired;
+        reassembly.expire();
+        let peers_in_parts: HashSet<_> = reassembly.parts.keys().map(FragmentKey::peer).collect();
+        let peers_in_table: HashSet<_> = reassembly.peers.keys().copied().collect();
+        assert_eq!(
+            peers_in_parts, peers_in_table,
+            "a peer with sets has a row and a peer with a row has sets"
+        );
+        let mut total = 0;
+        for (peer, usage) in &reassembly.peers {
+            let mut sets = 0;
+            let mut bytes = 0;
+            for (key, part) in &reassembly.parts {
+                if key.peer() == *peer {
+                    sets += 1;
+                    bytes += part.payload.len();
+                }
+            }
+            assert_eq!((usage.sets, usage.bytes), (sets, bytes));
+            total += usage.bytes;
+        }
+        assert_eq!(reassembly.bytes, total, "the byte total is the peer rows");
+    }
+
     #[test]
     fn a_flood_of_first_fragments_is_bounded_by_count() {
         let mut reassembly = Reassembly::default();
@@ -4223,7 +4335,7 @@ mod tests {
                 started: now + Duration::from_millis(1),
             },
         );
-        reassembly.bytes = 510_128;
+        reassembly.rebuild_usage();
         let payload = vec![0x5a; 20_000];
         let packet = fragment_at([10, 0, 0, 2], 1, 0, &payload, true);
         reassembly.accept(peer, &packet, 0);
@@ -4351,7 +4463,7 @@ mod tests {
                 started: StdInstant::now(),
             },
         );
-        reassembly.bytes = REASSEMBLY_BYTES;
+        reassembly.rebuild_usage();
         fragment[4..6].copy_from_slice(&128u16.to_be_bytes());
         let _ = reassembly.accept([200u8; 32], &fragment, 0);
         assert!(!reassembly.parts.contains_key(&key));
