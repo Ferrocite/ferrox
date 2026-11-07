@@ -8194,9 +8194,11 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
+        // Every H1 session parks on the socket between reads instead of pinning a relay worker: the
+        // download leg of a full-duplex cell must run beside an upload leg that is waiting.
+        chained.arm_relay_poll();
         // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
-            chained.arm_relay_poll();
             let settings = settings.clone();
             let users = shared.cloned().unwrap_or_else(|| Arc::from(users));
             spawn_carried(move || {
@@ -42573,6 +42575,43 @@ mod tests {
             "oracle.example",
             "/share",
         );
+    }
+
+    /// An H1 stream-one session arms the relay poll on its socket before it relays, so an upload leg
+    /// waiting for payload parks instead of pinning one of the few relay workers the download legs need.
+    #[cfg(unix)]
+    #[test]
+    fn an_h1_xhttp_session_arms_the_relay_poll_before_it_relays() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let id = [0xaau8; 16];
+        let settings = xhttp_settings("/share");
+        let users = [one_vless_user(&id)];
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            probe_tx
+                .send(stream.try_clone().expect("probe"))
+                .expect("probe");
+            serve_vless_xhttp(stream, &settings, &users, None, true, None);
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        xhttp_post_head(&mut peer, "/share", true);
+        let probe = probe_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe");
+        let until = Instant::now() + Duration::from_secs(5);
+        while probe.read_timeout().ok().flatten() != Some(budgets::RELAY_POLL) {
+            assert!(
+                Instant::now() < until,
+                "the H1 session never armed the relay poll"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(peer);
+        serving.join().expect("joins");
     }
 
     /// Raw HTTP/1.1 clients for the three xhttp modes, padded, with session and seq in the path.
