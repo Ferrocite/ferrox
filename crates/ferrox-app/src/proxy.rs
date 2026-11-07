@@ -8194,8 +8194,6 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
-        // Every H1 session parks on the socket between reads instead of pinning a relay worker: the
-        // download leg of a full-duplex cell must run beside an upload leg that is waiting.
         chained.arm_relay_poll();
         // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
@@ -42586,7 +42584,7 @@ mod tests {
         let addr = front.local_addr().expect("addr");
         let id = [0xaau8; 16];
         let settings = xhttp_settings("/share");
-        let users = [one_vless_user(&id)];
+        let users = one_vless_user(&id);
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
