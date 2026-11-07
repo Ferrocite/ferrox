@@ -1345,6 +1345,7 @@ impl ClientStack {
             return;
         }
         if self.device.absorb(packet) {
+            self.fragment = self.fragment.min(self.device.mtu);
             self.reset_iface();
         }
     }
@@ -1600,7 +1601,11 @@ impl ServerStack {
                 self.device.recycle(bytes, at);
             }
             _ => {
-                // A client's ICMP must not narrow the MTU every tunnel shares.
+                // Only the lane's own oversize answer, which carries no peer, may narrow the shared MTU.
+                if packet.peer == [0u8; 32] && self.device.absorb(&bytes[at..]) {
+                    self.fragment = self.fragment.min(self.device.mtu);
+                    self.reset_iface();
+                }
                 self.answer_echo(&bytes[at..]);
                 self.device.recycle(bytes, at);
             }
@@ -1814,6 +1819,15 @@ impl ServerStack {
             }
             self.flows.push(Flow::new(handle, tun, 0));
         }
+    }
+
+    /// Rebuild the interface so smoltcp's cached capabilities carry the learned MTU.
+    fn reset_iface(&mut self) {
+        let now = self.now();
+        self.iface = Interface::new(iface_config(0x5eed_5678), &mut self.device, now);
+        add_addresses(&mut self.iface, &self.addresses);
+        add_default_routes(&mut self.iface, &self.addresses);
+        self.iface.set_any_ip(true);
     }
 
     fn now(&self) -> Instant {
@@ -4320,7 +4334,7 @@ mod tests {
         let too_big =
             ferrox_core::foxy::connectip::icmp_too_large(&inner, 1170).expect("a v4 answer");
         stack.receive(Packet {
-            peer: [0u8; 32],
+            peer: [7u8; 32],
             bytes: too_big,
             at: 0,
         });
