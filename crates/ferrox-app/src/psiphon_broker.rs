@@ -30,6 +30,7 @@ const CLIENT_RECEIVE_CONTEXT: &[u8] = b"in-proxy-session-packet-responder-to-ini
 const NOISE_PARAMS: &str = "Noise_XK_25519_ChaChaPoly_BLAKE2b";
 const MAX_MESSAGE: usize = 64 * 1024;
 const MAX_PADDING: usize = 256;
+const MAX_TACTICS_BYTES: usize = 1024 * 1024;
 
 /// A CBOR value. Maps preserve their entries so callers can encode
 /// deterministic integer-key maps.
@@ -163,7 +164,14 @@ fn tactics_bytes(bytes: &[u8], compression: Option<&Value>) -> Option<Json> {
         0 => bytes.to_vec(),
         1 => {
             let mut out = Vec::new();
-            ZlibDecoder::new(bytes).read_to_end(&mut out).ok()?;
+            let limit = u64::try_from(MAX_TACTICS_BYTES).ok()? + 1;
+            let read = ZlibDecoder::new(bytes)
+                .take(limit)
+                .read_to_end(&mut out)
+                .ok()?;
+            if read > MAX_TACTICS_BYTES {
+                return None;
+            }
             out
         }
         _ => return None,
@@ -1805,6 +1813,28 @@ mod tests {
         assert_eq!(offer.answer_sdp, "answer");
         assert_eq!(offer.connection_id, vec![4; 32]);
         assert_eq!(offer.protocol_version, 2);
+    }
+
+    #[test]
+    fn an_oversized_compressed_tactics_payload_is_refused() {
+        use std::io::Write as _;
+
+        let compressed = {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+            let block = [b' '; 8192];
+            let mut left = MAX_TACTICS_BYTES + 1;
+            while left > 0 {
+                let take = left.min(block.len());
+                encoder.write_all(&block[..take]).expect("compresses");
+                left -= take;
+            }
+            encoder.finish().expect("finishes")
+        };
+        assert!(
+            tactics_bytes(&compressed, Some(&Value::UInt(1))).is_none(),
+            "zlib output past the cap is refused"
+        );
     }
 
     #[test]
