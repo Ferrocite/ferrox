@@ -2646,6 +2646,7 @@ struct BodyArrival {
 }
 
 impl BodyArrival {
+    /// Open the window: the first read is due inside `budget`, the whole body inside a relay stall.
     fn new(budget: std::time::Duration) -> Self {
         let now = std::time::Instant::now();
         let arrival = Self {
@@ -2657,15 +2658,18 @@ impl BodyArrival {
         arrival
     }
 
+    /// Hand the nearer of the two deadlines to the reads that enforce it.
     fn publish(&self) {
         crate::proxy::set_body_deadline(Some(self.idle.min(self.hard)));
     }
 
+    /// A byte landed: move the idle deadline out, leaving the hard cap where it is.
     fn advanced(&mut self) {
         self.idle = std::time::Instant::now() + self.budget;
         self.publish();
     }
 
+    /// Whether the body has outlived either deadline.
     fn passed(&self) -> bool {
         let now = std::time::Instant::now();
         now >= self.idle || now >= self.hard

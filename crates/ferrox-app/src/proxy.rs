@@ -10113,10 +10113,12 @@ thread_local! {
     static BODY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
+/// The body arrival deadline this thread is enforcing, if a body read is in progress.
 pub(crate) fn body_deadline() -> Option<std::time::Instant> {
     BODY_DEADLINE.with(std::cell::Cell::get)
 }
 
+/// Arms or clears the body arrival deadline the reads on this thread honour.
 pub(crate) fn set_body_deadline(until: Option<std::time::Instant>) {
     BODY_DEADLINE.with(|slot| slot.set(until));
 }
