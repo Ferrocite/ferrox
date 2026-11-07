@@ -8194,7 +8194,13 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
-        chained.arm_relay_poll();
+        // Packet-up reads its body before its session opens, so only the stream shapes park on the socket.
+        if matches!(
+            settings.mode,
+            crate::xhttp::XhttpMode::StreamOne | crate::xhttp::XhttpMode::StreamUp
+        ) {
+            chained.arm_relay_poll();
+        }
         // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
             let settings = settings.clone();
