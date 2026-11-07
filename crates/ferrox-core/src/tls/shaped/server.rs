@@ -352,6 +352,20 @@ impl<S: Stream> Server<S> {
         let certificate = certificate_message(&self.cfg.certs[cert].cert_chain);
         transcript.extend_from_slice(&certificate);
         flight.extend_from_slice(&certificate);
+        // The staple rides after the chain, the order a Go server answers a `status_request` with.
+        if let Some(response) = self.cfg.certs[cert]
+            .ocsp
+            .as_ref()
+            .and_then(|ocsp| ocsp.response.as_ref())
+        {
+            let mut status = Vec::with_capacity(4 + response.len());
+            status.push(1);
+            status.extend_from_slice(&(response.len() as u32).to_be_bytes()[1..]);
+            status.extend_from_slice(response);
+            let status = message(22, &status);
+            transcript.extend_from_slice(&status);
+            flight.extend_from_slice(&status);
+        }
         if let Some(share) = &share {
             let exchange = self.key_exchange(&hello, share, &random)?;
             transcript.extend_from_slice(&exchange);

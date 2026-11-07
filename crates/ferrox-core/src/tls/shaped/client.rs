@@ -493,8 +493,9 @@ impl<S: Stream> Session<S> {
             return Err(unexpected(msg[0]));
         }
         let chain = certificates13(&msg[4..])?;
-        self.verify_chain(&chain)?;
         self.transcript.extend_from_slice(&msg);
+        let ocsp = leaf_ocsp(&msg[4..])?;
+        self.verify_chain(&chain, &ocsp)?;
 
         let msg = self.next_expect(15)?;
         let signed = std::mem::take(&mut self.transcript);
@@ -545,6 +546,7 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run12(&mut self, hello: &mut Hello, sh: &mut ServerHello) -> Result<(), TlsError> {
         self.version = Some(Version::Tls12);
         let suite = Suite::from_id(sh.suite)
@@ -552,24 +554,38 @@ impl<S: Stream> Session<S> {
             .ok_or(TlsError::NoSharedCipher)?;
         let msg = self.next_expect(11)?;
         let chain = certificates12(&msg[4..])?;
-        self.verify_chain(&chain)?;
         self.transcript.extend_from_slice(&msg);
+        // A stapled chain answers with a `CertificateStatus` first: consume and verify it.
+        let mut next = self.next_handshake()?;
+        let mut ocsp: Vec<u8> = Vec::new();
+        if next[0] == 22 {
+            self.transcript.extend_from_slice(&next);
+            ocsp = ocsp_response(&next[4..])?;
+            next = self.next_handshake()?;
+        }
+        self.verify_chain(&chain, &ocsp)?;
 
         // A static-RSA suite has no ServerKeyExchange: the leaf's own key carries the pre-master.
         let share = if suite.is_rsa() {
             None
         } else {
-            let msg = self.next_expect(12)?;
-            let (group, peer, signed_at) = server_key_exchange(&msg[4..])?;
+            if next[0] != 12 {
+                return Err(unexpected(next[0]));
+            }
+            let (group, peer, signed_at) = server_key_exchange(&next[4..])?;
             let mut signed = Vec::with_capacity(64 + signed_at);
             signed.extend_from_slice(&self.client_random);
             signed.extend_from_slice(&sh.random);
-            signed.extend_from_slice(&msg[4..4 + signed_at]);
-            self.verify_certificate_verify(&msg[4 + signed_at..], &signed, false)?;
-            self.transcript.extend_from_slice(&msg);
+            signed.extend_from_slice(&next[4..4 + signed_at]);
+            self.verify_certificate_verify(&next[4 + signed_at..], &signed, false)?;
+            self.transcript.extend_from_slice(&next);
             Some((group, peer))
         };
-        let mut msg = self.next_handshake()?;
+        let mut msg = if suite.is_rsa() {
+            next
+        } else {
+            self.next_handshake()?
+        };
         let asked = (msg[0] == 13)
             .then(|| certificate_request12(&msg[4..]))
             .transpose()?;
@@ -799,7 +815,7 @@ impl<S: Stream> Session<S> {
         }
     }
 
-    fn verify_chain(&mut self, chain: &[&[u8]]) -> Result<(), TlsError> {
+    fn verify_chain(&mut self, chain: &[&[u8]], ocsp: &[u8]) -> Result<(), TlsError> {
         let leaf = *chain
             .first()
             .ok_or_else(|| TlsError::BadCertificate("empty certificate chain".to_owned()))?;
@@ -813,7 +829,7 @@ impl<S: Stream> Session<S> {
                 &CertificateDer::from(leaf),
                 &intermediates,
                 &self.server_name,
-                &[],
+                ocsp,
                 UnixTime::now(),
             )
             .map_err(|error| TlsError::BadCertificate(error.to_string()))?;
@@ -1565,6 +1581,43 @@ impl<'a> Reader<'a> {
 
 /// The chain a TLS 1.3 `Certificate` carries, each entry borrowed from `body`; TLS 1.3 wraps every entry
 /// in its own extensions, which the walk reads past.
+/// The OCSP response a TLS 1.2 `CertificateStatus` carries: the status type and the response
+/// behind its three-byte length.
+fn ocsp_response(body: &[u8]) -> Result<Vec<u8>, TlsError> {
+    if body.first() != Some(&1) || body.len() < 4 {
+        return Err(TlsError::Other("not an OCSP status".to_owned()));
+    }
+    let length = u32::from_be_bytes([0, body[1], body[2], body[3]]) as usize;
+    body.get(4..4 + length)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| TlsError::Other("truncated OCSP status".to_owned()))
+}
+
+/// The OCSP response the leaf's TLS 1.3 extensions carry, when the server stapled one.
+fn leaf_ocsp(body: &[u8]) -> Result<Vec<u8>, TlsError> {
+    let mut r = Reader::new(body);
+    let context = r.u8()?;
+    r.take(usize::from(context))?;
+    let list = r.vec24()?;
+    let mut list = Reader::new(list);
+    let leaf = list.vec24()?;
+    let _ = leaf;
+    let extensions = list.vec16()?;
+    let mut extensions = Reader::new(extensions);
+    while !extensions.done() {
+        let kind = extensions.u16()?;
+        let value = extensions.vec16()?;
+        if kind == 0x0005 && value.first() == Some(&1) && value.len() >= 3 {
+            let length = usize::from(u16::from_be_bytes([value[1], value[2]]));
+            return value
+                .get(3..3 + length)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| TlsError::Other("truncated OCSP status".to_owned()));
+        }
+    }
+    Ok(Vec::new())
+}
+
 fn certificates13(body: &[u8]) -> Result<Vec<&[u8]>, TlsError> {
     let mut r = Reader::new(body);
     let context = r.u8()?;

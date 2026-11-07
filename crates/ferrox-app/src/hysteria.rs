@@ -2876,6 +2876,7 @@ mod tests {
                 key_der: minted.signing_key.serialize_der(),
                 key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
                 reload: None,
+                ocsp: None,
             }],
             alpn: Vec::new(),
             min_version: None,

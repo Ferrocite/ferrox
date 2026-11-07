@@ -833,6 +833,25 @@ fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>>
                 });
             }
         }
+        // `ocspStapling` names the staple ticker too, so an inline entry staples without a file.
+        let one_time = cert
+            .get("oneTimeLoading")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let ocsp_interval = cert
+            .get("ocspStapling")
+            .and_then(as_whole)
+            .filter(|seconds| *seconds != 0);
+        if !one_time {
+            if let Some(seconds) = ocsp_interval {
+                let interval = Duration::from_secs(seconds);
+                let response = ferrox_core::tls::ocsp_staple_for(&entry.cert_chain);
+                if response.is_none() {
+                    eprintln!("ocspStapling: no OCSP response for the served chain; serving without a staple");
+                }
+                entry.ocsp = Some(ferrox_core::tls::OcspStaple { interval, response });
+            }
+        }
         entries.push(entry);
     }
     Some(entries)
@@ -4422,6 +4441,10 @@ mod tests {
             once.certs[0].reload.is_none(),
             "oneTimeLoading pins the identity it was read with"
         );
+        assert!(
+            once.certs[0].ocsp.is_none(),
+            "oneTimeLoading pins the staple it loaded with too"
+        );
         std::fs::write(&cert, renewed.cert.pem()).expect("new cert");
         std::fs::write(&key, renewed.signing_key.serialize_pem()).expect("new key");
         assert_eq!(
@@ -4445,6 +4468,37 @@ mod tests {
             "an unchanged read leaves the listener alone"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it() {
+        let minted = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let esc = |pem: &str| format!("\"{}\"", pem.replace('\n', "\\n"));
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}, "ocspStapling": 9}}]}}}}}}"#,
+            esc(&minted.cert.pem()),
+            esc(&minted.signing_key.serialize_pem()),
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config).expect("the inline identity loads");
+        let ocsp = identity.certs[0]
+            .ocsp
+            .as_ref()
+            .expect("stapling is recorded");
+        assert_eq!(
+            ocsp.interval,
+            Duration::from_secs(9),
+            "the block's own interval is the staple's ticker"
+        );
+        assert_eq!(
+            identity.reload_interval(),
+            Some(Duration::from_secs(9)),
+            "an inline entry still ticks"
+        );
+        assert!(
+            !identity.renew(),
+            "an unchanged chain with no responder swaps nothing"
+        );
     }
 
     #[test]

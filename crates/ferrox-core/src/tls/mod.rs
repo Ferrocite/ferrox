@@ -347,6 +347,18 @@ pub struct CertEntry {
     /// The files a path-backed entry was read from and the interval xray's ticker re-reads
     /// them at; `None` for an inline entry, which has nothing to re-read.
     pub reload: Option<CertReload>,
+    /// The `ocspStapling` interval the block names and the response it last fetched, when the
+    /// block names one; `None` serves the chain with no status.
+    pub ocsp: Option<OcspStaple>,
+}
+
+/// The `ocspStapling` interval a block names and the OCSP response it last fetched for its
+/// chain: xray's ticker re-fetches on that interval, and only swaps the staple when the bytes
+/// change, so a steady responder never rebuilds the listener.
+#[derive(Debug, Clone)]
+pub struct OcspStaple {
+    pub interval: std::time::Duration,
+    pub response: Option<Vec<u8>>,
 }
 
 impl PartialEq for CertEntry {
@@ -362,6 +374,13 @@ impl PartialEq for CertEntry {
                     ours.certificate == theirs.certificate
                         && ours.key == theirs.key
                         && ours.interval == theirs.interval
+                }
+                _ => false,
+            }
+            && match (&self.ocsp, &other.ocsp) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => {
+                    ours.interval == theirs.interval && ours.response == theirs.response
                 }
                 _ => false,
             }
@@ -441,12 +460,18 @@ impl TlsServerConfig {
         crate::tls::rustls_backend::ech_server_context_builder(self, keys)
     }
 
-    /// The interval a file-backed entry re-reads at, if any entry re-reads at all.
+    /// The interval xray's ticker fires at, if any entry re-reads files or re-fetches a staple.
     pub fn reload_interval(&self) -> Option<std::time::Duration> {
         self.certs
             .iter()
             .filter_map(|entry| entry.reload.as_ref())
             .map(|reload| reload.interval)
+            .chain(
+                self.certs
+                    .iter()
+                    .filter_map(|entry| entry.ocsp.as_ref())
+                    .map(|ocsp| ocsp.interval),
+            )
             .min()
     }
 
@@ -478,27 +503,35 @@ impl TlsServerConfig {
         true
     }
 
-    /// The identities as their files read now, or `None` when a read failed or nothing changed.
+    /// The identities as their files read now and their staples re-fetch now, or `None` when a
+    /// read failed or nothing changed.
     fn reread(&self, served: &[CertEntry]) -> Option<Vec<CertEntry>> {
         let mut entries = Vec::with_capacity(self.certs.len());
         let mut changed = false;
         for (index, entry) in self.certs.iter().enumerate() {
-            let Some(reload) = &entry.reload else {
-                entries.push(entry.clone());
-                continue;
-            };
-            let parsed = parse_pem_entry(
-                &(reload.read)(&reload.certificate)?,
-                &(reload.read)(&reload.key)?,
-            )
-            .ok()?;
-            changed |= served.get(index).is_none_or(|was| {
-                was.cert_chain != parsed.cert_chain || was.key_der != parsed.key_der
-            });
-            entries.push(CertEntry {
-                reload: Some(reload.clone()),
-                ..parsed
-            });
+            let mut entry = entry.clone();
+            if let Some(reload) = &entry.reload {
+                let parsed = parse_pem_entry(
+                    &(reload.read)(&reload.certificate)?,
+                    &(reload.read)(&reload.key)?,
+                )
+                .ok()?;
+                changed |= served.get(index).is_none_or(|was| {
+                    was.cert_chain != parsed.cert_chain || was.key_der != parsed.key_der
+                });
+                entry.cert_chain = parsed.cert_chain;
+                entry.key_der = parsed.key_der;
+                entry.key_kind = parsed.key_kind;
+            }
+            if let Some(ocsp) = &mut entry.ocsp {
+                let fetched = ocsp::staple_for(&entry.cert_chain);
+                // The swap is against what the listener serves, not what the config started with.
+                changed |= served.get(index).is_none_or(|was| {
+                    fetched.as_ref() != was.ocsp.as_ref().and_then(|was| was.response.as_ref())
+                });
+                ocsp.response = fetched.or_else(|| ocsp.response.clone());
+            }
+            entries.push(entry);
         }
         changed.then_some(entries)
     }
@@ -541,6 +574,7 @@ pub fn parse_pem_entry(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertEntry, Tls
                 key_kind: key_kind(&key_der).unwrap_or(ServerKeyKind::Pkcs1),
                 key_der,
                 reload: None,
+                ocsp: None,
             });
         }
     }
@@ -622,6 +656,12 @@ fn pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
 pub mod cipher_suites;
 mod ech;
 mod hpke;
+pub(crate) mod ocsp;
+
+/// The OCSP response bytes to staple for a served chain, fetched from the leaf's responder.
+pub fn ocsp_staple_for(chain: &[Vec<u8>]) -> Option<Vec<u8>> {
+    ocsp::staple_for(chain)
+}
 
 /// The ECH config list a client config names, decoded from base64 or a PEM `ECH CONFIGS` block.
 pub fn decode_ech_config(text: &str) -> Result<Vec<u8>, String> {
