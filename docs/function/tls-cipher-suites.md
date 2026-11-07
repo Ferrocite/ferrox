@@ -149,10 +149,13 @@ ids are reachable.
 - **One named limit on the shaped split.** A mixed list rides the shaped lane, which keeps no
   session cache, so `enableSessionResumption` does not carry there; it is not a refusal, and the
   limit is named rather than silent. ECH is no longer a second limit for a mixed list: a dial
-  with an ECH list and a TLS 1.2 id derives a list that also names TLS 1.3, so it rides the
-  shaped hello with or without a profile; its slot is appended last and its offer completes
-  (`an_ech_offer_rides_the_stock_shaped_hello`). An ECH config whose maximum is below TLS 1.3
-  stays on rustls, because ECH needs TLS 1.3; that is the remaining ECH boundary.
+  with an ECH list and a TLS 1.2 id normally also names the TLS 1.3 trio `hello_ids` appends, so
+  it rides the shaped hello with or without a profile; its slot is appended last and its offer
+  completes (`an_ech_offer_rides_the_stock_shaped_hello`). A TLS 1.2-only list with an ECH
+  config stays on rustls unless it names an id neither backend carries, such as `0xc007`, which
+  `needs_stock_hello` sends to the stock shaped hello before the ECH check. An ECH config whose
+  maximum is below TLS 1.3 also stays on rustls, where `with_ech` enables only TLS 1.3. That is
+  the remaining ECH boundary.
 - **Curves carry over.** The three stock groups a `curvePreferences` list can name here map to
   BoringSSL's `P-256`/`P-384`/`X25519`, so the legacy hello keeps the named group order; the
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
