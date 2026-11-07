@@ -2700,7 +2700,7 @@ impl Settings {
     }
 }
 
-fn transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>)> {
+fn dns_transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>)> {
     let Some(Json::Obj(specs)) =
         raw.and_then(|settings| settings.get("DNSResolverProtocolTransformSpecs"))
     else {
@@ -2729,7 +2729,7 @@ fn transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>)> {
         .collect()
 }
 
-fn transform_scopes(raw: Option<&Json>) -> Vec<(String, Vec<String>)> {
+fn dns_transform_scopes(raw: Option<&Json>) -> Vec<(String, Vec<String>)> {
     let Some(Json::Obj(scopes)) =
         raw.and_then(|settings| settings.get("DNSResolverProtocolTransformScopedSpecNames"))
     else {
@@ -2799,8 +2799,8 @@ fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
     config.transforms = Arc::new(crate::psiphon_dns::Transforms::new(
-        transform_specs(raw),
-        transform_scopes(raw),
+        dns_transform_specs(raw),
+        dns_transform_scopes(raw),
     ));
     config.preresolved_labels = if let Some(Json::Obj(labels)) =
         raw.and_then(|settings| settings.get("DNSResolverPreresolvedIPAddressCIDRs"))

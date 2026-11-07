@@ -81,7 +81,7 @@ impl Transforms {
                 compiled.insert(name, Arc::new(items));
             }
         }
-        let mut scopes = HashMap::new();
+        let mut by_scope = HashMap::new();
         for (scope, names) in scoped {
             let mut kept = Vec::new();
             for name in names {
@@ -91,11 +91,11 @@ impl Transforms {
                     eprintln!("psiphon: ignoring DNS transform scope {scope}: undefined {name}");
                 }
             }
-            scopes.insert(scope, kept);
+            by_scope.insert(scope, kept);
         }
         Self {
             specs: compiled,
-            scoped: scopes,
+            scoped: by_scope,
         }
     }
 
@@ -464,7 +464,9 @@ fn apply_transform(transforms: &[Transform], packet: &[u8]) -> io::Result<Vec<u8
         })?;
         value = transform
             .find
-            .replace_all(&value, |captures| expand(&replacement, captures))
+            .replace_all(&value, |captures: &regex::bytes::Captures<'_>| {
+                expand(&replacement, captures)
+            })
             .into_owned();
     }
     hex_decode(&value).ok_or_else(|| {
@@ -922,7 +924,7 @@ fn query(
                         server,
                         record,
                         &config,
-                        transform.as_ref().map(Vec::as_slice),
+                        transform.as_deref().map(Vec::as_slice),
                         must_match,
                     ),
                 ));
@@ -1357,7 +1359,7 @@ mod tests {
     #[test]
     /// Escaped replacement text generates the subgroup reference the reference expects.
     fn a_replacement_pattern_keeps_its_subgroup_reference() {
-        let node = super::Node::parse(r"\$\{1\}0140").expect("pattern");
+        let node = super::Node::parse(r"\$\{1\}0140".as_bytes()).expect("pattern");
         let mut out = Vec::new();
         super::generate(&node, &mut out).expect("generate");
         assert_eq!(out, b"${1}0140");
@@ -1367,7 +1369,7 @@ mod tests {
     /// A transform rewrites the hex packet and expands its subgroup references.
     fn a_transform_rewrites_the_hex_packet() {
         let find = regex::bytes::Regex::new("(12)(34)").expect("regex");
-        let replacement = super::Node::parse(r"\$\{2\}\$\{1\}").expect("pattern");
+        let replacement = super::Node::parse(r"\$\{2\}\$\{1\}".as_bytes()).expect("pattern");
         let transform = super::Transform { find, replacement };
         let packet =
             super::apply_transform(&[transform], &[0x12, 0x34, 0xab, 0xcd]).expect("transform");
