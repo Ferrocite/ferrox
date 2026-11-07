@@ -171,6 +171,10 @@ carrier-hysteria  hysteria::tests::the_direct_answer_costs_the_same_bytes_once  
 # frames, and only their difference is a claim about the searches.
 carrier-hysteria  hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else  ferrox_core::hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else
 carrier-hysteria  hysteria::tests::the_linear_scan_costs_the_same_answer  ferrox_core::hysteria::tests::the_linear_scan_costs_the_same_answer
+# The STUN binding exchange, 4096 times over the peer's answer, and the punch packet build and read
+# of 4096 packets: one ops job reports both frames, and their buffers are the caller's own.
+carrier-hysteria  stun::tests::a_binding_exchange_takes_no_heap  ferrox_core::stun::tests::a_binding_exchange_takes_no_heap
+carrier-hysteria  realm::tests::an_encoded_and_decoded_packet_takes_no_heap  ferrox_core::realm::tests::an_encoded_and_decoded_packet_takes_no_heap
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record

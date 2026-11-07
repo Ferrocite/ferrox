@@ -557,6 +557,9 @@ carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_
 carrier-hysteria masquerade-https-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin
 carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted
 carrier-hysteria masquerade-unix-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_a_unix_origin
+carrier-hysteria stun-binding-exchange-allocations 0 ferrox-core-stun::tests::a_binding_exchange_takes_no_heap
+carrier-hysteria realm-punch-allocations 0 ferrox-core-realm::tests::an_encoded_and_decoded_packet_takes_no_heap
+carrier-hysteria realm-configs-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_realm_rendezvous
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -877,6 +880,7 @@ wireguard reassembly-peer-set-cap 64 ferrox-app-wg-stack::tests::one_peers_fragm
 wireguard reassembly-peer-byte-cap 524288 ferrox-app-wg-stack::tests::a_peer_cannot_take_the_whole_reassembly_byte_budget
 wireguard reassembly-range-cap 256 ferrox-app-wg-stack::tests::range_metadata_is_bounded
 wireguard range-merge-allocations 0 ferrox-app-wg-stack::tests::merging_fragment_ranges_reuses_the_list
+wireguard timeout-walks-per-unexpired-fragment 0 ferrox-app-wg-stack::tests::an_unexpired_fragment_does_not_walk_the_sets
 wireguard reassembly-byte-cap 8388608 ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap
 wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles

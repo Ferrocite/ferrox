@@ -621,6 +621,9 @@ struct Reassembly {
     parts: HashMap<FragmentKey, FragmentSet>,
     peers: HashMap<[u8; 32], PeerUsage>,
     bytes: usize,
+    next_expiry: Option<StdInstant>,
+    #[cfg(test)]
+    scans: usize,
 }
 
 enum Reassembled {
@@ -646,19 +649,7 @@ impl Reassembly {
             if !self.make_room(end, key) {
                 return Reassembled::Held;
             }
-            self.parts.insert(
-                key,
-                FragmentSet {
-                    at,
-                    header: Vec::new(),
-                    next_header: 0,
-                    payload: Vec::new(),
-                    ranges: Vec::new(),
-                    last: None,
-                    started: StdInstant::now(),
-                },
-            );
-            self.peers.entry(key.peer()).or_default().sets += 1;
+            self.insert_set(key, at, StdInstant::now());
         }
         if self.parts.get(&key).is_some_and(|part| part.at != at) {
             self.remove(&key);
@@ -841,18 +832,53 @@ impl Reassembly {
         if empty {
             self.peers.remove(&peer);
         }
+        if self.parts.is_empty() {
+            self.next_expiry = None;
+        }
         Some(part)
     }
 
     /// Drop sets past the timeout and rebuild the peer table if any went.
     fn expire(&mut self) {
         let now = StdInstant::now();
+        if self.next_expiry.is_none_or(|next| now < next) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.scans += 1;
+        }
         let before = self.parts.len();
         self.parts
             .retain(|_, part| now.duration_since(part.started) <= REASSEMBLY_TIMEOUT);
-        if self.parts.len() != before {
+        if self.parts.len() == before {
+            self.next_expiry = self
+                .parts
+                .values()
+                .map(|part| part.started + REASSEMBLY_TIMEOUT)
+                .min();
+        } else {
             self.rebuild_usage();
         }
+    }
+
+    /// Admit one set and move the next timeout walk to its expiry if earlier.
+    fn insert_set(&mut self, key: FragmentKey, at: usize, started: StdInstant) {
+        self.parts.insert(
+            key,
+            FragmentSet {
+                at,
+                header: Vec::new(),
+                next_header: 0,
+                payload: Vec::new(),
+                ranges: Vec::new(),
+                last: None,
+                started,
+            },
+        );
+        self.peers.entry(key.peer()).or_default().sets += 1;
+        let expiry = started + REASSEMBLY_TIMEOUT;
+        self.next_expiry = Some(self.next_expiry.map_or(expiry, |next| next.min(expiry)));
     }
 
     /// Recompute the peer table and byte total from the sets that remain.
@@ -865,6 +891,11 @@ impl Reassembly {
             usage.sets += 1;
             usage.bytes += part.payload.len();
         }
+        self.next_expiry = self
+            .parts
+            .values()
+            .map(|part| part.started + REASSEMBLY_TIMEOUT)
+            .min();
     }
 }
 
@@ -4342,6 +4373,7 @@ mod tests {
             .checked_sub(REASSEMBLY_TIMEOUT + Duration::from_secs(1))
             .expect("instant");
         reassembly.parts.values_mut().next().expect("a set").started = expired;
+        reassembly.next_expiry = Some(expired + REASSEMBLY_TIMEOUT);
         reassembly.expire();
         let peers_in_parts: HashSet<_> = reassembly.parts.keys().map(FragmentKey::peer).collect();
         let peers_in_table: HashSet<_> = reassembly.peers.keys().copied().collect();
@@ -4363,6 +4395,57 @@ mod tests {
             total += usage.bytes;
         }
         assert_eq!(reassembly.bytes, total, "the byte total is the peer rows");
+    }
+
+    /// The timeout check is a comparison until the earliest set can expire; the
+    /// walk runs once when it does, not on every fragment.
+    #[test]
+    fn an_unexpired_fragment_does_not_walk_the_sets() {
+        let mut reassembly = Reassembly::default();
+        for id in 0..REASSEMBLY_PEER_SETS as u16 {
+            reassembly.accept([7; 32], &first_fragment([10, 0, 0, 7], id), 0);
+        }
+        reassembly.scans = 0;
+        for id in 0..REASSEMBLY_PEER_SETS as u16 {
+            reassembly.accept([8; 32], &first_fragment([10, 0, 0, 8], id), 0);
+        }
+        assert_eq!(reassembly.scans, 0, "no set can expire yet");
+        let aged = *reassembly
+            .parts
+            .keys()
+            .find(|key| key.peer() == [7; 32])
+            .expect("a peer-7 set");
+        let aged_bytes = reassembly.parts[&aged].payload.len();
+        let before_bytes = reassembly.bytes;
+        let before_sets = reassembly.peers[&[7; 32]].sets;
+        let before_peer_bytes = reassembly.peers[&[7; 32]].bytes;
+        let expired = StdInstant::now()
+            .checked_sub(REASSEMBLY_TIMEOUT + Duration::from_secs(1))
+            .expect("instant");
+        reassembly
+            .parts
+            .get_mut(&aged)
+            .expect("the aged set")
+            .started = expired;
+        reassembly.next_expiry = Some(expired + REASSEMBLY_TIMEOUT);
+        reassembly.accept([9; 32], &empty_fragment([10, 0, 0, 9], 0, 0), 0);
+        assert_eq!(reassembly.scans, 1, "the walk runs when a set can expire");
+        assert!(!reassembly.parts.contains_key(&aged), "the aged set went");
+        let after = reassembly
+            .peers
+            .get(&[7; 32])
+            .expect("peer 7 still has sets");
+        assert_eq!(after.sets, before_sets - 1, "the peer's set count fell");
+        assert_eq!(
+            after.bytes,
+            before_peer_bytes - aged_bytes,
+            "the peer's byte count fell"
+        );
+        assert_eq!(
+            reassembly.bytes,
+            before_bytes - aged_bytes,
+            "the total byte count fell"
+        );
     }
 
     #[test]

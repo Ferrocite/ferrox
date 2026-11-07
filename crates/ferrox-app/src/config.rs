@@ -2274,6 +2274,15 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             };
         }
     };
+    let realm = match hysteria_realm(settings, hy) {
+        Ok(realm) => realm,
+        Err(why) => {
+            eprintln!("hysteria realm: {why}; the carrier is refused");
+            return Carrier::Unknown {
+                network: network.to_owned(),
+            };
+        }
+    };
     if version == 1 {
         // Version 1 names xplus directly: `tlsSettings.obfs` is the password, not a mask name.
         return Carrier::Hysteria(Config {
@@ -2285,6 +2294,7 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             gecko: None,
             udp_idle,
             quic,
+            realm: realm.map(Box::new),
         });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
@@ -2312,6 +2322,7 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         gecko,
         udp_idle,
         quic,
+        realm: realm.map(Box::new),
     })
 }
 
@@ -2343,6 +2354,7 @@ pub(crate) fn hysteria_v1_config(
         gecko: None,
         udp_idle: hysteria_udp_idle(hy)?,
         quic,
+        realm: hysteria_realm(stream, hy)?.map(Box::new),
     })
 }
 
@@ -2354,6 +2366,229 @@ fn hysteria_v1_obfs(stream: Option<&Json>) -> Option<String> {
         .and_then(Json::as_str)
         .filter(|password| !password.is_empty())
         .map(str::to_owned)
+}
+
+/// The realm rendezvous a hysteria dial or serve knocks through STUN and punch, read from either
+/// `hysteriaSettings.realm` (the sing-box spelling, `server_url` with `realm_id`) or
+/// `finalmask.realm` and `finalmask.udp[type=realm]` (the xray spelling, `scheme`/`host`/`port` with
+/// `ID`). A block that is present but names no origin, no slot or no STUN server is refused rather
+/// than dialled direct — the peer it would punch is only reachable through the rendezvous. A
+/// `port_mapping` block is carried through; the dialer warns where a gateway mapping is requested and
+/// continues without a gateway address, as the reference does when its mapper fails to initialise.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn hysteria_realm_for_stream(
+    stream: Option<&Json>,
+    hy: Option<&Json>,
+) -> Result<Option<ferrox_core::realm::Config>, String> {
+    hysteria_realm(stream, hy)
+}
+
+#[allow(clippy::too_many_lines)]
+fn hysteria_realm(
+    settings: Option<&Json>,
+    hy: Option<&Json>,
+) -> Result<Option<ferrox_core::realm::Config>, String> {
+    use ferrox_core::realm::{Config, Family, PortMapping};
+    let object = hy
+        .and_then(|h| h.get("realm"))
+        .or_else(|| {
+            settings
+                .and_then(|s| s.get("finalmask"))
+                .and_then(|f| f.get("realm"))
+        })
+        .or_else(|| {
+            settings
+                .and_then(|s| s.get("finalmask"))
+                .and_then(|f| f.get("udp"))
+                .and_then(Json::as_arr)
+                .and_then(|udp| {
+                    udp.iter().find(|entry| {
+                        entry
+                            .get("type")
+                            .and_then(Json::as_str)
+                            .is_some_and(|t| t.eq_ignore_ascii_case("realm"))
+                    })
+                })
+                .and_then(|entry| entry.get("settings"))
+        });
+    let Some(node) = object else {
+        return Ok(None);
+    };
+    if salamander_obfs(settings).is_some()
+        || hysteria_hop(hy).is_some()
+        || hysteria_gecko(settings).is_ok_and(|gecko| gecko.is_some())
+    {
+        return Err("realm cannot ride salamander, gecko or a port hop yet; its punch bypasses the masked datagram demux".to_owned());
+    }
+    let field = |camel: &str, snake: &str| node.get(camel).or_else(|| node.get(snake));
+    let url = field("server_url", "serverUrl")
+        .and_then(Json::as_str)
+        .map(str::to_owned);
+    let (scheme_from_url, host_from_url, port_from_url) = match &url {
+        Some(text) => {
+            let (scheme, rest) = text.split_once("://").ok_or("server_url needs scheme://")?;
+            let scheme = scheme.to_ascii_lowercase();
+            if scheme != "http" && scheme != "https" {
+                return Err("server_url scheme must be http or https".to_owned());
+            }
+            let hostport = rest.split('/').next().unwrap_or(rest);
+            let default = if scheme == "https" { 443 } else { 80 };
+            let split = if let Some(inner) = hostport.strip_prefix('[') {
+                let (h, tail) = inner
+                    .split_once(']')
+                    .ok_or("server_url has an unclosed [")?;
+                match tail.strip_prefix(':') {
+                    Some(p) => Some((h, Some(p))),
+                    None if tail.is_empty() => Some((h, None)),
+                    None => return Err("server_url port must be a port".to_owned()),
+                }
+            } else {
+                hostport.rsplit_once(':').map(|(h, p)| (h, Some(p)))
+            };
+            let (host, port) = if let Some((h, p)) = split {
+                match p {
+                    Some(p) => (
+                        h.to_owned(),
+                        p.parse::<u16>()
+                            .map_err(|_| "server_url port must be a port".to_owned())?,
+                    ),
+                    None => (h.to_owned(), default),
+                }
+            } else {
+                (hostport.to_owned(), default)
+            };
+            if host.is_empty() {
+                return Err("server_url names no host".to_owned());
+            }
+            (Some(scheme), Some(host), Some(port))
+        }
+        None => (None, None, None),
+    };
+    let scheme = field("scheme", "scheme")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .or(scheme_from_url)
+        .unwrap_or_else(|| "http".to_owned());
+    if scheme != "http" && scheme != "https" {
+        return Err("realm scheme must be http or https".to_owned());
+    }
+    let host = field("host", "host")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .or(host_from_url)
+        .unwrap_or_default();
+    if host.is_empty() {
+        return Err("realm names no host".to_owned());
+    }
+    let port = field("port", "port")
+        .and_then(Json::as_port)
+        .or(port_from_url)
+        .or_else(|| {
+            field("port", "port")
+                .and_then(Json::as_str)
+                .and_then(|p| p.parse().ok())
+        })
+        .unwrap_or_else(|| if scheme == "https" { 443 } else { 80 });
+    let id = field("realm_id", "realmId")
+        .or_else(|| field("ID", "id"))
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    if !ferrox_core::realm::valid_realm_id(&id) {
+        return Err("realm id is missing or malformed".to_owned());
+    }
+    let token = field("token", "token")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let mut stun_servers = Vec::new();
+    if let Some(servers) = field("stun_servers", "stunServers") {
+        if let Some(items) = servers.as_arr() {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        stun_servers.push(text.to_owned());
+                    }
+                }
+            }
+        } else if let Some(text) = servers.as_str() {
+            let text = text.trim();
+            if !text.is_empty() {
+                stun_servers.push(text.to_owned());
+            }
+        }
+    }
+    if stun_servers.is_empty() {
+        return Err("realm names no STUN server".to_owned());
+    }
+    let family_value = field("ip_version", "ipVersion").or_else(|| field("IPMode", "ip_mode"));
+    let family = match family_value.and_then(Json::as_i64) {
+        Some(4) => Family::V4,
+        Some(6) => Family::V6,
+        None => match family_value.and_then(Json::as_str) {
+            Some(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "4" | "v4" => Family::V4,
+                "6" | "v6" => Family::V6,
+                _ => Family::Dual,
+            },
+            None => Family::Dual,
+        },
+        _ => Family::Dual,
+    };
+    let port_mapping = field("port_mapping", "portMapping").and_then(|mapping| {
+        let enabled = mapping
+            .get("enabled")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let timeout_seconds = mapping
+            .get("timeout")
+            .and_then(duration_seconds)
+            .unwrap_or(10);
+        let lifetime_seconds = mapping
+            .get("lifetime")
+            .and_then(duration_seconds)
+            .unwrap_or(600);
+        Some(PortMapping {
+            enabled: true,
+            timeout: timeout_seconds,
+            lifetime: lifetime_seconds,
+        })
+    });
+    Ok(Some(Config {
+        scheme,
+        host,
+        port,
+        token,
+        id,
+        stun_servers,
+        family,
+        port_mapping,
+    }))
+}
+
+/// A duration in seconds from a bare number or a number with an `s`/`ms` suffix; `None` when absent
+/// or malformed, so the port-mapping caller falls back to its default.
+fn duration_seconds(value: &Json) -> Option<u64> {
+    if let Some(seconds) = value.as_i64() {
+        return Some(seconds.max(0) as u64);
+    }
+    let text = value.as_str()?.trim();
+    let (number, divisor) = if let Some(ms) = text.strip_suffix("ms") {
+        (ms, 1000)
+    } else if let Some(s) = text.strip_suffix('s') {
+        (s, 1)
+    } else {
+        (text, 1)
+    };
+    number
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds / divisor)
 }
 
 /// The port-hopping plan a hysteria dial rotates its server port on, read from its
@@ -3219,6 +3454,55 @@ mod tests {
         assert!(matches!(
             carrier(
                 r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "gecko", "obfs-password": "gawrgura", "min_packet_size": 100, "max_packet_size": 5000}}}"#
+            ),
+            Carrier::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_a_realm_rendezvous() {
+        use ferrox_core::realm::Family;
+        let realm = |text: &str| {
+            let Carrier::Hysteria(config) = stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            ) else {
+                panic!("a hysteria carrier");
+            };
+            config.realm
+        };
+        // The sing-box spelling: one `server_url` plus `realm_id`, an ip version and a STUN list.
+        let box_form = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "realm": {"server_url": "https://realm.example.com:8443", "token": "tok", "realm_id": "slot-1", "stun_servers": ["stun.example.com:3478"], "ip_version": 4}}}}"#;
+        let parsed = realm(box_form).expect("a realm");
+        let parsed = &*parsed;
+        assert_eq!(parsed.scheme, "https");
+        assert_eq!(parsed.host, "realm.example.com");
+        assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.token, "tok");
+        assert_eq!(parsed.id, "slot-1");
+        assert_eq!(parsed.stun_servers, vec!["stun.example.com:3478"]);
+        assert_eq!(parsed.family, Family::V4);
+        // The xray spelling: `scheme`/`host`/`port` with `ID`, read from `finalmask.realm`.
+        let xray_form = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"realm": {"scheme": "http", "host": "realm.example", "port": 8080, "token": "tok", "ID": "slot_2", "stun_servers": ["192.0.2.1"], "IPMode": "v6"}}}}"#;
+        let parsed = realm(xray_form).expect("a realm");
+        let parsed = &*parsed;
+        assert_eq!(parsed.scheme, "http");
+        assert_eq!(parsed.host, "realm.example");
+        assert_eq!(parsed.port, 8080);
+        assert_eq!(parsed.id, "slot_2");
+        assert_eq!(parsed.family, Family::V6);
+        // The udp chain's `type: realm` entry is the same dial through a third spelling.
+        let chain_form = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"udp": [{"type": "realm", "settings": {"scheme": "http", "host": "realm.example", "port": 80, "ID": "slot3", "stun_servers": ["198.51.100.1:3478"]}}]}}}"#;
+        let parsed = realm(chain_form).expect("a realm");
+        assert_eq!(parsed.as_ref().id, "slot3");
+        assert_eq!(parsed.as_ref().family, Family::Dual);
+        // A realm with no slot, no origin or no STUN server is refused rather than dialled direct.
+        assert!(matches!(
+            stream_carrier(
+                crate::json::parse(r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "realm": {"server_url": "https://realm.example", "stun_servers": ["stun.example"]}}}}"#)
+                    .expect("parses")
+                    .get("streamSettings"),
             ),
             Carrier::Unknown { .. }
         ));
