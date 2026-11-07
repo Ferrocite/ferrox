@@ -488,11 +488,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(text: &[u8]) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 2);
-    for pair in text.chunks_exact(2) {
+    for pair in text.as_chunks::<2>().0 {
         out.push(hex_digit(pair[0])? << 4 | hex_digit(pair[1])?);
     }
     Some(out)
@@ -765,7 +765,7 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
             let first_attempt = first;
             first = false;
             let use_transform = if first_attempt {
-                transform.clone()
+                transform.as_ref()
             } else {
                 None
             };
@@ -905,7 +905,7 @@ fn query(
     host: &str,
     server: SocketAddr,
     config: &Config,
-    transform: Option<Arc<Vec<Transform>>>,
+    transform: Option<&Arc<Vec<Transform>>>,
     must_match: bool,
 ) -> io::Result<(Vec<IpAddr>, Duration)> {
     let (sender, receiver) = mpsc::channel();
@@ -913,7 +913,7 @@ fn query(
         let sender = sender.clone();
         let name = host.to_owned();
         let config = config.clone();
-        let transform = transform.clone();
+        let transform = transform.cloned();
         thread::Builder::new()
             .name(format!("psiphon-dns-{record}"))
             .spawn(move || {
