@@ -27,6 +27,8 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+/// A held datagram retries inside one poll grain, so a full queue never waits out a tick.
+const RETRY: Duration = Duration::from_millis(1);
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
 const H3_KEEPALIVE: Duration = Duration::from_secs(10);
 const H2_KEEPALIVE: Duration = Duration::from_secs(45);
@@ -2369,6 +2371,11 @@ fn worker(
             return;
         }
         let wait = conn.timeout().unwrap_or(TICK).min(TICK);
+        let wait = if tunnel.unsent.is_some() {
+            wait.min(RETRY)
+        } else {
+            wait
+        };
         match rx.recv_timeout(wait) {
             Ok(Arrival::Datagram(mut bytes, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
@@ -3765,7 +3772,18 @@ mod tests {
             .expect("timeout");
         masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
         let mut answer = vec![0u8; payload.len()];
-        app.read_exact(&mut answer).expect("read");
+        let mut got = 0;
+        while got < answer.len() {
+            match app.read(&mut answer[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(error) => panic!(
+                    "download stalled after {got} of {} bytes: {error}",
+                    answer.len()
+                ),
+            }
+        }
+        assert_eq!(got, payload.len(), "the download ended early");
         assert_eq!(answer, payload);
     }
 
