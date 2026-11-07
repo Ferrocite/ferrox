@@ -10065,7 +10065,10 @@ pub(crate) fn read_into_tail(
 }
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::Interrupted || ferrox_core::tls::TlsError::is_timeout(error)
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    ) || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
 /// A UDP socket reports a peer's ICMP as a reset on Windows; that is one lost datagram, not the lane's end.

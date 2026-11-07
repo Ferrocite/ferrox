@@ -382,6 +382,83 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
     state
 }
 
+/// CTR and GHASH reading `src` and writing `len` bytes to `dst`, which may be uninitialized. Every byte is written before this returns.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cipher state, both directions and the deferred tail are the pass, not a bundle"
+)]
+pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
+    rk: &[V; 11],
+    hp: &[(V, V); 4],
+    template: V,
+    mut state: V,
+    src: &[u8],
+    dst: *mut u8,
+    tailq: &mut Tail<V>,
+    mut ctr: u32,
+) -> V {
+    let (sblocks, stail) = src.as_chunks::<16>();
+    let (sgroups, srest) = sblocks.as_chunks::<4>();
+    for (group, sq) in sgroups.iter().enumerate() {
+        let mut ksv = ctr4v(template, ctr);
+        V::encrypt4(rk, &mut ksv);
+        let ct4 = [
+            ksv[0].xor(V::load(&sq[0])),
+            ksv[1].xor(V::load(&sq[1])),
+            ksv[2].xor(V::load(&sq[2])),
+            ksv[3].xor(V::load(&sq[3])),
+        ];
+        let at = group * 64;
+        // SAFETY: the caller guarantees `dst` has room for every byte stored here.
+        unsafe {
+            V::store_ptr(ct4[0], dst.add(at));
+            V::store_ptr(ct4[1], dst.add(at + 16));
+            V::store_ptr(ct4[2], dst.add(at + 32));
+            V::store_ptr(ct4[3], dst.add(at + 48));
+        }
+        state = ghash_group(
+            hp,
+            [
+                state.xor(ct4[0].bswap()),
+                ct4[1].bswap(),
+                ct4[2].bswap(),
+                ct4[3].bswap(),
+            ],
+        );
+        ctr += 4;
+    }
+    let mut at = sgroups.len() * 64;
+    for sb in srest {
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
+        let ct1 = ks1.xor(V::load(sb));
+        // SAFETY: `at` is inside the `src.len()`-byte destination.
+        unsafe { V::store_ptr(ct1, dst.add(at)) };
+        tailq.push(ct1.bswap());
+        ctr += 1;
+        at += 16;
+    }
+    if !stail.is_empty() {
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
+        let mut ksb = [0u8; 16];
+        ks1.store(&mut ksb);
+        let mut padded = [0u8; 16];
+        for (i, ((xb, kb), pb)) in stail
+            .iter()
+            .zip(ksb.iter())
+            .zip(padded.iter_mut())
+            .enumerate()
+        {
+            let v = *xb ^ kb;
+            *pb = v;
+            // SAFETY: the tail starts at `at` and has fewer than 16 bytes left.
+            unsafe { std::ptr::write(dst.add(at + i), v) };
+        }
+        tailq.push(V::load(&padded).bswap());
+    }
+    state
+}
+
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn seal_impl_from<V: Lanes>(
@@ -405,6 +482,34 @@ pub(crate) fn seal_impl_from<V: Lanes>(
         &mut tailq,
         aad.len() as u64,
         dst.len() as u64,
+        mask,
+    )
+}
+
+/// Seal `src` into initialization-free `dst` with the fused pass, returning the tag.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn seal_impl_from_uninit<V: Lanes>(
+    rk: &[V; 11],
+    h: &[(V, V); 4],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: *mut u8,
+) -> [u8; 16] {
+    let template = counter_template::<V>(nonce);
+    let mask = V::encrypt1v(rk, template.ctr_be(1));
+    let mut tailq = Tail::new();
+    let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
+    let state = flush(h, state, &mut tailq);
+    // SAFETY: the caller guarantees `dst` has room for every plaintext byte.
+    let state = unsafe { ctr_ghash_from_uninit(rk, h, template, state, src, dst, &mut tailq, 2) };
+    finish(
+        h,
+        state,
+        &mut tailq,
+        aad.len() as u64,
+        src.len() as u64,
         mask,
     )
 }
@@ -654,7 +759,52 @@ impl Aes128Gcm {
         }
     }
 
+    /// Seal `src` into `dst`, which may be uninitialized, returning the tag. Every byte of `dst` is written before this returns.
     #[cfg_attr(target_arch = "aarch64", inline)]
+    #[must_use]
+    pub fn seal_from_uninit(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: &mut [std::mem::MaybeUninit<u8>],
+    ) -> [u8; 16] {
+        assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        assert!(
+            (dst.len() as u64) <= (u64::from(u32::MAX) - 1) * 16,
+            "GCM plaintext is at most 2^32 - 2 blocks"
+        );
+        assert!(
+            (aad.len() as u64) < (1u64 << 61),
+            "GCM associated data is at most 2^61 - 1 bytes"
+        );
+        match &self.inner {
+            #[cfg(target_arch = "x86_64")]
+            Inner::X86V(e) => unsafe {
+                e.seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+            },
+            #[cfg(target_arch = "x86_64")]
+            Inner::X86(e) => unsafe {
+                e.seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+            },
+            #[cfg(target_arch = "aarch64")]
+            Inner::Arm(e) => unsafe {
+                e.engine
+                    .seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+            },
+            Inner::Crate(_) => {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    d.write(*s);
+                }
+                // SAFETY: every byte was initialized by writing the plaintext above.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len())
+                };
+                self.seal_in_place(nonce, aad, dst)
+            }
+        }
+    }
+
     #[must_use]
     pub fn open_in_place(
         &self,
@@ -1567,6 +1717,17 @@ mod tests {
                     let tag = engine.seal_from(&nonce, &aad, &plain, &mut dst);
                     assert_eq!(tag, want, "tag: aad {aad_len} len {len}");
                     assert_eq!(dst, in_place, "ciphertext: aad {aad_len} len {len}");
+                    let mut uninit = vec![std::mem::MaybeUninit::new(0xa5u8); len];
+                    let tag = engine.seal_from_uninit(&nonce, &aad, &plain, &mut uninit);
+                    assert_eq!(tag, want, "uninit tag: aad {aad_len} len {len}");
+                    // SAFETY: seal_from_uninit wrote every byte of the destination.
+                    let uninit = unsafe {
+                        std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len())
+                    };
+                    assert_eq!(
+                        uninit, in_place,
+                        "uninit ciphertext: aad {aad_len} len {len}"
+                    );
                     assert_eq!(
                         plain,
                         (0..len)
