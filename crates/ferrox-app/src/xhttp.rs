@@ -2365,7 +2365,6 @@ impl crate::proxy::WindowRead for SessionReader {
                 };
                 match window {
                     Ok(window) if window.is_empty() => {
-                        drop(window);
                         note_upload_done(&session);
                         return Ok(crate::proxy::Window::empty());
                     }
@@ -6408,14 +6407,15 @@ mod tests {
         let session = get_or_create_session("windowed-upload-test");
         session.state.lock().expect("session lock").upload = Some(Box::new(source));
         let mut reader = SessionReader::new(Arc::clone(&session), String::new());
-        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("window");
-        assert_eq!(window.bytes(), &[1, 2, 3, 4]);
-        assert_eq!(
-            window.bytes().as_ptr(),
-            expected,
-            "the relay writes the upload's own bytes"
-        );
-        drop(window);
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("window");
+            assert_eq!(window.bytes(), &[1, 2, 3, 4]);
+            assert_eq!(
+                window.bytes().as_ptr(),
+                expected,
+                "the relay writes the upload's own bytes"
+            );
+        }
         assert!(crate::proxy::WindowRead::read_window(&mut reader)
             .expect("empty")
             .is_empty());
