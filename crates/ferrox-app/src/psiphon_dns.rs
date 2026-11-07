@@ -23,6 +23,7 @@ struct CacheEntry {
     expires: Instant,
 }
 
+#[derive(Debug)]
 struct SteeringEntry {
     address: IpAddr,
     expires: Instant,
