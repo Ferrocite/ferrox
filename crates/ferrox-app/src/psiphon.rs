@@ -2700,6 +2700,7 @@ impl Settings {
     }
 }
 
+/// Read the named DNS protocol transforms from settings.
 fn dns_transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>)> {
     let Some(Json::Obj(specs)) =
         raw.and_then(|settings| settings.get("DNSResolverProtocolTransformSpecs"))
@@ -2729,6 +2730,7 @@ fn dns_transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>
         .collect()
 }
 
+/// Read the DNS transform scope-to-spec-name mapping from settings.
 fn dns_transform_scopes(raw: Option<&Json>) -> Vec<(String, Vec<String>)> {
     let Some(Json::Obj(scopes)) =
         raw.and_then(|settings| settings.get("DNSResolverProtocolTransformScopedSpecNames"))
@@ -8100,6 +8102,7 @@ mod tests {
         );
     }
 
+    /// The five DNS knobs reach the runtime config.
     #[test]
     fn dns_transforms_and_the_verified_extension_are_parsed() {
         let settings = Settings::from_json(Some(
