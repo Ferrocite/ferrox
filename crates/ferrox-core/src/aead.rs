@@ -85,9 +85,7 @@ pub fn chacha20_poly1305_seal_from_uninit(
         "the source and the wire are the same message"
     );
     let mut one_time = [0u8; 32];
-    // `fill_exact_with_head_from` writes every wrapped byte through `xor_chunk_from`, which
-    // stores a value plus the keystream word and never reads `dst`'s staging. Every byte is
-    // written before the initialized slice is formed below.
+    // `fill_exact_with_head_from` writes every wrapped byte through `xor_chunk_from`, so every byte is initialized before this slice is formed.
     let dst_initialized =
         unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
     crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst_initialized);
