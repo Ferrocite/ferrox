@@ -7908,6 +7908,19 @@ fn serve_vless_tls_inbound(
         );
         return false;
     }
+    if let Carrier::Xhttp { settings } = carrier {
+        if crate::xhttp_h3::is_h3(&server.alpn) {
+            let service =
+                crate::xhttp_h2::h3_vless_service(settings, users, freedom, decryption.clone());
+            return match crate::xhttp_h3::serve_inbound(address, &server, settings, service) {
+                Ok(_) => true,
+                Err(error) => {
+                    eprintln!("xhttp h3 in {path}: {error}");
+                    false
+                }
+            };
+        }
+    }
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
         let config = config.clone();
@@ -12511,6 +12524,26 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                 eprintln!("unreadable trojan tls identity on {address}: refused, not served");
                 return false;
             };
+            if let Carrier::Xhttp { settings } = &carrier {
+                if crate::xhttp_h3::is_h3(&server.alpn) {
+                    let keys: Vec<[u8; 56]> = key.to_vec();
+                    let service: Arc<dyn crate::xhttp_h3::H3Service> =
+                        Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+                            (**settings).clone(),
+                            Arc::new(move |reader, writer, _decryption| {
+                                serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
+                            }),
+                        ));
+                    return match crate::xhttp_h3::serve_inbound(address, &server, settings, service)
+                    {
+                        Ok(_) => true,
+                        Err(error) => {
+                            eprintln!("xhttp h3 trojan on {address}: {error}");
+                            false
+                        }
+                    };
+                }
+            }
             spawn_role(
                 address,
                 inbound_role(
@@ -12834,6 +12867,29 @@ fn serve_vmess_inbound_users(
                 eprintln!("unreadable vmess tls identity on {address}: refused, not served");
                 return false;
             };
+            if let Carrier::Xhttp { settings } = &carrier {
+                if crate::xhttp_h3::is_h3(&server.alpn) {
+                    let users = std::sync::Arc::clone(users);
+                    let service: Arc<dyn crate::xhttp_h3::H3Service> =
+                        Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+                            (**settings).clone(),
+                            Arc::new(move |reader, writer, _decryption| {
+                                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                                crate::vmess::serve_xhttp_accepted(
+                                    reader, writer, &users, freedom, &close,
+                                );
+                            }),
+                        ));
+                    return match crate::xhttp_h3::serve_inbound(address, &server, settings, service)
+                    {
+                        Ok(_) => true,
+                        Err(error) => {
+                            eprintln!("xhttp h3 vmess on {address}: {error}");
+                            false
+                        }
+                    };
+                }
+            }
             spawn_role_stopped(
                 address,
                 inbound_role(
@@ -18240,6 +18296,26 @@ fn dial_vless_tls(
     let Some(header) = vless_request_header(vless, target) else {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     };
+    if let Carrier::Xhttp { settings } = &vless.carrier {
+        if crate::xhttp_h3::is_h3(&cfg.alpn) {
+            let address = server.ip().to_string();
+            let port = server.port();
+            let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                crate::xhttp_h3::connect_split(&address, port, &vless.host, settings, cfg).map(
+                    |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                )
+            } else {
+                crate::xhttp_h3::connect_dual_split(&address, port, &vless.host, settings, cfg).map(
+                    |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                )
+            };
+            let Some((reader, writer)) = pair else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            };
+            relay_vless_xhttp_session(server, client, vless, &header, reader, writer);
+            return;
+        }
+    }
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
@@ -18664,6 +18740,30 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     let Some(cfg) = trojan.tls.as_deref() else {
         return;
     };
+    if let Carrier::Xhttp { settings } = &trojan.carrier {
+        if crate::xhttp_h3::is_h3(&cfg.alpn) {
+            let address = server.ip().to_string();
+            let port = server.port();
+            let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                crate::xhttp_h3::connect_split(&address, port, &trojan.host, settings, cfg).map(
+                    |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                )
+            } else {
+                crate::xhttp_h3::connect_dual_split(&address, port, &trojan.host, settings, cfg)
+                    .map(|(reader, writer)| {
+                        (Box::new(reader) as Box<dyn WindowRead + Send>, writer)
+                    })
+            };
+            let Some((reader, writer)) = pair else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            };
+            if !writer.send(header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink_xhttp_drained(reader, &writer, client);
+            return;
+        }
+    }
     let Some(session) = dial_tls_session(server, cfg, trojan.carrier.tcp_mask()) else {
         return;
     };
@@ -19009,6 +19109,54 @@ fn dial_vmess_tls(
     let Some(cfg) = vmess.tls.as_deref() else {
         return;
     };
+    if let Carrier::Xhttp { settings } = &vmess.carrier {
+        if crate::xhttp_h3::is_h3(&cfg.alpn) {
+            let Some((request, send, recv, response_key, response_iv, auth)) =
+                crate::vmess::client_request(
+                    &vmess.id,
+                    vmess.cipher,
+                    vmess.auth_len,
+                    vmess.no_termination,
+                    target,
+                    1,
+                )
+            else {
+                return note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Local),
+                );
+            };
+            let address = server.ip().to_string();
+            let port = server.port();
+            let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                crate::xhttp_h3::connect_split(&address, port, &vmess.host, settings, cfg).map(
+                    |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                )
+            } else {
+                crate::xhttp_h3::connect_dual_split(&address, port, &vmess.host, settings, cfg).map(
+                    |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                )
+            };
+            let Some((reader, writer)) = pair else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            };
+            if !writer.send(&request) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                writer,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
+            return;
+        }
+    }
     let Some(session) = dial_tls_session(server, cfg, vmess.carrier.tcp_mask()) else {
         return;
     };
