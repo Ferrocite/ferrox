@@ -8,6 +8,7 @@ use std::io;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -81,12 +82,17 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
 }
 
 fn build(spec: &Spec, multi: bool, offload: bool) -> io::Result<(SyncDevice, bool, bool)> {
-    let mut builder = DeviceBuilder::new()
-        .name(spec.name())
-        .mtu(u16::try_from(spec.mtu()).unwrap_or(1500));
+    spec.validate()?;
+    let mtu = u16::try_from(spec.mtu()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tun mtu {} exceeds 65535", spec.mtu()),
+        )
+    })?;
+    let mut builder = DeviceBuilder::new().name(spec.name()).mtu(mtu);
     builder = match spec.address() {
-        IpAddr::V4(address) => builder.ipv4(address, spec.prefix().min(32), None),
-        IpAddr::V6(address) => builder.ipv6(address, spec.prefix().min(128)),
+        IpAddr::V4(address) => builder.ipv4(address, spec.prefix(), None),
+        IpAddr::V6(address) => builder.ipv6(address, spec.prefix()),
     };
     #[cfg(target_os = "linux")]
     let builder = builder.offload(offload).multi_queue(multi);
@@ -113,6 +119,8 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     let wake_write = ();
     let config = device_config(spec);
     let stack_out = out.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let stack_failed = Arc::clone(&failed);
     thread::spawn(move || {
         #[cfg(unix)]
         crate::wg_stack::serve_tun_device(
@@ -122,12 +130,20 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             wake_read,
+            stack_failed,
         );
         #[cfg(not(unix))]
-        crate::wg_stack::serve_tun_device(config, incoming, outgoing, stack_out, Some(recycle));
+        crate::wg_stack::serve_tun_device(
+            config,
+            incoming,
+            outgoing,
+            stack_out,
+            Some(recycle),
+            stack_failed,
+        );
     });
     let send_device = Arc::clone(&device);
-    thread::spawn(move || send_loop(send_device, writes, offload));
+    thread::spawn(move || send_loop(send_device, writes, offload, &failed));
     let mtu = spec.mtu();
     thread::spawn(move || recv_loop(device, packets, reused, mtu, wake_write));
 }
@@ -224,9 +240,14 @@ fn recv_loop(
 }
 
 #[cfg(target_os = "linux")]
-fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool) {
+fn send_loop(
+    device: Arc<SyncDevice>,
+    packets: Receiver<Vec<u8>>,
+    offload: bool,
+    failed: &AtomicBool,
+) {
     if !offload {
-        send_plain(device, packets);
+        send_plain(device, packets, failed);
         return;
     }
     let mut gro = GROTable::default();
@@ -260,14 +281,20 @@ fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, offload: bool)
         }
         if let Err(error) = written {
             eprintln!("tun write: {error}");
+            failed.store(true, Ordering::Relaxed);
             return;
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn send_loop(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, _offload: bool) {
-    send_plain(device, packets);
+fn send_loop(
+    device: Arc<SyncDevice>,
+    packets: Receiver<Vec<u8>>,
+    _offload: bool,
+    failed: &AtomicBool,
+) {
+    send_plain(device, packets, failed);
 }
 
 #[cfg(unix)]
@@ -286,10 +313,11 @@ fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>) {
+fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, failed: &AtomicBool) {
     while let Ok(packet) = packets.recv() {
         if let Err(error) = device.send(&packet) {
             eprintln!("tun write: {error}");
+            failed.store(true, Ordering::Relaxed);
             return;
         }
     }

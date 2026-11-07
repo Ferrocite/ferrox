@@ -24,6 +24,8 @@ SERVER_PID=""
 FORWARDER_PID=""
 IPERF_PID=""
 SAMPLER_PID=""
+CPU_START=0
+WALL_START=0
 
 cleanup() {
     [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2> /dev/null || true
@@ -88,7 +90,10 @@ command_for() {
 
 start_variant() {
     variant=$1
-    command=$(command_for "$variant") || return 1
+    command=$(command_for "$variant") || {
+        echo "  $variant: no command (TUN_RS_DIR unset or unknown variant)" >&2
+        return 1
+    }
     # shellcheck disable=SC2086
     $command > "$OUT_DIR/$variant.log" 2>&1 &
     FORWARDER_PID=$!
@@ -140,8 +145,14 @@ stop_variant() {
     sleep 0.5
 }
 
+cpu_ticks() {
+    python3 -c 'import sys; fields = open(sys.argv[1]).read().rsplit(")", 1)[1].split(); print(int(fields[11]) + int(fields[12]))' "/proc/$FORWARDER_PID/stat" 2> /dev/null || echo 0
+}
+
 sample_start() {
     file=$1
+    CPU_START=$(cpu_ticks)
+    WALL_START=$(date +%s%N)
     : > "$file"
     (
         while [ -n "$FORWARDER_PID" ] && kill -0 "$FORWARDER_PID" 2> /dev/null; do
@@ -154,20 +165,21 @@ sample_start() {
 
 sample_stop() {
     file=$1
+    cpu_end=$(cpu_ticks)
+    wall_end=$(date +%s%N)
     [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2> /dev/null || true
     SAMPLER_PID=""
-    python3 - "$file" << 'PY'
+    python3 - "$file" "$CPU_START" "$cpu_end" "$WALL_START" "$wall_end" "$(getconf CLK_TCK 2> /dev/null || echo 100)" << 'PY'
 import sys
-cpu = rss = 0.0
-count = 0
-for line in open(sys.argv[1]):
+file, start, end, wall_start, wall_end, hz = sys.argv[1:7]
+rss = 0.0
+for line in open(file):
     parts = line.split()
-    if len(parts) != 2:
-        continue
-    cpu += float(parts[0])
-    rss = max(rss, float(parts[1]))
-    count += 1
-print(f"{cpu / count if count else 0:.1f} {rss:.0f}")
+    if len(parts) == 2:
+        rss = max(rss, float(parts[1]))
+seconds = (int(wall_end) - int(wall_start)) / 1e9
+cpu = 100.0 * (int(end) - int(start)) / (float(hz) * seconds) if seconds > 0 else 0.0
+print(f"{cpu:.1f} {rss:.0f}")
 PY
 }
 
@@ -178,15 +190,16 @@ emit() {
     unit=$4
     cpu=$5
     rss=$6
-    printf '{"engine":"%s","scenario":"%s","value":%s,"unit":"%s","cpu_pct":%s,"rss_kb":%s,"mtu":1500,"queues":%s}\n' \
-        "$variant" "$scenario" "$value" "$unit" "$cpu" "$rss" "$QUEUES" >> "$RESULTS"
+    slot=$7
+    printf '{"engine":"%s","scenario":"%s","slot":%s,"value":%s,"unit":"%s","cpu_pct":%s,"rss_kb":%s,"mtu":1500,"queues":%s}\n' \
+        "$variant" "$scenario" "$slot" "$value" "$unit" "$cpu" "$rss" "$QUEUES" >> "$RESULTS"
     printf '  %-28s %-6s %s %s cpu %s%% rss %s KB\n' "$variant" "$scenario" "$value" "$unit" "$cpu" "$rss"
 }
 
 run_variant() {
     variant=$1
     rep=$2
-    command=$(command_for "$variant") || return 1
+    slot=$3
     echo "round $rep variant $variant"
     if ! start_variant "$variant"; then
         stop_variant
@@ -207,7 +220,7 @@ received = end.get("sum_received") or end.get("sum") or {}
 print("%.3f" % (received.get("bits_per_second", 0) / 1e9))
 PY
 )
-    emit "$variant" "tcp-${rep}" "$tcp" "Gbit/s" "$1" "$2"
+    emit "$variant" "tcp-${rep}" "$tcp" "Gbit/s" "$1" "$2" "$slot"
 
     sample_start "$OUT_DIR/$variant-$rep-udp.samples"
     timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -u -b 1G -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-udp.json" 2> /dev/null || true
@@ -226,7 +239,7 @@ print("%.3f %.2f" % (total.get("bits_per_second", 0) / 1e9, total.get("lost_perc
 PY
 )
     set -- $udp
-    emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss"
+    emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot"
 
     timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1 || true
     rtt=$(python3 - "$OUT_DIR/$variant-$rep-ping.log" << 'PY'
@@ -236,7 +249,7 @@ m = re.search(r'= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', text)
 print("%.3f" % float(m.group(2)) if m else "0")
 PY
 )
-    emit "$variant" "ping-${rep}" "$rtt" "ms" "0" "0"
+    emit "$variant" "ping-${rep}" "$rtt" "ms" "0" "0" "$slot"
 
     stop_variant
 }
@@ -260,10 +273,32 @@ for knob in "net.ipv4.tcp_tw_reuse=1" "net.ipv4.ip_local_port_range=1024 65000";
     sysctl -qw "$knob" 2> /dev/null || true
 done
 
+order_for_round() {
+    round=$1
+    count=0
+    for _ in $VARIANTS; do count=$((count + 1)); done
+    [ "$count" -gt 0 ] || return 0
+    cut=$(((round - 1) % count))
+    index=0
+    head=""
+    tail=""
+    for variant in $VARIANTS; do
+        if [ "$index" -ge "$cut" ]; then
+            tail="$tail $variant"
+        else
+            head="$head $variant"
+        fi
+        index=$((index + 1))
+    done
+    printf '%s%s\n' "$tail" "$head"
+}
+
 rep=1
 while [ "$rep" -le "$REPEAT" ]; do
-    for variant in $VARIANTS; do
-        run_variant "$variant" "$rep"
+    slot=0
+    for variant in $(order_for_round "$rep"); do
+        slot=$((slot + 1))
+        run_variant "$variant" "$rep" "$slot"
     done
     rep=$((rep + 1))
 done

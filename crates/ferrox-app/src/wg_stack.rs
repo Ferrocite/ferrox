@@ -1257,12 +1257,16 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<Sender<Vec<u8>>>,
     wake: std::os::unix::net::UnixStream,
+    failed: Arc<AtomicBool>,
 ) {
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
     stack.device.recycle = recycle;
     let _ = wake.set_nonblocking(true);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
         let mut closed = false;
         for _ in 0..RX_BURST {
             match packets.try_recv() {
@@ -1296,11 +1300,15 @@ pub(crate) fn serve_tun_device(
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
     recycle: Option<Sender<Vec<u8>>>,
+    failed: Arc<AtomicBool>,
 ) {
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
     stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
         let tick = if stack.flows.is_empty() {
             TICK
         } else {
@@ -1323,7 +1331,8 @@ fn wait_for_tun(stack: &ServerStack, wake: &std::os::unix::net::UnixStream) -> b
         revents: 0,
     });
     for flow in &stack.flows {
-        if flow.up_pending() || flow.up_eof {
+        let can_send = stack.sockets.get::<TcpSocket>(flow.handle).can_send();
+        if flow.up_pending() || flow.up_eof || !can_send {
             continue;
         }
         fds.push(libc::pollfd {
@@ -1333,9 +1342,18 @@ fn wait_for_tun(stack: &ServerStack, wake: &std::os::unix::net::UnixStream) -> b
         });
     }
     let timeout = TICK.as_millis() as libc::c_int;
-    let answered = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
-    if answered <= 0 {
-        return answered < 0;
+    let answered = loop {
+        let answered = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if answered < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return true;
+        }
+        break answered;
+    };
+    if answered == 0 {
+        return false;
     }
     if fds[0].revents & libc::POLLIN != 0 {
         let mut sink = [0u8; 256];

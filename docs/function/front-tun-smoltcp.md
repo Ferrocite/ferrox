@@ -1,8 +1,8 @@
 # TUN userspace stack (tun-rs + smoltcp)
 
-A `tun` inbound with no `stack` setting, or `stack: "smoltcp"` / `"userspace"`, opens the device through `tun-rs` and terminates TCP in a userspace `smoltcp` interface. The kernel device is multi-queue and negotiates virtio GSO/GRO when the platform offers it; each queue is one reader, one smoltcp server stack and one writer, so flows hash across cores without a lock between them. A flow still reaches the proxy machinery through the same per-flow local stream every other front uses.
+A `tun` inbound with no `stack` setting, or `stack: "smoltcp"` / `"userspace"`, opens the device through `tun-rs` and terminates TCP in a userspace `smoltcp` interface. On Linux the device is multi-queue when `queues` exceeds one and setup succeeds; non-Linux platforms and `queues: 1` use one queue. Each queue is one reader, one smoltcp server stack and one writer, so flows hash across queues without a lock between them when more than one queue is active. The device negotiates virtio GSO/GRO when the platform offers it. A flow still reaches the proxy machinery through the same per-flow local stream every other front uses.
 
-`stack: "loopback"` keeps the native packet handler in `docs/function/front-tun.md` as the fallback. An unknown stack name warns once and takes the userspace path rather than silently changing protocol.
+`stack: "loopback"` keeps the native packet handler in `docs/function/front-tun.md` as the fallback for an IPv4 address; an IPv6 address is refused because that handler reads only IPv4. An unknown stack name warns once and takes the userspace path rather than silently changing protocol.
 
 ## Data path
 
@@ -27,37 +27,38 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-tun-packet | UNBLESSED | no syscall checker yet |
+| user-space-copies-per-tun-packet | UNBLESSED | no copy checker yet |
+| time-tcp-down-1 | ferrox=9.883Gbit/s,zeptun=17.937Gbit/s,ratio=0.55 | tun-bench.yml |
+| time-tcp-down-10 | ferrox=14.309Gbit/s,zeptun=23.950Gbit/s,ratio=0.60 | tun-bench.yml |
+| time-tcp-up-1 | ferrox=12.860Gbit/s,zeptun=20.331Gbit/s,ratio=0.63 | tun-bench.yml |
+| time-tcp-up-10 | ferrox=15.854Gbit/s,zeptun=26.821Gbit/s,ratio=0.59 | tun-bench.yml |
+| time-rr | ferrox=6581tps,zeptun=11504tps,ratio=0.57 | tun-bench.yml |
+| time-rr-8x1k | ferrox=38261tps,zeptun=64001tps,ratio=0.60 | tun-bench.yml |
+| time-udp-100k | ferrox=99920pps,zeptun=99962pps,ratio=1.00 | tun-bench.yml |
+| cpu-cores-at-tcp-down-10 | ferrox=2.9cores,zeptun=1.7cores | tun-bench.yml |
+| rss-mb-at-ten-flows | ferrox=60-75MB,zeptun=2-8MB | tun-bench.yml |
 <!-- counts:end -->
 
-No pointer-identity row yet covers this path: the writer copies each smoltcp segment into an aggregate buffer, and the reader copies each device packet into a stack slot. The rows above name only what the current tests observe, so the operation count stays an open claim rather than a number.
+No pointer-identity or copy-count checker yet covers this path: the writer copies each smoltcp segment into an aggregate buffer, and the reader copies each device packet into a stack slot. Only the benchmark rows above are observed, so the operation count stays an open claim rather than a number.
 
 ## Time
 
-Measured in CI, `tun-bench.yml` artefact `tun-bench-42379982423` (repeat 2, queues 4, MTU 1500), same runner for both engines:
-
-| cell | ferrox | zeptun-userspace | ratio |
-| --- | ---: | ---: | ---: |
-| tcp-down-1 | 9.883 Gbit/s | 17.937 Gbit/s | 0.55 |
-| tcp-down-10 | 14.309 Gbit/s | 23.950 Gbit/s | 0.60 |
-| tcp-up-1 | 12.860 Gbit/s | 20.331 Gbit/s | 0.63 |
-| tcp-up-10 | 15.854 Gbit/s | 26.821 Gbit/s | 0.59 |
-| rr | 6 581 tps | 11 504 tps | 0.57 |
-| rr-8x1k | 38 261 tps | 64 001 tps | 0.60 |
-| udp-100k | 99 920 pps | 99 962 pps | 1.00 |
-
-A later single-engine run reached 18.8 Gbit/s down-1, so the cell is host-sensitive; the same-run ratios above are the comparable figure. The remaining gap is stack CPU, not the device: ferrox burns roughly 2.9 cores for 14 Gbit/s where the reference burns 1.7, and its RSS is 60–75 MB against the reference's 2–8 MB.
+The `time-*` rows above are the same-run `tun-bench.yml` cells; a later single-engine run is host-sensitive, so the same-run ratios are the comparable figure. The `cpu-*` and `rss-*` rows name the remaining gap: stack CPU, not the device. No duration outside those rows is claimed.
 
 ## What we removed
 
 Against the native handler the userspace path removes the hand-written TCP reassembly and the single-queue limit: `smoltcp` supplies retransmit, receive windows and congestion control, and `tun-rs` supplies multi-queue and GSO/GRO. The writer batches a queue's segments so GRO can coalesce same-flow packets into one aggregate, and the reader asks for a batch instead of one packet per syscall. The `tun` config keeps one stack knob (`smoltcp`, `userspace`, `loopback`) instead of growing a second inbound protocol.
 
+Against the pinned references, xray-core and sing-box open the platform device and hand packets to their configured stack, ZeroNet's zero-tun is its own device wrapper, and this tree's native handler remains the `loopback` fallback. None of those references carries this per-queue smoltcp server, so the comparison is the same-run Time rows rather than a removed pass; this page does not claim their code was removed. What is not removed is the userspace stack's per-byte copying, priced in the rows above.
+
 ## What was not removed
 
 - **The userspace stack itself.** `smoltcp` per-socket receive and send buffers still copy every byte: the device read copies into a stack slot, `smoltcp` copies into the socket ring, the pump copies to the local stream, and the writer copies into the aggregate. The reference's custom stack does less of that; this is the measured CPU gap, not a device limitation.
-- **The native handler.** It is still the fallback for `stack: "loopback"` and for a failed `tun-rs` open. Its page stays the description of that path.
-- **Per-flow buffers and relay threads.** A flow still owns two 1 MiB smoltcp buffers and the relay's local pair; RSS after ten flows is 60–75 MB. Reducing the buffers is a tuning cell, not a proven win yet.
-- **The download scale cell.** `tcp-down-10` reaches 0.60 of the reference while `tcp-down-1` reaches 0.55 here; neither is 1.2×. The gap is open and is not claimed as done.
-- **UDP lane scheduling.** The UDP cell is at 1.00 in this run but has varied between 56% and 100% across runners; no lane change is claimed until a focused repeat separates variance from a limit.
+- **The native handler.** It remains the path for `stack: "loopback"` with an IPv4 address; an IPv6 address is refused rather than handed to it, and a failed userspace open returns its error instead of falling back. Its page stays the description of that path.
+- **Per-flow buffers and relay threads.** A flow still owns a pair of fixed smoltcp socket buffers and the relay's local pair; the RSS row above carries the post-flow cost. Reducing the buffers is a tuning cell, not a proven win yet.
+- **The download scale cell.** The larger download cell does not reach the reference; the ratio row above is the claim. The gap is open and is not claimed as done.
+- **UDP lane scheduling.** The UDP cell has varied across runners; no lane change is claimed until a focused repeat separates variance from a limit.
 
 ## Pins
 

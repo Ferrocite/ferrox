@@ -307,6 +307,7 @@ run_scenario() {
     engine=$1
     scenario=$2
     rep=$3
+    slot=$4
     tag="$engine-$scenario-$rep"
     rm -f "$OUT_DIR"/mon-"$tag"-*.json
     monitor_engine "$tag"
@@ -354,8 +355,8 @@ run_scenario() {
     peak_pss=$3
     sleep "$SETTLE"
     set -- $(engine_memory)
-    printf '{"engine":"%s","scenario":"%s","rep":%s,"value":"%s","unit":"%s","cpu_pct":%s,"rss_kb":%s,"pss_kb":%s,"rss_after_kb":%s,"pss_after_kb":%s,"settle_s":%s,"mtu":%s,"queues":%s}\n' \
-        "$engine" "$scenario" "$rep" "$value" "$unit" "$cpu_pct" "$peak_rss" "$peak_pss" "$1" "$2" "$SETTLE" "$MTU" "$QUEUES" >> "$RESULTS"
+    printf '{"engine":"%s","scenario":"%s","rep":%s,"slot":%s,"value":"%s","unit":"%s","cpu_pct":%s,"rss_kb":%s,"pss_kb":%s,"rss_after_kb":%s,"pss_after_kb":%s,"settle_s":%s,"mtu":%s,"queues":%s}\n' \
+        "$engine" "$scenario" "$rep" "$slot" "$value" "$unit" "$cpu_pct" "$peak_rss" "$peak_pss" "$1" "$2" "$SETTLE" "$MTU" "$QUEUES" >> "$RESULTS"
     printf "  %-18s %-12s rep %s: %s %s cpu %s%% rss %s KB, %s KB after %ss idle\n" \
         "$engine" "$scenario" "$rep" "$value" "$unit" "$cpu_pct" "$peak_rss" "$1" "$SETTLE"
 }
@@ -383,9 +384,31 @@ for knob in "net.ipv4.tcp_tw_reuse=1" "net.ipv4.ip_local_port_range=1024 65000";
     in_server sysctl -qw "$knob" 2> /dev/null || true
 done
 
+order_for_round() {
+    round=$1
+    count=0
+    for _ in $ENGINES; do count=$((count + 1)); done
+    [ "$count" -gt 0 ] || return 0
+    cut=$(((round - 1) % count))
+    index=0
+    head=""
+    tail=""
+    for engine in $ENGINES; do
+        if [ "$index" -ge "$cut" ]; then
+            tail="$tail $engine"
+        else
+            head="$head $engine"
+        fi
+        index=$((index + 1))
+    done
+    printf '%s%s\n' "$tail" "$head"
+}
+
 rep=1
 while [ "$rep" -le "$REPEAT" ]; do
-    for engine in $ENGINES; do
+    slot=0
+    for engine in $(order_for_round "$rep"); do
+        slot=$((slot + 1))
         case "$engine" in
             ferrox) [ -n "$FERROX" ] || continue ;;
             zeptun-*) [ -n "$ZEPTUN" ] || continue ;;
@@ -405,7 +428,7 @@ while [ "$rep" -le "$REPEAT" ]; do
             continue
         fi
         for scenario in $SCENARIOS; do
-            run_scenario "$engine" "$scenario" "$rep"
+            run_scenario "$engine" "$scenario" "$rep" "$slot"
         done
         stop_engine
     done

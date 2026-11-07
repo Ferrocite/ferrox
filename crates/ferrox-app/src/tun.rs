@@ -48,6 +48,8 @@ pub(crate) fn is_device(protocol: &str) -> bool {
 
 const DEFAULT_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 1));
 const DEFAULT_PREFIX: u8 = 15;
+const DEFAULT_PREFIX_V6: u8 = 64;
+const MAX_QUEUES: usize = 4;
 
 pub(crate) struct Spec {
     name: String,
@@ -70,15 +72,21 @@ impl Spec {
         prefix: Option<u8>,
         queues: Option<usize>,
     ) -> Self {
+        let address = address.unwrap_or(DEFAULT_ADDRESS);
+        let prefix = prefix.unwrap_or(if address.is_ipv6() {
+            DEFAULT_PREFIX_V6
+        } else {
+            DEFAULT_PREFIX
+        });
         Self {
             name: name
                 .filter(|n| !n.is_empty())
                 .unwrap_or("ferrox0")
                 .to_owned(),
             mtu: mtu.filter(|m| *m > 0).unwrap_or(DEFAULT_MTU),
-            address: address.unwrap_or(DEFAULT_ADDRESS),
-            prefix: prefix.filter(|p| *p > 0).unwrap_or(DEFAULT_PREFIX),
-            queues: queues.filter(|q| *q > 0).unwrap_or_else(default_queues),
+            address,
+            prefix,
+            queues: queues.unwrap_or_else(default_queues),
         }
     }
 
@@ -102,11 +110,45 @@ impl Spec {
     pub(crate) fn queues(&self) -> usize {
         self.queues
     }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        if self.mtu > usize::from(u16::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tun mtu {} exceeds 65535", self.mtu),
+            ));
+        }
+        let max_prefix = if self.address.is_ipv6() { 128 } else { 32 };
+        if self.prefix > max_prefix {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tun prefix /{} is outside /0../{max_prefix} for {}",
+                    self.prefix, self.address
+                ),
+            ));
+        }
+        let max_queues = if cfg!(target_os = "linux") {
+            MAX_QUEUES
+        } else {
+            1
+        };
+        if self.queues == 0 || self.queues > max_queues {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tun queues {} is outside 1..={max_queues} on this platform",
+                    self.queues
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn default_queues() -> usize {
     if cfg!(target_os = "linux") {
-        std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_QUEUES))
     } else {
         1
     }
@@ -116,16 +158,48 @@ pub(crate) fn default_queues() -> usize {
 pub(crate) fn parse_address(
     value: Option<&str>,
     prefix: Option<u32>,
-) -> (Option<IpAddr>, Option<u8>) {
-    let explicit = prefix.and_then(|p| u8::try_from(p).ok());
+) -> Result<(Option<IpAddr>, Option<u8>), String> {
+    let explicit = match prefix {
+        Some(prefix) => Some(
+            u8::try_from(prefix)
+                .map_err(|_| format!("tun prefix /{prefix} is outside /0../128"))?,
+        ),
+        None => None,
+    };
     let Some(value) = value else {
-        return (None, explicit);
+        if let Some(prefix) = explicit {
+            if prefix > 32 {
+                return Err(format!(
+                    "tun prefix /{prefix} is outside /0../32 for the default IPv4 address"
+                ));
+            }
+        }
+        return Ok((None, explicit));
     };
     let (address, cidr) = match value.split_once('/') {
-        Some((address, prefix)) => (address, prefix.parse::<u8>().ok()),
+        Some((address, prefix)) => (
+            address,
+            Some(
+                prefix
+                    .parse::<u8>()
+                    .map_err(|_| format!("tun address `{value}` has an invalid prefix"))?,
+            ),
+        ),
         None => (value, None),
     };
-    (address.parse::<IpAddr>().ok(), cidr.or(explicit))
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| format!("tun address `{value}` is not an IP address"))?;
+    let prefix = cidr.or(explicit);
+    if let Some(prefix) = prefix {
+        let max_prefix = if address.is_ipv6() { 128 } else { 32 };
+        if prefix > max_prefix {
+            return Err(format!(
+                "tun prefix /{prefix} is outside /0../{max_prefix} for {address}"
+            ));
+        }
+    }
+    Ok((Some(address), prefix))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -912,6 +986,39 @@ mod tests {
             assert!(is_device(p));
         }
         assert!(!is_device("vless"));
+    }
+
+    #[test]
+    fn a_tun_prefix_is_kept_or_refused_by_family() {
+        let (address, prefix) = parse_address(Some("198.18.0.1/0"), None).unwrap();
+        assert_eq!(address, Some("198.18.0.1".parse().unwrap()));
+        assert_eq!(prefix, Some(0));
+        assert!(parse_address(Some("198.18.0.1/33"), None).is_err());
+        assert!(parse_address(Some("2001:db8::1/129"), None).is_err());
+        assert!(parse_address(Some("not-an-ip"), None).is_err());
+        let (_, prefix) = parse_address(Some("2001:db8::1"), None).unwrap();
+        assert_eq!(prefix, None);
+    }
+
+    #[test]
+    fn the_tun_spec_defaults_ipv6_and_bounds_its_values() {
+        let spec = Spec::with(None, None, Some("2001:db8::1".parse().unwrap()), None, None);
+        assert_eq!(spec.prefix(), 64);
+        assert!(Spec::with(None, Some(65_536), None, None, None)
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, Some(33), None)
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, None, Some(0))
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, None, Some(5))
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, Some(0), None)
+            .validate()
+            .is_ok());
     }
 
     #[test]
