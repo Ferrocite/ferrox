@@ -26,6 +26,16 @@ graph TD
     C --> D["hand to the target"]
 ```
 
+## HTTP/3
+
+HTTP/3 keeps the three modes and the session state above and replaces only the framing under them. An inbound whose TLS ALPN is exactly `["h3"]` binds UDP instead of TCP and runs the shared `quic::serve_loop`; `xhttp_h3::serve_inbound` gives the connection one server preface (SETTINGS and the QPACK streams on unidirectional ids 3, 7 and 11), and every client bidirectional stream is served as its own session. The request's QPACK HEADERS block is turned into the same H1 head `accept_core` already parses, so the mode gates, padding checks and session table do not move; DATA frames after the head are the body. The answer takes the opposite path: the dispatch's H1 response head becomes a QPACK HEADERS block with `content-length`, `transfer-encoding`, `connection` and `keep-alive` dropped, and every later write is a DATA frame.
+
+The client is `xhttp_h3::H3Client`, one QUIC connection with a pump thread so an upload waiting on credit does not stop the downlink's datagrams. `connect_split` is the stream-one shape and sends no session id, exactly as the H2 client's `request_block` does; `connect_dual_split` opens the GET downlink and then either the chunked POST or the packet-up poster. Packet-up is accepted only when the answer's decoded QPACK `:status` is 2xx, which `H3Reader::status` reads from the response HEADERS rather than from the synthesized H1 head.
+
+VLESS, VMess and Trojan outbounds take this path when the negotiated ALPN is `h3`; the same three inbounds serve it. The loopback gates cover the carrier itself, not each protocol above it, and are `xhttp_h3::tests::a_stream_one_session_crosses_h3_both_ways`, `a_stream_up_upload_reaches_the_downlink_over_h3` and `an_h3_packet_up_post_gets_a_2xx_and_carries_the_body`; the upstream suites and the ratio cells are the cross-implementation gates.
+
+What this does not claim: the per-protocol H3 loopbacks are not written yet, VLESS mux and the `encryption` layer are not carried over H3, and an h2c client is not provided because the reference's dialer never writes one. No row in the count table moves: the rows below measure the H1 chunked framing and the H2 lanes, and the H3 DATA/HEADERS framing is not yet a counted row, so it stays prose rather than a number.
+
 ## Refusal teardown
 
 An H2 connection we refuse — oversized frame, header block past `HEAD_CAP` — writes its GOAWAY and then closes. Closing with the peer's bytes still sitting unread in our receive queue makes the stack abort instead of shut down, and the RST can swallow the GOAWAY a few microseconds before it: `winsock` delivers `ConnectionReset` with nothing read. So a refused connection now stays open for `budgets::GOAWAY_GRACE` (100 ms, the window a peer already blocked in `recv` takes the refusal in) before it is killed. The grace is a window, not a guarantee: a peer slower than 100 ms one-way still loses the refusal to our close, and this slice does not fix that — making the close orderly needs a read deadline the plaintext carrier does not arm.

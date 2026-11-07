@@ -454,10 +454,55 @@ impl<R: Read> Reader<R> {
     }
 }
 
+/// The stream a session writes through after `accept_core` split it: HTTP/2 frames on a negotiated
+/// h2 stream, HTTP/3 frames on a QUIC stream. The carrier above it only asks whether the body is raw.
+#[derive(Debug, Clone)]
+pub(crate) enum StreamOut {
+    H2(crate::xhttp_h2::H2StreamOut),
+    H3(crate::xhttp_h3::H3StreamOut),
+}
+
+impl StreamOut {
+    pub(crate) fn data(&self, payload: &[u8]) -> bool {
+        match self {
+            Self::H2(out) => out.data(payload),
+            Self::H3(out) => out.data(payload),
+        }
+    }
+
+    pub(crate) fn bind_session(&self, sid: &str) {
+        match self {
+            Self::H2(out) => out.bind_session(sid),
+            Self::H3(_) => crate::xhttp_h3::H3StreamOut::bind_session(sid),
+        }
+    }
+
+    pub(crate) fn bind_upload(&self, sid: &str) {
+        match self {
+            Self::H2(out) => out.bind_upload(sid),
+            Self::H3(_) => crate::xhttp_h3::H3StreamOut::bind_upload(sid),
+        }
+    }
+
+    pub(crate) fn end(&self) {
+        match self {
+            Self::H2(out) => out.end(),
+            Self::H3(out) => out.end(),
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        match self {
+            Self::H2(out) => out.reset(),
+            Self::H3(out) => out.reset(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct XhttpWriter {
     shared: Arc<Shared>,
-    h2: OnceLock<crate::xhttp_h2::H2StreamOut>,
+    stream: OnceLock<StreamOut>,
     lease: Option<Arc<crate::xmux::Lease>>,
 }
 
@@ -479,7 +524,7 @@ struct Packets {
 
 /// One POST's transport: the H1 dial writes a request head and drains its answer, the H2 dial opens
 /// a stream per packet on the connection both directions already share.
-trait PacketPost: Send {
+pub(crate) trait PacketPost: Send {
     fn post(&mut self, seq: u64, piece: &[u8]) -> bool;
 }
 
@@ -822,7 +867,7 @@ impl XhttpWriter {
                 )),
                 finished: AtomicBool::new(false),
             }),
-            h2: OnceLock::new(),
+            stream: OnceLock::new(),
             lease: None,
         }
     }
@@ -857,7 +902,15 @@ impl XhttpWriter {
         };
         Self::packets_with(Box::new(post), settings)
     }
-    fn packets_with(post: Box<dyn PacketPost + Send>, settings: &XhttpSettings) -> Self {
+    pub(crate) fn packets_h3(
+        client: Arc<crate::xhttp_h3::H3Client>,
+        host: &str,
+        settings: &XhttpSettings,
+        session: String,
+    ) -> Self {
+        crate::xhttp_h3::packets(client, host, settings, session)
+    }
+    pub(crate) fn packets_with(post: Box<dyn PacketPost + Send>, settings: &XhttpSettings) -> Self {
         let up = Arc::new(Packer {
             transport: Mutex::new(post),
             queue: Mutex::new(Vec::new()),
@@ -880,19 +933,22 @@ impl XhttpWriter {
                 body: Body::Packets(Box::new(Packets::new(up, poster))),
                 finished: AtomicBool::new(false),
             }),
-            h2: OnceLock::new(),
+            stream: OnceLock::new(),
             lease: None,
         }
     }
     pub(crate) fn hold(&mut self, lease: Arc<crate::xmux::Lease>) {
         self.lease = Some(lease);
     }
+    pub(crate) fn set_stream(&self, out: StreamOut) {
+        let _ = self.stream.set(out);
+    }
     pub(crate) fn set_h2(&self, out: crate::xhttp_h2::H2StreamOut) {
-        let _ = self.h2.set(out);
+        self.set_stream(StreamOut::H2(out));
     }
     pub(crate) fn send(&self, data: &[u8]) -> bool {
-        if let Some(h2) = self.h2.get() {
-            return h2.data(data);
+        if let Some(stream) = self.stream.get() {
+            return stream.data(data);
         }
         let stream = match &self.shared.body {
             Body::Stream(stream) => stream,
@@ -916,11 +972,11 @@ impl XhttpWriter {
     /// The session refused the request: the response ends and, on h2, the request is reset so its
     /// unread body is not credited for the connection's life.
     pub(crate) fn abort(&self) {
-        if let Some(h2) = self.h2.get() {
+        if let Some(stream) = self.stream.get() {
             if self.shared.finished.swap(true, Ordering::SeqCst) {
                 return;
             }
-            h2.reset();
+            stream.reset();
             return;
         }
         self.finish();
@@ -930,8 +986,8 @@ impl XhttpWriter {
         if self.shared.finished.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Some(h2) = self.h2.get() {
-            h2.end();
+        if let Some(stream) = self.stream.get() {
+            stream.end();
             return;
         }
         match &self.shared.body {
@@ -994,7 +1050,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
             )),
             finished: AtomicBool::new(false),
         }),
-        h2: OnceLock::new(),
+        stream: OnceLock::new(),
         lease: None,
     };
     (reader, writer)
@@ -2066,22 +2122,18 @@ pub(crate) fn session_is_carried(id: &str) -> bool {
 }
 
 /// An h2 connection owns the sessions its streams opened, so its death can end them; a bare H1 request has no carrier to bind to.
-fn bound_session(
-    sid: &str,
-    h2: Option<&crate::xhttp_h2::H2StreamOut>,
-    downlink: bool,
-) -> Arc<Session> {
+fn bound_session(sid: &str, stream: Option<&StreamOut>, downlink: bool) -> Arc<Session> {
     let session = get_or_create_session(sid);
     if downlink {
         let mut st = session.state.lock().expect("session lock");
         st.downlink = true;
         session.cv.notify_all();
     }
-    if let Some(h2) = h2 {
+    if let Some(stream) = stream {
         if downlink {
-            h2.bind_session(sid);
+            stream.bind_session(sid);
         } else {
-            h2.bind_upload(sid);
+            stream.bind_upload(sid);
         }
     }
     session
@@ -2619,11 +2671,11 @@ pub(crate) fn accept_split_with_settings<
 
 fn writer_for<W: crate::proxy::FrameWrite + Send + 'static>(
     write: W,
-    h2: Option<crate::xhttp_h2::H2StreamOut>,
+    stream: Option<StreamOut>,
 ) -> XhttpWriter {
     let writer = XhttpWriter::new(write);
-    if let Some(h) = h2 {
-        writer.set_h2(h);
+    if let Some(out) = stream {
+        writer.set_stream(out);
     }
     writer
 }
@@ -2836,7 +2888,7 @@ pub(crate) fn accept_core<
     mut upload: Upload<R>,
     mut write: W,
     settings: &XhttpSettings,
-    h2: Option<crate::xhttp_h2::H2StreamOut>,
+    h2: Option<StreamOut>,
     fd: Option<crate::proxy::WaitFd>,
 ) -> Served<R, W> {
     let Ok(text) = std::str::from_utf8(head) else {
@@ -3485,8 +3537,8 @@ impl crate::proxy::CarrierSink for XhttpWriter {
     }
     #[inline]
     fn push(&self, bytes: &[u8]) -> crate::proxy::Push {
-        if let Some(h2) = self.h2.get() {
-            return if h2.data(bytes) {
+        if let Some(stream) = self.stream.get() {
+            return if stream.data(bytes) {
                 crate::proxy::Push::Took(bytes.len())
             } else {
                 crate::proxy::Push::Lost

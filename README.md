@@ -162,7 +162,7 @@ Rows 1–26 are the proxy-protocol world; rows 27–52 are the xray-core config 
 | 49 | OCSP stapling + anti-replay/time-window caches | planned — high priority | Planned high priority; OCSP stapling and anti-replay caches. | — |
 | 50 | Browser dialer | planned | Planned; xray browser dialer. | — |
 | 51 | kTLS | planned | Planned; Linux kTLS. | — |
-| 52 | xHTTP over h2c and HTTP/3 | planned — high priority; H1 and stream-one H2 only | The reference serves h2c on a cleartext port and HTTP/3 on QUIC; this tree refuses h2c, has no H3, and refuses packet-up/stream-up on a negotiated H2 stream. | [carrier-xhttp](docs/function/carrier-xhttp.md) |
+| 52 | xHTTP over h2c and HTTP/3 | partial — H1 and h2c serving, every H2 shape, H3 stream-one/stream-up/packet-up | The hub serves the cleartext H1 + h2c listener the reference keeps; packet-up and stream-up are served on a negotiated H2 stream. HTTP/3 rides QUIC on ALPN `h3` in both roles, with VLESS/VMess/Trojan inbound and outbound paths wired; the three H3 loopback tests gate the carrier, not each protocol. Open: per-protocol H3 loopbacks, VLESS mux/`encryption` over H3, an h2c client (the reference dialer never writes one), and the upstream/conformance/ratio gates. | [carrier-xhttp](docs/function/carrier-xhttp.md) |
 
 ### B — PattNG and engine app surfaces
 
