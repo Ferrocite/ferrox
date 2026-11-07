@@ -905,6 +905,7 @@ dependencies = [
  "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",
  "crypto_box",
+ "crypto_secretbox",
  "ctr 0.10.1",
  "curve25519-dalek 4.1.3",
  "ferrox-core",
