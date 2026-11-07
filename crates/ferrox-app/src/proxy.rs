@@ -50850,7 +50850,7 @@ mod tests {
         let sink_addr: SocketAddr = sink.local_addr().expect("addr");
         thread::spawn(move || {
             let (mut stream, _) = sink.accept().expect("accepts");
-            let chunk = [0x5Au8; 65536];
+            let chunk = vec![0x5Au8; 65536];
             let mut left = BULK;
             while left > 0 {
                 let n = left.min(chunk.len());
@@ -50900,7 +50900,7 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let mut got = 0usize;
-        let mut buf = [0u8; 65536];
+        let mut buf = vec![0u8; 65536];
         while got < BULK {
             let n = sock
                 .read(&mut buf)
