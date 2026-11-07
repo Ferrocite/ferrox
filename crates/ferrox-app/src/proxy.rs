@@ -20131,7 +20131,7 @@ fn serve_trojan_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_trojan_xhttp(reader, writer, settings, key, freedom);
+            serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom);
         }
         Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
