@@ -1262,6 +1262,7 @@ struct Inner {
     provider_id: Option<String>,
     region: Option<String>,
     fronting_provider_id: Option<String>,
+    handshake: HandshakeState,
 }
 
 struct ChannelState {
@@ -1338,6 +1339,20 @@ pub(crate) struct Identity<'a> {
     pub(crate) client_features: &'a [String],
     pub(crate) split_tunnel: bool,
     pub(crate) split_tunnel_regions: &'a [String],
+}
+
+/// The server's handshake reply: new server entries, client region, tactics and steering IP.
+#[derive(Debug, Default)]
+pub(crate) struct HandshakeState {
+    pub(crate) homepages: Vec<String>,
+    pub(crate) upgrade_client_version: Option<String>,
+    pub(crate) encoded_server_list: Vec<String>,
+    pub(crate) client_region: Option<String>,
+    pub(crate) client_address: Option<String>,
+    pub(crate) server_timestamp: Option<String>,
+    pub(crate) active_authorization_ids: Vec<String>,
+    pub(crate) tactics_payload: Option<crate::json::Json>,
+    pub(crate) steering_ip: Option<String>,
 }
 
 impl Session {
@@ -1455,7 +1470,7 @@ impl Session {
             identity.sponsor,
         )?;
         // A Psiphon server refuses every port forward until this handshake completes.
-        handshake(
+        let handshake = handshake(
             &mut output,
             &mut input,
             relay_protocol,
@@ -1485,6 +1500,7 @@ impl Session {
             provider_id: server.provider_id.clone(),
             region: server.region.clone(),
             fronting_provider_id: server.fronting_provider_id.clone(),
+            handshake,
         });
         let read_inner = Arc::clone(&inner);
         std::thread::Builder::new()
@@ -1704,6 +1720,11 @@ impl Session {
     #[must_use]
     pub(crate) fn fronting_provider_id(&self) -> Option<&str> {
         self.inner.fronting_provider_id.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn handshake(&self) -> &HandshakeState {
+        &self.inner.handshake
     }
 }
 
@@ -3582,7 +3603,7 @@ fn handshake(
     identity: &Identity<'_>,
     relay: &mut Option<Relay>,
     requests: Option<&dyn ServerRequests>,
-) -> Result<(), String> {
+) -> Result<HandshakeState, String> {
     let body = handshake_body(relay_protocol, identity, relay.as_ref());
     let mut request = vec![MSG_GLOBAL_REQUEST];
     put_str(&mut request, b"psiphon-handshake");
@@ -3594,7 +3615,7 @@ fn handshake(
     loop {
         let packet = recv(reader)?;
         match packet.kind() {
-            Some(MSG_REQUEST_SUCCESS) => return Ok(()),
+            Some(MSG_REQUEST_SUCCESS) => return Ok(parse_handshake(packet.body())),
             Some(MSG_REQUEST_FAILURE) => {
                 return Err("psiphon ssh refused the tunnel handshake".to_owned());
             }
@@ -3637,6 +3658,45 @@ fn handshake(
             }
             None => return Err("psiphon ssh empty packet".to_owned()),
         }
+    }
+}
+
+/// The JSON handshake reply; an empty or malformed body leaves every field empty.
+fn parse_handshake(body: &[u8]) -> HandshakeState {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return HandshakeState::default();
+    };
+    let Ok(json) = crate::json::parse(text) else {
+        return HandshakeState::default();
+    };
+    let strings = |key: &str| {
+        json.get(key)
+            .and_then(crate::json::Json::as_arr)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(crate::json::Json::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let value = |key: &str| {
+        json.get(key)
+            .and_then(crate::json::Json::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    HandshakeState {
+        homepages: strings("homepages"),
+        upgrade_client_version: value("upgrade_client_version"),
+        encoded_server_list: strings("encoded_server_list"),
+        client_region: value("client_region"),
+        client_address: value("client_address"),
+        server_timestamp: value("server_timestamp"),
+        active_authorization_ids: strings("active_authorization_ids"),
+        tactics_payload: json.get("tactics_payload").cloned(),
+        steering_ip: value("steering_ip"),
     }
 }
 
@@ -3982,6 +4042,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         provider_id: None,
         region: None,
         fronting_provider_id: None,
+        handshake: HandshakeState::default(),
     });
     let state = Arc::new(ChannelState {
         local: 1,
@@ -4261,6 +4322,7 @@ mod tests {
             provider_id: None,
             region: None,
             fronting_provider_id: None,
+            handshake: HandshakeState::default(),
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4345,6 +4407,7 @@ mod tests {
             provider_id: None,
             region: None,
             fronting_provider_id: None,
+            handshake: HandshakeState::default(),
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4415,6 +4478,7 @@ mod tests {
             provider_id: None,
             region: None,
             fronting_provider_id: None,
+            handshake: HandshakeState::default(),
         });
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(ChannelState {
@@ -4510,6 +4574,7 @@ mod tests {
             provider_id: None,
             region: None,
             fronting_provider_id: None,
+            handshake: HandshakeState::default(),
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4600,6 +4665,7 @@ mod tests {
             provider_id: None,
             region: None,
             fronting_provider_id: None,
+            handshake: HandshakeState::default(),
         });
         assert!(matches!(
             dispatch(
@@ -4645,6 +4711,7 @@ mod tests {
             provider_id: None,
             region: None,
             fronting_provider_id: None,
+            handshake: HandshakeState::default(),
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4819,5 +4886,39 @@ mod tests {
             assert!(period <= Duration::from_millis(2));
             assert!((3..=5).contains(&keepalive.padding()));
         }
+    }
+
+    #[test]
+    /// A handshake reply carries the server list, region, tactics and steering IP.
+    fn a_handshake_reply_carries_the_server_list_and_steering_ip() {
+        let body = br#"{
+            "homepages": ["https://example.org/"],
+            "upgrade_client_version": "999",
+            "encoded_server_list": ["AAAA", "BBBB"],
+            "client_region": "US",
+            "client_address": "192.0.2.8",
+            "server_timestamp": "2026-01-01T00:00:00Z",
+            "active_authorization_ids": ["a1"],
+            "tactics_payload": {"Tactics": {"x": 1}},
+            "steering_ip": "192.0.2.4"
+        }"#;
+        let state = parse_handshake(body);
+        assert_eq!(state.homepages, ["https://example.org/"]);
+        assert_eq!(state.upgrade_client_version.as_deref(), Some("999"));
+        assert_eq!(state.encoded_server_list, ["AAAA", "BBBB"]);
+        assert_eq!(state.client_region.as_deref(), Some("US"));
+        assert_eq!(state.client_address.as_deref(), Some("192.0.2.8"));
+        assert_eq!(
+            state.server_timestamp.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(state.active_authorization_ids, ["a1"]);
+        assert!(state.tactics_payload.is_some());
+        assert_eq!(state.steering_ip.as_deref(), Some("192.0.2.4"));
+        assert_eq!(
+            parse_handshake(b"not json").steering_ip,
+            None,
+            "a malformed reply leaves every field empty"
+        );
     }
 }

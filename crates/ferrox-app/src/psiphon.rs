@@ -804,6 +804,7 @@ impl Inner {
                             thread::sleep(remaining.min(Duration::from_millis(50)));
                         }
                     }
+                    self.apply_handshake(&session);
                     let established = !lock(&self.sessions).is_empty();
                     if let Some(probe) = self.settings.liveness.spec(protocol, established) {
                         if let Err(why) = session.liveness_test(
@@ -840,6 +841,38 @@ impl Inner {
             }
         }
         Err(format!("psiphon: no server accepted the tunnel: {last}"))
+    }
+
+    /// Apply the server's handshake reply: a steering IP for the fronting provider and new entries.
+    fn apply_handshake(&self, session: &Session) {
+        let state = session.handshake();
+        if let Some(provider) = session.fronting_provider_id() {
+            if let Some(address) = state
+                .steering_ip
+                .as_deref()
+                .and_then(|text| text.parse::<IpAddr>().ok())
+                .filter(|address| !is_bogon(*address))
+            {
+                self.settings.dns.remember_steering(provider, address);
+            }
+        }
+        if state.encoded_server_list.is_empty() {
+            return;
+        }
+        let mut entries = lock(&self.entries);
+        let list = Arc::make_mut(&mut *entries);
+        for encoded in &state.encoded_server_list {
+            let Some(server) = decode_entry_with(encoded, true, &self.settings.conduit_protocols)
+            else {
+                continue;
+            };
+            if !list
+                .iter()
+                .any(|known| known.host == server.host && known.port == server.port)
+            {
+                list.push(server);
+            }
+        }
     }
 
     /// Build the broker conduit once from the tactics payload and selected compartments.
@@ -2735,6 +2768,23 @@ fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_
     config.preresolved_probability = decimal(raw, "DNSResolverPreresolvedIPAddressProbability")
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
+    config.steering_ttl = Duration::from_secs(
+        u64::try_from(
+            number(raw, "SteeringIPCacheTTLSeconds")
+                .unwrap_or(3600)
+                .clamp(0, 86_400),
+        )
+        .unwrap_or(3600),
+    );
+    config.steering_probability = decimal(raw, "SteeringIPProbability")
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    config.steering_max = usize::try_from(
+        number(raw, "SteeringIPCacheMaxEntries")
+            .unwrap_or(65_536)
+            .max(0),
+    )
+    .unwrap_or(65_536);
     config
 }
 
@@ -3467,6 +3517,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "rejectProxyCountryCodes",
     "GeoIPDatabasePath",
     "DNSResolverAlternateServers",
+    "SteeringIPCacheTTLSeconds",
+    "SteeringIPCacheMaxEntries",
+    "SteeringIPProbability",
     "cdnProfile",
     "cdnIps",
     "cdnSni",
@@ -5302,6 +5355,37 @@ fn absorb(
             }
         }
     }
+}
+
+/// The reference's `IsBogon`: an address no handshake steering IP should name.
+fn is_bogon(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => is_bogon_v4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return is_bogon_v4(ip);
+            }
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_bogon_v4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        || octets[0] >= 240
 }
 
 /// Decode one base64 server-list entry for the tunnel race.
@@ -9736,5 +9820,19 @@ mod tests {
         socks_udp_frame_into(&mut frame, address, 5300, b"x");
         assert_eq!(frame.len(), 11);
         assert_eq!(&frame[10..], b"x");
+    }
+
+    #[test]
+    fn a_steering_ip_is_not_a_bogon() {
+        for bogon in ["10.0.0.1", "172.16.0.1", "192.168.0.1", "127.0.0.1", "::1"] {
+            assert!(is_bogon(bogon.parse().expect("address")), "{bogon}");
+        }
+        for bogon in [
+            Ipv4Addr::from([100, 64, 0, 1]),
+            Ipv4Addr::from([240, 0, 0, 1]),
+        ] {
+            assert!(is_bogon(bogon.into()), "{bogon}");
+        }
+        assert!(!is_bogon(Ipv4Addr::from([8, 8, 8, 8]).into()));
     }
 }
