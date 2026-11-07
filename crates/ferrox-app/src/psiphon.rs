@@ -2182,6 +2182,24 @@ impl Settings {
             meek_redial_tls: decimal(settings, "MeekRedialTLSProbability")
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
+            meek_payload_padding: decimal(settings, "MeekPayloadPaddingProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            meek_payload_padding_omit: decimal(settings, "MeekPayloadPaddingOmitProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            meek_payload_padding_min: usize::try_from(
+                number(settings, "MeekPayloadPaddingMinSize")
+                    .unwrap_or(0)
+                    .min(65_533),
+            )
+            .unwrap_or(0),
+            meek_payload_padding_max: usize::try_from(
+                number(settings, "MeekPayloadPaddingMaxSize")
+                    .unwrap_or(65_533)
+                    .min(65_533),
+            )
+            .unwrap_or(65_533),
             fragmentor: crate::psiphon_fragment::Fragmentor::new(
                 decimal(settings, "FragmentorProbability").unwrap_or(0.5),
                 protocol_list_named(settings, "FragmentorLimitProtocols"),
@@ -3675,6 +3693,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "MeekRedialTLSProbability",
     "MeekAlternateCookieNameProbability",
     "MeekAlternateContentTypeProbability",
+    "MeekPayloadPaddingProbability",
+    "MeekPayloadPaddingMinSize",
+    "MeekPayloadPaddingMaxSize",
+    "MeekPayloadPaddingOmitProbability",
     "TLSTunnelTrafficShapingProbability",
     "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",

@@ -460,6 +460,14 @@ pub(crate) struct TlsShape {
     pub(crate) meek_max_limit_request: usize,
     /// The chance a shaped connection drops after a successful round trip.
     pub(crate) meek_redial_tls: f64,
+    /// The chance a meek relay pads its request and response payloads.
+    pub(crate) meek_payload_padding: f64,
+    /// The chance a padded empty request omits its padding entirely.
+    pub(crate) meek_payload_padding_omit: f64,
+    /// The smallest padding size.
+    pub(crate) meek_payload_padding_min: usize,
+    /// The largest padding size.
+    pub(crate) meek_payload_padding_max: usize,
 }
 
 /// The reference defaults for one lane's TLS shape.
@@ -490,6 +498,10 @@ impl Default for TlsShape {
             meek_min_limit_request: crate::psiphon_meek::MAX_REQUEST_PAYLOAD,
             meek_max_limit_request: crate::psiphon_meek::MAX_REQUEST_PAYLOAD,
             meek_redial_tls: 0.0,
+            meek_payload_padding: 0.0,
+            meek_payload_padding_omit: 0.0,
+            meek_payload_padding_min: 0,
+            meek_payload_padding_max: 65_533,
         }
     }
 }
