@@ -2214,7 +2214,7 @@ impl SessionReader {
 
     fn take_upload(&mut self) -> bool {
         let mut st = self.session.state.lock().expect("session lock");
-        if st.ended {
+        if st.ended || st.upload_done {
             self.upload = None;
             return false;
         }
@@ -2227,45 +2227,50 @@ impl SessionReader {
         self.upload.is_some()
     }
 
-    fn end_upload(&mut self) {
-        self.upload = None;
-        let mut st = self.session.state.lock().expect("session lock");
-        st.ended = true;
-        self.session.cv.notify_all();
-    }
-
     /// The upload reached its own end, so the reader reports EOF but the session keeps the downlink
     /// it is still relaying: a hard read error still ends the whole session instead.
     fn finish_upload(&mut self) {
+        note_upload_done(&self.session);
         self.upload = None;
-        let mut st = self.session.state.lock().expect("session lock");
-        st.upload_done = true;
-        self.session.cv.notify_all();
     }
 
-    /// A timeout on the upload's own socket is the lane's poll, not the session's end: the lane parks
-    /// on that descriptor and the client's next byte wakes it, so an idle upload holds no relay worker.
     fn upload_error(&mut self, error: std::io::Error) -> std::io::Error {
-        let mapped = error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<ferrox_core::tls::TlsError>())
-            .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout));
-        let pending = cfg!(windows) && error.raw_os_error() == Some(997);
-        if ferrox_core::tls::TlsError::is_timeout(&error) {
-            if let Some(fd) = self.upload_fd {
-                crate::proxy::note_wait_fd(fd);
-                return std::io::Error::from(std::io::ErrorKind::WouldBlock);
-            }
-            if mapped || pending {
-                return error;
-            }
+        map_upload_error(&self.session, self.upload_fd, error)
+    }
+}
+
+/// A timeout on the upload's own socket is the lane's poll, not the session's end: the lane parks
+/// on that descriptor and the client's next byte wakes it, so an idle upload holds no relay worker.
+fn map_upload_error(
+    session: &Session,
+    fd: Option<crate::proxy::WaitFd>,
+    error: std::io::Error,
+) -> std::io::Error {
+    let mapped = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ferrox_core::tls::TlsError>())
+        .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout));
+    let pending = cfg!(windows) && error.raw_os_error() == Some(997);
+    if ferrox_core::tls::TlsError::is_timeout(&error) {
+        if let Some(fd) = fd {
+            crate::proxy::note_wait_fd(fd);
+            return std::io::Error::from(std::io::ErrorKind::WouldBlock);
         }
-        if poll_grain(&error) {
+        if mapped || pending {
             return error;
         }
-        self.end_upload();
-        error
     }
+    if poll_grain(&error) {
+        return error;
+    }
+    session.state.lock().expect("session lock").ended = true;
+    session.cv.notify_all();
+    error
+}
+
+fn note_upload_done(session: &Session) {
+    session.state.lock().expect("session lock").upload_done = true;
+    session.cv.notify_all();
 }
 
 /// A poll grain is the reader's own wake-up, not a socket deadline, so it ends no session.
@@ -2353,29 +2358,24 @@ impl crate::proxy::WindowRead for SessionReader {
             }
             if self.take_upload() {
                 let session = Arc::clone(&self.session);
+                let upload_fd = self.upload_fd;
                 let window = {
                     let upload = self.upload.as_mut().expect("upload");
                     upload.read_window()
                 };
-                let outcome = match window {
+                match window {
                     Ok(window) if window.is_empty() => {
                         drop(window);
-                        Ok(())
+                        note_upload_done(&session);
+                        return Ok(crate::proxy::Window::empty());
                     }
                     Ok(window) => {
                         session.state.lock().expect("session lock").last_seen =
                             std::time::Instant::now();
                         return Ok(window);
                     }
-                    Err(error) => Err(error),
-                };
-                return match outcome {
-                    Ok(()) => {
-                        self.finish_upload();
-                        Ok(crate::proxy::Window::empty())
-                    }
-                    Err(error) => Err(self.upload_error(error)),
-                };
+                    Err(error) => return Err(map_upload_error(&session, upload_fd, error)),
+                }
             }
             let mut st = self.session.state.lock().expect("session lock");
             if let Some(pkt) = {
@@ -2630,7 +2630,7 @@ pub(crate) enum Upload<R> {
     Window(Box<dyn crate::proxy::WindowRead + Send>),
 }
 
-impl<R: Read + Send> Upload<R> {
+impl<R: Read + Send + 'static> Upload<R> {
     fn as_read(&mut self) -> &mut dyn Read {
         match self {
             Self::Read(read) => read,
