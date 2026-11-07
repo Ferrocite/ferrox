@@ -29,6 +29,8 @@ pub(crate) struct Hello {
     stock_alpn: Option<Vec<Vec<u8>>>,
     sni: Option<String>,
     ech: Option<Vec<u8>>,
+    /// A stock hello appends the real ECH offer where a preset already keeps its GREASE slot.
+    ech_slot: bool,
     /// A config-named padding extension body length, placed first as Psiphon does; `None`
     /// keeps the preset's own `BoringSSL` padding rule.
     padding: Option<usize>,
@@ -99,6 +101,7 @@ impl Hello {
             stock_alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, false),
+            ech_slot: false,
             padding: None,
             offer: None,
             canonical: false,
@@ -136,6 +139,12 @@ impl Hello {
             self.stock_alpn = Some(alpn.to_vec());
             self.msg = self.encode(None);
         }
+    }
+
+    /// Appends the ECH slot a stock hello lacks, then seals the real offer into it.
+    pub(crate) fn enable_stock_ech(&mut self, list: &[u8]) -> Result<(), TlsError> {
+        self.ech_slot = true;
+        self.enable_ech(list)
     }
 
     /// Replaces the GREASE cover with a real ECH offer sealed to the named config.
@@ -336,6 +345,7 @@ impl Hello {
             stock_alpn: self.stock_alpn.clone(),
             sni: self.sni.clone(),
             ech: self.ech.clone(),
+            ech_slot: self.ech_slot,
             padding: self.padding,
             offer,
             canonical: self.canonical,
@@ -605,6 +615,15 @@ impl Hello {
             }
         }
 
+        // A stock profile has no GREASE slot, so the real offer is appended where RFC 9849 puts it.
+        if self.ech_slot && !entries.iter().any(|entry| entry.kind == 0xfe0d) {
+            if let Some(ech) = ech {
+                let source = Source::Fixed(ech);
+                let len = self.width_of(&source, shares);
+                entries.push(Entry::new(0xfe0d, len, false, source));
+            }
+        }
+
         // RFC 9849 makes real ECH the last extension; the uTLS GREASE cover keeps the preset's slot.
         if ech_last {
             if let Some(at) = entries.iter().position(|entry| entry.kind == 0xfe0d) {
@@ -754,6 +773,7 @@ impl Hello {
             stock_alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, true),
+            ech_slot: false,
             padding: None,
             offer: None,
             canonical: true,
