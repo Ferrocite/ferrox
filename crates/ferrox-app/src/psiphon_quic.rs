@@ -223,6 +223,7 @@ fn packet_io(
     obfuscated: bool,
     decoy: bool,
     packet_key: [u8; 32],
+    shape: &crate::psiphon_ssh::TlsShape,
 ) -> Result<Udp, String> {
     if !obfuscated {
         return Ok(Udp::Plain(io));
@@ -231,6 +232,7 @@ fn packet_io(
         io,
         key: packet_key,
         nonce: [0u8; 12],
+        nonce_transform: shape.quic_nonce_transform.selected(""),
         decoy: if decoy {
             Some(u8::try_from(bounded_random(10).map_err(|error| error.to_string())?).unwrap_or(0))
         } else {
@@ -245,6 +247,7 @@ impl QuicStream {
         server: &Server,
         timeout: Duration,
         proxy: Option<&Proxy>,
+        shape: &crate::psiphon_ssh::TlsShape,
     ) -> Result<Self, String> {
         if proxy.is_some() {
             return Err("psiphon quic: an upstream proxy cannot carry UDP QUIC".to_owned());
@@ -270,7 +273,13 @@ impl QuicStream {
                     .map_err(|error| format!("psiphon quic noise {remote}: {error}"))?;
             }
         }
-        let udp = packet_io(PacketIo::Socket(socket), obfuscated, decoy, packet_key)?;
+        let udp = packet_io(
+            PacketIo::Socket(socket),
+            obfuscated,
+            decoy,
+            packet_key,
+            shape,
+        )?;
         Self::connect_over(udp, remote, timeout, proof_key, randomized)
     }
 
@@ -279,11 +288,18 @@ impl QuicStream {
         server: &Server,
         timeout: Duration,
         stream: WebRtcStream,
+        shape: &crate::psiphon_ssh::TlsShape,
     ) -> Result<Self, String> {
         let (obfuscated, decoy, randomized, proof_key, packet_key) = quic_parameters(server)?;
         let remote = SocketAddr::new(server.address, server.port);
         stream.set_timeout(Some(timeout));
-        let udp = packet_io(PacketIo::WebRtc(stream), obfuscated, decoy, packet_key)?;
+        let udp = packet_io(
+            PacketIo::WebRtc(stream),
+            obfuscated,
+            decoy,
+            packet_key,
+            shape,
+        )?;
         Self::connect_over(udp, remote, timeout, proof_key, randomized)
     }
 
@@ -611,6 +627,7 @@ struct ObfuscatedUdp {
     io: PacketIo,
     key: [u8; 32],
     nonce: [u8; 12],
+    nonce_transform: Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>>,
     decoy: Option<u8>,
 }
 
@@ -625,6 +642,11 @@ impl ObfuscatedUdp {
         let mut framed = [0u8; MAX_PACKET_SIZE];
         loop {
             getrandom::fill(&mut self.nonce).map_err(|_| io::Error::other("psiphon quic nonce"))?;
+            crate::psiphon_ssh::apply_seed_transform(
+                self.nonce_transform.as_deref().map(Vec::as_slice),
+                &mut self.nonce,
+            )
+            .map_err(io::Error::other)?;
             let max_padding = PADDING_LIMIT.saturating_sub(plain.len()).min(255);
             let padding = bounded_random(max_padding + 1)?;
             framed[..12].copy_from_slice(&self.nonce);
@@ -2427,12 +2449,14 @@ mod tests {
             io: PacketIo::Socket(right),
             key,
             nonce: [0u8; 12],
+            nonce_transform: None,
             decoy: None,
         };
         let mut receiver = ObfuscatedUdp {
             io: PacketIo::Socket(left),
             key,
             nonce: [0u8; 12],
+            nonce_transform: None,
             decoy: None,
         };
         for length in [1usize, 13, 64, 255, 1199, 1200, 1267] {

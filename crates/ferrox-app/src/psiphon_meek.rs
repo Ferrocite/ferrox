@@ -492,6 +492,26 @@ impl MeekStream {
     }
 }
 
+/// The protocols the reference wraps in its HTTP request transformer.
+fn uses_http_transform(protocol: &str) -> bool {
+    matches!(
+        protocol,
+        "UNFRONTED-MEEK-OSSH"
+            | "UNFRONTED-MEEK-HTTP-OSSH"
+            | "FRONTED-MEEK-HTTP-OSSH"
+            | "FRONTED-MEEK-CDN-HTTP-OSSH"
+    )
+}
+
+/// The HTTP transform this connection selected, or `None` for a non-HTTP or untransformed dial.
+fn http_transform(meek: &Meek) -> Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>> {
+    if !uses_http_transform(meek.protocol) {
+        return None;
+    }
+    meek.shape
+        .http_transform(meek.fronted, meek.provider_id.as_deref())
+}
+
 pub(crate) struct MeekHttp {
     meek: Meek,
     proxy: Option<Proxy>,
@@ -500,6 +520,7 @@ pub(crate) struct MeekHttp {
     stream: Option<MeekStream>,
     cookie: Option<(String, String)>,
     profile: Profile,
+    http_transform: Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>>,
     front_index: usize,
     alpn_warned: bool,
     preconnected: bool,
@@ -517,6 +538,7 @@ impl MeekHttp {
         endpoint: Option<&'static str>,
     ) -> Result<Self, String> {
         let chosen = profile(&meek.shape, meek.protocol);
+        let transform = http_transform(&meek);
         let cookie = Some(make_cookie(&meek, endpoint, &chosen.cookie_name)?);
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
@@ -527,6 +549,7 @@ impl MeekHttp {
             stream: None,
             cookie,
             profile: chosen,
+            http_transform: transform,
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
@@ -548,6 +571,7 @@ impl MeekHttp {
             request_limit: MAX_REQUEST_PAYLOAD,
             redial_tls: 0.0,
         };
+        let transform = http_transform(&meek);
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Self {
             meek,
@@ -557,6 +581,7 @@ impl MeekHttp {
             stream: None,
             cookie: None,
             profile: chosen,
+            http_transform: transform,
             front_index: 0,
             alpn_warned: false,
             preconnected: false,
@@ -573,6 +598,7 @@ impl MeekHttp {
         stream: MeekStream,
     ) -> Result<Self, String> {
         let chosen = profile(&meek.shape, meek.protocol);
+        let transform = http_transform(&meek);
         let cookie = Some(make_cookie(&meek, None, &chosen.cookie_name)?);
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
@@ -583,6 +609,7 @@ impl MeekHttp {
             stream: Some(stream),
             cookie,
             profile: chosen,
+            http_transform: transform,
             front_index: 0,
             alpn_warned: false,
             preconnected: true,
@@ -851,7 +878,12 @@ impl MeekHttp {
             self.absorb_cookie(&reply.headers);
             return Ok(reply.body);
         }
-        let head = crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
+        let mut head =
+            crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
+        if let Some(transform) = self.http_transform.as_deref().map(Vec::as_slice) {
+            head = crate::psiphon_dns::apply_bytes_transform(transform, &head)
+                .map_err(|error| format!("psiphon meek transform: {error}"))?;
+        }
         let stream = self
             .stream
             .as_mut()
