@@ -143,7 +143,7 @@ if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
     engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box"
   else
-    engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box,xray-rust,leaf"
+    engines_list="ferrox,xray-core,aether,xray-core-rust,zeronet,sing-box,xray-rust,leaf"
   fi
 fi
 if [[ -z "$repeats" ]]; then
@@ -203,7 +203,7 @@ done
   echo "engines skipped: ${skipped[*]:-<none>}" >&2
 } || true
 ordered=()
-for want in xray-core ferrox xray-core-rust zeronet sing-box xray-rust leaf; do
+for want in xray-core ferrox aether xray-core-rust zeronet sing-box xray-rust leaf; do
   for have in ${built[@]+"${built[@]}"}; do
     [[ "${have%%=*}" == "$want" ]] && ordered+=("$have")
   done
@@ -261,7 +261,7 @@ manifest() {
       label="${have%%=*}"
       echo "engine $label: ${have#*=} sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${have#*=}") mib=$(python3 -c 'import os,sys;print(f"{os.path.getsize(sys.argv[1]) / 1048576:.1f}")' "${have#*=}")"
     done
-    for pin in xray-core xray-core-rust sing-box zeronet xray-rust leaf; do
+    for pin in xray-core xray-core-rust sing-box zeronet xray-rust leaf aether; do
       echo "pin $pin: $(pin_of "$pin")"
     done
   } >"$out/manifest.txt"
@@ -525,6 +525,14 @@ while read -r id traffic connections iterations payload duration_ms; do
       label="${have%%=*}"
       if skip_reason="$(matrix_engine_skip_reason "$label" "$id")"; then
         client_args+=(--skip-engine-for "$label=$skip_reason")
+        continue
+      fi
+      if [[ "$label" == aether && "$id" == masque-* && "$server" != ferrox ]]; then
+        client_args+=(--skip-engine-for "aether=Aether's cf-connect-ip dialect is served by ferrox in this matrix")
+        continue
+      fi
+      if [[ "$label" == aether && "$id" == wireguard-raw-* && "$server" == xray-core ]]; then
+        client_args+=(--skip-engine-for "aether=xray-core has no WireGuard server at this pin")
         continue
       fi
       case "$label" in

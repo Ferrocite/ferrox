@@ -142,7 +142,7 @@ jobs:
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
           [[ "${WANT_GAPS:-false}" == "true" ]] && flags="$flags --gaps"
-          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf,xray-rust"
+          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf,xray-rust,aether"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"

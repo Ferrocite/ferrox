@@ -99,6 +99,7 @@ SETUP_PANELS = (
 ENGINE_ORDER = [
     "xray-core",
     "ferrox",
+    "aether",
     "xray-core-rust",
     "zeronet",
     "sing-box",
@@ -108,6 +109,7 @@ ENGINE_ORDER = [
 PALETTE = {
     "xray-core": "#4C78A8",
     "ferrox": "#F58518",
+    "aether": "#9467BD",
     "xray-core-rust": "#72B7B2",
     "zeronet": "#54A24B",
     "sing-box": "#B279A2",

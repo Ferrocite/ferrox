@@ -51,6 +51,7 @@ SETUP_CHART = "setup-latency.png"
 THROUGHPUT_ENGINES = [
     "xray-core",
     "ferrox",
+    "aether",
     "xray-core-rust",
     "zeronet",
     "sing-box",

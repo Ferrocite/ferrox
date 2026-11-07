@@ -75,6 +75,19 @@ matrix_engine_skip_reason() {
       return 0
     fi
   fi
+  if [[ "$engine" == "aether" ]]; then
+    case "$id" in
+      masque-* | wireguard-raw-*) ;;
+      *)
+        printf '%s\n' "Aether at this pin only speaks MASQUE and WireGuard"
+        return 0
+        ;;
+    esac
+    if [[ "$role" == server ]]; then
+      printf '%s\n' "Aether is a client-only reference"
+      return 0
+    fi
+  fi
   if [[ "$engine" == "leaf" && "$id" == vless-* && "$id" != *-vision-* ]]; then
     printf '%s\n' "leaf at this pin only sends VLESS with the Vision flow, which this scenario does not configure"
     return 0
@@ -335,7 +348,7 @@ quic_client_settings() {
 masque_server_settings() {
   local dir
   dir="$(matrix_tls_dir)"
-  echo "\"protocol\": \"masque\", \"settings\": {\"users\": [{\"email\": \"matrix@carrier.test\", \"pass\": \"$PASSWORD\"}], \"address\": [\"10.13.0.1/24\", \"fd13::1/64\"]}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"h3\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+  echo "\"protocol\": \"masque\", \"settings\": {\"warp\": true, \"users\": [{\"email\": \"matrix@carrier.test\", \"pass\": \"$PASSWORD\"}], \"address\": [\"10.13.0.1/24\", \"fd13::1/64\"]}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"h3\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
 }
 
 masque_client_settings() {
