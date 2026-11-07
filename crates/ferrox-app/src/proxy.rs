@@ -659,8 +659,21 @@ fn serve_inbounds_counted(
                         let Some(out) = routed(inbound, false) else {
                             continue;
                         };
+                        let spec = match tun_spec(inbound) {
+                            Ok(spec) => spec,
+                            Err(error) => {
+                                eprintln!("tun inbound: {error}");
+                                continue;
+                            }
+                        };
                         // `-test` proves the device spec without opening an interface the reference also leaves closed.
-                        if test || serve_tun_inbound(inbound, &out, address) {
+                        if test {
+                            if spec.address().is_ipv6() && tun_stack(inbound) == "loopback" {
+                                eprintln!("tun inbound: the loopback handler supports IPv4 only");
+                                continue;
+                            }
+                            inbounds += 1;
+                        } else if serve_tun_inbound(&spec, inbound, &out, address) {
                             inbounds += 1;
                         }
                     }
@@ -13751,21 +13764,94 @@ fn serve_shadowsocks_inbound(
     true
 }
 
+/// The inbound's own key, preferring `settings`.
+fn tun_field<'a>(inbound: &'a Json, key: &str) -> Option<&'a Json> {
+    inbound
+        .get("settings")
+        .and_then(|settings| settings.get(key))
+        .or_else(|| inbound.get(key))
+}
+
+/// The configured stack name, defaulting to `smoltcp`.
+fn tun_stack(inbound: &Json) -> &str {
+    tun_field(inbound, "stack")
+        .and_then(Json::as_str)
+        .unwrap_or("smoltcp")
+}
+
+/// Parse an optional unsigned integer, refusing a non-number.
+fn tun_u32(inbound: &Json, key: &str) -> Result<Option<u32>, String> {
+    tun_field(inbound, key)
+        .map(|value| {
+            value
+                .as_u32()
+                .ok_or_else(|| format!("`{key}` must be an unsigned integer"))
+        })
+        .transpose()
+}
+
+/// Parse an optional string, refusing a non-string.
+fn tun_string<'a>(inbound: &'a Json, key: &str) -> Result<Option<&'a str>, String> {
+    match tun_field(inbound, key) {
+        None => Ok(None),
+        Some(Json::Str(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+/// The configured address string, refusing a non-string.
+fn tun_address(inbound: &Json) -> Result<Option<&str>, String> {
+    match tun_field(inbound, "address") {
+        None => Ok(None),
+        Some(Json::Str(text)) => Ok(Some(text.as_str())),
+        Some(Json::Arr(items)) => match items.first() {
+            None => Ok(None),
+            Some(Json::Str(text)) => Ok(Some(text.as_str())),
+            Some(_) => Err("`address` entries must be strings".to_owned()),
+        },
+        Some(_) => Err("`address` must be a string or an array of strings".to_owned()),
+    }
+}
+
+/// Parse and validate the TUN spec without opening the device.
+fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
+    let name = tun_string(inbound, "name")?;
+    let _ = tun_string(inbound, "stack")?;
+    let mtu = tun_u32(inbound, "mtu")?.map(|mtu| mtu as usize);
+    let (address, prefix) =
+        crate::tun::parse_address(tun_address(inbound)?, tun_u32(inbound, "prefix")?)?;
+    let queues = tun_u32(inbound, "queues")?.and_then(|queues| usize::try_from(queues).ok());
+    let spec = crate::tun::Spec::with(name, mtu, address, prefix, queues);
+    spec.validate().map_err(|error| error.to_string())?;
+    Ok(spec)
+}
+
 /// Open the TUN device and spawn the packet handler. Returns true when the device opens.
-fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
-    let settings = inbound.get("settings");
-    let field = |key| {
-        settings
-            .as_ref()
-            .and_then(|s| s.get(key))
-            .or_else(|| inbound.get(key))
-    };
-    let spec = crate::tun::Spec::new(
-        field("name").and_then(Json::as_str),
-        field("mtu").and_then(Json::as_u32).map(|m| m as usize),
-    );
-    let Ok(device) = crate::tun::Device::open(&spec) else {
-        eprintln!("tun inbound: {}", crate::tun::refusal_reason(&spec));
+fn serve_tun_inbound(
+    spec: &crate::tun::Spec,
+    inbound: &Json,
+    out: &Outbound,
+    _address: &str,
+) -> bool {
+    let stack = tun_stack(inbound);
+    if stack != "loopback" {
+        if !matches!(stack, "smoltcp" | "userspace") {
+            eprintln!("tun inbound: unknown stack `{stack}`, using the userspace stack");
+        }
+        return match crate::tun_stack::serve(spec, out) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("tun inbound: {error}");
+                false
+            }
+        };
+    }
+    if spec.address().is_ipv6() {
+        eprintln!("tun inbound: the native handler supports IPv4 only");
+        return false;
+    }
+    let Ok(device) = crate::tun::Device::open(spec) else {
+        eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
         return false;
     };
     let outbound = out.clone();
@@ -35820,6 +35906,23 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tun_field_with_the_wrong_type_is_refused() {
+        for config in [
+            r#"{"address":"198.18.0.1","prefix":"24"}"#,
+            r#"{"address":"198.18.0.1","queues":"four"}"#,
+            r#"{"address":"198.18.0.1","mtu":"1500"}"#,
+            r#"{"address":42}"#,
+            r#"{"address":"198.18.0.1","name":42}"#,
+            r#"{"address":"198.18.0.1","stack":42}"#,
+        ] {
+            let parsed = crate::json::parse(config).expect("config");
+            assert!(tun_spec(&parsed).is_err(), "{config}");
+        }
+        let parsed = crate::json::parse(r#"{"address":"198.18.0.1","prefix":24}"#).expect("config");
+        assert!(tun_spec(&parsed).is_ok());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

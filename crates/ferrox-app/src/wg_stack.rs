@@ -41,10 +41,13 @@ use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The receive side of one flow: a peer may have this much in flight before a
 /// window update, which is the reference's order of magnitude.
-const TCP_RECV_BUFFER: usize = 512 * 1024;
+const TCP_RECV_BUFFER: usize = 1024 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
-const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
+const TCP_SEND_BUFFER: usize = 1024 * 1024;
+/// One turn drains at most this many local reads into a flow, so a download
+/// does not wait a whole tick for each buffer when the peer is far ahead.
+const UP_BURST: usize = 64;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -77,6 +80,10 @@ const LISTENER_TTL: Duration = Duration::from_secs(60);
 /// ready with no tunnel packet to wake the stack, so the wait bounds a request's
 /// round trip and stays short.
 const TICK: Duration = Duration::from_millis(1);
+/// A TUN carries no tunnel reader to wake the stack, so an idle wait is also
+/// the bound on a target's answer; keep it below a request's round trip.
+#[cfg(not(unix))]
+const TUN_TICK: Duration = Duration::from_micros(100);
 /// Datagram lanes are idle most of their life; a ten millisecond wake is a
 /// poll of their own, not a bound on a request.
 const LANE_TICK: Duration = Duration::from_millis(10);
@@ -1311,14 +1318,129 @@ pub(crate) fn server(
     stack.device.recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if server_turn(&mut stack, &packets, &mut buf) {
+        if server_turn(&mut stack, &packets, &mut buf, TICK) {
             return;
         }
     }
 }
 
+/// Run the server stack over a TUN until its reader is dropped.
+#[cfg(unix)]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn serve_tun_device(
+    config: DeviceConfig,
+    packets: Receiver<Packet>,
+    to_tunnel: SyncSender<Vec<u8>>,
+    out: Outbound,
+    recycle: Option<Sender<Vec<u8>>>,
+    wake: std::os::unix::net::UnixStream,
+    failed: Arc<AtomicBool>,
+) {
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    stack.device.recycle = recycle;
+    let _ = wake.set_nonblocking(true);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut closed = false;
+        for _ in 0..RX_BURST {
+            match packets.try_recv() {
+                Ok(packet) => stack.receive(packet),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let progressed = stack.poll(&mut buf);
+        if closed {
+            return;
+        }
+        if progressed {
+            continue;
+        }
+        if wait_for_tun(&stack, &wake) {
+            return;
+        }
+    }
+}
+
+/// Run the server stack over a TUN until its reader is dropped.
+#[cfg(not(unix))]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn serve_tun_device(
+    config: DeviceConfig,
+    packets: Receiver<Packet>,
+    to_tunnel: SyncSender<Vec<u8>>,
+    out: Outbound,
+    recycle: Option<Sender<Vec<u8>>>,
+    failed: Arc<AtomicBool>,
+) {
+    let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
+    stack.device.recycle = recycle;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let tick = if stack.flows.is_empty() {
+            TICK
+        } else {
+            TUN_TICK
+        };
+        if server_turn(&mut stack, &packets, &mut buf, tick) {
+            return;
+        }
+    }
+}
+
+/// Wait until the TUN reader signals a packet or a local stream has bytes; the
+/// timeout services smoltcp's retransmit timers.
+#[cfg(unix)]
+fn wait_for_tun(stack: &ServerStack, wake: &std::os::unix::net::UnixStream) -> bool {
+    let mut fds = Vec::with_capacity(stack.flows.len() + 1);
+    fds.push(libc::pollfd {
+        fd: wake.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    for flow in &stack.flows {
+        let can_send = stack.sockets.get::<TcpSocket>(flow.handle).can_send();
+        if flow.up_pending() || flow.up_eof || !can_send {
+            continue;
+        }
+        fds.push(libc::pollfd {
+            fd: flow.local.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let timeout = TICK.as_millis() as libc::c_int;
+    let answered = loop {
+        let answered = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if answered < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return true;
+        }
+        break answered;
+    };
+    if answered == 0 {
+        return false;
+    }
+    if fds[0].revents & libc::POLLIN != 0 {
+        let mut sink = [0u8; 256];
+        let _ = unsafe { libc::read(wake.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
+    }
+    fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
 /// One server turn, or true once the inbound is closed.
-fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bool {
+fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8], tick: Duration) -> bool {
     let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
@@ -1337,7 +1459,7 @@ fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bo
     if progressed {
         return false;
     }
-    match packets.recv_timeout(TICK) {
+    match packets.recv_timeout(tick) {
         Ok(packet) => stack.receive(packet),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
@@ -1647,7 +1769,28 @@ impl ServerStack {
         out: Outbound,
         headroom: usize,
     ) -> Self {
-        let mut device = QueueDevice::new(INNER_MTU, headroom);
+        let fragment = if headroom == 0 {
+            TUNNEL_FRAGMENT
+        } else {
+            config.mtu
+        };
+        Self::with_mtu(config, to_tunnel, out, headroom, INNER_MTU, fragment)
+    }
+
+    /// Build the same interface over a TUN whose packets already carry their IP header.
+    fn new_tun(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
+        Self::with_mtu(config, to_tunnel, out, 0, config.mtu, config.mtu)
+    }
+
+    fn with_mtu(
+        config: &DeviceConfig,
+        to_tunnel: impl Into<ToTunnel>,
+        out: Outbound,
+        headroom: usize,
+        device_mtu: usize,
+        fragment: usize,
+    ) -> Self {
+        let mut device = QueueDevice::new(device_mtu, headroom);
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
             &mut device,
@@ -1671,11 +1814,7 @@ impl ServerStack {
             addresses: config.addresses.clone(),
             mtu: config.mtu,
             reassembly: Reassembly::default(),
-            fragment: if headroom == 0 {
-                TUNNEL_FRAGMENT
-            } else {
-                config.mtu
-            },
+            fragment,
             started: StdInstant::now(),
         }
     }
@@ -2008,43 +2147,55 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         }
     }
 
-    if up_ready && !flow.up_pending() && !flow.up_eof && socket.can_send() {
-        match flow.local.read(buf) {
-            Ok(0) => flow.up_eof = true,
-            Ok(n) => {
-                moved = true;
-                match socket.send_slice(&buf[..n]) {
-                    Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
-                    Ok(_) => {}
-                    Err(SendError::InvalidState) => {
-                        flow.done = true;
-                        socket.abort();
+    let mut bursts = 0;
+    while bursts < UP_BURST && !flow.up_eof && socket.can_send() {
+        if flow.up_pending() {
+            let at = flow.pending_up_at;
+            match socket.send_slice(&flow.pending_up[at..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    flow.pending_up_at += n;
+                    moved = true;
+                    bursts += 1;
+                    if !flow.up_pending() {
+                        flow.pending_up.clear();
+                        flow.pending_up_at = 0;
                     }
                 }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => {
-                flow.done = true;
-                socket.abort();
-            }
-        }
-    }
-    if flow.up_pending() && socket.can_send() {
-        let at = flow.pending_up_at;
-        match socket.send_slice(&flow.pending_up[at..]) {
-            Ok(0) => {}
-            Ok(n) => {
-                flow.pending_up_at += n;
-                moved = true;
-                if !flow.up_pending() {
-                    flow.pending_up.clear();
-                    flow.pending_up_at = 0;
+                Err(SendError::InvalidState) => {
+                    flow.done = true;
+                    socket.abort();
+                    break;
                 }
             }
-            Err(SendError::InvalidState) => {
-                flow.done = true;
-                socket.abort();
+        } else if up_ready {
+            match flow.local.read(buf) {
+                Ok(0) => {
+                    flow.up_eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    moved = true;
+                    bursts += 1;
+                    match socket.send_slice(&buf[..n]) {
+                        Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
+                        Ok(_) => {}
+                        Err(SendError::InvalidState) => {
+                            flow.done = true;
+                            socket.abort();
+                            break;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    flow.done = true;
+                    socket.abort();
+                    break;
+                }
             }
+        } else {
+            break;
         }
     }
     if flow.up_eof && !flow.up_pending() && socket.is_open() && !flow.sent_fin {
