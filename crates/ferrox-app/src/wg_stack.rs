@@ -1336,12 +1336,12 @@ impl ClientStack {
         let Some((source, destination)) = icmp_quoted(packet) else {
             return;
         };
-        if !self.addresses.contains(&source)
-            || !self
+        let routed = self.peers.is_empty()
+            || self
                 .peers
                 .iter()
-                .any(|known| known.public == peer && known.routes(destination))
-        {
+                .any(|known| known.public == peer && known.routes(destination));
+        if !self.addresses.contains(&source) || !routed {
             return;
         }
         if self.device.absorb(packet) {
@@ -4864,6 +4864,46 @@ mod client_tests {
             "the SYN advertises the learned MTU's segment size"
         );
         drop(app);
+    }
+
+    /// A MASQUE client has no peer table, so its own Packet Too Big still narrows the path.
+    #[test]
+    fn a_packet_too_big_narrows_a_client_without_peers() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 1200).expect("a v4 answer");
+        receive_client(
+            &mut stack,
+            Packet {
+                peer: [0u8; 32],
+                bytes: too_big,
+                at: 0,
+            },
+        );
+        assert_eq!(
+            stack.device.capabilities().max_transmission_unit,
+            1200,
+            "the client without peers ignored its own Packet Too Big"
+        );
     }
 
     /// One peer's Packet Too Big does not narrow another peer's path.
