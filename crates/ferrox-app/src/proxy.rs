@@ -20633,6 +20633,19 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
+    // The demux runs for the connection's life, so it must not keep the handshake lane that accepted it.
+    if take_handshake_lane() {
+        let settings = settings.clone();
+        let keys: Vec<[u8; 56]> = key.to_vec();
+        let sniffing = crate::sniff::current();
+        let flow = crate::accesslog::snapshot();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let _flow = crate::accesslog::install_snapshot(flow);
+            serve_trojan_xhttp_carrier(read, write, &settings, &keys, freedom);
+        });
+        return;
+    }
     let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
         return;
     };
@@ -50950,16 +50963,25 @@ mod tests {
             mode_source: crate::xhttp::ModeSource::Auto,
             ..crate::xhttp::XhttpSettings::stream_one()
         });
-        let server_settings = settings.clone();
+        let server_settings = (*settings).clone();
+        let keys = vec![key];
         thread::spawn(move || {
             for _ in 0..FLOWS {
                 let (stream, _) = listener.accept().expect("accepts");
-                let carrier = Carrier::Xhttp {
-                    settings: server_settings.clone(),
+                stream.set_read_timeout(Some(RELAY_POLL)).expect("poll");
+                let Ok(out) = stream.try_clone() else {
+                    continue;
                 };
-                let serving = Arc::clone(&server_config);
-                thread::spawn(move || {
-                    serve_trojan_tls(stream, &[key], &carrier, true, &serving, None);
+                let Ok(session) = ferrox_core::tls::accept(&server_config, stream) else {
+                    continue;
+                };
+                let settings = server_settings.clone();
+                let keys = keys.clone();
+                run_tls_handshake(session, move |session, prefix| {
+                    let _flow = lane_flow(None, None, "", 0);
+                    let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
+                    serve_trojan_xhttp_carrier(reader, writer, &settings, &keys, true);
                 });
             }
         });
