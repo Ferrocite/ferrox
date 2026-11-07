@@ -2201,6 +2201,10 @@ pub(crate) fn serve_grpc_muxed(
 ) {
     reader.arm_mux_poll();
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
+    if decoded.is_none() {
+        reader.abort();
+        return;
+    }
     if let Some(Accepted { cmd, .. }) = &decoded {
         if freedom && matches!(*cmd, 1 | 2) {
             opened.store(true, std::sync::atomic::Ordering::Relaxed);
