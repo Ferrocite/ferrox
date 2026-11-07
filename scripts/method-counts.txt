@@ -26,6 +26,7 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
 shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks write-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
@@ -685,6 +686,7 @@ http-proxy connect-grant-allocations 0 ferrox-app-proxy::tests::a_connect_grant_
 http-proxy connect-request-allocations 0 ferrox-app-proxy::tests::the_connect_request_builds_in_one_buffer
 http-proxy forwarded-head-allocations 0 ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed
 http-proxy forwarded-head-copies 0 ferrox-app-proxy::tests::a_forwarded_head_is_the_head_that_was_read
+http-proxy pb-client-endpoints-decoded 1 ferrox-app-xray_pb::tests::a_socks_http_fallback_scenario_decodes_both_sides
 
 # --- Routing rules and geosite/geoip -----------------------------------------
 engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -706,6 +708,7 @@ engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests:
 
 # --- SOCKS5, both roles ------------------------------------------------------
 socks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
 socks oracle-lines-matching-the-pinned-go 8 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
 socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
@@ -743,6 +746,8 @@ socks socks5-long-connect-allocations 0 ferrox-app-socks::tests::a_long_destinat
 socks socks5-long-connect-read-calls 4 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
 socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
 socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
+socks http-fallback-requests-served 1 ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account
+socks http-fallback-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 
 # --- dokodemo-door transparent inbound -----------------------------------------
 front-dokodemo ops-retired-instructions UNBLESSED scripts/count-ops.sh

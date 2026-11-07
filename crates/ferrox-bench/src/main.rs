@@ -1012,7 +1012,7 @@ fn main() {
         .chain(framing::gated_seals(&seals))
         .chain(muxframe::gated(&muxed))
         .chain(early.iter())
-        .chain(aes_gcm_rows.iter())
+        .chain(aesgcm::gated_rows(&aes_gcm_rows))
         .filter(|r| r.ratio() < BAR)
         .collect();
     let slow_b64: Vec<&framing::Row> = b64_rows
