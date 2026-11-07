@@ -9,15 +9,18 @@ import time
 
 
 def fail(message):
+    """Report an adapter error and exit 2."""
     print(f"aether adapter: {message}", file=sys.stderr)
     raise SystemExit(2)
 
 
 def text(value):
+    """Render a config value as text."""
     return str(value)
 
 
 def endpoint(settings):
+    """Return the peer address and port the outbound settings name."""
     address = settings.get("address")
     port = settings.get("port")
     if address and port:
@@ -43,6 +46,7 @@ def endpoint(settings):
 
 
 def local_addresses(settings):
+    """Return one local IPv4 and one local IPv6 address from the settings."""
     values = []
     for item in settings.get("address") or []:
         values.append(text(item).split("/", 1)[0])
@@ -56,15 +60,18 @@ def local_addresses(settings):
 
 
 def pem(value):
+    """Wrap PEM text in a TOML multiline string."""
     return '"""' + value + '"""'
 
 
 def base64_key(value):
+    """Normalize a WireGuard key to padded standard base64."""
     key = str(value).strip().replace("-", "+").replace("_", "/")
     return key + "=" * (-len(key) % 4)
 
 
 def identity(path, fields):
+    """Write a TOML identity file and return its path."""
     lines = []
     for key, value in fields:
         lines.append(f"{key} = {value}")
@@ -73,6 +80,7 @@ def identity(path, fields):
 
 
 def masque_identity(cfg_path, stream):
+    """Build the MASQUE identity TOML from the client TLS settings."""
     tls = stream.get("tlsSettings") or {}
     certificates = tls.get("certificates") or []
     certificate = certificates[0].get("certificateFile") if certificates else None
@@ -103,6 +111,7 @@ def masque_identity(cfg_path, stream):
 
 
 def wireguard_identity(cfg_path, settings):
+    """Build the WireGuard identity TOML from the client settings."""
     secret = settings.get("secretKey")
     peers = settings.get("peers") or []
     if not secret or not peers:
@@ -127,6 +136,7 @@ def wireguard_identity(cfg_path, settings):
 
 
 def main():
+    """Read the matrix client config and exec the pinned Aether."""
     args = sys.argv[1:]
     if len(args) != 3 or args[0] != "run" or args[1] not in ("-config", "--config"):
         fail("expected `run -config <path>`")

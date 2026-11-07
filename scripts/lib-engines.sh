@@ -154,7 +154,7 @@ build() {
       local aether_bin
       aether_bin="$(built "$engine_dir/aether-target/release/aether")" || return 1
       cp "$aether_bin" "$engine_dir/aether-bin" || return 1
-      cp "$OLDPWD/scripts/run-aether.py" "$binary" || return 1
+      cp scripts/run-aether.py "$binary" || return 1
       chmod +x "$binary"
       ;;
     *)
