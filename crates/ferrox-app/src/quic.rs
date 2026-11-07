@@ -102,6 +102,7 @@ impl PooledStream {
             id: self.id,
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
+            prefaced: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -1267,6 +1268,23 @@ pub(crate) fn recv_batch(_sock: &Datagram, _batch: &mut Batch) -> Drain {
 /// The HTTP/3 opening, carried exactly once per connection: a second control stream is a connection error.
 pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
     for (stream, payload) in crate::foxy::H3::h3_opening() {
+        let mut rest = &payload[..];
+        while !rest.is_empty() {
+            match conn.stream_send(stream, rest, false) {
+                Ok(0) | Err(_) => return false,
+                Ok(wrote) => rest = &rest[wrote..],
+            }
+        }
+    }
+    flush_egress(conn, sock);
+    true
+}
+
+/// The server half of `send_h3_opening`: the same control stream on the server's unidirectional
+/// ids (3, 7, 11) rather than the client's (2, 6, 10).
+pub(crate) fn send_h3_server_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
+    for (index, (_, payload)) in crate::foxy::H3::h3_opening().into_iter().enumerate() {
+        let stream = [3u64, 7, 11][index];
         let mut rest = &payload[..];
         while !rest.is_empty() {
             match conn.stream_send(stream, rest, false) {
@@ -3490,6 +3508,9 @@ pub(crate) struct QuicStream {
     meter: crate::stats::Meter,
     /// The peer's FIN can arrive with the last bytes, and `Read` has nowhere to report it; keeping it makes the next read the EOF instead of a read the poll repeats.
     peer_fin: Arc<AtomicBool>,
+    /// One H3 server preface per connection: the first request stream sends it, and a client-side
+    /// handle starts true because it must never send one.
+    prefaced: Arc<AtomicBool>,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -3615,7 +3636,8 @@ impl QuicStream {
 
     /// Half-close our direction: the peer reads everything sent, then EOF. A stream the peer already
     /// reset is finished, not a send to wait ten seconds for; and the wait itself takes the lock one
-    /// poll at a time, so a lane finishing never parks every other stream behind it.
+    /// poll at a time, so a lane finishing never parks every other stream behind it. `stream_finished`
+    /// is the peer's FIN, not ours, so it cannot stand in for the FIN this call exists to send.
     pub(crate) fn fin(&self) -> bool {
         let deadline = Instant::now() + SEND_WAIT;
         loop {
@@ -3623,7 +3645,7 @@ impl QuicStream {
                 let Ok(mut conn) = self.conn.lock() else {
                     return false;
                 };
-                if conn.is_closed() || conn.stream_finished(self.id) {
+                if conn.is_closed() {
                     Some(true)
                 } else {
                     match conn.stream_send(self.id, &[], true) {
@@ -3649,6 +3671,18 @@ impl QuicStream {
     pub(crate) fn close(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
     }
+
+    /// The H3 server preface, once per connection: SETTINGS and the QPACK hellos ride the server's
+    /// unidirectional ids, and a second control stream would be a connection error.
+    pub(crate) fn preface_h3(&self) -> bool {
+        if self.prefaced.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        let Ok(mut conn) = self.conn.lock() else {
+            return false;
+        };
+        send_h3_server_opening(&mut conn, &self.sock)
+    }
 }
 
 /// One serving session: the QUIC connection behind one lock, the stream ids already handed out.
@@ -3657,6 +3691,7 @@ struct ServerConn {
     seen: Mutex<HashSet<u64>>,
     visit: AtomicU64,
     gone: AtomicBool,
+    prefaced: Arc<AtomicBool>,
 }
 
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
@@ -3666,7 +3701,7 @@ pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
-    fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)>,
+    fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64, Arc<AtomicBool>)>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
     /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
@@ -3856,6 +3891,7 @@ fn route(
         seen: Mutex::new(HashSet::new()),
         visit: AtomicU64::new(0),
         gone: AtomicBool::new(false),
+        prefaced: Arc::new(AtomicBool::new(false)),
     });
     conns.insert(scid.to_vec(), Arc::clone(&state));
     conns.insert(header.dcid.as_ref().to_vec(), state);
@@ -3959,12 +3995,14 @@ fn reap(
                 if stream % 4 != 0 || !seen.insert(stream) {
                     continue;
                 }
-                scratch.fresh.push((Arc::clone(&state.conn), stream));
+                scratch
+                    .fresh
+                    .push((Arc::clone(&state.conn), stream, Arc::clone(&state.prefaced)));
                 spawned = true;
             }
-            // Only a pass that added a stream can leave a finished one behind: an idle connection's set has nothing to sweep.
+            // A peer FIN ends only its own direction, so a stream leaves the set once both are closed: else the next readable pass serves it again and resets the half-finished answer.
             if spawned {
-                seen.retain(|stream| !conn.stream_finished(*stream));
+                seen.retain(|stream| !conn.stream_closed(*stream));
             }
         }
     }
@@ -3975,13 +4013,14 @@ fn reap(
     for key in scratch.closed.drain(..) {
         conns.remove(&key);
     }
-    for (conn, stream) in scratch.fresh.drain(..) {
+    for (conn, stream, prefaced) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
             id: stream,
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
+            prefaced: Arc::clone(&prefaced),
         };
         let serve = Arc::clone(serve);
         std::thread::spawn(move || serve(session));

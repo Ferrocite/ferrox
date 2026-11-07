@@ -2206,9 +2206,10 @@ pub(crate) type SessionServe = dyn Fn(
     ) + Send
     + Sync;
 
-struct XhttpService {
+pub(crate) struct XhttpService {
     settings: XhttpSettings,
     serve: Arc<SessionServe>,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 }
 
 impl H2Service for XhttpService {
@@ -2222,6 +2223,32 @@ impl H2Service for XhttpService {
             end_stream,
         )
     }
+}
+
+impl crate::xhttp_h3::H3Service for XhttpService {
+    fn serve(
+        &self,
+        reader: Box<dyn crate::proxy::WindowRead + Send>,
+        writer: crate::xhttp::XhttpWriter,
+    ) {
+        (self.serve)(reader, writer, self.decryption.clone());
+    }
+}
+
+pub(crate) fn h3_vless_service(
+    settings: &XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+) -> Arc<dyn crate::xhttp_h3::H3Service> {
+    let users: VlessUsers = Arc::from(users);
+    Arc::new(XhttpService {
+        settings: settings.clone(),
+        serve: Arc::new(move |reader, writer, decryption| {
+            serve_stream(reader, writer, &users, freedom, decryption);
+        }),
+        decryption,
+    })
 }
 
 /// The same demux for a carrier whose protocol above xHTTP is not VLESS: the accept still splits the
@@ -2247,6 +2274,16 @@ impl H2Service for XhttpSessionService {
             block,
             end_stream,
         )
+    }
+}
+
+impl crate::xhttp_h3::H3Service for XhttpSessionService {
+    fn serve(
+        &self,
+        reader: Box<dyn crate::proxy::WindowRead + Send>,
+        writer: crate::xhttp::XhttpWriter,
+    ) {
+        (self.serve)(reader, writer, None);
     }
 }
 
@@ -2385,7 +2422,7 @@ fn open_stream(
             upload,
             writer,
             &settings,
-            Some(h2out.clone()),
+            Some(crate::xhttp::StreamOut::H2(h2out.clone())),
             None,
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
@@ -2411,6 +2448,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         serve: Arc::new(move |reader, writer, decryption| {
             serve_stream(reader, writer, &users, freedom, decryption);
         }),
+        decryption: decryption.clone(),
     };
     serve_h2_service(read, write, &service, decryption);
 }
@@ -2434,6 +2472,7 @@ pub(crate) fn h2_xhttp_lane<
         serve: Arc::new(move |reader, writer, decryption| {
             serve_stream(reader, writer, &users, freedom, decryption);
         }),
+        decryption: decryption.clone(),
     };
     h2_lane(read, write, service, decryption, None)
 }
@@ -3054,6 +3093,7 @@ mod tests {
             serve: Arc::new(move |reader, writer, decryption| {
                 serve_stream(reader, writer, &users, true, decryption);
             }),
+            decryption: None,
         }
     }
 
