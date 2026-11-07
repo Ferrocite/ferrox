@@ -23,24 +23,26 @@ The one place the tree does **not** copy the reference is the method list. The p
 
 ```mermaid
 graph TD
-    A["device packet, or a front client"] --> F0{"first byte: 5 or 4?"}
-    F0 -- "yes" --> B["serve_device_flow: the rules pick the lane,<br/>then serve_connect — the entry the socks and http fronts reach"]
-    F0 -- "no" --> F1["serve_http: a CONNECT or a plain head,<br/>the socks accounts check the credential"]
-    F1 --> F2["the hop: CONNECT built in the caller's buffer"]
-    F2 --> H
-    B --> C["dial_socks_client: the destination keeps its shape<br/>— a name stays a name on the wire"]
-    C --> D["greeting: [5, 1, method] on the stack,<br/>one method, the one the client will use"]
-    D --> E{"a credential configured?"}
-    E -- "yes" --> F["RFC 1929 block: [1, ulen, user, plen, pass]"]
+    D["device packet"] --> DF["serve_device_flow"]
+    F["front client"] --> FB{"first byte: 5 or 4?"}
+    FB -- "yes" --> FS["socks_request, then serve_socks_connected"]
+    FB -- "no" --> FH["serve_http: a CONNECT or a plain head,<br/>the socks accounts check the credential"]
+    DF --> SC["serve_connect: the rules pick the lane;<br/>the socks client lane below is that lane when chosen"]
+    FS --> SC
+    FH --> SC
+    SC --> C["dial_socks_client: the destination keeps its shape<br/>— a name stays a name on the wire"]
+    C --> G0["greeting: [5, 1, method] on the stack,<br/>one method, the one the client will use"]
+    G0 --> E{"a credential configured?"}
+    E -- "yes" --> F1["RFC 1929 block: [1, ulen, user, plen, pass]"]
     E -- "no" --> G["request: [5, cmd, 0, atyp, addr, port]"]
-    F --> G
-    G --> H["the tunnel: the relay's own copy per byte"]
-    A --> I["UDP ASSOCIATE: the same request with cmd 3,<br/>the all-zero IPv4 address RFC 1928 names"]
+    F1 --> G
+    G --> T["the tunnel: the relay's own copy per byte"]
+    SC --> I["UDP ASSOCIATE: the same request with cmd 3,<br/>the all-zero IPv4 address RFC 1928 names"]
     I --> J["one association, every destination<br/>framed RSV|FRAG|address|payload"]
-    J --> H
-    A --> K["SOCKS4 request: [4, cmd, port, addr, user\0,<br/>name\0 for 4a] — no greeting, no method"]
+    J --> T
+    SC --> K["SOCKS4 request: [4, cmd, port, addr, user\0,<br/>name\0 for 4a] — no greeting, no method"]
     K --> L["reply: [0, 90, 0, 0, 0, 0, 0, 0] granted,<br/>[0, 91, ...] refused"]
-    L --> H
+    L --> T
 ```
 
 ## Measured
@@ -49,6 +51,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-socks-dial | UNBLESSED | CI bench.yml (no socks cell yet) |
 | oracle-lines-matching-the-pinned-go | 8 | ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes |
 | methods-offered-in-the-greeting | 1 | ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes |
 | request-bytes-per-tcp-dial | 10 | ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes |
@@ -186,7 +189,7 @@ Named rather than claimed, with the worst input worked out first:
 
 `conformance.yml`'s scenario-map job runs every test in the pinned `xray-core`'s `testing/scenarios` package against `ferrox-app`, and the pin's gate names the ones that must be green. `TestSocksBridgeTCP` is one of them now: it is xray's own scenario — a `socks.ServerConfig` inbound that asks for a password on one side, a `socks.ClientConfig` outbound that offers one on the other, and a `dokodemo.Config` front that rewrites every flow to an echo server — and it runs against this tree unmodified through the `scripts/xray-scenarios.sh` seam. The bridge carries `xray.proxy.socks.ServerConfig` (the auth type, the account map, the address and the datagram flag read and dropped) and `xray.proxy.socks.ClientConfig` (one endpoint, with the credential when the config names one); a user level is refused by name, because it feeds a policy app this tree has no lane for.
 
-`TestSocksBridageUDP` and `TestSocksBridageUDPWithRouting` pass now, because the `dokodemo-door` carries the datagram and the router's tag and port selectors decode; both are in the pin's gate. `TestSocksConformanceMod` — the scenario that dials this front with `socks4.Dial` — passes and is gated beside `TestSocksBridgeTCP`. The one remaining socks failure is `TestSocksWithHttpRequest`, which needs the front's HTTP sniff. The map at this pin is 43 of 73 green and the socks family 4 of its 5; the run is `scripts/run-xray-scenario-map.sh` against the pinned checkout, and it is informational — a failing test never fails the job.
+`TestSocksBridageUDP` and `TestSocksBridageUDPWithRouting` pass now, because the `dokodemo-door` carries the datagram and the router's tag and port selectors decode; both are in the pin's gate. `TestSocksConformanceMod` — the scenario that dials this front with `socks4.Dial` — passes and is gated beside `TestSocksBridgeTCP`. `TestSocksWithHttpRequest` passes too, and is now gated with them: the front hands the CONNECT to `serve_http`, and the bridge carries the `xray.proxy.http.ClientConfig` outbound the client leg dials. The map at this pin is 44 of 73 green and the socks family 5 of its 5; the run is `scripts/run-xray-scenario-map.sh` against the pinned checkout, and it is informational — a failing test never fails the job.
 
 ## Pins
 
