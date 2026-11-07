@@ -218,6 +218,9 @@ carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer
 # their difference is a claim about the copy.
 carrier-psiphon  psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else  ferrox_app::psiphon_shadowsocks::tests::direct_write_probe
 carrier-psiphon  psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy  ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe
+# The sniff probe's frame is not an exact gate: on the same source it has read
+# 1228 and 1231, so it is reported here and not in expected-ops.
+engine-sniffing-http-tls-quic-fakedns  sniff::tests::a_warm_probe_costs_the_documented_instructions  ferrox_app::sniff::Sniffing::inspect
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_scan_once
