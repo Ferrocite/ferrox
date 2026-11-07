@@ -4410,13 +4410,42 @@ mod tests {
             reassembly.accept([8; 32], &first_fragment([10, 0, 0, 8], id), 0);
         }
         assert_eq!(reassembly.scans, 0, "no set can expire yet");
+        let aged = *reassembly
+            .parts
+            .keys()
+            .find(|key| key.peer() == [7; 32])
+            .expect("a peer-7 set");
+        let aged_bytes = reassembly.parts[&aged].payload.len();
+        let before_bytes = reassembly.bytes;
+        let before_sets = reassembly.peers[&[7; 32]].sets;
+        let before_peer_bytes = reassembly.peers[&[7; 32]].bytes;
         let expired = StdInstant::now()
             .checked_sub(REASSEMBLY_TIMEOUT + Duration::from_secs(1))
             .expect("instant");
-        reassembly.parts.values_mut().next().expect("a set").started = expired;
+        reassembly
+            .parts
+            .get_mut(&aged)
+            .expect("the aged set")
+            .started = expired;
         reassembly.next_expiry = Some(expired + REASSEMBLY_TIMEOUT);
-        reassembly.expire();
+        reassembly.accept([9; 32], &empty_fragment([10, 0, 0, 9], 0, 0), 0);
         assert_eq!(reassembly.scans, 1, "the walk runs when a set can expire");
+        assert!(!reassembly.parts.contains_key(&aged), "the aged set went");
+        let after = reassembly
+            .peers
+            .get(&[7; 32])
+            .expect("peer 7 still has sets");
+        assert_eq!(after.sets, before_sets - 1, "the peer's set count fell");
+        assert_eq!(
+            after.bytes,
+            before_peer_bytes - aged_bytes,
+            "the peer's byte count fell"
+        );
+        assert_eq!(
+            reassembly.bytes,
+            before_bytes - aged_bytes,
+            "the total byte count fell"
+        );
     }
 
     #[test]
