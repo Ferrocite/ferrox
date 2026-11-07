@@ -2362,13 +2362,27 @@ fn open_stream(
         head: Vec::new(),
         headed: false,
     };
+    let windowed = std::str::from_utf8(&head)
+        .ok()
+        .zip(std::str::from_utf8(&target).ok())
+        .is_some_and(|(text, target)| {
+            method.as_slice() == settings.uplink_method.as_bytes()
+                && crate::xhttp::extract_meta(text, target, settings)
+                    .1
+                    .is_none()
+        });
+    let upload = if windowed {
+        crate::xhttp::Upload::Window(Box::new(reader))
+    } else {
+        crate::xhttp::Upload::Read(reader)
+    };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
-            reader,
+            upload,
             writer,
             &settings,
             Some(h2out.clone()),
