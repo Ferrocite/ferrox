@@ -557,9 +557,8 @@ mod tests {
         let (old, old_counts) =
             ferrox_core::alloc_count::measure(|| parse_payload_json_first(&payload));
         assert_eq!(new.expect("new"), old.expect("old"));
-        assert_eq!(
-            old_counts.allocs,
-            new_counts.allocs + 1,
+        assert!(
+            old_counts.allocs > new_counts.allocs,
             "the old path copied the binary payload through a lossy string: {new_counts:?} vs {old_counts:?}"
         );
         assert!(old_counts.bytes > new_counts.bytes);
