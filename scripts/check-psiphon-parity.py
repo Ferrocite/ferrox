@@ -76,10 +76,8 @@ def without_comment(line, in_block):
     return "".join(out), in_block
 
 
-def brace_delta(line):
+def brace_delta(line, quote=None, escaped=False):
     delta = 0
-    quote = None
-    escaped = False
     for char in line:
         if quote is not None:
             if escaped:
@@ -95,7 +93,7 @@ def brace_delta(line):
             delta += 1
         elif char == "}":
             delta -= 1
-    return delta
+    return delta, quote, escaped
 
 
 def upstream_fields(root):
@@ -162,11 +160,14 @@ def upstream_fields(root):
     fields = []
     depth = 0
     in_block = False
+    quote = None
+    escaped = False
     for line in body.splitlines():
         line, in_block = without_comment(line, in_block)
         line = line.strip()
         top = depth == 0
-        depth += brace_delta(line)
+        delta, quote, escaped = brace_delta(line, quote, escaped)
+        depth += delta
         if not top or not line:
             continue
         match = re.match(r"^([A-Z]\w*)\s+[^`]*(?:`([^`]*)`)?", line)
@@ -488,10 +489,14 @@ def selftest():
                 "\t// {\n"
                 "\tE bool\n"
                 "\t/* } */ F string `json:\"-\"`\n"
+                "\tG string `json:\"g\" {\n"
+                "}\n"
+                "`\n"
+                "\tH string `json:\",omitempty\"`\n"
                 "}\n"
             )
         fails, _ = run_check(root)
-        if not any("unclassified upstream field(s): D, E" in line
+        if not any("unclassified upstream field(s): D, E, H" in line
                    for line in fails):
             print("check-psiphon-parity: self-test untagged field still passes")
             return 1
