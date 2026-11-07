@@ -39,16 +39,14 @@ def between(text, begin, end, fails, label):
     return text[start + len(begin):stop]
 
 
-def without_comment(line, in_block):
+def without_comment(line, in_block, quote=None, escaped=False):
     out = []
-    quote = None
-    escaped = False
     index = 0
     while index < len(line):
         if in_block:
             end = line.find("*/", index)
             if end < 0:
-                return "".join(out), True
+                return "".join(out), True, quote, escaped
             index = end + 2
             in_block = False
             continue
@@ -73,7 +71,7 @@ def without_comment(line, in_block):
         else:
             out.append(char)
         index += 1
-    return "".join(out), in_block
+    return "".join(out), in_block, quote, escaped
 
 
 def brace_delta(line, quote=None, escaped=False):
@@ -163,10 +161,13 @@ def upstream_fields(root):
     quote = None
     escaped = False
     for line in body.splitlines():
-        line, in_block = without_comment(line, in_block)
+        start_quote, start_escaped = quote, escaped
+        line, in_block, quote, escaped = without_comment(
+            line, in_block, quote, escaped
+        )
         line = line.strip()
         top = depth == 0
-        delta, quote, escaped = brace_delta(line, quote, escaped)
+        delta, _, _ = brace_delta(line, start_quote, start_escaped)
         depth += delta
         if not top or not line:
             continue
@@ -490,18 +491,25 @@ def selftest():
                 "\tE bool\n"
                 "\t/* } */ F string `json:\"-\"`\n"
                 "\tG string `json:\"g\" {\n"
-                "}\n"
+                "// } {\n"
                 "`\n"
                 "\tH string `json:\",omitempty\"`\n"
+                "\tNested struct {\n"
+                "\t\tInner string `json:\"inner\"`\n"
+                "\t}\n"
+                "\tK string `json:\",omitempty\"`\n"
                 "}\n"
             )
         fails, _ = run_check(root)
-        if not any("unclassified upstream field(s): D, E, G, H" in line
+        if not any("unclassified upstream field(s): D, E, G, H, K" in line
                    for line in fails):
             print("check-psiphon-parity: self-test untagged field still passes")
             return 1
         if any("F" in line for line in fails):
             print("check-psiphon-parity: self-test json:\"-\" field is listed")
+            return 1
+        if any("Inner" in line for line in fails):
+            print("check-psiphon-parity: self-test nested field is listed")
             return 1
         print("check-psiphon-parity: self-test passed (ten mutations refused)")
         return 0
