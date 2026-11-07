@@ -70,7 +70,9 @@ pub fn chacha20_poly1305_seal_from(
     state.finish()
 }
 
-/// Seal `src` into `dst`, which may be uninitialized: every byte is written before this returns, so a caller holding spare capacity pays no zeroing pass beside the fill, and no staging copy of the plaintext — the payload register file is read through `xor_chunk_from`, which never writes `src`.
+/// Seal `src` into `dst`, which may be uninitialized. A slice over uninitialized bytes is not a
+/// value, so the destination is zero-filled once before the fused fill; the plaintext is still
+/// read through `xor_chunk_from` and never copied into a separate staging buffer.
 #[must_use]
 pub fn chacha20_poly1305_seal_from_uninit(
     key: &[u8; 32],
@@ -85,9 +87,11 @@ pub fn chacha20_poly1305_seal_from_uninit(
         "the source and the wire are the same message"
     );
     let mut one_time = [0u8; 32];
-    // `fill_exact_with_head_from` writes every wrapped byte through `xor_chunk_from`, so every byte is initialized before this slice is formed.
-    let dst_initialized =
-        unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
+    // SAFETY: write_bytes initializes every byte before the slice exists; the fill overwrites all of them.
+    let dst_initialized = unsafe {
+        std::ptr::write_bytes(dst.as_mut_ptr(), 0, dst.len());
+        std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len())
+    };
     crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst_initialized);
 
     let mut state = Poly1305::new(&one_time);
@@ -167,7 +171,8 @@ mod tests {
             let got = chacha20_poly1305_seal_from(&key, &nonce, aad, &plain, &mut dst);
             assert_eq!(got, want, "tag at length {len}");
             assert_eq!(dst, in_place, "ciphertext at length {len}");
-            let mut uninit = vec![std::mem::MaybeUninit::new(0xa5u8); len];
+            let mut uninit: Vec<std::mem::MaybeUninit<u8>> =
+                (0..len).map(|_| std::mem::MaybeUninit::uninit()).collect();
             let got = chacha20_poly1305_seal_from_uninit(&key, &nonce, aad, &plain, &mut uninit);
             assert_eq!(got, want, "uninit tag at length {len}");
             // SAFETY: seal_from_uninit wrote every byte of the destination.

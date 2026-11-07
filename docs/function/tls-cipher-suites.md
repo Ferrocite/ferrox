@@ -79,16 +79,17 @@ graph TD
 The derivation is byte-identical to `crypto/tls` for every case the oracle reaches. Three lanes
 now carry the result: `rustls` for a TLS 1.3-only list, BoringSSL (already linked for ECH) for
 a TLS 1.2-only list without ECH, and the stock shaped hello for a mixed list, one naming an id
-neither backend carries, or an ECH offer with a TLS 1.2 id. Twenty of the reference's
-twenty-five ids are reachable.
+neither backend carries, or, under a stock fingerprint, an ECH offer with a TLS 1.2 id. Twenty
+of the reference's twenty-five ids are reachable.
 
 - **Nine ids by ring.** `rustls` is built with `tls12`, so the provider is the TLS 1.3 trio
   `0x1301`/`0x1302`/`0x1303` plus ring's six TLS 1.2 AEAD suites `0xc02b`, `0xc02c`, `0xcca9`,
   `0xc02f`, `0xc030`, `0xcca8`. `the_reachable_set_is_the_tls13_trio_and_ring_s_six_tls12_aead_suites`
   reads the provider and asserts both the nine ids and the absence of every CBC and static-RSA
-  one. A dial that names only TLS 1.2 ids rides the legacy lane, or the stock shaped hello when
-  an ECH config is present; both write the reference's field and carry no SCSV
-  (`a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire`); a dial to a
+  one. A dial that names only TLS 1.2 ids rides the legacy lane when no ECH config is present;
+  with ECH it stays on rustls unless a stock fingerprint, or an id neither backend carries,
+  sends it to the stock shaped hello. The legacy and shaped lanes write the reference's field
+  and carry no SCSV (`a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire`); a dial to a
   TLS 1.2 listener still negotiates `0xc02b` (`a_tls12_dial_negotiates_the_configured_suite`),
   and the listener role is pinned by `a_tls_floor_and_suite_reach_the_negotiation`; the other
   five are wired through the same provider and are not each dialled by a test.
@@ -128,10 +129,12 @@ twenty-five ids are reachable.
   `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` to every hello that offers TLS 1.2; Go only ever *reads*
   that id on a server. BoringSSL appends no SCSV, so a TLS 1.2-only dial without an ECH config
   now rides the legacy lane; `a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire`
-  captures that hello and asserts the exact field, with no SCSV. With an ECH config the same
-  list rides the stock shaped hello, which appends the offer in a slot of its own;
-  `an_ech_list_keeps_the_configured_ids_without_an_scsv` captures that field with the CBC id
-  present and no SCSV. Only a TLS 1.3-only list still matches id-for-id on the rustls lane.
+  captures that hello and asserts the exact field, with no SCSV. With an ECH config and a stock
+  fingerprint the same list rides the stock shaped hello, which appends the offer in a slot of
+  its own; without a fingerprint it stays on rustls and its SCSV, so
+  `an_ech_list_keeps_the_configured_ids_without_an_scsv` sets the stock profile and captures
+  that field with the CBC id present and no SCSV. Only a TLS 1.3-only list still matches
+  id-for-id on the rustls lane.
 - **Mixed lists ride the stock shaped hello.** A list that names a TLS 1.3 and a TLS 1.2 id
   cannot use either stock lane: BoringSSL writes its trio first and rustls appends SCSV, so
   neither writes the reference's field. The stock shaped hello writes the derived field
@@ -143,10 +146,11 @@ twenty-five ids are reachable.
   (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`).
 - **One named limit on the shaped split.** A mixed list rides the shaped lane, which keeps no
   session cache, so `enableSessionResumption` does not carry there; it is not a refusal, and the
-  limit is named rather than silent. ECH is no longer a second limit: a dial with an ECH list
-  and a TLS 1.2 id rides the shaped hello, whose slot is appended last and whose offer completes
-  (`an_ech_offer_rides_the_stock_shaped_hello`). An ECH config whose maximum is below TLS 1.3
-  stays on rustls, because ECH needs TLS 1.3; that is the remaining ECH boundary.
+  limit is named rather than silent. ECH is no longer a second limit under a stock fingerprint:
+  a dial with an ECH list and a TLS 1.2 id rides the shaped hello, whose slot is appended last
+  and whose offer completes (`an_ech_offer_rides_the_stock_shaped_hello`). Without a
+  fingerprint the same list stays on rustls, and an ECH config whose maximum is below TLS 1.3
+  also stays there, because ECH needs TLS 1.3; that is the remaining ECH boundary.
 - **Curves carry over.** The three stock groups a `curvePreferences` list can name here map to
   BoringSSL's `P-256`/`P-384`/`X25519`, so the legacy hello keeps the named group order; the
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.

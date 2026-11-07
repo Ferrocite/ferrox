@@ -8,8 +8,10 @@ use crate::psiphon_ssh::{random, Identity, Proxy};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
+use flate2::read::ZlibDecoder;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_VERSION: u8 = 1;
@@ -114,6 +116,62 @@ fn value_to_json(value: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Float(number) => Json::Num(*number),
     }
+}
+
+/// The JSON view of a CBOR tactics payload. The outer map names `Tag`, `Tactics` and
+/// `TacticsCompression` by text or by the reference's integer keys `1`, `2` and `3`; the inner
+/// tactics are zlib-decompressed when the compression field says so.
+pub(crate) fn cbor_tactics_to_json(bytes: &[u8]) -> Option<Json> {
+    let (value, used) = decode(bytes)?;
+    if used != bytes.len() {
+        return None;
+    }
+    let Value::Map(entries) = value else {
+        return None;
+    };
+    let field = |name: &str, key: u64| {
+        entries
+            .iter()
+            .find_map(|(entry_key, value)| match entry_key {
+                Value::Text(text) if text == name => Some(value),
+                Value::UInt(number) if *number == key => Some(value),
+                _ => None,
+            })
+    };
+    let tag = field("Tag", 1)
+        .and_then(Value::text)
+        .unwrap_or("")
+        .to_owned();
+    let Some(tactics) = field("Tactics", 2) else {
+        return Some(Json::Obj(vec![("Tag".to_owned(), Json::Str(tag))]));
+    };
+    let tactics = match tactics {
+        Value::Map(_) => value_to_json(tactics),
+        Value::Bytes(bytes) => tactics_bytes(bytes, field("TacticsCompression", 3))?,
+        Value::Text(text) => tactics_bytes(text.as_bytes(), field("TacticsCompression", 3))?,
+        _ => return None,
+    };
+    Some(Json::Obj(vec![
+        ("Tag".to_owned(), Json::Str(tag)),
+        ("Tactics".to_owned(), tactics),
+    ]))
+}
+
+fn tactics_bytes(bytes: &[u8], compression: Option<&Value>) -> Option<Json> {
+    let compression = compression.and_then(Value::uint).unwrap_or(0);
+    let decoded = match compression {
+        0 => bytes.to_vec(),
+        1 => {
+            let mut out = Vec::new();
+            ZlibDecoder::new(bytes).read_to_end(&mut out).ok()?;
+            out
+        }
+        _ => return None,
+    };
+    std::str::from_utf8(&decoded)
+        .ok()
+        .and_then(|text| crate::json::parse(text).ok())
+        .or_else(|| cbor_to_json(&decoded))
 }
 
 /// A decoded record with its type stripped.
