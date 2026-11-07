@@ -30,7 +30,6 @@ const TICK: Duration = Duration::from_millis(10);
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
 const H3_KEEPALIVE: Duration = Duration::from_secs(10);
 const H2_KEEPALIVE: Duration = Duration::from_secs(45);
-const RETRY: Duration = Duration::from_millis(1);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
@@ -2369,11 +2368,7 @@ fn worker(
         if conn.is_closed() {
             return;
         }
-        let wait = if tunnel.unsent.is_some() {
-            RETRY
-        } else {
-            conn.timeout().unwrap_or(TICK).min(TICK)
-        };
+        let wait = conn.timeout().unwrap_or(TICK).min(TICK);
         match rx.recv_timeout(wait) {
             Ok(Arrival::Datagram(mut bytes, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
@@ -2394,7 +2389,7 @@ fn worker(
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
         }
-        while let Some(packet) = tunnel
+        'packets: while let Some(packet) = tunnel
             .unsent
             .take()
             .or_else(|| tunnel.outgoing.try_recv().ok())
@@ -2402,18 +2397,26 @@ fn worker(
             let Some(stream) = tunnel.stream else {
                 continue;
             };
-            match send_datagram(&mut conn, stream, &packet) {
-                Emission::Queued => {}
-                Emission::Full => {
-                    tunnel.unsent = Some(packet);
-                    break;
-                }
-                Emission::TooLarge(icmp) => {
-                    let _ = shared.packets.send(Packet {
-                        peer: [0u8; 32],
-                        bytes: icmp,
-                        at: 0,
-                    });
+            let mut flushed = false;
+            loop {
+                match send_datagram(&mut conn, stream, &packet) {
+                    Emission::Queued => break,
+                    Emission::TooLarge(icmp) => {
+                        let _ = shared.packets.send(Packet {
+                            peer: [0u8; 32],
+                            bytes: icmp,
+                            at: 0,
+                        });
+                        break;
+                    }
+                    Emission::Full if !flushed => {
+                        quic::flush_egress(&mut conn, &sock);
+                        flushed = true;
+                    }
+                    Emission::Full => {
+                        tunnel.unsent = Some(packet);
+                        break 'packets;
+                    }
                 }
             }
         }
