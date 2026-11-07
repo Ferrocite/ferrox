@@ -96,6 +96,123 @@ impl core::fmt::Debug for Metadata {
     }
 }
 
+impl Metadata {
+    /// Fresh punch metadata from the system RNG: sixteen nonce bytes and thirty-two obfs key bytes.
+    /// `None` only when the system RNG fails, so a dial that cannot be punched under a new nonce
+    /// fails instead of reusing one an earlier punch already answered.
+    #[must_use]
+    pub fn new_random() -> Option<Self> {
+        let mut nonce = [0u8; NONCE_SIZE];
+        let mut obfs = [0u8; OBFS_SIZE];
+        getrandom::fill(&mut nonce).ok()?;
+        getrandom::fill(&mut obfs).ok()?;
+        Some(Self { nonce, obfs })
+    }
+}
+
+/// Hex-encode `bytes` as the rendezvous carries them: lowercase, two digits a byte. One string, no
+/// second hex table beside the tests' own. `hex_encode_into` writes into a caller buffer the same
+/// way, so a header that carries hex pays no string to build one.
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        _ => char::from(b'a' + nibble - 10),
+    }
+}
+
+/// Hex-decode `text` into an exact-size array. One allocation of the target size, or `None` on any
+/// odd or non-hex digit — a rendezvous that names the wrong length is refused, never truncated into
+/// a different nonce or key.
+#[must_use]
+pub fn hex_decode<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, pair) in text.as_bytes().chunks(2).enumerate() {
+        let hi = hex_value(pair[0])?;
+        let lo = hex_value(pair[1])?;
+        out[i] = hi << 4 | lo;
+    }
+    Some(out)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode the `nonce` and `obfs` hex strings a rendezvous names into punch metadata. `None` on any
+/// wrong length or non-hex digit, so a forged metadata never punches under a different nonce or key.
+#[must_use]
+pub fn decode_metadata_hex(nonce_hex: &str, obfs_hex: &str) -> Option<Metadata> {
+    Some(Metadata {
+        nonce: hex_decode(nonce_hex)?,
+        obfs: hex_decode(obfs_hex)?,
+    })
+}
+
+/// The rendezvous of one realm: the HTTP origin it is reached on, the bearer token both ends
+/// present, the slot both ends agree, and the STUN servers that name the publics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// `http` or `https`: the scheme the origin is dialled on.
+    pub scheme: String,
+    /// The rendezvous host as a name or an address.
+    pub host: String,
+    /// The rendezvous port.
+    pub port: u16,
+    /// Bearer token both ends present.
+    pub token: String,
+    /// Slot identifier both ends agree on: the reference's `realm_id`/`ID`.
+    pub id: String,
+    /// STUN servers as `host` or `host:port` strings.
+    pub stun_servers: Vec<String>,
+    /// The address family the punch walks.
+    pub family: Family,
+    /// Port-mapping request, when the config names one.
+    pub port_mapping: Option<PortMapping>,
+}
+
+/// A gateway port-mapping request: the lease the gateway holds and how long the search for it may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Whether the gateway is asked for a mapping at all.
+    pub enabled: bool,
+    /// Seconds the discovery and mapping operations may take.
+    pub timeout: u64,
+    /// Lease lifetime in seconds.
+    pub lifetime: u64,
+}
+
+/// Whether `id` is a realm slot the rendezvous accepts: `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` — the
+/// reference server's check, so a name it would refuse is refused here at parse rather than after a
+/// dial.
+#[must_use]
+pub fn valid_realm_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// The address family a punch may walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Family {
@@ -482,22 +599,22 @@ mod tests {
         let v4_local: SocketAddr = "127.0.0.1:1000".parse().unwrap();
         let v6_local: SocketAddr = "[::1]:1000".parse().unwrap();
         let peers: Vec<SocketAddr> = vec![
-            "1.1.1.1:5000".parse().unwrap(),
+            "192.0.2.11:5000".parse().unwrap(),
             "[2001:db8::1]:5000".parse().unwrap(),
-            "1.1.1.1:5000".parse().unwrap(),
+            "192.0.2.11:5000".parse().unwrap(),
         ];
         assert_eq!(
             candidate_addrs(&[v4_local], &peers, Family::Dual),
-            vec!["1.1.1.1:5000".parse().unwrap()]
+            vec!["192.0.2.11:5000".parse().unwrap()]
         );
         assert_eq!(
             candidate_addrs(&[v4_local, v6_local], &peers, Family::V4),
-            vec!["1.1.1.1:5000".parse().unwrap()]
+            vec!["192.0.2.11:5000".parse().unwrap()]
         );
         assert_eq!(
             candidate_addrs(&[v4_local, v6_local], &peers, Family::Dual),
             vec![
-                "1.1.1.1:5000".parse().unwrap(),
+                "192.0.2.11:5000".parse().unwrap(),
                 "[2001:db8::1]:5000".parse().unwrap()
             ]
         );
@@ -512,22 +629,22 @@ mod tests {
     #[test]
     fn a_symmetric_nat_group_is_interpolated_through_its_extra_ports() {
         let two: Vec<SocketAddr> = vec![
-            "1.2.3.4:30000".parse().unwrap(),
-            "1.2.3.4:30002".parse().unwrap(),
+            "192.0.2.4:30000".parse().unwrap(),
+            "192.0.2.4:30002".parse().unwrap(),
         ];
         let expanded = expand_symmetric(&two);
         for port in [30000u16, 30001, 30002, 30006] {
             assert!(
                 expanded.contains(&SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                    IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 4)),
                     port
                 )),
                 "port {port} joins the walk"
             );
         }
         let sparse: Vec<SocketAddr> = vec![
-            "1.2.3.4:30000".parse().unwrap(),
-            "1.2.3.4:30100".parse().unwrap(),
+            "192.0.2.4:30000".parse().unwrap(),
+            "192.0.2.4:30100".parse().unwrap(),
         ];
         assert_eq!(
             expand_symmetric(&sparse).len(),
@@ -541,14 +658,44 @@ mod tests {
         );
     }
 
+    /// Hex carries the metadata the rendezvous names: sixteen nonce bytes and thirty-two obfs bytes
+    /// round-trip through lowercase hex, and a wrong length or a non-hex digit is refused.
+    #[test]
+    fn metadata_hex_round_trips_and_refuses_wrong_lengths() {
+        let nonce_hex = hex_encode(&NONCE);
+        let obfs_hex = hex_encode(&OBFS);
+        assert_eq!(nonce_hex.len(), NONCE_SIZE * 2);
+        assert_eq!(obfs_hex.len(), OBFS_SIZE * 2);
+        let decoded = decode_metadata_hex(&nonce_hex, &obfs_hex).expect("the hex agrees");
+        assert_eq!(decoded.nonce, NONCE);
+        assert_eq!(decoded.obfs, OBFS);
+        assert!(decode_metadata_hex("00", &obfs_hex).is_none());
+        assert!(decode_metadata_hex(&nonce_hex, "zz").is_none());
+        let random = Metadata::new_random().expect("rng");
+        let hex = hex_encode(&random.nonce);
+        assert_eq!(hex_decode::<NONCE_SIZE>(&hex), Some(random.nonce));
+    }
+
+    /// The realm slot the server admits is the reference's pattern: one alphanum-
+    /// er, then alphanumerics, `-` and `_` to sixty-four in total.
+    #[test]
+    fn a_realm_id_answers_as_the_server_admits_it() {
+        assert!(valid_realm_id("a"));
+        assert!(valid_realm_id("Realm-1_ok"));
+        assert!(!valid_realm_id(""));
+        assert!(!valid_realm_id("-lead"));
+        assert!(!valid_realm_id("has space"));
+        assert!(!valid_realm_id(&"a".repeat(65)));
+    }
+
     /// The expansion is the candidates' sorted distinct set: its base lies in the sorted order the
     /// punch walks, never duplicated and never out of order.
     #[test]
     fn an_expanded_set_is_sorted_and_distinct() {
         let two: Vec<SocketAddr> = vec![
-            "1.2.3.4:30002".parse().unwrap(),
-            "1.2.3.4:30000".parse().unwrap(),
-            "1.2.3.4:30002".parse().unwrap(),
+            "192.0.2.4:30002".parse().unwrap(),
+            "192.0.2.4:30000".parse().unwrap(),
+            "192.0.2.4:30002".parse().unwrap(),
         ];
         let expanded = expand_symmetric(&two);
         assert!(expanded.is_sorted(), "the walk is ascending");

@@ -244,6 +244,9 @@ pub struct Config {
     pub udp_idle: u64,
     /// The reference's `finalmask.quicParams`, when the stream carried one.
     pub quic: Option<QuicParams>,
+    /// The realm rendezvous this dial knocks through STUN and punch first, or
+    /// `None` for a direct dial to the configured address.
+    pub realm: Option<Box<crate::realm::Config>>,
 }
 
 impl Default for Config {
@@ -257,6 +260,7 @@ impl Default for Config {
             gecko: None,
             udp_idle: 60,
             quic: None,
+            realm: None,
         }
     }
 }

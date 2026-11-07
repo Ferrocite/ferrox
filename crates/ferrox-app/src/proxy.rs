@@ -1044,6 +1044,7 @@ fn serve_hysteria_thread(
         serve,
         std::time::Duration::from_secs(config.udp_idle),
         config.quic.as_ref(),
+        config.realm.as_deref(),
     );
 }
 
@@ -11207,6 +11208,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         serve_hysteria_flow(flow, freedom);
     });
     let masq = crate::config::masquerade_from_stream(Some(stream));
+    let realm = crate::config::hysteria_realm_for_stream(Some(stream), hy).unwrap_or(None);
     thread::spawn(move || {
         crate::hysteria::serve_loop(
             &owned,
@@ -11218,6 +11220,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
             &serve,
             udp_idle,
             quic.as_ref(),
+            realm.as_ref(),
         );
     });
     true
@@ -12931,6 +12934,7 @@ fn serve_vmess_hysteria_inbound(
             &serve,
             std::time::Duration::from_secs(config.udp_idle),
             config.quic.as_ref(),
+            config.realm.as_deref(),
         );
     });
     true
@@ -59760,6 +59764,7 @@ mod tests {
                 &masq,
                 &serve,
                 std::time::Duration::from_secs(60),
+                None,
                 None,
             );
         });
