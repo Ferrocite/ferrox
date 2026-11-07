@@ -1430,6 +1430,15 @@ mod tests {
     }
 
     #[test]
+    /// A nested repeat that emits nothing is refused by the work budget.
+    fn a_nested_empty_repeat_is_refused() {
+        let pattern = super::Node::parse(b"(((^){4096}){4096}){4096}").expect("pattern");
+        let mut out = Vec::new();
+        let mut work = 0;
+        assert!(super::generate(&pattern, &mut out, &mut work).is_err());
+    }
+
+    #[test]
     /// An undefined scope falls back to the empty scope, while an empty one selects nothing.
     fn a_transform_scope_selects_or_refuses() {
         let transforms = super::Transforms::new(
