@@ -864,6 +864,7 @@ wireguard reassembly-set-cap 1024 ferrox-app-wg-stack::tests::a_flood_of_first_f
 wireguard reassembly-peer-set-cap 64 ferrox-app-wg-stack::tests::one_peers_fragments_do_not_evict_anothers
 wireguard reassembly-peer-byte-cap 524288 ferrox-app-wg-stack::tests::a_peer_cannot_take_the_whole_reassembly_byte_budget
 wireguard reassembly-range-cap 256 ferrox-app-wg-stack::tests::range_metadata_is_bounded
+wireguard range-merge-allocations 0 ferrox-app-wg-stack::tests::merging_fragment_ranges_reuses_the_list
 wireguard reassembly-byte-cap 8388608 ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap
 wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
@@ -925,6 +926,7 @@ carrier-psiphon relay-staging-copies-per-byte UNBLESSED not measured
 carrier-psiphon download-staging-copies-per-byte 0 ferrox-app-psiphon-ssh::tests::a_channel_chunk_is_the_packet_allocation
 carrier-psiphon ss-vectored-write-extra-buffers 0 ferrox-app-psiphon-shadowsocks::tests::a_vectored_write_allocates_only_the_wire_buffer
 carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
+carrier-psiphon affinity-lookup-allocations 0 ferrox-app-psiphon::tests::an_affinity_lookup_does_not_format_each_entry
 carrier-psiphon ss-direct-write-probe-ops 47483770 scripts/count-ops.sh
 carrier-psiphon ss-flatten-write-probe-ops 47621538 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh

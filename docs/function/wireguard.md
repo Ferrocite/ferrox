@@ -60,6 +60,7 @@ graph TD
 | reassembly-peer-set-cap | 64 | ferrox-app-wg-stack::tests::one_peers_fragments_do_not_evict_anothers |
 | reassembly-peer-byte-cap | 524288 | ferrox-app-wg-stack::tests::a_peer_cannot_take_the_whole_reassembly_byte_budget |
 | reassembly-range-cap | 256 | ferrox-app-wg-stack::tests::range_metadata_is_bounded |
+| range-merge-allocations | 0 | ferrox-app-wg-stack::tests::merging_fragment_ranges_reuses_the_list |
 | reassembly-byte-cap | 8388608 | ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap |
 | large-segment-fragments | 4 | ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles |
 | ipv4-fragment-round-trips | 1 | ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles |
@@ -112,6 +113,8 @@ Zero extra copies on the stack send path. Every producer reserves the 16-byte tr
 ## What we removed
 
 The per-packet peer-by-peer longest-prefix scan. The client's outbound lookup and the server's source-owner check now walk one bit trie per family, so a packet costs at most 32 or 128 bit steps instead of one full scan of every peer's allowed list. The scan remains below the chosen 32/128-prefix thresholds, and the table preserves the scan's deepest-prefix choice and its last-peer tie. The iptables control plane. The upstream kernel-mode work installs mangle rules, toggles `src_valid_mark`, and vendors an iptables runner; this tree writes route and generic netlink only, uses a private table with `SO_MARK` on the inner sockets, and adds an `iif` rule so the reverse-path lookup stays on the link. No firewall chain, global sysctl or `SO_BINDTODEVICE` is touched, and the link, table and rules are removed on drop. The host resolver for a client name is also gone: the query rides the tunnel against `remoteDNS`, so the name and the answer are not visible to the host's resolver. The reserved bytes are handled in one place — after the MACs are computed, before any parse, and put back when a record is refused — so the WARP form and the vanilla form are the same code path rather than two.
+
+The second list every fragment merge built. `merge_ranges` now compacts the sorted range list where it lies, so the merge step itself allocates nothing; payload growth and range-list growth may still allocate during `Reassembly::accept`, but not for the merge. `merging_fragment_ranges_reuses_the_list` measures the old second list at one allocation and the in-place pass at zero over the same ranges. The peer-scoped byte and set counts are now a table keyed by peer, so `peer_usage` is one lookup instead of a scan of every incomplete set; `the_peer_table_agrees_with_the_sets` checks the table against the sets it summarizes.
 
 The per-datagram frame on the server datagram lane. Its head is now the lane's reused buffer and its payload is the second iovec of one `sendmsg`, so the relay gets the SOCKS frame without a new `Vec` and without copying the inner payload into it; on Windows the connected lane's `WSASend` does the same. The client lane still builds its reply frame in the buffer it already reused.
 
