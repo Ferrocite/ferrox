@@ -789,7 +789,8 @@ impl Aes128Gcm {
             },
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(e) => unsafe {
-                e.seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
+                e.engine
+                    .seal_from_uninit(nonce, aad, src, dst.as_mut_ptr().cast())
             },
             Inner::Crate(_) => {
                 for (d, s) in dst.iter_mut().zip(src) {
