@@ -773,6 +773,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: false,
+            large_segments: false,
             dns: Vec::new(),
         }
     }

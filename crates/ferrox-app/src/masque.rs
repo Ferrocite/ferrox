@@ -219,6 +219,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         alive,
         move |from_tunnel, to_stack, routes| {
@@ -286,6 +287,7 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
@@ -311,6 +313,7 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
@@ -333,6 +336,7 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     Ok(assemble(
         addresses,
         mtu,
+        spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
         move |from_tunnel, to_stack, routes| {
@@ -365,6 +369,7 @@ fn resolve_edge(spec: &ClientSpec) -> Result<SocketAddr, String> {
 fn assemble(
     addresses: Vec<IpAddr>,
     mtu: usize,
+    large_segments: bool,
     initial: Vec<Vec<u8>>,
     alive: Arc<AtomicBool>,
     run: impl FnOnce(Receiver<Vec<u8>>, Sender<Packet>, UdpRoutes) + Send + 'static,
@@ -377,6 +382,7 @@ fn assemble(
         reserved: [0u8; 3],
         is_client: Some(true),
         no_kernel_tun: true,
+        large_segments,
         dns: Vec::new(),
     });
     let (packets_tx, packets_rx) = mpsc::channel();
@@ -385,6 +391,7 @@ fn assemble(
     let routes: UdpRoutes = Arc::default();
     let stack_config = Arc::clone(&config);
     let stack_tunnel = to_tunnel.clone();
+    let stack_routes = Arc::clone(&routes);
     std::thread::spawn(move || {
         wg_stack::client(
             (*stack_config).clone(),
@@ -392,6 +399,7 @@ fn assemble(
             packets_rx,
             flow_rx,
             0,
+            stack_routes,
             None,
         );
     });
@@ -435,6 +443,7 @@ struct ClientSpec {
     remote_dns: Vec<IpAddr>,
     warp: Option<Warp>,
     keepalive: Option<i64>,
+    large_segments: bool,
 }
 
 impl ClientSpec {
@@ -516,6 +525,10 @@ impl ClientSpec {
         credentials(user, pass, &mut headers)?;
         let keepalive = keepalive(transport)?;
         let remote_dns = remote_dns(settings)?;
+        let large_segments = settings
+            .get("largeSegments")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         Ok(Self {
             address,
             port,
@@ -526,6 +539,7 @@ impl ClientSpec {
             remote_dns,
             warp,
             keepalive,
+            large_segments,
         })
     }
 
@@ -1562,6 +1576,9 @@ enum Delivery {
 }
 
 fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
+    if wg_stack::ipv4_fragment(packet) {
+        return Some(Delivery::Stack);
+    }
     if let Some(datagram) = connectip::udp_from_packet(packet) {
         if !datagram.verified {
             return None;
@@ -1573,7 +1590,7 @@ fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
             .cloned()
             .map(Delivery::Udp);
     }
-    (wg_stack::inner_protocol(packet) == Some(6)).then_some(Delivery::Stack)
+    wg_stack::stack_packet(packet).then_some(Delivery::Stack)
 }
 
 pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
@@ -1760,6 +1777,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         reserved: [0u8; 3],
         is_client: Some(false),
         no_kernel_tun: true,
+        large_segments: false,
         dns: Vec::new(),
     };
     let stack_out = out.clone();
@@ -1806,6 +1824,7 @@ fn serve_cleartext_inbound(
         reserved: [0u8; 3],
         is_client: Some(false),
         no_kernel_tun: true,
+        large_segments: false,
         dns: Vec::new(),
     };
     let stack_out = out.clone();
@@ -2911,6 +2930,7 @@ mod tests {
         let inner = assemble(
             Vec::new(),
             DEFAULT_MTU,
+            false,
             Vec::new(),
             Arc::new(AtomicBool::new(true)),
             move |from_tunnel, _to_stack, _routes| {
@@ -2979,6 +2999,7 @@ mod tests {
             remote_dns: Vec::new(),
             warp: None,
             keepalive: None,
+            large_segments: false,
         };
         let mut config = client_config(&spec).expect("config");
         let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
@@ -3070,6 +3091,21 @@ mod tests {
         packet[9] = 17;
         packet[12..16].copy_from_slice(&source);
         packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    fn ipv6_fragment() -> Vec<u8> {
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8u16.to_be_bytes());
+        packet[6] = 44;
+        packet[7] = 64;
+        packet[8..24]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        packet[24..40]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        packet[40] = 6;
+        packet[42..44].copy_from_slice(&1u16.to_be_bytes());
         packet
     }
 
@@ -3210,6 +3246,55 @@ mod tests {
             capacity,
             "the buffer did not grow on its way to the stack"
         );
+    }
+
+    /// A first IPv4 UDP fragment goes to the stack, not the datagram lane.
+    #[test]
+    fn an_ipv4_udp_fragment_reaches_the_stack() {
+        let (to_stack, stack_rx) = mpsc::channel();
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let payload = vec![0x5a; 3000];
+        let datagram = connectip::UdpDatagram {
+            source: &[10, 14, 0, 2],
+            destination: &[192, 0, 2, 1],
+            source_port: 1234,
+            destination_port: 4321,
+            payload: &payload,
+        };
+        let mut packet = Vec::new();
+        assert!(connectip::udp_datagram(&datagram, &mut packet));
+        let piece = 1_344usize - 20;
+        packet[2..4].copy_from_slice(&((20 + piece) as u16).to_be_bytes());
+        packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        packet[10..12].fill(0);
+        let header = ferrox_core::foxy::connectip::ipv4_checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header.to_be_bytes());
+        packet.truncate(20 + piece);
+        deliver(&to_stack, &routes, &packet);
+        let delivered = stack_rx.recv().expect("the fragment reaches the stack");
+        assert_eq!(delivered.bytes, packet);
+        let mut later = packet.clone();
+        later[6..8].copy_from_slice(&((piece / 8) as u16).to_be_bytes());
+        deliver(&to_stack, &routes, &later);
+        let delivered = stack_rx.recv().expect("a later fragment reaches the stack");
+        assert_eq!(delivered.bytes, later);
+    }
+
+    #[test]
+    fn an_ipv6_fragment_reaches_the_stack() {
+        let (to_stack, stack_rx) = mpsc::channel();
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let packet = ipv6_fragment();
+        deliver(&to_stack, &routes, &packet);
+        let delivered = stack_rx.recv().expect("delivered");
+        assert_eq!(delivered.bytes, packet);
+        let mut datagram = Vec::with_capacity(3 + packet.len());
+        connectip::datagram_prefix(4, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let offset = datagram.len() - packet.len();
+        deliver_owned(&to_stack, &routes, datagram, offset);
+        let delivered = stack_rx.recv().expect("delivered from its datagram");
+        assert_eq!(delivered.bytes, packet);
     }
 
     #[test]
@@ -3863,6 +3948,22 @@ mod tests {
         assert_eq!(server.path, "/masque/ip&target=*&ipproto=*");
     }
 
+    /// `largeSegments` is off unless the outbound names it.
+    #[test]
+    fn large_segments_are_opt_in_for_masque() {
+        let plain = ClientSpec::from(&outbound(8443)).expect("the default spec");
+        assert!(!plain.large_segments);
+        let opted = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443,"largeSegments":true},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the opted outbound");
+        assert!(
+            ClientSpec::from(&opted)
+                .expect("the opted spec")
+                .large_segments
+        );
+    }
+
     #[test]
     fn the_reference_keepalive_period_reaches_the_carrier() {
         let plain = crate::json::parse(
@@ -4127,6 +4228,7 @@ mod tests {
             remote_dns: Vec::new(),
             warp: None,
             keepalive: None,
+            large_segments: false,
         };
         let mut client_config = client_config(&spec).expect("client config");
         let server_lane = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));

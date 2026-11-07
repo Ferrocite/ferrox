@@ -265,6 +265,7 @@ impl WireGuardOut {
         });
         let stack_config = config.clone();
         let stack_tunnel = to_tunnel.clone();
+        let stack_routes = Arc::clone(&routes);
         std::thread::spawn(move || {
             wg_stack::client(
                 stack_config,
@@ -272,6 +273,7 @@ impl WireGuardOut {
                 packets_rx,
                 flow_rx,
                 WG_HEADER_SIZE,
+                stack_routes,
                 Some(recycle),
             );
         });
@@ -1572,6 +1574,7 @@ impl ReceiveBatch {
         } else if buffer.len() > self.slot {
             buffer.truncate(self.slot);
         }
+        buffer.shrink_to(self.slot);
         self.spare.push(buffer);
     }
 
@@ -1734,24 +1737,26 @@ fn deliver_data(
         return;
     }
     if let Some(routes) = routes {
-        if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
-            .map(|datagram| datagram.destination_port)
-        {
-            if let Ok(table) = routes.lock() {
-                if let Some(lane) = table.get(&port) {
-                    let payload = if at == 0 {
-                        inner
-                    } else {
-                        let payload = inner[at..].to_vec();
-                        recycle_slot(inner, at, recycle);
-                        payload
-                    };
-                    let _ = lane.send(payload);
-                    return;
+        if !wg_stack::ipv4_fragment(&inner[at..]) {
+            if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
+                .map(|datagram| datagram.destination_port)
+            {
+                if let Ok(table) = routes.lock() {
+                    if let Some(lane) = table.get(&port) {
+                        let payload = if at == 0 {
+                            inner
+                        } else {
+                            let payload = inner[at..].to_vec();
+                            recycle_slot(inner, at, recycle);
+                            payload
+                        };
+                        let _ = lane.send(payload);
+                        return;
+                    }
                 }
+                recycle_slot(inner, at, recycle);
+                return;
             }
-            recycle_slot(inner, at, recycle);
-            return;
         }
     }
     let _ = to_stack.send(Packet {
@@ -2387,6 +2392,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let peers = peers(&config, [0; 12]);
@@ -2796,6 +2802,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
@@ -2846,6 +2853,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::new(config).expect("outbound");
@@ -2868,6 +2876,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let (to_tunnel, packets) = mpsc::channel();
@@ -3047,6 +3056,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let peers = peers(&config, [0; 12]);
@@ -3171,6 +3181,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(true),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let socket = bind_socket(&config).expect("dual-stack socket");
@@ -3346,6 +3357,7 @@ mod tests {
             reserved: [0; 3],
             is_client: Some(false),
             no_kernel_tun: true,
+            large_segments: false,
             dns: Vec::new(),
         };
         let server = UdpSocket::bind("127.0.0.1:0").expect("server");
