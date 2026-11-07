@@ -18,6 +18,7 @@ const MAX_REPLY: usize = 4096;
 const CACHE_LIMIT: usize = 4096;
 const REPEAT_MAX: usize = 4096;
 const REPLACEMENT_MAX: usize = 65_536;
+const EXPANSION_MAX: usize = 65_536;
 
 #[derive(Clone, Debug)]
 struct CacheEntry {
@@ -362,7 +363,11 @@ impl Parser<'_> {
 }
 
 /// Emit one random expansion of a replacement generator.
-fn generate(node: &Node, out: &mut Vec<u8>) -> Result<(), String> {
+fn generate(node: &Node, out: &mut Vec<u8>, work: &mut usize) -> Result<(), String> {
+    *work = work.saturating_add(1);
+    if *work > EXPANSION_MAX {
+        return Err("replacement too complex".to_owned());
+    }
     match node {
         Node::Literal(bytes) => {
             for byte in bytes {
@@ -388,7 +393,7 @@ fn generate(node: &Node, out: &mut Vec<u8>) -> Result<(), String> {
         Node::Any => push(out, crate::psiphon_ssh::random::<1>()[0])?,
         Node::Concat(nodes) => {
             for child in nodes {
-                generate(child, out)?;
+                generate(child, out, work)?;
             }
         }
         Node::Alternate(branches) => {
@@ -396,13 +401,17 @@ fn generate(node: &Node, out: &mut Vec<u8>) -> Result<(), String> {
                 u64::try_from(branches.len()).unwrap_or(u64::MAX),
             ))
             .unwrap_or(0);
-            generate(&branches[index.min(branches.len().saturating_sub(1))], out)?;
+            generate(
+                &branches[index.min(branches.len().saturating_sub(1))],
+                out,
+                work,
+            )?;
         }
         Node::Repeat(child, min, max) => {
             let span = u64::try_from(max.saturating_sub(*min)).unwrap_or(0) + 1;
             let count = min.saturating_add(usize::try_from(random_below(span)).unwrap_or(0));
             for _ in 0..count {
-                generate(child, out)?;
+                generate(child, out, work)?;
             }
         }
     }
@@ -479,7 +488,8 @@ fn apply_transform(transforms: &[Transform], packet: &[u8]) -> io::Result<Vec<u8
     let mut value = hex_encode(packet).into_bytes();
     for transform in transforms {
         let mut replacement = Vec::new();
-        generate(&transform.replacement, &mut replacement).map_err(|why| {
+        let mut work = 0;
+        generate(&transform.replacement, &mut replacement, &mut work).map_err(|why| {
             io::Error::new(io::ErrorKind::InvalidData, format!("DNS transform: {why}"))
         })?;
         value = transform
@@ -792,7 +802,13 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
             } else {
                 None
             };
-            match query(&name, *server, config, use_transform, must_match) {
+            match query(
+                &name,
+                *server,
+                config,
+                use_transform,
+                first_attempt && must_match,
+            ) {
                 Ok((addresses, ttl)) if !addresses.is_empty() => {
                     config.cache_put(&name, addresses.clone(), ttl);
                     return Ok(with_port(addresses, port));
