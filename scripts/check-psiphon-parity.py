@@ -496,7 +496,7 @@ def selftest():
                 "}\n"
             )
         fails, _ = run_check(root)
-        if not any("unclassified upstream field(s): D, E, H" in line
+        if not any("unclassified upstream field(s): D, E, G, H" in line
                    for line in fails):
             print("check-psiphon-parity: self-test untagged field still passes")
             return 1
