@@ -2138,6 +2138,30 @@ impl Settings {
                 .clamp(0.0, 1.0),
             shadowsocks_prefix: shadowsocks_prefix(settings),
             ossh_prefix: ossh_prefix(settings),
+            ossh_seed_transform: protocol_transforms(
+                settings,
+                "OSSHObfuscatorSeedTransformProbability",
+                "OSSHObfuscatorSeedTransformSpecs",
+                "OSSHObfuscatorSeedTransformScopedSpecNames",
+            ),
+            quic_nonce_transform: protocol_transforms(
+                settings,
+                "ObfuscatedQUICNonceTransformProbability",
+                "ObfuscatedQUICNonceTransformSpecs",
+                "ObfuscatedQUICNonceTransformScopedSpecNames",
+            ),
+            direct_http_transform: protocol_transforms(
+                settings,
+                "DirectHTTPProtocolTransformProbability",
+                "DirectHTTPProtocolTransformSpecs",
+                "DirectHTTPProtocolTransformScopedSpecNames",
+            ),
+            fronted_http_transform: protocol_transforms(
+                settings,
+                "FrontedHTTPProtocolTransformProbability",
+                "FrontedHTTPProtocolTransformSpecs",
+                "FrontedHTTPProtocolTransformScopedSpecNames",
+            ),
             obfuscated_min_padding,
             obfuscated_max_padding,
             meek_alternate_cookie_name: decimal(settings, "MeekAlternateCookieNameProbability")
@@ -2701,10 +2725,11 @@ impl Settings {
 }
 
 /// Read the named DNS protocol transforms from settings.
-fn dns_transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>)> {
-    let Some(Json::Obj(specs)) =
-        raw.and_then(|settings| settings.get("DNSResolverProtocolTransformSpecs"))
-    else {
+fn protocol_transform_specs(
+    raw: Option<&Json>,
+    field: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let Some(Json::Obj(specs)) = raw.and_then(|settings| settings.get(field)) else {
         return Vec::new();
     };
     specs
@@ -2730,11 +2755,9 @@ fn dns_transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>
         .collect()
 }
 
-/// Read the DNS transform scope-to-spec-name mapping from settings.
-fn dns_transform_scopes(raw: Option<&Json>) -> Vec<(String, Vec<String>)> {
-    let Some(Json::Obj(scopes)) =
-        raw.and_then(|settings| settings.get("DNSResolverProtocolTransformScopedSpecNames"))
-    else {
+/// Read a transform scope-to-spec-name mapping from settings.
+fn protocol_transform_scopes(raw: Option<&Json>, field: &str) -> Vec<(String, Vec<String>)> {
+    let Some(Json::Obj(scopes)) = raw.and_then(|settings| settings.get(field)) else {
         return Vec::new();
     };
     scopes
@@ -2751,6 +2774,24 @@ fn dns_transform_scopes(raw: Option<&Json>) -> Vec<(String, Vec<String>)> {
             (scope.clone(), names)
         })
         .collect()
+}
+
+/// One transform family: its probability, compiled specs and scope map.
+fn protocol_transforms(
+    settings: Option<&Json>,
+    probability: &str,
+    specs: &str,
+    scopes: &str,
+) -> crate::psiphon_dns::ProtocolTransforms {
+    crate::psiphon_dns::ProtocolTransforms {
+        probability: decimal(settings, probability)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        transforms: std::sync::Arc::new(crate::psiphon_dns::Transforms::new(
+            protocol_transform_specs(settings, specs),
+            protocol_transform_scopes(settings, scopes),
+        )),
+    }
 }
 
 /// Build the DNS fallback config from the reference's `DNSResolver*` fields.
@@ -2801,8 +2842,8 @@ fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
     config.transforms = Arc::new(crate::psiphon_dns::Transforms::new(
-        dns_transform_specs(raw),
-        dns_transform_scopes(raw),
+        protocol_transform_specs(raw, "DNSResolverProtocolTransformSpecs"),
+        protocol_transform_scopes(raw, "DNSResolverProtocolTransformScopedSpecNames"),
     ));
     config.preresolved_labels = if let Some(Json::Obj(labels)) =
         raw.and_then(|settings| settings.get("DNSResolverPreresolvedIPAddressCIDRs"))
@@ -3657,6 +3698,18 @@ const KNOWN_SETTINGS: &[&str] = &[
     "OSSHPrefixSplitMaxDelayMilliseconds",
     "OSSHPrefixSplitMinDelay",
     "OSSHPrefixSplitMaxDelay",
+    "OSSHObfuscatorSeedTransformProbability",
+    "OSSHObfuscatorSeedTransformScopedSpecNames",
+    "OSSHObfuscatorSeedTransformSpecs",
+    "ObfuscatedQUICNonceTransformProbability",
+    "ObfuscatedQUICNonceTransformScopedSpecNames",
+    "ObfuscatedQUICNonceTransformSpecs",
+    "DirectHTTPProtocolTransformProbability",
+    "DirectHTTPProtocolTransformScopedSpecNames",
+    "DirectHTTPProtocolTransformSpecs",
+    "FrontedHTTPProtocolTransformProbability",
+    "FrontedHTTPProtocolTransformScopedSpecNames",
+    "FrontedHTTPProtocolTransformSpecs",
     "ObfuscatedSSHMinPadding",
     "ObfuscatedSSHMaxPadding",
     "RateLimits",
@@ -9128,6 +9181,96 @@ mod tests {
             settings.tls_shape.shadowsocks_prefix("9000"),
             Some(vec![0x16, 0x03, 0x01])
         );
+    }
+
+    #[test]
+    fn an_ossh_seed_transform_reaches_the_ssh_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"OSSHObfuscatorSeedTransformSpecs":{"p":[["^[0-9a-f]+$","\\x30{32}"]]},"OSSHObfuscatorSeedTransformScopedSpecNames":{"":["p"]},"OSSHObfuscatorSeedTransformProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut seed = [0xab; crate::psiphon_ssh::SEED_LENGTH];
+        settings
+            .tls_shape
+            .ossh_seed(&mut seed)
+            .expect("seed transform");
+        assert_eq!(seed, [0u8; crate::psiphon_ssh::SEED_LENGTH]);
+    }
+
+    #[test]
+    fn an_obfuscated_quic_nonce_transform_keeps_the_nonce_length() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"ObfuscatedQUICNonceTransformSpecs":{"p":[["^[0-9a-f]+$","\\x30{24}"]]},"ObfuscatedQUICNonceTransformScopedSpecNames":{"":["p"]},"ObfuscatedQUICNonceTransformProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let selected = settings
+            .tls_shape
+            .quic_nonce_transform
+            .selected("")
+            .expect("transform");
+        let mut nonce = [0xcd; 12];
+        crate::psiphon_ssh::apply_seed_transform(Some(selected.as_slice()), &mut nonce)
+            .expect("nonce transform");
+        assert_eq!(nonce, [0u8; 12]);
+    }
+
+    #[test]
+    fn a_direct_http_transform_rewrites_the_request_head() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"DirectHTTPProtocolTransformSpecs":{"p":[["^POST","GET"]]},"DirectHTTPProtocolTransformScopedSpecNames":{"":["p"]},"DirectHTTPProtocolTransformProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let selected = settings
+            .tls_shape
+            .http_transform(false, None)
+            .expect("transform");
+        let head = b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let transformed = crate::psiphon_dns::apply_bytes_transform(selected.as_slice(), head)
+            .expect("transform");
+        assert!(transformed.starts_with(b"GET / HTTP/1.1"));
+    }
+
+    #[test]
+    fn a_fronted_http_transform_is_scoped_to_its_provider() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"FrontedHTTPProtocolTransformSpecs":{"p":[["^POST","GET"]]},"FrontedHTTPProtocolTransformScopedSpecNames":{"cdn":["p"]},"FrontedHTTPProtocolTransformProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings
+            .tls_shape
+            .http_transform(true, Some("cdn"))
+            .is_some());
+        assert!(settings
+            .tls_shape
+            .http_transform(true, Some("other"))
+            .is_none());
+        assert!(settings.tls_shape.http_transform(false, None).is_none());
+    }
+
+    #[test]
+    fn a_transform_that_changes_the_seed_length_is_refused() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"OSSHObfuscatorSeedTransformSpecs":{"p":[["^[0-9a-f]+$","\\x30{8}"]]},"OSSHObfuscatorSeedTransformScopedSpecNames":{"":["p"]},"OSSHObfuscatorSeedTransformProbability":1}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut seed = [0xab; crate::psiphon_ssh::SEED_LENGTH];
+        assert!(settings.tls_shape.ossh_seed(&mut seed).is_err());
+        assert_eq!(seed, [0xab; crate::psiphon_ssh::SEED_LENGTH]);
     }
 
     #[test]

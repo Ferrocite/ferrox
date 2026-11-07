@@ -439,6 +439,10 @@ pub(crate) struct TlsShape {
     pub(crate) randomized_probability: f64,
     pub(crate) shadowsocks_prefix: ShadowsocksPrefix,
     pub(crate) ossh_prefix: OsshPrefix,
+    pub(crate) ossh_seed_transform: crate::psiphon_dns::ProtocolTransforms,
+    pub(crate) quic_nonce_transform: crate::psiphon_dns::ProtocolTransforms,
+    pub(crate) direct_http_transform: crate::psiphon_dns::ProtocolTransforms,
+    pub(crate) fronted_http_transform: crate::psiphon_dns::ProtocolTransforms,
     pub(crate) obfuscated_min_padding: usize,
     pub(crate) obfuscated_max_padding: usize,
     pub(crate) fragmentor: crate::psiphon_fragment::Fragmentor,
@@ -472,6 +476,10 @@ impl Default for TlsShape {
             randomized_probability: 0.0,
             shadowsocks_prefix: ShadowsocksPrefix::default(),
             ossh_prefix: OsshPrefix::default(),
+            ossh_seed_transform: crate::psiphon_dns::ProtocolTransforms::default(),
+            quic_nonce_transform: crate::psiphon_dns::ProtocolTransforms::default(),
+            direct_http_transform: crate::psiphon_dns::ProtocolTransforms::default(),
+            fronted_http_transform: crate::psiphon_dns::ProtocolTransforms::default(),
             obfuscated_min_padding: MIN_PADDING,
             obfuscated_max_padding: MAX_PADDING,
             fragmentor: crate::psiphon_fragment::Fragmentor::default(),
@@ -511,6 +519,25 @@ impl TlsShape {
     /// The generated OSSH prefix for one dial, or `None` to write the bare seed message.
     pub(crate) fn ossh_prefix(&self, port: &str, keyword: &str) -> Option<OsshPrefixBytes> {
         self.ossh_prefix.generate(port, keyword)
+    }
+
+    /// Transform the OSSH seed in place before its RC4 keys are derived.
+    pub(crate) fn ossh_seed(&self, seed: &mut [u8; SEED_LENGTH]) -> Result<(), String> {
+        let selected = self.ossh_seed_transform.selected("");
+        apply_seed_transform(selected.as_deref().map(Vec::as_slice), seed)
+    }
+
+    /// The HTTP transform this connection selected, scoped by fronting provider when fronted.
+    pub(crate) fn http_transform(
+        &self,
+        fronted: bool,
+        provider: Option<&str>,
+    ) -> Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>> {
+        if fronted {
+            self.fronted_http_transform.selected(provider.unwrap_or(""))
+        } else {
+            self.direct_http_transform.selected("")
+        }
     }
 
     /// Whether this dial may fragment. An OSSH or Shadowsocks prefix suppresses the
@@ -655,6 +682,23 @@ fn ossh_terminator(keyword: &str, prefix: &[u8]) -> [u8; OSSH_PREFIX_TERMINATOR]
     hkdf.expand(b"client_to_server", &mut terminator)
         .expect("psiphon ssh prefix terminator");
     terminator
+}
+
+/// Apply a selected seed transform in place, refusing a replacement that changes the length.
+pub(crate) fn apply_seed_transform(
+    transforms: Option<&[crate::psiphon_dns::Transform]>,
+    bytes: &mut [u8],
+) -> Result<(), String> {
+    let Some(transforms) = transforms else {
+        return Ok(());
+    };
+    let transformed = crate::psiphon_dns::apply_hex_transform(transforms, bytes)
+        .map_err(|error| format!("psiphon transform: {error}"))?;
+    if transformed.len() != bytes.len() {
+        return Err("psiphon transform: the replacement changed the length".to_owned());
+    }
+    bytes.copy_from_slice(&transformed);
+    Ok(())
 }
 
 /// A uniform split delay in the configured window, or `None` when both ends are zero.
@@ -1377,7 +1421,7 @@ impl Session {
                 let base = destination.base_protocol();
                 let stream = match base {
                     "QUIC-OSSH" => Stream::Quic(crate::psiphon_quic::QuicStream::connect_inproxy(
-                        server, timeout, stream,
+                        server, timeout, stream, shape,
                     )?),
                     "UNFRONTED-MEEK-OSSH"
                     | "UNFRONTED-MEEK-HTTPS-OSSH"
@@ -2354,7 +2398,7 @@ fn direct_stream(
     limit_meek_buffers: bool,
 ) -> Result<(Stream, &'static str), String> {
     if server.quic {
-        let stream = crate::psiphon_quic::QuicStream::connect(server, timeout, proxy)?;
+        let stream = crate::psiphon_quic::QuicStream::connect(server, timeout, proxy, shape)?;
         return Ok((Stream::Quic(stream), "QUIC-OSSH"));
     }
     let address = SocketAddr::new(server.address, server.port);
@@ -2585,7 +2629,8 @@ fn split(
             None => return Err("psiphon ssh: obfuscated entry has no key".to_owned()),
         };
         let prefix = shape.ossh_prefix(&server.port.to_string(), key);
-        let seed = random::<SEED_LENGTH>();
+        let mut seed = random::<SEED_LENGTH>();
+        shape.ossh_seed(&mut seed)?;
         let client = Rc4::new(&derive_key(&seed, key.as_bytes(), b"client_to_server"));
         let remote = Rc4::new(&derive_key(&seed, key.as_bytes(), b"server_to_client"));
         let padding_len = shape.obfuscated_padding();

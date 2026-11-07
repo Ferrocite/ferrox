@@ -44,7 +44,7 @@ enum Node {
 }
 
 #[derive(Clone, Debug)]
-struct Transform {
+pub(crate) struct Transform {
     find: regex::bytes::Regex,
     replacement: Node,
 }
@@ -70,12 +70,12 @@ impl Transforms {
             let mut valid = true;
             for (find, replacement) in transforms {
                 let Ok(find) = regex::bytes::Regex::new(&find) else {
-                    eprintln!("psiphon: ignoring DNS transform {name}: bad regex");
+                    eprintln!("psiphon: ignoring transform {name}: bad regex");
                     valid = false;
                     break;
                 };
                 let Ok(replacement) = Node::parse(replacement.as_bytes()) else {
-                    eprintln!("psiphon: ignoring DNS transform {name}: bad replacement");
+                    eprintln!("psiphon: ignoring transform {name}: bad replacement");
                     valid = false;
                     break;
                 };
@@ -92,7 +92,7 @@ impl Transforms {
                 if compiled.contains_key(&name) {
                     kept.push(name);
                 } else {
-                    eprintln!("psiphon: ignoring DNS transform scope {scope}: undefined {name}");
+                    eprintln!("psiphon: ignoring transform scope {scope}: undefined {name}");
                 }
             }
             scope_map.insert(scope, kept);
@@ -104,7 +104,7 @@ impl Transforms {
     }
 
     /// Pick a spec by scope, falling back to the empty scope.
-    fn select(&self, scope: &str) -> Option<Arc<Vec<Transform>>> {
+    pub(crate) fn select(&self, scope: &str) -> Option<Arc<Vec<Transform>>> {
         let names = if scope.is_empty() {
             self.scoped.get("")?
         } else {
@@ -120,6 +120,23 @@ impl Transforms {
         let index = usize::try_from(random_below(u64::try_from(names.len()).unwrap_or(u64::MAX)))
             .unwrap_or(0);
         self.specs.get(&names[index]).cloned()
+    }
+}
+
+/// A named transform family and the chance one dial selects it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProtocolTransforms {
+    pub(crate) probability: f64,
+    pub(crate) transforms: Arc<Transforms>,
+}
+
+impl ProtocolTransforms {
+    /// The spec this dial selected for a scope, or `None` when its coin missed.
+    pub(crate) fn selected(&self, scope: &str) -> Option<Arc<Vec<Transform>>> {
+        if !coin(self.probability) {
+            return None;
+        }
+        self.transforms.select(scope)
     }
 }
 
@@ -484,13 +501,34 @@ fn expand(replacement: &[u8], captures: &regex::bytes::Captures<'_>) -> Vec<u8> 
 }
 
 /// Apply the configured transforms to a packet through its hex form.
-fn apply_transform(transforms: &[Transform], packet: &[u8]) -> io::Result<Vec<u8>> {
-    let mut value = hex_encode(packet).into_bytes();
+pub(crate) fn apply_hex_transform(transforms: &[Transform], packet: &[u8]) -> io::Result<Vec<u8>> {
+    let value = run_transforms(transforms, hex_encode(packet).into_bytes())?;
+    hex_decode(&value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "psiphon transform produced invalid hex",
+        )
+    })
+}
+
+/// Apply the configured transforms directly to bytes, as the HTTP transformer does.
+pub(crate) fn apply_bytes_transform(
+    transforms: &[Transform],
+    packet: &[u8],
+) -> io::Result<Vec<u8>> {
+    run_transforms(transforms, packet.to_vec())
+}
+
+/// Run each transform in order over one value.
+fn run_transforms(transforms: &[Transform], mut value: Vec<u8>) -> io::Result<Vec<u8>> {
     for transform in transforms {
         let mut replacement = Vec::new();
         let mut work = 0;
         generate(&transform.replacement, &mut replacement, &mut work).map_err(|why| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("DNS transform: {why}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("psiphon transform: {why}"),
+            )
         })?;
         value = transform
             .find
@@ -499,12 +537,7 @@ fn apply_transform(transforms: &[Transform], packet: &[u8]) -> io::Result<Vec<u8
             })
             .into_owned();
     }
-    hex_decode(&value).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS transform produced invalid hex",
-        )
-    })
+    Ok(value)
 }
 
 /// Encode bytes as lowercase hex.
@@ -1031,7 +1064,7 @@ fn query_one(
     let casing = coin(config.qname_casing_probability);
     let (mut request, mut sent_name) = query_packet(id, host, record, edns0, casing)?;
     if let Some(transforms) = transform {
-        request = apply_transform(transforms, &request)?;
+        request = apply_hex_transform(transforms, &request)?;
         sent_name = question_name(&request).map(<[u8]>::to_vec).or(sent_name);
     }
     socket.send(&request)?;
@@ -1426,7 +1459,7 @@ mod tests {
         let replacement = super::Node::parse(r"\$\{2\}\$\{1\}".as_bytes()).expect("pattern");
         let transform = super::Transform { find, replacement };
         let packet =
-            super::apply_transform(&[transform], &[0x12, 0x34, 0xab, 0xcd]).expect("transform");
+            super::apply_hex_transform(&[transform], &[0x12, 0x34, 0xab, 0xcd]).expect("transform");
         assert_eq!(packet, [0x34, 0x12, 0xab, 0xcd]);
     }
 
