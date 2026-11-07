@@ -299,6 +299,8 @@ pub(crate) struct Server {
     pub(crate) tls_obfuscation_key: Option<String>,
     pub(crate) meek_obfuscated_key: Option<String>,
     pub(crate) region: Option<String>,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) fronting_provider_id: Option<String>,
     pub(crate) direct: bool,
     pub(crate) tls: bool,
     pub(crate) tls_port: Option<u16>,
@@ -1257,6 +1259,9 @@ struct Inner {
     requests: Option<Arc<dyn ServerRequests>>,
     server: String,
     protocol: &'static str,
+    provider_id: Option<String>,
+    region: Option<String>,
+    fronting_provider_id: Option<String>,
 }
 
 struct ChannelState {
@@ -1477,6 +1482,9 @@ impl Session {
             requests,
             server: format!("{}:{}", server.host, server.port),
             protocol,
+            provider_id: server.provider_id.clone(),
+            region: server.region.clone(),
+            fronting_provider_id: server.fronting_provider_id.clone(),
         });
         let read_inner = Arc::clone(&inner);
         std::thread::Builder::new()
@@ -1681,6 +1689,21 @@ impl Session {
     #[must_use]
     pub(crate) fn protocol(&self) -> &'static str {
         self.inner.protocol
+    }
+
+    #[must_use]
+    pub(crate) fn provider_id(&self) -> Option<&str> {
+        self.inner.provider_id.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn region(&self) -> Option<&str> {
+        self.inner.region.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn fronting_provider_id(&self) -> Option<&str> {
+        self.inner.fronting_provider_id.as_deref()
     }
 }
 
@@ -3956,6 +3979,9 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         requests: None,
         server: "test".to_owned(),
         protocol: "SSH",
+        provider_id: None,
+        region: None,
+        fronting_provider_id: None,
     });
     let state = Arc::new(ChannelState {
         local: 1,
@@ -4232,6 +4258,9 @@ mod tests {
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4313,6 +4342,9 @@ mod tests {
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4380,6 +4412,9 @@ mod tests {
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
         });
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(ChannelState {
@@ -4472,6 +4507,9 @@ mod tests {
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -4559,6 +4597,9 @@ mod tests {
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
         });
         assert!(matches!(
             dispatch(
@@ -4601,6 +4642,9 @@ mod tests {
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
         });
         let state = Arc::new(ChannelState {
             local: 1,

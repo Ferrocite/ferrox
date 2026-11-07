@@ -87,6 +87,35 @@ impl Value {
     }
 }
 
+/// The JSON view of a CBOR tactics payload; non-text map keys are dropped.
+pub(crate) fn cbor_to_json(bytes: &[u8]) -> Option<Json> {
+    let (value, used) = decode(bytes)?;
+    (used == bytes.len()).then(|| value_to_json(&value))
+}
+
+#[allow(clippy::cast_precision_loss, clippy::match_same_arms)] // tactics counts stay below 2^52
+fn value_to_json(value: &Value) -> Json {
+    match value {
+        Value::UInt(number) => Json::Num(*number as f64),
+        Value::Int(number) => Json::Num(*number as f64),
+        Value::Bytes(bytes) => Json::Str(String::from_utf8_lossy(bytes).into_owned()),
+        Value::Text(text) => Json::Str(text.clone()),
+        Value::Array(items) => Json::Arr(items.iter().map(value_to_json).collect()),
+        Value::Map(entries) => Json::Obj(
+            entries
+                .iter()
+                .filter_map(|(key, value)| match key {
+                    Value::Text(key) => Some((key.clone(), value_to_json(value))),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Value::Bool(value) => Json::Bool(*value),
+        Value::Null => Json::Null,
+        Value::Float(number) => Json::Num(*number),
+    }
+}
+
 /// A decoded record with its type stripped.
 #[derive(Debug, Clone, PartialEq)]
 struct Record {
