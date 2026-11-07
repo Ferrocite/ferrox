@@ -213,9 +213,10 @@ front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_wal
 # difference is a claim about the decode.
 carrier-psiphon  psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else  ferrox_app::psiphon_quic::tests::word_varint_probe
 carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer  ferrox_app::psiphon_quic::tests::byte_varint_probe
-# The same four SSH packet slices sealed 4096 times directly and after the
-# flatten the stream used to make: one ops job reports both frames, and only
-# their difference is a claim about the copy.
+# The same four SSH packet slices sealed 4096 times directly and after
+# flattening: one ops job reports both probe frames. Their difference includes
+# the flatten copy and the effect of passing four slices versus one to the same
+# writer; it is not a measurement of the previous writer.
 carrier-psiphon  psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else  ferrox_app::psiphon_shadowsocks::tests::direct_write_probe
 carrier-psiphon  psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy  ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe
 # The sniff probe's frame is not an exact gate: on the same source it has read

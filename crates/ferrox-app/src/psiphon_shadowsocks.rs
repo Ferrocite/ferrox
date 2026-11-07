@@ -215,10 +215,12 @@ impl Writer {
         self.write_slices(io, &[IoSlice::new(buf)]).map(|_| ())
     }
 
+    /// Seal the caller's slices in one wire write.
     fn write_vectored(&mut self, io: &mut impl Write, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.write_slices(io, bufs)
     }
 
+    /// Seal the slices and latch a failure so later writes fail.
     fn write_slices(&mut self, io: &mut impl Write, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         if self.failed {
             return Err(io::Error::new(
