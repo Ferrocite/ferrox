@@ -56,6 +56,7 @@ pub(crate) struct Meek {
     pub(crate) quic: bool,
     pub(crate) fronted: bool,
     pub(crate) protocol: &'static str,
+    pub(crate) provider_id: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) dns: Vec<SocketAddr>,
     pub(crate) shape: TlsShape,
@@ -66,6 +67,7 @@ pub(crate) fn connect(
     meek: &Meek,
     timeout: Duration,
     proxy: Option<&Proxy>,
+    dns: &crate::psiphon_dns::Config,
     limit_buffer_sizes: bool,
 ) -> Result<TcpStream, String> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -82,13 +84,19 @@ pub(crate) fn connect(
         .map_err(|error| format!("psiphon meek loopback: {error}"))?;
     let config = meek.clone();
     let proxy = proxy.cloned();
+    let dns = dns.clone();
     std::thread::Builder::new()
         .name("psiphon-meek".to_owned())
         .spawn(move || match listener.accept() {
             Ok((socket, _)) => {
-                if let Err(why) =
-                    relay(socket, &config, proxy.as_ref(), timeout, limit_buffer_sizes)
-                {
+                if let Err(why) = relay(
+                    socket,
+                    &config,
+                    proxy.as_ref(),
+                    timeout,
+                    &dns,
+                    limit_buffer_sizes,
+                ) {
                     eprintln!("psiphon: fronted-meek relay: {why}");
                 }
             }
@@ -154,8 +162,10 @@ pub(crate) fn post(
     body: &[u8],
     timeout: Duration,
     proxy: Option<&Proxy>,
+    dns: &crate::psiphon_dns::Config,
 ) -> Result<Vec<u8>, String> {
-    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, path, endpoint)?;
+    let mut http =
+        MeekHttp::new(meek.clone(), proxy.cloned(), timeout, path, endpoint)?.with_dns(dns.clone());
     http.round_trip(body)
 }
 
@@ -199,12 +209,14 @@ fn relay(
     meek: &Meek,
     proxy: Option<&Proxy>,
     timeout: Duration,
+    dns: &crate::psiphon_dns::Config,
     limit_buffer_sizes: bool,
 ) -> Result<(), String> {
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
     let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?
+        .with_dns(dns.clone())
         .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
@@ -286,10 +298,18 @@ fn relay_stream(
     Ok(())
 }
 
+/// A TCP stream with or without the fragmentor beneath TLS.
+enum FragmentOrTcp {
+    Tcp(TcpStream),
+    Fragment(crate::psiphon_fragment::FragmentStream),
+}
+
 /// A plain TCP or TLS stream carrying meek HTTP.
 enum MeekStream {
     Plain(TcpStream),
+    Fragment(crate::psiphon_fragment::FragmentStream),
     Tls(ClientSession<TcpStream>),
+    TlsFragment(ClientSession<crate::psiphon_fragment::FragmentStream>),
     WebRtc(WebRtcStream),
     TlsWebRtc(ClientSession<WebRtcStream>),
     H3(Box<crate::psiphon_h3::H3>),
@@ -300,7 +320,9 @@ impl Read for MeekStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.read(buf),
+            Self::Fragment(stream) => stream.read(buf),
             Self::Tls(stream) => stream.read(buf),
+            Self::TlsFragment(stream) => stream.read(buf),
             Self::WebRtc(stream) => stream.read(buf),
             Self::TlsWebRtc(stream) => stream.read(buf),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
@@ -313,7 +335,9 @@ impl Write for MeekStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.write(buf),
+            Self::Fragment(stream) => stream.write(buf),
             Self::Tls(stream) => stream.write(buf),
+            Self::TlsFragment(stream) => stream.write(buf),
             Self::WebRtc(stream) => stream.write(buf),
             Self::TlsWebRtc(stream) => stream.write(buf),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
@@ -324,7 +348,9 @@ impl Write for MeekStream {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(stream) => stream.flush(),
+            Self::Fragment(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
+            Self::TlsFragment(stream) => stream.flush(),
             Self::WebRtc(stream) => stream.flush(),
             Self::TlsWebRtc(stream) => stream.flush(),
             Self::H3(_) => Ok(()),
@@ -338,7 +364,9 @@ impl MeekStream {
     fn write_parts(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         match self {
             Self::Plain(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
+            Self::Fragment(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
             Self::Tls(stream) => stream.write_all_slices(parts),
+            Self::TlsFragment(stream) => stream.write_all_slices(parts),
             Self::WebRtc(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
             Self::TlsWebRtc(stream) => stream.write_all_slices(parts),
             Self::H3(_) => Err(std::io::Error::other("psiphon h3 is not a byte stream")),
@@ -349,8 +377,11 @@ impl MeekStream {
     fn peer_closed(&self) -> bool {
         let stream = match self {
             Self::Plain(stream) => stream,
+            Self::Fragment(stream) => stream.get_ref(),
             Self::Tls(stream) if stream.closed() => return true,
             Self::Tls(stream) => stream.get_ref(),
+            Self::TlsFragment(stream) if stream.closed() => return true,
+            Self::TlsFragment(stream) => stream.get_ref().get_ref(),
             Self::WebRtc(_) => return false,
             Self::TlsWebRtc(stream) => return stream.closed(),
             Self::H3(h3) => return h3.is_closed(),
@@ -376,6 +407,7 @@ pub(crate) struct MeekHttp {
     alpn_warned: bool,
     preconnected: bool,
     limit_buffer_sizes: bool,
+    dns: crate::psiphon_dns::Config,
 }
 
 impl MeekHttp {
@@ -388,6 +420,7 @@ impl MeekHttp {
         endpoint: Option<&'static str>,
     ) -> Result<Self, String> {
         let cookie = Some(make_cookie(&meek, endpoint)?);
+        let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
             meek,
             proxy,
@@ -399,6 +432,7 @@ impl MeekHttp {
             alpn_warned: false,
             preconnected: false,
             limit_buffer_sizes: false,
+            dns,
         })
     }
 
@@ -409,6 +443,7 @@ impl MeekHttp {
         timeout: Duration,
         path: &'static str,
     ) -> Self {
+        let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Self {
             meek,
             proxy,
@@ -420,6 +455,7 @@ impl MeekHttp {
             alpn_warned: false,
             preconnected: false,
             limit_buffer_sizes: false,
+            dns,
         }
     }
 
@@ -431,6 +467,7 @@ impl MeekHttp {
         stream: MeekStream,
     ) -> Result<Self, String> {
         let cookie = Some(make_cookie(&meek, None)?);
+        let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
             meek,
             proxy: None,
@@ -442,7 +479,14 @@ impl MeekHttp {
             alpn_warned: false,
             preconnected: true,
             limit_buffer_sizes: false,
+            dns,
         })
+    }
+
+    /// Use the lane's resolver knobs and cache instead of a per-client default.
+    pub(crate) fn with_dns(mut self, dns: crate::psiphon_dns::Config) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// Apply `LimitMeekBufferSizes` to both response readers.
@@ -483,6 +527,7 @@ impl MeekHttp {
     }
 
     /// Dial the next front and start a TLS session when required.
+    #[allow(clippy::too_many_lines)]
     fn open(&mut self) -> Result<(), String> {
         if self.preconnected {
             return Err("psiphon meek connection is gone".to_owned());
@@ -499,16 +544,21 @@ impl MeekHttp {
                 self.meek.port,
                 &sni,
                 self.timeout,
-                &self.meek.dns,
+                &self.dns,
             )?;
             self.stream = Some(MeekStream::H3(Box::new(h3)));
             return Ok(());
         }
-        let address = crate::psiphon_dns::resolve(&self.meek.dial, self.meek.port, &self.meek.dns)
-            .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("psiphon meek resolve {}: no address", self.meek.dial))?;
+        let address = crate::psiphon_dns::resolve_fronting(
+            &self.dns,
+            self.meek.provider_id.as_deref(),
+            &self.meek.dial,
+            self.meek.port,
+        )
+        .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("psiphon meek resolve {}: no address", self.meek.dial))?;
         let stream = match &self.proxy {
             Some(proxy) => proxy.connect(address, self.timeout)?,
             None => TcpStream::connect_timeout(&address, self.timeout)
@@ -518,10 +568,26 @@ impl MeekHttp {
             .set_read_timeout(Some(self.timeout))
             .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
             .map_err(|error| format!("psiphon meek socket: {error}"))?;
+        let fragment = self.meek.shape.may_fragment(self.meek.protocol);
         if !self.meek.https {
-            self.stream = Some(MeekStream::Plain(stream));
+            self.stream = Some(if fragment {
+                MeekStream::Fragment(crate::psiphon_fragment::FragmentStream::new(
+                    stream,
+                    self.meek.shape.fragmentor.clone(),
+                ))
+            } else {
+                MeekStream::Plain(stream)
+            });
             return Ok(());
         }
+        let stream = if fragment {
+            FragmentOrTcp::Fragment(crate::psiphon_fragment::FragmentStream::new(
+                stream,
+                self.meek.shape.fragmentor.clone(),
+            ))
+        } else {
+            FragmentOrTcp::Tcp(stream)
+        };
         // The SSH host key authenticates the payload; the fronting certificate is only cover.
         let server_name = if self.meek.disable_sni {
             address.ip().to_string()
@@ -548,11 +614,24 @@ impl MeekHttp {
             padding: self.meek.shape.padding(),
             ..TlsConfig::default()
         };
-        let mut tls = ferrox_core::tls::connect(&config, stream)
-            .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
-        tls.handshake()
-            .map_err(|error| format!("psiphon meek handshake {}: {error}", self.meek.sni))?;
-        self.stream = Some(MeekStream::Tls(tls));
+        match stream {
+            FragmentOrTcp::Tcp(stream) => {
+                let mut tls = ferrox_core::tls::connect(&config, stream)
+                    .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
+                tls.handshake().map_err(|error| {
+                    format!("psiphon meek handshake {}: {error}", self.meek.sni)
+                })?;
+                self.stream = Some(MeekStream::Tls(tls));
+            }
+            FragmentOrTcp::Fragment(stream) => {
+                let mut tls = ferrox_core::tls::connect(&config, stream)
+                    .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
+                tls.handshake().map_err(|error| {
+                    format!("psiphon meek handshake {}: {error}", self.meek.sni)
+                })?;
+                self.stream = Some(MeekStream::TlsFragment(tls));
+            }
+        }
         Ok(())
     }
 
@@ -772,6 +851,7 @@ mod tests {
             protocol: "FRONTED-MEEK-OSSH",
             headers: Vec::new(),
             dns: Vec::new(),
+            provider_id: None,
             shape: TlsShape::default(),
         }
     }
