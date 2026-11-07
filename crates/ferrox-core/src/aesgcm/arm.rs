@@ -358,7 +358,16 @@ fn ctr_ghash8(
         );
         ctr += 8;
     }
-    super::ctr_ghash(rk, h, template, state, &mut buf[done * 16..], tailq, ctr, mask)
+    super::ctr_ghash(
+        rk,
+        h,
+        template,
+        state,
+        &mut buf[done * 16..],
+        tailq,
+        ctr,
+        mask,
+    )
 }
 
 #[inline(always)]
@@ -509,7 +518,16 @@ fn ctr_ghash8_256(
         );
         ctr += 8;
     }
-    super::ctr_ghash_256(rk, h, template, state, &mut buf[done * 16..], tailq, ctr, mask)
+    super::ctr_ghash_256(
+        rk,
+        h,
+        template,
+        state,
+        &mut buf[done * 16..],
+        tailq,
+        ctr,
+        mask,
+    )
 }
 
 #[inline(always)]
@@ -827,7 +845,9 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_from(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask);
+        let state = ctr_ghash8_from(
+            &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
+        );
         super::finish(
             &self.h,
             state,
@@ -858,7 +878,9 @@ impl Engine {
         );
         let state = super::flush(&self.h, state, &mut tailq);
         let state = unsafe {
-            ctr_ghash8_from_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask)
+            ctr_ghash8_from_uninit(
+                &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
+            )
         };
         super::finish(
             &self.h,
@@ -1038,7 +1060,9 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_from_256(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask);
+        let state = ctr_ghash8_from_256(
+            &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
+        );
         super::finish(
             &self.h,
             state,
@@ -1069,7 +1093,9 @@ impl Engine256 {
         );
         let state = super::flush(&self.h, state, &mut tailq);
         let state = unsafe {
-            ctr_ghash8_from_256_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask)
+            ctr_ghash8_from_256_uninit(
+                &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
+            )
         };
         super::finish(
             &self.h,

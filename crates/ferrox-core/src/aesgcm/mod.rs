@@ -606,9 +606,8 @@ pub(crate) unsafe fn seal_impl_from_uninit<V: Lanes>(
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
     // SAFETY: the caller guarantees `dst` has room for every plaintext byte.
-    let state = unsafe {
-        ctr_ghash_from_uninit(rk, h, template, state, src, dst, &mut tailq, 2, mask)
-    };
+    let state =
+        unsafe { ctr_ghash_from_uninit(rk, h, template, state, src, dst, &mut tailq, 2, mask) };
     finish(
         h,
         state,
@@ -1359,9 +1358,8 @@ pub(crate) unsafe fn seal_impl_from_256_uninit<V: Lanes>(
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
     // SAFETY: the caller guarantees `dst` has room for every plaintext byte.
-    let state = unsafe {
-        ctr_ghash_from_256_uninit(rk, h, template, state, src, dst, &mut tailq, 2, mask)
-    };
+    let state =
+        unsafe { ctr_ghash_from_256_uninit(rk, h, template, state, src, dst, &mut tailq, 2, mask) };
     finish(
         h,
         state,

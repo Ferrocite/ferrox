@@ -231,7 +231,16 @@ impl Engine {
                 );
                 ctr += 8;
             }
-            super::ctr_ghash(&self.rk, &self.h, template, state, &mut buf[done..], tailq, ctr, mask)
+            super::ctr_ghash(
+                &self.rk,
+                &self.h,
+                template,
+                state,
+                &mut buf[done..],
+                tailq,
+                ctr,
+                mask,
+            )
         }
     }
 
@@ -436,9 +445,8 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = unsafe {
-            self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq, mask)
-        };
+        let state =
+            unsafe { self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq, mask) };
         super::finish(
             &self.h,
             state,
@@ -784,9 +792,8 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = unsafe {
-            self.ctr_ghash8_from_256_uninit(template, state, src, dst, &mut tailq, mask)
-        };
+        let state =
+            unsafe { self.ctr_ghash8_from_256_uninit(template, state, src, dst, &mut tailq, mask) };
         super::finish(
             &self.h,
             state,
