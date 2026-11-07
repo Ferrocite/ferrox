@@ -50832,6 +50832,85 @@ mod tests {
         );
     }
 
+    /// The benchmark's trojan/`xhttp`/h2 row writes `mode: auto`, which the reference resolves to
+    /// packet-up on a TLS carrier: one GET downlink and a POST stream per packet on the one h2
+    /// connection. The download has to cross the 4 MiB stream window and keep flowing, so a body
+    /// past that window proves both the client's reader and the server's writer replenish it.
+    #[test]
+    fn a_packet_up_trojan_h2_download_crosses_the_stream_window() {
+        const BULK: usize = 16 * 1024 * 1024;
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let key = trojan_key("packet-up-h2-bulk-download");
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds sink");
+        let sink_addr: SocketAddr = sink.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            let chunk = [0x5Au8; 65536];
+            let mut left = BULK;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                stream.write_all(&chunk[..n]).expect("writes the bulk");
+                left -= n;
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut rest = [0u8; 1024];
+            while stream.read(&mut rest).unwrap_or(0) != 0 {}
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            path: "/share".to_owned(),
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        });
+        let server_settings = settings.clone();
+        let serving = Arc::clone(&server_config);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_tls(
+                stream,
+                &[key],
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                true,
+                &serving,
+                None,
+            );
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds downstream");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            dial_socks_outbound(
+                &client,
+                &tls_trojan_out(port, key, Carrier::Xhttp { settings }, client_config),
+                &server,
+                &Destination::from(sink_addr),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut got = 0usize;
+        let mut buf = [0u8; 65536];
+        while got < BULK {
+            let n = sock
+                .read(&mut buf)
+                .expect("the packet-up h2 download must not stall");
+            assert!(n > 0, "the download ended early at {got} of {BULK}");
+            got += n;
+        }
+        assert_eq!(got, BULK);
+    }
+
     #[test]
     fn trojan_over_tls_httpheader_carries_an_echo() {
         let (_, client_config) = carried_tls_configs();
