@@ -2555,6 +2555,9 @@ fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
     let Some(fields) = hpack::qpack_fields(block) else {
         return false;
     };
+    tunnel.buf.drain(..tunnel.at);
+    tunnel.buf.shrink_to_fit();
+    tunnel.at = 0;
     let field = |name: &[u8]| {
         fields
             .iter()
@@ -4238,6 +4241,8 @@ mod tests {
         assert!(parse_head(&mut tunnel, &spec));
         assert!(tunnel.headers);
         assert!(!tunnel.rejected);
+        assert_eq!(tunnel.at, 0);
+        assert!(!tunnel.buf.windows(6).any(|window| window == b"GREASE"));
     }
 
     #[test]
