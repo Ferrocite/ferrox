@@ -4741,6 +4741,19 @@ mod client_tests {
             .expect("lane")
             .send(reply)
             .expect("reply");
+
+        app.send_to(&frame, relay_address).expect("send again");
+        let inner = packets.recv_timeout(LANE_WAIT).unwrap_or_else(|error| {
+            let alive = routes
+                .lock()
+                .is_ok_and(|table| table.contains_key(&source_port));
+            panic!("inner: {error} (lane alive: {alive})");
+        });
+        let datagram = udp_from_packet(&inner).expect("packet");
+        assert_eq!(
+            socket_addr(datagram.destination, 53).expect("target"),
+            winner
+        );
         app.set_read_timeout(Some(Duration::from_millis(150)))
             .expect("timeout");
         assert!(
@@ -4749,14 +4762,6 @@ mod client_tests {
         );
         app.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
-
-        app.send_to(&frame, relay_address).expect("send again");
-        let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
-        let datagram = udp_from_packet(&inner).expect("packet");
-        assert_eq!(
-            socket_addr(datagram.destination, 53).expect("target"),
-            winner
-        );
         assert!(
             packets.recv_timeout(Duration::from_millis(150)).is_err(),
             "a replied lane must not fan the next datagram out"
