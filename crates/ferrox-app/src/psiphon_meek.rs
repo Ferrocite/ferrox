@@ -664,6 +664,9 @@ impl MeekHttp {
                 &self.dns,
             )?;
             self.stream = Some(MeekStream::H3(Box::new(h3)));
+            if self.meek.fronted {
+                self.dns.verify_cache_extension(&self.meek.dial);
+            }
             return Ok(());
         }
         let address = crate::psiphon_dns::resolve_fronting(
@@ -695,6 +698,9 @@ impl MeekHttp {
             } else {
                 MeekStream::Plain(stream)
             });
+            if self.meek.fronted {
+                self.dns.verify_cache_extension(&self.meek.dial);
+            }
             return Ok(());
         }
         let stream = if fragment {
@@ -748,6 +754,9 @@ impl MeekHttp {
                 })?;
                 self.stream = Some(MeekStream::TlsFragment(tls));
             }
+        }
+        if self.meek.fronted {
+            self.dns.verify_cache_extension(&self.meek.dial);
         }
         Ok(())
     }
