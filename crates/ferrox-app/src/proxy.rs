@@ -63425,6 +63425,41 @@ mod tests {
         assert_eq!(&back, b"ping");
     }
 
+    /// The shape `TestSocksWithHttpRequest` dials: the hop's CONNECT reaches a socks
+    /// front, whose first byte is not a greeting, so it serves the request as the http
+    /// front and checks the credential the socks front already holds.
+    #[test]
+    fn a_socks_front_serves_an_http_outbound_that_offers_its_account() {
+        let echo = echo_loop();
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![SocksAccount {
+                user: "Test Account".to_owned(),
+                pass: "Test Password".to_owned(),
+                email: String::new(),
+                level: 0,
+            }],
+        };
+        let upstream = socks_front_with_accounts(freedom(), accounts);
+        let front = socks_front_with(Outbound::Http(HttpOut {
+            address: "127.0.0.1".to_owned(),
+            port: upstream,
+            tls: None,
+            carrier: Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
+            headers: Vec::new(),
+            user: Some("Test Account".to_owned()),
+            pass: Some("Test Password".to_owned()),
+        }));
+        let mut client = socks_tcp_client(front, echo);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
     #[test]
     fn mixed_serves_socks_and_http_on_one_port() {
         let echo_socks = echo_loop();
