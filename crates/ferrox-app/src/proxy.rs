@@ -9381,10 +9381,10 @@ fn relay_vless_reply<S>(
         ReverseAsk::Refused => return,
         ReverseAsk::NotReverse => {}
     }
-    if !vless_flow_ok(user, header.1, header.2, vision) {
+    if !vless_reply_ok(user, header.1, header.2, vision) {
         return;
     }
-    if header.2 == 3 {
+    if header.2 == 2 {
         if !freedom {
             return;
         }
@@ -9415,6 +9415,46 @@ fn relay_vless_reply<S>(
                         Box::new(SharedRead(Arc::clone(&shared))),
                         Box::new(SharedWrite(shared)),
                     )
+                }
+            };
+        serve_udp_stream(reader, writer, &header.3, carried, &close);
+        return;
+    }
+    if header.2 == 3 {
+        if !freedom {
+            return;
+        }
+        if session.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let close = raw
+            .as_ref()
+            .map_or_else(|| Arc::new(|| {}), connection_closer);
+        let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+            if header.1 == Flow::Vision {
+                vision_stream(session, raw, &header.0)
+            } else {
+                match driven_halves(session, RELAY_POLL) {
+                    Ok(Half::Split { read, write }) => (
+                        Box::new(
+                            read.into_inner()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
+                        Box::new(
+                            write
+                                .into_inner()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
+                    ),
+                    Ok(_) => return,
+                    Err(session) => {
+                        let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> =
+                            Arc::new(Mutex::new(Box::new(session)));
+                        (
+                            Box::new(SharedRead(Arc::clone(&shared))),
+                            Box::new(SharedWrite(shared)),
+                        )
+                    }
                 }
             };
         spawn_carried(move || {
@@ -13753,11 +13793,38 @@ fn dial_udp_uplink(
     let header = vless_header(&vless.id, 2, &Destination::from(*dest));
     let (read, write, close, deferred): (Box<dyn Read + Send>, Box<dyn Write + Send>, _, bool) =
         if let Carrier::Raw(_) = &vless.carrier {
-            if vless.reality.is_some() {
-                return None;
-            }
             let uplink = dial_or_report(&server)?.with_mask(mask);
-            if let Some(encryption) = &vless.encryption {
+            if let Some(reality) = vless.reality.as_deref() {
+                let raw = uplink.try_clone().ok()?;
+                let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+                let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+                let mut session =
+                    ferrox_core::tls::RealityClientSession::connect(reality, now, limiter).ok()?;
+                session
+                    .get_ref()
+                    .get_ref()
+                    .set_read_timeout(Some(SESSION_POLL))
+                    .ok()?;
+                raw.set_read_timeout(Some(SESSION_POLL)).ok()?;
+                session.write_all(&header).ok()?;
+                let close = connection_closer(&raw);
+                let (read, write): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                    match driven_halves_answering(session, RELAY_POLL, Arc::new(|| {})) {
+                        Ok(Half::Split { read, write }) => (
+                            Box::new(
+                                read.into_inner()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            ),
+                            Box::new(
+                                write
+                                    .into_inner()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            ),
+                        ),
+                        _ => return None,
+                    };
+                (read, write, close, false)
+            } else if let Some(encryption) = &vless.encryption {
                 let close = connection_closer(&uplink);
                 let mut sealed = match encryption.handshake(uplink) {
                     Ok(sealed) => sealed,
@@ -17453,6 +17520,65 @@ where
     let write = DrivenHalf::new(session, cipher, out);
     let (read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
     Ok(Half::split(read, write))
+}
+
+/// The server's Vision link split into a reader and a writer, so the mux decoder's read never holds
+/// its sibling's seal. A session that cannot be driven keeps the shared shape, armed on both handles.
+fn vision_stream<S>(
+    session: S,
+    raw: Option<Connection>,
+    uuid: &[u8; 16],
+) -> (Box<dyn Read + Send>, Box<dyn Write + Send>)
+where
+    S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
+{
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL) {
+        Ok(vision) => split_stream(vision),
+        Err(session) => {
+            let transport = session.transport();
+            split_stream(Half::shared_armed_capped(
+                crate::vision::Link::new(session, raw, uuid),
+                move |link, grain| {
+                    link.arm_read_timeout(grain)?;
+                    match &transport {
+                        Some(transport) => transport.set_read_timeout(Some(grain)),
+                        None => Ok(()),
+                    }
+                },
+                SESSION_POLL,
+            ))
+        }
+    }
+}
+
+fn split_stream<T>(half: Half<T>) -> (Box<dyn Read + Send>, Box<dyn Write + Send>)
+where
+    T: Read + Write + Send + 'static,
+{
+    match half {
+        Half::Split { read, write } => (
+            Box::new(
+                read.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            Box::new(
+                write
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        ),
+        Half::Shared { inner, .. } => {
+            let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> = Arc::new(Mutex::new(Box::new(
+                inner
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )));
+            (
+                Box::new(SharedRead(Arc::clone(&shared))),
+                Box::new(SharedWrite(shared)),
+            )
+        }
+    }
 }
 
 /// One Vision relay for both roles: the read drives the transport, so its wait holds no session
@@ -32347,6 +32473,12 @@ fn vless_flow_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
         Flow::None => matches!(cmd, 1..=4) && !(user.flow == Flow::Vision && cmd == 1),
         Flow::Other => false,
     }
+}
+
+/// The reality/tls front also serves xray's XUDP shape: a Vision UDP association rides a mux request.
+fn vless_reply_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
+    vless_flow_ok(user, wire, cmd, vision)
+        || (vision && wire == Flow::Vision && cmd == 3 && user.flow == Flow::Vision)
 }
 
 /// A front that does not frame Vision still speaks the account's flow: the id must be served and the wire flow the account's own.
@@ -51345,6 +51477,9 @@ mod tests {
         assert!(!vless_flow_ok(&plain, Flow::Vision, 1, true));
         assert!(!vless_flow_ok(&plain, Flow::Other, 1, true));
         assert!(!vless_flow_ok(&vision, Flow::Vision, 1, false));
+        assert!(vless_reply_ok(&vision, Flow::Vision, 3, true));
+        assert!(!vless_reply_ok(&vision, Flow::Vision, 2, true));
+        assert!(!vless_reply_ok(&plain, Flow::Vision, 3, true));
     }
 
     #[test]
