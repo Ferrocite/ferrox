@@ -43604,7 +43604,6 @@ mod tests {
         server_config: Arc<ferrox_core::tls::TlsServerConfig>,
         serve: impl FnOnce(&mut FakeStream) + Send + 'static,
     ) -> (u16, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
-        use ferrox_core::tls::TlsProvider as _;
         let listener = ferrox_core::kcp::Listener::bind(
             "127.0.0.1:0".parse().expect("addr"),
             ferrox_core::kcp::Config::default(),
@@ -43619,7 +43618,7 @@ mod tests {
             else {
                 return;
             };
-            if tls.handshake().is_err() {
+            if !shake_tls(&mut tls) {
                 return;
             }
             let mut stream: FakeStream = Box::new(tls);
