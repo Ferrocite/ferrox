@@ -72,21 +72,26 @@ pub fn decode_binding_response(
     {
         return None;
     }
+    let mut plain = None;
     let mut offset = HEADER_LEN;
     while offset + 4 <= HEADER_LEN + length {
         let attribute = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
         let size = usize::from(u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]));
-        let value = packet.get(offset + 4..offset + 4 + size)?;
-        if let Some(address) = match attribute {
-            XOR_MAPPED_ADDRESS => mapped(value, transaction, true),
-            MAPPED_ADDRESS => mapped(value, transaction, false),
-            _ => None,
-        } {
-            return Some(address);
+        let Some(value) = packet.get(offset + 4..offset + 4 + size) else {
+            break;
+        };
+        match attribute {
+            XOR_MAPPED_ADDRESS => {
+                if let Some(address) = mapped(value, transaction, true) {
+                    return Some(address);
+                }
+            }
+            MAPPED_ADDRESS if plain.is_none() => plain = mapped(value, transaction, false),
+            _ => {}
         }
         offset += 4 + ((size + 3) & !3);
     }
-    None
+    plain
 }
 
 /// Unmask one mapped or XOR-mapped address value. The port and, for the XOR form, the address ride
@@ -187,6 +192,58 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
                 8000
             ))
+        );
+    }
+
+    /// A reply carrying both attributes answers its XOR form wherever the plain one sits, and a
+    /// truncated tail after it does not discard the plain fallback dam.
+    #[test]
+    fn the_xor_form_wins_wherever_the_plain_one_sits() {
+        let transaction = [7u8; TRANSACTION_SIZE];
+        // Plain first, XOR second, both different: the XOR address must win.
+        let plain_value = {
+            let mut value = Vec::with_capacity(8);
+            value.push(0);
+            value.push(0x01);
+            value.extend_from_slice(&1111u16.to_be_bytes());
+            value.extend_from_slice(&[192, 0, 2, 9]);
+            value
+        };
+        let mut both = Vec::with_capacity(20 + 24);
+        both.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        both.extend_from_slice(&24u16.to_be_bytes());
+        both.extend_from_slice(&COOKIE.to_be_bytes());
+        both.extend_from_slice(&transaction);
+        both.extend_from_slice(&MAPPED_ADDRESS.to_be_bytes());
+        both.extend_from_slice(&(plain_value.len() as u16).to_be_bytes());
+        both.extend_from_slice(&plain_value);
+        xor_v4(&mut both, Ipv4Addr::new(203, 0, 113, 7), 8000, &transaction);
+        assert_eq!(
+            decode_binding_response(&both, &transaction),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+                8000
+            )),
+            "the XOR form wins wherever the plain one sits"
+        );
+        // Plain only, then a truncated second attribute: the plain fallback still answers.
+        let mut truncated = Vec::with_capacity(20 + 12 + 4);
+        truncated.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        truncated.extend_from_slice(&16u16.to_be_bytes());
+        truncated.extend_from_slice(&COOKIE.to_be_bytes());
+        truncated.extend_from_slice(&transaction);
+        truncated.extend_from_slice(&MAPPED_ADDRESS.to_be_bytes());
+        truncated.extend_from_slice(&(plain_value.len() as u16).to_be_bytes());
+        truncated.extend_from_slice(&plain_value);
+        truncated.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
+        truncated.extend_from_slice(&8u16.to_be_bytes());
+        assert_eq!(
+            decode_binding_response(&truncated, &transaction),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+                1111
+            )),
+            "a truncated tail does not discard the fallback"
         );
     }
 

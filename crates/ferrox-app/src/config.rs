@@ -2414,6 +2414,12 @@ fn hysteria_realm(
     let Some(node) = object else {
         return Ok(None);
     };
+    if salamander_obfs(settings).is_some()
+        || hysteria_hop(hy).is_some()
+        || hysteria_gecko(settings).is_ok_and(|gecko| gecko.is_some())
+    {
+        return Err("realm cannot ride salamander, gecko or a port hop yet; its punch bypasses the masked datagram demux".to_owned());
+    }
     let field = |camel: &str, snake: &str| node.get(camel).or_else(|| node.get(snake));
     let url = field("server_url", "serverUrl")
         .and_then(Json::as_str)
@@ -2426,14 +2432,30 @@ fn hysteria_realm(
                 return Err("server_url scheme must be http or https".to_owned());
             }
             let hostport = rest.split('/').next().unwrap_or(rest);
-            let (host, port) = if let Some((h, p)) = hostport.rsplit_once(':') {
-                let port = p
-                    .parse::<u16>()
-                    .map_err(|_| "server_url port must be a port".to_owned())?;
-                (h.trim_matches(['[', ']']).to_owned(), port)
+            let default = if scheme == "https" { 443 } else { 80 };
+            let split = if let Some(inner) = hostport.strip_prefix('[') {
+                let (h, tail) = inner
+                    .split_once(']')
+                    .ok_or("server_url has an unclosed [")?;
+                match tail.strip_prefix(':') {
+                    Some(p) => Some((h, Some(p))),
+                    None if tail.is_empty() => Some((h, None)),
+                    None => return Err("server_url port must be a port".to_owned()),
+                }
             } else {
-                let default = if scheme == "https" { 443 } else { 80 };
-                (hostport.trim_matches(['[', ']']).to_owned(), default)
+                hostport.rsplit_once(':').map(|(h, p)| (h, Some(p)))
+            };
+            let (host, port) = if let Some((h, p)) = split {
+                match p {
+                    Some(p) => (
+                        h.to_owned(),
+                        p.parse::<u16>()
+                            .map_err(|_| "server_url port must be a port".to_owned())?,
+                    ),
+                    None => (h.to_owned(), default),
+                }
+            } else {
+                (hostport.to_owned(), default)
             };
             if host.is_empty() {
                 return Err("server_url names no host".to_owned());

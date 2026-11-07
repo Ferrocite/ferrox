@@ -920,6 +920,9 @@ struct Server {
     hop: Option<hysteria::Hop>,
     /// A tuned QUIC lane is its own connection: its windows and idle bound were negotiated, so a plain dial may not ride it.
     quic: Option<hysteria::QuicParams>,
+    /// A realm rendezvous is its own connection: its punch peer was negotiated through that
+    /// rendezvous, so a dial through another may not ride it.
+    realm: Option<Box<ferrox_core::realm::Config>>,
     roots: Option<ferrox_core::tls::Anchors>,
 }
 
@@ -941,6 +944,7 @@ fn server_of(dial: &Dial) -> Server {
         auth: dial.config.auth.clone(),
         hop: dial.config.hop.clone(),
         quic: dial.config.quic,
+        realm: dial.config.realm.clone(),
         roots: dial.roots.clone(),
     }
 }

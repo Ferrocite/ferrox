@@ -168,7 +168,7 @@ pub fn decode_metadata_hex(nonce_hex: &str, obfs_hex: &str) -> Option<Metadata> 
 
 /// The rendezvous of one realm: the HTTP origin it is reached on, the bearer token both ends
 /// present, the slot both ends agree, and the STUN servers that name the publics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Config {
     /// `http` or `https`: the scheme the origin is dialled on.
     pub scheme: String,
@@ -189,7 +189,7 @@ pub struct Config {
 }
 
 /// A gateway port-mapping request: the lease the gateway holds and how long the search for it may run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortMapping {
     /// Whether the gateway is asked for a mapping at all.
     pub enabled: bool,

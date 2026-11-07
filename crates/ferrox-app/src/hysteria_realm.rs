@@ -277,8 +277,7 @@ fn join_path(id: &str, sub: &str) -> String {
 }
 
 fn sanitize_id(id: &str) -> String {
-    // `valid_realm_id` admits only a character the path needs no escape for; this keeps the
-    // one place a path is joined honest if that pattern ever widens.
+    // `valid_realm_id` admits only chars the path needs no escape for.
     id.replace('%', "%25").replace('?', "%3F")
 }
 
@@ -299,6 +298,7 @@ fn encode_addresses(addrs: &[SocketAddr]) -> String {
 /// Read one HTTP response body off `stream` as text, refusing the body a chunked or content-length
 /// head cannot name within the ceiling.
 fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
+    const MAX_BODY: usize = 64 * 1024;
     let _ = with_tls;
     let mut reader = BufReader::new(StreamReader(stream));
     let mut head = String::new();
@@ -327,15 +327,23 @@ fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
             }
         }
     }
+    let deadline = Instant::now() + Duration::from_secs(5);
     let body = if chunked {
         let mut out = String::new();
         loop {
+            if Instant::now() >= deadline {
+                return None;
+            }
             let mut line = String::new();
             reader.read_line(&mut line).ok()?;
-            let size = usize::from_str_radix(line.trim(), 16).ok()?;
+            let size_text = line.trim().split(';').next()?.trim();
+            let size = usize::from_str_radix(size_text, 16).ok()?;
             if size == 0 {
                 reader.read_line(&mut line).ok()?;
                 break;
+            }
+            if size > MAX_BODY - out.len() {
+                return None;
             }
             let mut buf = vec![0u8; size];
             reader.read_exact(&mut buf).ok()?;
@@ -345,8 +353,10 @@ fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
         }
         out
     } else {
-        let take = content_length.min(64 * 1024);
-        let mut buf = vec![0u8; take];
+        if content_length > MAX_BODY {
+            return None;
+        }
+        let mut buf = vec![0u8; content_length];
         reader.read_exact(&mut buf).ok()?;
         String::from_utf8(buf).ok()?
     };
@@ -756,6 +766,7 @@ pub(crate) fn serve_registration(
                 eprintln!("hysteria realm port mapping: gateway unreachable; serving without a gateway address");
             }
         }
+        let shared_locals = std::sync::Arc::new(std::sync::Mutex::new(locals.clone()));
         let Some((session, ttl)) = client.register(&config.id, &locals) else {
             std::thread::sleep(backoff.min(Duration::from_secs(30)));
             backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -766,7 +777,7 @@ pub(crate) fn serve_registration(
         let heartbeat_session = session.clone();
         let heartbeat_sock = std::sync::Arc::clone(&sock);
         let heartbeat_state = std::sync::Arc::clone(&state);
-        let heartbeat_locals = std::sync::Arc::new(std::sync::Mutex::new(locals.clone()));
+        let heartbeat_locals = std::sync::Arc::clone(&shared_locals);
         let heartbeat_stop = std::sync::Arc::clone(&stop);
         let heartbeat_servers = config.stun_servers.clone();
         let heartbeat_family = config.family;
@@ -802,13 +813,18 @@ pub(crate) fn serve_registration(
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let filtered = realm::candidate_addrs(&locals, &peer_addresses, config.family);
+                let current_locals = shared_locals
+                    .lock()
+                    .ok()
+                    .map_or_else(|| locals.clone(), |guard| guard.clone());
+                let filtered =
+                    realm::candidate_addrs(&current_locals, &peer_addresses, config.family);
                 let expanded = realm::expand_symmetric(&filtered);
                 if expanded.is_empty() {
                     continue;
                 }
                 let nonce_hex = realm::hex_encode(&meta.nonce);
-                let _ = events.connect_response(&config.id, &session, &nonce_hex, &locals);
+                let _ = events.connect_response(&config.id, &session, &nonce_hex, &current_locals);
                 let _ = punch_via_state(&state, &sock, &meta, &expanded);
             }
         }
@@ -859,43 +875,21 @@ fn heartbeat_loop(
     }
 }
 
-/// Ask the local gateway for a UDP mapping of `local` and read its external address back. The
-/// reference's mapper is `UPnP` and NAT-PMP through `go-nat`; this build speaks NAT-PMP only, the
-/// exchange already on the gateway's own port, and answers `None` when it refuses — the caller
-/// continues without a gateway address, as the reference does when its mapper fails to initialise.
-/// SSDP discovery of `UPnP` gateways is the named gap: a gateway that speaks only `UPnP` reaches this
-/// build at its STUN address and not sooner.
+/// Ask the local gateway for a UDP mapping of `local` and read its external address back. Until this
+/// build discovers a gateway without hard-coding one and exchanges the correct RFC 6886 requests and
+/// replies, it asks for no mapping and answers `None` — a wrong external address registered with the
+/// rendezvous would mislead the punch, and the caller continues with its STUN address instead. The
+/// reference's mapper is `UPnP` and NAT-PMP through `go-nat`; SSDP discovery of `UPnP` gateways is the
+/// named gap, so no mapping is claimed from either family of gateway yet.
 #[must_use]
 pub(crate) fn port_mapping_external(
     local: Option<SocketAddr>,
     timeout_secs: u64,
     lifetime_secs: u64,
 ) -> Option<SocketAddr> {
-    let local = local?;
-    let internal_port = local.port();
-    let mut request = [0u8; 12];
-    request[0] = 0;
-    request[1] = 0;
-    request[2..4].copy_from_slice(&internal_port.to_be_bytes());
-    request[4..12].copy_from_slice(&u32::try_from(lifetime_secs).unwrap_or(0).to_be_bytes());
-    let gateway: SocketAddr = "192.168.1.1:5351".parse().ok()?;
-    let socket = UdpSocket::bind(if gateway.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    })
-    .ok()?;
-    let _ = socket.set_read_timeout(Some(Duration::from_secs(timeout_secs.max(1))));
-    socket.send_to(&request, gateway).ok()?;
-    let mut reply = [0u8; 16];
-    let (length, _) = socket.recv_from(&mut reply).ok()?;
-    let reply = &reply[..length.min(reply.len())];
-    if reply.len() < 16 || reply[0] != 0 || reply[1] != 1 {
-        return None;
-    }
-    let external_port = u16::from_be_bytes([reply[2], reply[3]]);
-    let ip = std::net::Ipv4Addr::new(reply[12], reply[13], reply[14], reply[15]);
-    Some(SocketAddr::new(std::net::IpAddr::V4(ip), external_port))
+    let _ = (local, timeout_secs, lifetime_secs);
+    eprintln!("hysteria realm port mapping: gateway discovery not yet implemented; serving without a gateway address");
+    None
 }
 
 /// Punch the hole the QUIC dial walks: at every interval a hello goes to every candidate, and the

@@ -11208,7 +11208,13 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         serve_hysteria_flow(flow, freedom);
     });
     let masq = crate::config::masquerade_from_stream(Some(stream));
-    let realm = crate::config::hysteria_realm_for_stream(Some(stream), hy).unwrap_or(None);
+    let realm = match crate::config::hysteria_realm_for_stream(Some(stream), hy) {
+        Ok(realm) => realm,
+        Err(why) => {
+            eprintln!("hysteria realm: {why}; serves nothing");
+            return false;
+        }
+    };
     thread::spawn(move || {
         crate::hysteria::serve_loop(
             &owned,
