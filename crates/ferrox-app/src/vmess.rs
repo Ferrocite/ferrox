@@ -1968,7 +1968,7 @@ pub(crate) fn serve_decoded<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    serve_decoded_impl(reader, writer, close, decoded, freedom, None, false);
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, false, None);
 }
 
 /// The gRPC carrier reads a hunk shorter than 2 KiB only at stream end, so the response header rides
@@ -1979,11 +1979,12 @@ pub(crate) fn serve_decoded_deferred<R, W>(
     close: &Close,
     decoded: Option<Accepted>,
     freedom: bool,
+    abort: Option<Abort>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    serve_decoded_impl(reader, writer, close, decoded, freedom, None, true);
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, true, abort);
 }
 
 /// [`serve_decoded`] with the carrier's write-side finish for the clean EOF `NoTerminationSignal` leaves markerless.
@@ -1998,7 +1999,17 @@ pub(crate) fn serve_decoded_with_finish<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    serve_decoded_impl(reader, writer, close, decoded, freedom, finish, false);
+    serve_decoded_impl(reader, writer, close, decoded, freedom, finish, false, None);
+}
+
+/// A rejection frees the request stream before answering: a close alone leaves its queue registered for the connection's life.
+type Abort = Box<dyn FnOnce() + Send>;
+
+fn abandon(close: &Close, abort: &mut Option<Abort>) {
+    if let Some(abort) = abort.take() {
+        abort();
+    }
+    close();
 }
 
 /// Runs a decoded request over its uplink; `defer_prefix` holds the response head for the first body frame.
@@ -2010,6 +2021,7 @@ fn serve_decoded_impl<R, W>(
     freedom: bool,
     finish: Option<Close>,
     defer_prefix: bool,
+    mut abort: Option<Abort>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
@@ -2023,18 +2035,18 @@ fn serve_decoded_impl<R, W>(
         user,
     }) = decoded
     else {
-        close();
+        abandon(close, &mut abort);
         return;
     };
     if !freedom || !matches!(cmd, 1 | 2) {
-        close();
+        abandon(close, &mut abort);
         return;
     }
     crate::accesslog::record_current(&target);
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-                close();
+                abandon(close, &mut abort);
                 return;
             };
             let uplink = uplink.with_meter(user.reversed());
@@ -2042,7 +2054,7 @@ fn serve_decoded_impl<R, W>(
                 Some(prefix)
             } else {
                 if !write_prefix(&mut writer, &prefix) {
-                    close();
+                    abandon(close, &mut abort);
                     return;
                 }
                 None
@@ -2051,7 +2063,9 @@ fn serve_decoded_impl<R, W>(
                 &uplink, reader, writer, close, send, recv, None, head, finish,
             );
         }
-        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv, &user),
+        2 => serve_udp_carried(
+            reader, writer, close, &mut abort, &target, &prefix, send, recv, &user,
+        ),
         _ => {}
     }
 }
@@ -2065,6 +2079,7 @@ fn serve_udp_carried<R, W>(
     reader: R,
     mut writer: W,
     close: &Close,
+    abort: &mut Option<Abort>,
     target: &SocketAddr,
     prefix: &[u8],
     send: Flow,
@@ -2080,15 +2095,15 @@ fn serve_udp_carried<R, W>(
         "0.0.0.0:0"
     };
     let Ok(udp) = UdpSocket::bind(bind) else {
-        close();
+        abandon(close, abort);
         return;
     };
     if udp.connect(target).is_err() {
-        close();
+        abandon(close, abort);
         return;
     }
     if !write_prefix(&mut writer, prefix) {
-        close();
+        abandon(close, abort);
         return;
     }
     crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv, user);
@@ -2151,7 +2166,7 @@ pub(crate) fn serve_grpc_with(
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded_deferred(reader, writer, &close, decoded, freedom);
+    serve_decoded_deferred(reader, writer, &close, decoded, freedom, None);
 }
 
 /// Serves a TLS or REALITY gRPC listener as one muxed connection, arming the writer clock first.
@@ -2201,18 +2216,22 @@ pub(crate) fn serve_grpc_muxed(
 ) {
     reader.arm_mux_poll();
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
-    if decoded.is_none() {
-        reader.abort();
-        return;
-    }
     if let Some(Accepted { cmd, .. }) = &decoded {
         if freedom && matches!(*cmd, 1 | 2) {
             opened.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    let reset = reader.reset_handle();
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded_deferred(reader, writer, &close, decoded, freedom);
+    serve_decoded_deferred(
+        reader,
+        writer,
+        &close,
+        decoded,
+        freedom,
+        Some(Box::new(reset)),
+    );
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
