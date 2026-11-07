@@ -86,6 +86,11 @@ fn take_into<R: Read>(read: &mut R, reads: &mut usize, buf: &mut [u8]) -> std::i
             Err(error)
                 if crate::proxy::is_timeout(&error) && !crate::proxy::relay_step_owns_poll() =>
             {
+                if crate::proxy::body_deadline()
+                    .is_some_and(|until| std::time::Instant::now() >= until)
+                {
+                    return Err(error);
+                }
                 std::thread::sleep(crate::budgets::RELAY_POLL);
             }
             other => return other,
@@ -2633,6 +2638,22 @@ fn keeps_alive(text: &str) -> bool {
     keep
 }
 
+/// Clears the body deadline however the read ends, so a later request on the same thread does not inherit it.
+struct BodyDeadlineGuard;
+
+impl BodyDeadlineGuard {
+    fn until(until: std::time::Instant) -> Self {
+        crate::proxy::set_body_deadline(Some(until));
+        Self
+    }
+}
+
+impl Drop for BodyDeadlineGuard {
+    fn drop(&mut self) {
+        crate::proxy::set_body_deadline(None);
+    }
+}
+
 /// The body of `n` bytes, and how much of the bytes already read as the head it used; the rest of those belong to the next request on this connection.
 fn read_body<R: Read>(
     read: &mut R,
@@ -2645,6 +2666,7 @@ fn read_body<R: Read>(
     buf[..pre].copy_from_slice(&prefix[..pre]);
     let mut at = pre;
     let mut until = std::time::Instant::now() + budget;
+    let _deadline = BodyDeadlineGuard::until(until);
     while at < n {
         match read.read(&mut buf[at..]) {
             Err(error) if crate::proxy::is_timeout(&error) => {
@@ -2656,6 +2678,7 @@ fn read_body<R: Read>(
             Ok(r) => {
                 at += r;
                 until = std::time::Instant::now() + budget;
+                crate::proxy::set_body_deadline(Some(until));
             }
         }
     }
@@ -2681,6 +2704,7 @@ fn drain_body(read: &mut dyn Read, cap: usize, budget: std::time::Duration) -> D
     let mut body = Vec::new();
     let mut buf = [0u8; 8192];
     let mut until = std::time::Instant::now() + budget;
+    let _deadline = BodyDeadlineGuard::until(until);
     loop {
         match read.read(&mut buf) {
             Err(error) if crate::proxy::is_timeout(&error) => {
@@ -2692,6 +2716,7 @@ fn drain_body(read: &mut dyn Read, cap: usize, budget: std::time::Duration) -> D
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
                 until = std::time::Instant::now() + budget;
+                crate::proxy::set_body_deadline(Some(until));
                 if body.len() > cap {
                     return Drained::Over;
                 }
@@ -4624,6 +4649,41 @@ mod tests {
             ),
             "a withheld stream ends at its deadline"
         );
+    }
+
+    /// A chunked body that withholds its first frame ends at the body deadline, not in the framing read's poll sleep.
+    #[test]
+    fn a_withheld_chunked_body_ends_at_its_deadline() {
+        struct Silent;
+        impl std::io::Read for Silent {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+        let mut framed = Reader {
+            read: Silent,
+            prefix: Vec::new(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            head_progress: None,
+            chunk: Chunk::Body,
+        };
+        let started = std::time::Instant::now();
+        assert!(
+            matches!(
+                drain_body(&mut framed, 64, std::time::Duration::from_millis(5)),
+                Drained::Broken
+            ),
+            "a withheld chunked body ends at its deadline"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the deadline ends the framing read, not the poll sleep"
+        );
+        assert!(framed.reads > 0, "the framing read reached the source");
     }
 
     /// What a body read leaves behind is the next request's head; it moves down inside the head's buffer, where the old shape copied it into a fresh one.

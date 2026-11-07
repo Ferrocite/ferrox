@@ -10109,6 +10109,19 @@ pub(crate) fn relay_step_owns_poll() -> bool {
 }
 
 thread_local! {
+    /// The instant a request body must have arrived by: a framed or carrier read that keeps timing out past it ends the body instead of sleeping in an unauthenticated handler.
+    static BODY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn body_deadline() -> Option<std::time::Instant> {
+    BODY_DEADLINE.with(std::cell::Cell::get)
+}
+
+pub(crate) fn set_body_deadline(until: Option<std::time::Instant>) {
+    BODY_DEADLINE.with(|slot| slot.set(until));
+}
+
+thread_local! {
     /// The socket a relay step's read timed out on: the lane waits on its readiness instead of the clock.
     static WAIT_FD: std::cell::Cell<Option<WaitFd>> = const { std::cell::Cell::new(None) };
 }
