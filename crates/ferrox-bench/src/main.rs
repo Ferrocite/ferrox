@@ -36,9 +36,9 @@ fn lengths() -> Vec<usize> {
 
 const BAR: f64 = 0.95;
 
-const ROUNDS: usize = 5;
+const ROUNDS: usize = 7;
 
-const CONFIRMATIONS: usize = 3;
+const CONFIRMATIONS: usize = 5;
 
 const _: () = assert!(CONFIRMATIONS >= 3);
 
