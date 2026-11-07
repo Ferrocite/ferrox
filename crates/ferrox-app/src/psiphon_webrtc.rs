@@ -16,11 +16,7 @@ use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
-const STUN_COOKIE: u32 = 0x2112_a442;
-const STUN_BINDING_REQUEST: u16 = 0x0001;
-const STUN_BINDING_SUCCESS: u16 = 0x0101;
-const STUN_XOR_MAPPED_ADDRESS: u16 = 0x0020;
-const STUN_MAPPED_ADDRESS: u16 = 0x0001;
+const STUN_HEADER_LEN: usize = ferrox_core::stun::HEADER_LEN;
 const MAX_DATAGRAM: usize = 65_536;
 const PADDING_DONE: i64 = -1;
 const MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
@@ -318,11 +314,8 @@ fn stun_binding(
         .find(same_family)
         .ok_or_else(|| format!("psiphon webrtc STUN {server}: no address"))?;
     let transaction = random::<12>();
-    let mut request = Vec::with_capacity(20);
-    request.extend_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
-    request.extend_from_slice(&0u16.to_be_bytes());
-    request.extend_from_slice(&STUN_COOKIE.to_be_bytes());
-    request.extend_from_slice(&transaction);
+    let mut request = [0u8; STUN_HEADER_LEN];
+    let _ = ferrox_core::stun::binding_request_into(&mut request, &transaction);
     socket
         .send_to(&request, target)
         .map_err(|error| format!("psiphon webrtc STUN send: {error}"))?;
@@ -354,74 +347,10 @@ fn stun_binding(
     }
 }
 
-/// Decode a binding success and return its mapped address.
+/// Decode a binding success and return its mapped address, borrowed from the core codec the realm
+/// punch shares — the duplicate walk and unmask this function used to own are gone.
 fn parse_stun(reply: &[u8], transaction: &[u8; 12]) -> Option<SocketAddr> {
-    if reply.len() < 20 {
-        return None;
-    }
-    let kind = u16::from_be_bytes([reply[0], reply[1]]);
-    let length = usize::from(u16::from_be_bytes([reply[2], reply[3]]));
-    if kind != STUN_BINDING_SUCCESS
-        || u32::from_be_bytes([reply[4], reply[5], reply[6], reply[7]]) != STUN_COOKIE
-        || reply.get(8..20)? != transaction.as_slice()
-        || reply.len() < 20 + length
-    {
-        return None;
-    }
-    let mut offset = 20;
-    while offset + 4 <= 20 + length {
-        let attribute = u16::from_be_bytes([reply[offset], reply[offset + 1]]);
-        let size = usize::from(u16::from_be_bytes([reply[offset + 2], reply[offset + 3]]));
-        let value = reply.get(offset + 4..offset + 4 + size)?;
-        if let Some(address) = match attribute {
-            STUN_XOR_MAPPED_ADDRESS => mapped(value, transaction, true),
-            STUN_MAPPED_ADDRESS => mapped(value, transaction, false),
-            _ => None,
-        } {
-            return Some(address);
-        }
-        offset += 4 + ((size + 3) & !3);
-    }
-    None
-}
-
-/// Unmask a MAPPED or XOR-MAPPED address attribute.
-fn mapped(value: &[u8], transaction: &[u8; 12], xor: bool) -> Option<SocketAddr> {
-    if value.len() < 4 {
-        return None;
-    }
-    let family = value[1];
-    let mut port = u16::from_be_bytes([value[2], value[3]]);
-    if xor {
-        port ^= 0x2112;
-    }
-    match family {
-        0x01 if value.len() >= 8 => {
-            let mut octets = [value[4], value[5], value[6], value[7]];
-            if xor {
-                let cookie = STUN_COOKIE.to_be_bytes();
-                for (octet, cookie) in octets.iter_mut().zip(cookie) {
-                    *octet ^= cookie;
-                }
-            }
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
-        }
-        0x02 if value.len() >= 20 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&value[4..20]);
-            if xor {
-                let cookie = STUN_COOKIE.to_be_bytes();
-                for (octet, cookie) in octets[..4].iter_mut().zip(cookie) {
-                    *octet ^= cookie;
-                }
-                for (octet, transaction) in octets[4..].iter_mut().zip(transaction.iter()) {
-                    *octet ^= transaction;
-                }
-            }
-            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
-        }
-        _ => None,
-    }
+    ferrox_core::stun::decode_binding_response(reply, transaction)
 }
 
 type InputChannel = Arc<Mutex<Receiver<Result<Vec<u8>, String>>>>;
@@ -1018,7 +947,7 @@ mod tests {
         let transaction = [7u8; 12];
         let port = 0x1f40u16 ^ 0x2112;
         let mut value = vec![0, 1, port.to_be_bytes()[0], port.to_be_bytes()[1]];
-        let cookie = STUN_COOKIE.to_be_bytes();
+        let cookie = ferrox_core::stun::COOKIE.to_be_bytes();
         value.extend_from_slice(&[
             0xc0 ^ cookie[0],
             cookie[1],
@@ -1027,7 +956,7 @@ mod tests {
         ]);
         let mut reply = vec![0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42];
         reply.extend_from_slice(&transaction);
-        reply.extend_from_slice(&STUN_XOR_MAPPED_ADDRESS.to_be_bytes());
+        reply.extend_from_slice(&ferrox_core::stun::XOR_MAPPED_ADDRESS.to_be_bytes());
         reply.extend_from_slice(&8u16.to_be_bytes());
         reply.extend_from_slice(&value);
         assert_eq!(
