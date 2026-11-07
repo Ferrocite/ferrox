@@ -434,8 +434,23 @@ pub(crate) struct TlsShape {
     pub(crate) obfuscated_min_padding: usize,
     pub(crate) obfuscated_max_padding: usize,
     pub(crate) fragmentor: crate::psiphon_fragment::Fragmentor,
+    /// The chance a relay names its cookie with a cover word.
+    pub(crate) meek_alternate_cookie_name: f64,
+    /// The chance a relay draws a cover request content type.
+    pub(crate) meek_alternate_content_type: f64,
+    /// The chance a relay applies the request-shaping profile.
+    pub(crate) meek_traffic_shaping: f64,
+    /// The protocols that admit the request-shaping profile; empty admits all.
+    pub(crate) meek_traffic_shaping_protocols: Vec<String>,
+    /// The smallest shaped request cap.
+    pub(crate) meek_min_limit_request: usize,
+    /// The largest shaped request cap.
+    pub(crate) meek_max_limit_request: usize,
+    /// The chance a shaped connection drops after a successful round trip.
+    pub(crate) meek_redial_tls: f64,
 }
 
+/// The reference defaults for one lane's TLS shape.
 impl Default for TlsShape {
     fn default() -> Self {
         Self {
@@ -452,6 +467,13 @@ impl Default for TlsShape {
             obfuscated_min_padding: MIN_PADDING,
             obfuscated_max_padding: MAX_PADDING,
             fragmentor: crate::psiphon_fragment::Fragmentor::default(),
+            meek_alternate_cookie_name: 0.5,
+            meek_alternate_content_type: 0.5,
+            meek_traffic_shaping: 1.0,
+            meek_traffic_shaping_protocols: Vec::new(),
+            meek_min_limit_request: crate::psiphon_meek::MAX_REQUEST_PAYLOAD,
+            meek_max_limit_request: crate::psiphon_meek::MAX_REQUEST_PAYLOAD,
+            meek_redial_tls: 0.0,
         }
     }
 }
