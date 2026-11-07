@@ -8194,9 +8194,9 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
+        chained.arm_relay_poll();
         // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
-            chained.arm_relay_poll();
             let settings = settings.clone();
             let users = shared.cloned().unwrap_or_else(|| Arc::from(users));
             spawn_carried(move || {
@@ -10109,6 +10109,21 @@ thread_local! {
 
 pub(crate) fn relay_step_owns_poll() -> bool {
     RELAY_STEP.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// The instant a request body must have arrived by: a framed or carrier read that keeps timing out past it ends the body instead of sleeping in an unauthenticated handler.
+    static BODY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The body arrival deadline this thread is enforcing, if a body read is in progress.
+pub(crate) fn body_deadline() -> Option<std::time::Instant> {
+    BODY_DEADLINE.with(std::cell::Cell::get)
+}
+
+/// Arms or clears the body arrival deadline the reads on this thread honour.
+pub(crate) fn set_body_deadline(until: Option<std::time::Instant>) {
+    BODY_DEADLINE.with(|slot| slot.set(until));
 }
 
 thread_local! {
@@ -42576,6 +42591,57 @@ mod tests {
             "oracle.example",
             "/share",
         );
+    }
+
+    /// An H1 stream-one session arms the relay poll on its socket before it relays, so an upload leg
+    /// waiting for payload parks instead of pinning one of the few relay workers the download legs need.
+    #[cfg(unix)]
+    fn assert_h1_arms(settings: Box<crate::xhttp::XhttpSettings>) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let users = one_vless_user(&[0xaau8; 16]);
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            probe_tx
+                .send(stream.try_clone().expect("probe"))
+                .expect("probe");
+            serve_vless_xhttp(stream, &settings, &users, None, true, None);
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        xhttp_post_head(&mut peer, "/share", true);
+        let probe = probe_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe");
+        let until = Instant::now() + Duration::from_secs(5);
+        while probe.read_timeout().ok().flatten() != Some(budgets::RELAY_POLL) {
+            assert!(
+                Instant::now() < until,
+                "the H1 session never armed the relay poll"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_h1_xhttp_session_arms_the_relay_poll_before_it_relays() {
+        assert_h1_arms(xhttp_settings("/share"));
+    }
+
+    /// Automatic mode resolves to packet-up, yet the same hub serves a stream-one POST; its upload must not pin a worker either.
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_h1_stream_one_post_arms_the_relay_poll() {
+        assert_h1_arms(Box::new(crate::xhttp::XhttpSettings {
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..*xhttp_settings("/share")
+        }));
     }
 
     /// Raw HTTP/1.1 clients for the three xhttp modes, padded, with session and seq in the path.
