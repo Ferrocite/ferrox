@@ -1349,9 +1349,19 @@ mod tests {
         reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
         reply.extend_from_slice(echo);
         reply.extend_from_slice(&[0, 1, 0, 1]);
-        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), false, true).is_ok());
-        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), true, true).is_err());
-        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), true, false).is_ok());
+        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), false).is_ok());
+        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), true).is_err());
+    }
+
+    #[test]
+    /// A matching reply needs a question when matching is required.
+    fn a_matching_reply_needs_a_question() {
+        let id = [0x12, 0x34];
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&id);
+        reply.extend_from_slice(&[0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(super::parse_reply(id, &reply, 1, None, true).is_err());
+        assert!(super::parse_reply(id, &reply, 1, None, false).is_ok());
     }
 
     #[test]
