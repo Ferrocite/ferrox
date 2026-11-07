@@ -42,7 +42,7 @@ vmess-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-ws-down-8|server-threads|1.54|696
 vmess-reality-raw-down-8|server|0.78|486|ceiling
 vmess-grpc-down-8|server-threads|1.08|696
-vmess-tls-grpc-down-8|server-threads|1.07|696
+vmess-tls-grpc-down-8|server-threads|1.14|696
 # The xray client's 65_535-byte stream window makes the muxed hunk writer flush four messages at a time; the server pays the round trips.
 vmess-grpc-down-8|server-cpu|1.30|696
 vmess-reality-raw-down-8|server-threads|1.08|696
