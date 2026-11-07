@@ -493,7 +493,10 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
     HANDSHAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let roots = dial.roots.as_deref().unwrap_or(&[]);
-    let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
+    let (sock, mut peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
+    if let Some(realm) = dial.config.realm.as_deref() {
+        peer = crate::hysteria_realm::dial_peer(&sock, realm)?;
+    }
     let mut scid = [0u8; SCID_LEN];
     getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
@@ -2094,6 +2097,7 @@ struct Router<'a> {
     auths: &'a [String],
     serve: &'a Serve,
     masq: Arc<Masquerade>,
+    realm_state: Option<Arc<crate::hysteria_realm::RealmState>>,
     /// The reference's `udpIdleTimeout`: how long a datagram association may stay quiet.
     udp_idle: Duration,
     /// This server's `brutalDown`, answered as the client's `hysteria-cc-rx` hint.
@@ -2516,11 +2520,12 @@ pub(crate) fn serve_loop(
     serve: &Serve,
     udp_idle: Duration,
     quic: Option<&hysteria::QuicParams>,
+    realm: Option<&ferrox_core::realm::Config>,
 ) {
     let Some(prepared) = prepare(address, identity, cc, obfs_password, quic) else {
         return;
     };
-    serve_prepared(prepared, auths, masq, serve, udp_idle, quic);
+    serve_prepared(prepared, auths, masq, serve, udp_idle, quic, realm);
 }
 
 pub(crate) fn serve_prepared(
@@ -2530,18 +2535,29 @@ pub(crate) fn serve_prepared(
     serve: &Serve,
     udp_idle: Duration,
     quic: Option<&hysteria::QuicParams>,
+    realm: Option<&ferrox_core::realm::Config>,
 ) {
     let Prepared {
         sock,
         local,
         mut template,
     } = prepared;
+    let sock = Arc::new(sock);
+    let realm_state = realm.map(|_| crate::hysteria_realm::RealmState::new());
+    if let Some((cfg, state)) = realm.cloned().zip(realm_state.clone()) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let sock_for_realm = Arc::clone(&sock);
+        std::thread::spawn(move || {
+            crate::hysteria_realm::serve_registration(sock_for_realm, &cfg, state, stop);
+        });
+    }
     let mut router = Router {
-        sock: Arc::new(sock),
+        sock: Arc::clone(&sock),
         local,
         auths,
         serve,
         masq: Arc::from(masq.clone()),
+        realm_state,
         udp_idle,
         cc_rx: quic.map_or(0, |params| params.brutal_down),
         stateless_reset: quic.is_none_or(|params| !params.disable_stateless_reset),
@@ -2563,6 +2579,11 @@ pub(crate) fn serve_prepared(
                     let Some((packet, from)) = batch.at(at) else {
                         continue;
                     };
+                    if router.realm_state.as_ref().is_some_and(|state| {
+                        crate::hysteria_realm::demux(state, &router.sock, packet, from)
+                    }) {
+                        continue;
+                    }
                     route_packet(&mut router, &mut template, packet, from);
                 }
                 router.wake();
@@ -2578,6 +2599,12 @@ pub(crate) fn serve_prepared(
         }
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
+                if router.realm_state.as_ref().is_some_and(|state| {
+                    crate::hysteria_realm::demux(state, &router.sock, &buf.as_mut()[..n], from)
+                }) {
+                    router.wake();
+                    continue;
+                }
                 route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from);
                 router.wake();
             }
@@ -3050,6 +3077,7 @@ mod tests {
                 auths: &auths,
                 serve: &handler,
                 masq: Arc::new(Masquerade::NotFound),
+                realm_state: None,
                 udp_idle,
                 cc_rx: 0,
                 stateless_reset: false,
@@ -3087,6 +3115,7 @@ mod tests {
             auths: &auths,
             serve: &handler,
             masq: Arc::new(Masquerade::NotFound),
+            realm_state: None,
             udp_idle: Duration::from_secs(60),
             cc_rx: 0,
             stateless_reset: false,
@@ -3204,6 +3233,7 @@ mod tests {
             auths: &auths,
             serve: &handler,
             masq: Arc::new(Masquerade::NotFound),
+            realm_state: None,
             udp_idle: Duration::from_secs(60),
             cc_rx: 0,
             stateless_reset: false,

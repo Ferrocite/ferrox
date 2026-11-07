@@ -559,6 +559,7 @@ carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::
 carrier-hysteria masquerade-unix-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_a_unix_origin
 carrier-hysteria stun-binding-exchange-allocations 0 ferrox-core-stun::tests::a_binding_exchange_takes_no_heap
 carrier-hysteria realm-punch-allocations 0 ferrox-core-realm::tests::an_encoded_and_decoded_packet_takes_no_heap
+carrier-hysteria realm-configs-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_realm_rendezvous
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
