@@ -657,6 +657,18 @@ unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout
 unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
 
 # --- tun device inbound -----------------------------------------------------
+front-tun-smoltcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-tun-smoltcp syscalls-per-tun-packet UNBLESSED no syscall checker yet
+front-tun-smoltcp user-space-copies-per-tun-packet UNBLESSED no copy checker yet
+front-tun-smoltcp time-tcp-down-1 ferrox=9.883Gbit/s,zeptun=17.937Gbit/s,ratio=0.55 tun-bench.yml
+front-tun-smoltcp time-tcp-down-10 ferrox=14.309Gbit/s,zeptun=23.950Gbit/s,ratio=0.60 tun-bench.yml
+front-tun-smoltcp time-tcp-up-1 ferrox=12.860Gbit/s,zeptun=20.331Gbit/s,ratio=0.63 tun-bench.yml
+front-tun-smoltcp time-tcp-up-10 ferrox=15.854Gbit/s,zeptun=26.821Gbit/s,ratio=0.59 tun-bench.yml
+front-tun-smoltcp time-rr ferrox=6581tps,zeptun=11504tps,ratio=0.57 tun-bench.yml
+front-tun-smoltcp time-rr-8x1k ferrox=38261tps,zeptun=64001tps,ratio=0.60 tun-bench.yml
+front-tun-smoltcp time-udp-100k ferrox=99920pps,zeptun=99962pps,ratio=1.00 tun-bench.yml
+front-tun-smoltcp cpu-cores-at-tcp-down-10 ferrox=2.9cores,zeptun=1.7cores tun-bench.yml
+front-tun-smoltcp rss-mb-at-ten-flows ferrox=60-75MB,zeptun=2-8MB tun-bench.yml
 front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream
 front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets
