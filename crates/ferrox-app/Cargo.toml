@@ -38,6 +38,7 @@ x25519-dalek = "3"
 socket2 = "0.6"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic"] }
 crypto_box = "0.9"
+crypto_secretbox = "0.1"
 snow = "0.10"
 curve25519-dalek = "4"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }

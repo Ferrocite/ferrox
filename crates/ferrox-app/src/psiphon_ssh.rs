@@ -65,6 +65,12 @@ impl KeepAlive {
 }
 const MAX_IDENTIFICATION: usize = 1024;
 const CLIENT_CAPABILITIES: &str = "server-requests";
+
+/// The server-initiated requests a client answers after advertising the capability.
+pub(crate) trait ServerRequests: Send + Sync {
+    /// Answer one request; the returned bytes are the success payload.
+    fn handle(&self, name: &[u8], payload: &[u8]) -> Result<Vec<u8>, String>;
+}
 /// One channel packet plus its header, padding and tag; a larger peer packet
 /// grows the one buffer it needs instead of every pooled buffer.
 const PACKET_CHUNK: usize = CHANNEL_PACKET as usize + 1024;
@@ -1248,6 +1254,7 @@ struct Inner {
     opened_at: Instant,
     last_read: AtomicU64,
     pending_request: Mutex<Option<mpsc::Sender<bool>>>,
+    requests: Option<Arc<dyn ServerRequests>>,
     server: String,
     protocol: &'static str,
 }
@@ -1341,6 +1348,7 @@ impl Session {
         keepalive: Option<KeepAlive>,
         shape: &TlsShape,
         limit_meek_buffers: bool,
+        requests: Option<Arc<dyn ServerRequests>>,
     ) -> Result<Self, String> {
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
@@ -1448,6 +1456,7 @@ impl Session {
             relay_protocol,
             identity,
             &mut relay,
+            requests.as_deref(),
         )?;
         control
             .set_timeout(None)
@@ -1465,6 +1474,7 @@ impl Session {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests,
             server: format!("{}:{}", server.host, server.port),
             protocol,
         });
@@ -3548,6 +3558,7 @@ fn handshake(
     relay_protocol: &str,
     identity: &Identity<'_>,
     relay: &mut Option<Relay>,
+    requests: Option<&dyn ServerRequests>,
 ) -> Result<(), String> {
     let body = handshake_body(relay_protocol, identity, relay.as_ref());
     let mut request = vec![MSG_GLOBAL_REQUEST];
@@ -3568,15 +3579,19 @@ fn handshake(
                 let mut at = 0;
                 let name = take_str(packet.body(), &mut at);
                 let want_reply = packet.body().get(at).copied().unwrap_or(0);
-                let reply = if name == Some(b"psiphon-inproxy-relay") {
-                    relay_round_trip(relay, packet.body().get(at + 1..).unwrap_or(&[]))
-                } else {
-                    Err("psiphon ssh unexpected handshake request".to_owned())
+                let payload = packet.body().get(at + 1..).unwrap_or(&[]);
+                let reply = match name {
+                    Some(b"psiphon-inproxy-relay") => relay_round_trip(relay, payload).map(Some),
+                    Some(name) => match requests {
+                        Some(requests) => requests.handle(name, payload).map(Some),
+                        None => Err("psiphon ssh unexpected handshake request".to_owned()),
+                    },
+                    None => Err("psiphon ssh malformed handshake request".to_owned()),
                 };
                 match reply {
                     Ok(payload) if want_reply != 0 => {
                         let mut reply = vec![MSG_REQUEST_SUCCESS];
-                        reply.extend_from_slice(&payload);
+                        reply.extend_from_slice(payload.as_deref().unwrap_or(&[]));
                         writer
                             .send(&reply)
                             .map_err(|error| format!("psiphon ssh relay reply: {error}"))?;
@@ -3586,7 +3601,10 @@ fn handshake(
                         if want_reply != 0 {
                             let _ = writer.send(&[MSG_REQUEST_FAILURE]);
                         }
-                        return Err(error);
+                        if name == Some(b"psiphon-inproxy-relay") {
+                            return Err(error);
+                        }
+                        eprintln!("psiphon ssh: {error}");
                     }
                 }
             }
@@ -3795,8 +3813,9 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                 return Dispatch::Stop;
             };
             let want_reply = body.get(at).copied().unwrap_or(0);
+            let payload = body.get(at + 1..).unwrap_or(&[]);
             if name == b"psiphon-inproxy-relay" {
-                match inner.relay_round_trip(body.get(at + 1..).unwrap_or(&[])) {
+                match inner.relay_round_trip(payload) {
                     Ok(payload) if want_reply != 0 => {
                         let mut reply = vec![MSG_REQUEST_SUCCESS];
                         reply.extend_from_slice(&payload);
@@ -3808,6 +3827,21 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                             let _ = inner.send(&[MSG_REQUEST_FAILURE]);
                         }
                         return Dispatch::Stop;
+                    }
+                }
+            } else if let Some(requests) = inner.requests.as_deref() {
+                match requests.handle(name, payload) {
+                    Ok(payload) if want_reply != 0 => {
+                        let mut reply = vec![MSG_REQUEST_SUCCESS];
+                        reply.extend_from_slice(&payload);
+                        let _ = inner.send(&reply);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if want_reply != 0 {
+                            let _ = inner.send(&[MSG_REQUEST_FAILURE]);
+                        }
+                        eprintln!("psiphon ssh: {error}");
                     }
                 }
             } else if want_reply != 0 {
@@ -3919,6 +3953,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         opened_at: Instant::now(),
         last_read: AtomicU64::new(0),
         pending_request: Mutex::new(None),
+        requests: None,
         server: "test".to_owned(),
         protocol: "SSH",
     });
@@ -4194,6 +4229,7 @@ mod tests {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4274,6 +4310,7 @@ mod tests {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4340,6 +4377,7 @@ mod tests {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4431,6 +4469,7 @@ mod tests {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4517,6 +4556,7 @@ mod tests {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
         });
@@ -4558,6 +4598,7 @@ mod tests {
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
             pending_request: Mutex::new(None),
+            requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
         });

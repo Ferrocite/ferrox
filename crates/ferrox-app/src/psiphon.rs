@@ -39,6 +39,8 @@ const UDPGW_MAX_MESSAGE: usize = 32_768 + 23;
 const MAX_LIST_BYTES: u64 = 16 * 1024 * 1024;
 const RELAY_BUFFER: usize = 256 * 1024;
 const RELAY_BATCH: usize = 64;
+/// How long a fetched OSL registry and its files are reused before another attempt.
+const OSL_REFRESH: Duration = Duration::from_secs(300);
 /// How long one server classification keeps a destination on the direct path.
 const SPLIT_TUNNEL_CLASSIFICATION_TTL: Duration = Duration::from_hours(24);
 /// The reference's cap on cached split-tunnel classifications.
@@ -88,7 +90,11 @@ pub(crate) struct PsiphonOut {
 
 struct Inner {
     settings: Settings,
-    entries: Vec<Server>,
+    entries: Mutex<Arc<Vec<Server>>>,
+    sloks: Arc<crate::psiphon_osl::SlokStore>,
+    requests: Arc<crate::psiphon_osl::ServerEvents>,
+    osl_seeded: Arc<AtomicBool>,
+    last_osl: Mutex<Option<Instant>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
     affinity: Mutex<Option<String>>,
@@ -262,6 +268,10 @@ struct Settings {
     server_lists_explicit: bool,
     remote_fetch_disabled: bool,
     server_list_key: String,
+    osl_roots: Vec<String>,
+    remote_list_key: String,
+    emit_sloks: bool,
+    emit_server_alerts: bool,
     headers: Vec<(String, String)>,
     proxy: Option<Proxy>,
     sponsor: String,
@@ -338,6 +348,15 @@ impl PsiphonOut {
         if entries.is_empty() {
             return Err("psiphon: the server list holds no SSH entries".to_owned());
         }
+        let slok_path = state_is_ours(&settings.state).then(|| settings.state.join("osl-sloks"));
+        let sloks = crate::psiphon_osl::SlokStore::open(slok_path);
+        let osl_seeded = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(crate::psiphon_osl::ServerEvents {
+            sloks: Arc::clone(&sloks),
+            seeded: Arc::clone(&osl_seeded),
+            emit_alerts: settings.emit_server_alerts,
+            emit_sloks: settings.emit_sloks,
+        });
         let http = settings
             .http_listen
             .map(|port| {
@@ -357,7 +376,11 @@ impl PsiphonOut {
         let inner = Arc::new(Inner {
             session_id,
             settings,
-            entries,
+            entries: Mutex::new(Arc::new(entries)),
+            sloks,
+            requests,
+            osl_seeded,
+            last_osl: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -507,7 +530,7 @@ impl Inner {
 
     /// The first entry to dial and the head start its affinity buys, read once per batch.
     fn start(&self) -> (usize, Duration) {
-        let entries = &self.entries;
+        let entries = Arc::clone(&lock(&self.entries));
         if entries.is_empty() {
             return (0, Duration::ZERO);
         }
@@ -537,7 +560,7 @@ impl Inner {
         if self.stopping.load(Ordering::Acquire) {
             return Err("psiphon: the lane is stopping".to_owned());
         }
-        let entries = &self.entries;
+        let entries = Arc::clone(&lock(&self.entries));
         if entries.is_empty() {
             return Err("psiphon: the server list holds no SSH entries".to_owned());
         }
@@ -563,7 +586,7 @@ impl Inner {
                 break;
             }
             let (batch, taken) = take_dial_batch(
-                entries,
+                &entries,
                 start,
                 offset,
                 limit,
@@ -629,6 +652,8 @@ impl Inner {
                 } else {
                     None
                 };
+            let requests =
+                Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
             let attempt = move |server: &Server| {
                 let timeout = if conduit.is_some() && server.inproxy.is_some() {
                     conduit_timeout
@@ -659,6 +684,7 @@ impl Inner {
                     keepalive,
                     &tls_shape,
                     limit_meek_buffers,
+                    Some(Arc::clone(&requests)),
                 )
             };
             match race(batch, attempt, budget, stagger, lead) {
@@ -970,7 +996,7 @@ impl Inner {
             }
             let width = missing.min(FILL_WORKERS);
             let (base, lead) = self.start();
-            let count = self.entries.len();
+            let count = lock(&self.entries).len();
             if count == 0 {
                 return Err("psiphon: the server list holds no SSH entries".to_owned());
             }
@@ -1007,6 +1033,67 @@ impl Inner {
             }
         }
     }
+
+    /// Fetch and import the seeded obfuscated server lists, at most once per interval.
+    fn refresh_osl(&self) {
+        if self.settings.osl_roots.is_empty()
+            || self.settings.remote_fetch_disabled
+            || self.settings.target.is_some()
+        {
+            return;
+        }
+        let forced = self.osl_seeded.swap(false, Ordering::AcqRel);
+        let mut last = lock(&self.last_osl);
+        if !forced && last.is_some_and(|at| at.elapsed() < OSL_REFRESH) {
+            return;
+        }
+        *last = Some(Instant::now());
+        drop(last);
+        match fetch_osl_entries(&self.settings, &self.sloks) {
+            Ok(entries) => {
+                let added = self.add_entries(entries);
+                if added > 0 {
+                    eprintln!("psiphon: imported {added} obfuscated server entries");
+                }
+            }
+            Err(why) => eprintln!("psiphon: {why}"),
+        }
+    }
+
+    /// Append entries the lane does not already dial, keeping the snapshot stable.
+    fn add_entries(&self, entries: Vec<Server>) -> usize {
+        let mut current = lock(&self.entries);
+        let mut list = (**current).clone();
+        let mut added = 0;
+        for entry in entries {
+            let key = (
+                entry.address,
+                entry.port,
+                entry.ssh_port,
+                entry.quic,
+                entry.ss,
+                entry.tls,
+            );
+            if list.iter().any(|existing| {
+                (
+                    existing.address,
+                    existing.port,
+                    existing.ssh_port,
+                    existing.quic,
+                    existing.ss,
+                    existing.tls,
+                ) == key
+            }) {
+                continue;
+            }
+            list.push(entry);
+            added += 1;
+        }
+        if added > 0 {
+            *current = Arc::new(list);
+        }
+        added
+    }
 }
 
 /// Keep the pool warm beside the edge: a refused dial is a retry, not an exit.
@@ -1021,6 +1108,9 @@ fn warm_tunnel(lane: &Weak<Inner>) {
         }
         let pause = inner.settings.pause;
         let outcome = inner.fill();
+        if outcome.is_ok() {
+            inner.refresh_osl();
+        }
         drop(inner);
         match outcome {
             Ok(()) => {
@@ -2300,6 +2390,17 @@ impl Settings {
                 .or_else(|| text(settings, "remoteServerListSignaturePublicKey"))
                 .or_else(|| env("AETHER_PSIPHON_SERVER_LIST_KEY"))
                 .unwrap_or_else(|| ferrox_core::psiphon::SERVER_LIST_SIGNATURE_KEY.to_owned()),
+            osl_roots: osl_roots(settings),
+            remote_list_key: text(settings, "RemoteServerListSignaturePublicKey")
+                .or_else(|| text(settings, "remoteServerListSignaturePublicKey"))
+                .or_else(|| env("AETHER_PSIPHON_REMOTE_LIST_KEY"))
+                .unwrap_or_else(|| ferrox_core::psiphon::SERVER_LIST_SIGNATURE_KEY.to_owned()),
+            emit_sloks: flag(settings, "EmitSLOKs", "AETHER_PSIPHON_EMIT_SLOKS"),
+            emit_server_alerts: flag(
+                settings,
+                "EmitServerAlerts",
+                "AETHER_PSIPHON_EMIT_SERVER_ALERTS",
+            ),
             headers: custom_headers(settings),
             proxy,
             sponsor: text(settings, "sponsorId")
@@ -2885,6 +2986,17 @@ fn string_list(settings: Option<&Json>, key: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// The OSL roots, preferring the plural list and falling back to the legacy single URL.
+fn osl_roots(settings: Option<&Json>) -> Vec<String> {
+    let mut roots = json_list(settings, "ObfuscatedServerListRootURLs");
+    if roots.is_empty() {
+        if let Some(root) = text(settings, "ObfuscatedServerListRootURL") {
+            roots.push(list_url(root.trim()));
+        }
+    }
+    roots
+}
+
 /// Split-tunnel regions are ISO 3166-1 alpha-2 codes; accept either case and drop duplicates.
 fn split_tunnel_regions(settings: Option<&Json>) -> Vec<String> {
     let mut regions = Vec::new();
@@ -3010,6 +3122,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "serverListSignaturePublicKey",
     "remoteServerListSignaturePublicKey",
     "RemoteServerListSignaturePublicKey",
+    "ObfuscatedServerListRootURLs",
+    "ObfuscatedServerListRootURL",
+    "EmitSLOKs",
+    "EmitServerAlerts",
     "DisableRemoteServerListFetcher",
     "DisablePeriodicSshKeepAlive",
     "DisableKeepAlive",
@@ -5501,8 +5617,13 @@ fn split_fronting_address_with(raw: &str, default_port: u16) -> (String, u16) {
 }
 
 fn fetch_list(url: &str, public_key: &str, custom: &[(String, String)]) -> Result<String, String> {
+    let body = fetch_bytes(url, custom)?;
+    unpack(&body, public_key)
+}
+
+fn fetch_bytes(url: &str, custom: &[(String, String)]) -> Result<Vec<u8>, String> {
     let endpoint = crate::foxy_account::Endpoint::parse(url, crate::quic::system_roots())
-        .ok_or_else(|| format!("psiphon: server list {url} is not https"))?;
+        .ok_or_else(|| format!("psiphon: {url} is not https"))?;
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(custom.len() + 1);
     headers.push(("Accept", "*/*"));
     headers.extend(
@@ -5512,12 +5633,93 @@ fn fetch_list(url: &str, public_key: &str, custom: &[(String, String)]) -> Resul
     );
     let reply = crate::foxy_account::ask(&endpoint, "GET", &endpoint.url(""), &headers, &[])?;
     if reply.status != 200 {
-        return Err(format!("psiphon: server list {url}: HTTP {}", reply.status));
+        return Err(format!("psiphon: {url}: HTTP {}", reply.status));
     }
-    unpack(&reply.body, public_key)
+    Ok(reply.body)
 }
 
-fn unpack(body: &[u8], public_key: &str) -> Result<String, String> {
+/// Download, authenticate and decrypt every seeded OSL under the configured roots.
+fn fetch_osl_entries(
+    settings: &Settings,
+    sloks: &crate::psiphon_osl::SlokStore,
+) -> Result<Vec<Server>, String> {
+    let lookup = |id: &[u8]| sloks.get(id);
+    let mut servers = Vec::new();
+    let mut seen = HashSet::new();
+    let mut last = String::new();
+    for root in &settings.osl_roots {
+        let root = root.trim_end_matches('/');
+        let registry = match fetch_bytes(&format!("{root}/osl-registry"), &settings.headers) {
+            Ok(body) => body,
+            Err(why) => {
+                last = why;
+                continue;
+            }
+        };
+        let specs = match crate::psiphon_osl::parse_registry(&registry, &settings.remote_list_key) {
+            Ok(specs) => specs,
+            Err(why) => {
+                last = why;
+                continue;
+            }
+        };
+        for spec in specs {
+            if !spec.seeded(&lookup) {
+                continue;
+            }
+            let url = format!("{root}/osl-{}", hex(&spec.id));
+            let body = match fetch_bytes(&url, &settings.headers) {
+                Ok(body) => body,
+                Err(why) => {
+                    last = why;
+                    continue;
+                }
+            };
+            match crate::psiphon_osl::decrypt_osl(&body, &spec, &lookup, &settings.remote_list_key)
+            {
+                Ok(text) => absorb(
+                    &text,
+                    &mut servers,
+                    &mut seen,
+                    settings.conduit,
+                    &settings.conduit_protocols,
+                ),
+                Err(why) => last = why,
+            }
+        }
+    }
+    if servers.is_empty() {
+        return if last.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(last)
+        };
+    }
+    let servers: Vec<Server> = servers
+        .into_iter()
+        .filter(|server| {
+            server.direct
+                || server.meek.is_some()
+                || server.unfronted_meek.is_some()
+                || (settings.conduit && server.inproxy.is_some())
+        })
+        .collect();
+    let servers = filter_region(servers, settings);
+    let mut selected = select_protocols_with(
+        servers,
+        &settings.protocols,
+        &[],
+        0,
+        settings.fronted,
+        settings.fronted_fallback,
+        None,
+    );
+    apply_fronting_overrides(&mut selected, settings);
+    apply_session_settings(&mut selected, settings);
+    Ok(limit_quic_versions(selected, settings))
+}
+
+pub(crate) fn unpack(body: &[u8], public_key: &str) -> Result<String, String> {
     let mut decompressed = Vec::new();
     let too_large = ZlibDecoder::new(body)
         .take(MAX_LIST_BYTES + 1)
@@ -7184,6 +7386,22 @@ mod tests {
     }
 
     #[test]
+    fn osl_roots_decode_transfer_urls_and_the_legacy_single_url() {
+        let encoded = ferrox_core::b64::encode(b"https://osl.example/root");
+        let text = format!(
+            r#"{{"ObfuscatedServerListRootURLs":[{{"URL":"{encoded}"}},{{"URL":"https://plain.example"}}]}}"#
+        );
+        let settings = json::parse(&text).expect("settings");
+        assert_eq!(
+            osl_roots(Some(&settings)),
+            ["https://osl.example/root", "https://plain.example"]
+        );
+        let settings = json::parse(r#"{"ObfuscatedServerListRootURL":"https://legacy.example"}"#)
+            .expect("settings");
+        assert_eq!(osl_roots(Some(&settings)), ["https://legacy.example"]);
+    }
+
+    #[test]
     fn additional_custom_headers_follow_the_base_map() {
         let settings = json::parse(
             r#"{"CustomHeaders":{"X-One":"a","X-Two":"old"},"AdditionalCustomHeaders":{"X-Two":["b","c"]}}"#,
@@ -8635,7 +8853,16 @@ mod tests {
         let inner = Inner {
             session_id: String::new(),
             settings,
-            entries: Vec::new(),
+            entries: Mutex::new(Arc::new(Vec::new())),
+            sloks: crate::psiphon_osl::SlokStore::open(None),
+            requests: Arc::new(crate::psiphon_osl::ServerEvents {
+                sloks: crate::psiphon_osl::SlokStore::open(None),
+                seeded: Arc::new(AtomicBool::new(false)),
+                emit_alerts: false,
+                emit_sloks: false,
+            }),
+            osl_seeded: Arc::new(AtomicBool::new(false)),
+            last_osl: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -8681,7 +8908,16 @@ mod tests {
         let inner = Inner {
             session_id: String::new(),
             settings,
-            entries: Vec::new(),
+            entries: Mutex::new(Arc::new(Vec::new())),
+            sloks: crate::psiphon_osl::SlokStore::open(None),
+            requests: Arc::new(crate::psiphon_osl::ServerEvents {
+                sloks: crate::psiphon_osl::SlokStore::open(None),
+                seeded: Arc::new(AtomicBool::new(false)),
+                emit_alerts: false,
+                emit_sloks: false,
+            }),
+            osl_seeded: Arc::new(AtomicBool::new(false)),
+            last_osl: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),

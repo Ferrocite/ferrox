@@ -54,6 +54,7 @@ mod psiphon_fragment;
 mod psiphon_geoip;
 mod psiphon_h3;
 mod psiphon_meek;
+mod psiphon_osl;
 mod psiphon_quic;
 mod psiphon_rate;
 mod psiphon_shadowsocks;
