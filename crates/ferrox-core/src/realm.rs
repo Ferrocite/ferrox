@@ -13,6 +13,19 @@ use std::net::SocketAddr;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+std::thread_local! {
+    static SORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sort `addrs` and drop duplicates, counting the sort under test so a walk's sort count is observable.
+fn sort_distinct(addrs: &mut Vec<SocketAddr>) {
+    #[cfg(test)]
+    SORTS.with(|sorts| sorts.set(sorts.get() + 1));
+    addrs.sort_unstable();
+    addrs.dedup();
+}
+
 /// 8 bytes of random salt in front of every punch packet.
 pub const SALT_LEN: usize = 8;
 
@@ -370,11 +383,9 @@ pub fn candidate_addrs(
         if peer.is_ipv4() && !v4 || peer.is_ipv6() && !v6 {
             continue;
         }
-        if out.binary_search(&peer).is_err() {
-            out.push(peer);
-            out.sort_unstable();
-        }
+        out.push(peer);
     }
+    sort_distinct(&mut out);
     out
 }
 
@@ -395,8 +406,7 @@ fn predictable_group(sorted: &[u16]) -> bool {
 #[must_use]
 pub fn expand_symmetric(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
     let mut out: Vec<SocketAddr> = candidates.to_vec();
-    out.sort_unstable();
-    out.dedup();
+    sort_distinct(&mut out);
     let mut hosts: Vec<(std::net::IpAddr, Vec<u16>)> = Vec::new();
     for &addr in &out {
         if !addr.is_ipv4() {
@@ -408,6 +418,7 @@ pub fn expand_symmetric(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
             None => hosts.push((ip, vec![addr.port()])),
         }
     }
+    let mut added_candidates: Vec<SocketAddr> = Vec::new();
     for (ip, mut ports) in hosts {
         ports.sort_unstable();
         ports.dedup();
@@ -425,15 +436,14 @@ pub fn expand_symmetric(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
         while port <= u32::from(end) && added < NAT_MAX_PORTS_PER_HOST {
             let candidate = SocketAddr::new(ip, port as u16);
             if out.binary_search(&candidate).is_err() {
-                out.push(candidate);
-                out.sort_unstable();
+                added_candidates.push(candidate);
                 added += 1;
             }
             port += 1;
         }
     }
-    out.sort_unstable();
-    out.dedup();
+    out.extend(added_candidates);
+    sort_distinct(&mut out);
     out
 }
 
@@ -686,6 +696,52 @@ mod tests {
         assert!(!valid_realm_id("-lead"));
         assert!(!valid_realm_id("has space"));
         assert!(!valid_realm_id(&"a".repeat(65)));
+    }
+
+    fn sorts() -> usize {
+        SORTS.with(std::cell::Cell::get)
+    }
+
+    fn reset_sorts() {
+        SORTS.with(|sorts| sorts.set(0));
+    }
+
+    /// A walk over many peers sorts once, and an expansion sorts its input and its merged result
+    /// once each — never once per peer or per added candidate — while the answer stays sorted and
+    /// distinct.
+    #[test]
+    fn a_candidate_walk_sorts_once_and_an_expansion_sorts_twice() {
+        let v4_local: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let v6_local: SocketAddr = "[::1]:1000".parse().unwrap();
+        let mut peers: Vec<SocketAddr> = (0..128u16)
+            .flat_map(|i| {
+                let host = 10 + (i % 16) as u8;
+                [
+                    format!("192.0.2.{host}:{}", 30000 + i).parse().unwrap(),
+                    format!("[2001:db8::{i}]:4000").parse().unwrap(),
+                ]
+            })
+            .collect();
+        peers.reverse();
+        let duplicate = peers[..16].to_vec();
+        peers.extend(duplicate);
+        reset_sorts();
+        let candidates = candidate_addrs(&[v4_local, v6_local], &peers, Family::Dual);
+        assert_eq!(sorts(), 1, "one sort for the whole walk");
+        assert!(candidates.is_sorted());
+        assert!(candidates.windows(2).all(|w| w[0] != w[1]));
+        reset_sorts();
+        let predictable: Vec<SocketAddr> = vec![
+            "192.0.2.4:30000".parse().unwrap(),
+            "192.0.2.4:30002".parse().unwrap(),
+            "192.0.2.5:40000".parse().unwrap(),
+            "192.0.2.5:40001".parse().unwrap(),
+        ];
+        let expanded = expand_symmetric(&predictable);
+        assert_eq!(sorts(), 2, "the input sort and the one merged result");
+        assert!(expanded.is_sorted());
+        assert!(expanded.windows(2).all(|w| w[0] != w[1]));
+        assert!(expanded.contains(&"192.0.2.4:30006".parse().unwrap()));
     }
 
     /// The expansion is the candidates' sorted distinct set: its base lies in the sorted order the

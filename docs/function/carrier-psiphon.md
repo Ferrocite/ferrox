@@ -56,6 +56,7 @@ graph TD
 | ss-vectored-write-extra-buffers | 0 | ferrox-app-psiphon-shadowsocks::tests::a_vectored_write_allocates_only_the_wire_buffer |
 | flow-clone-allocations | 0 | ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words |
 | affinity-lookup-allocations | 0 | ferrox-app-psiphon::tests::an_affinity_lookup_does_not_format_each_entry |
+| preresolved-pick-allocations | 0 | ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap |
 | ss-direct-write-probe-ops | 47483770 | scripts/count-ops.sh |
 | ss-flatten-write-probe-ops | 47621538 | scripts/count-ops.sh |
 | quic-varint-probe-ops | 131079 | scripts/count-ops.sh |
@@ -119,6 +120,8 @@ The protocol reference is the pinned `psiphon-tunnel-core` console client; both 
 **The single tunnel.** The lane used to replace its one session on every reconnect, so every flow shared one TCP connection and one send window. `TunnelPoolSize` keeps up to thirty-two live sessions and picks one per flow round-robin; a flow is still one `direct-tcpip` channel on one session, so byte order and the SSH stream are unchanged, while independent flows use independent connections. `TargetServerEntry` pins the pool to one, as the reference does. The live workflow takes a `pool` dispatch input and, above one, runs eight parallel downloads as the aggregate gate.
 
 **The affinity string per entry.** The first-entry lookup used to format `host:port` for every server it scanned past, then compare the strings. It now keeps the affinity as the entry's host and port and compares those fields, so a dial with an affinity set allocates nothing while it finds the last good server; `an_affinity_lookup_does_not_format_each_entry` measures 88 allocations for the old scan and zero for the field compare over the same 64 entries, with the same index chosen.
+
+**The preresolved pick.** A preresolved CIDR answer used to collect its matching family into a `Vec` and lowercase the host and provider into fresh strings. The host and provider now stay borrowed when they are already lowercase, and the family is counted and walked rather than collected, so a pick takes no heap at all; `preresolved-pick-allocations` holds 4,096 picks at zero allocations, bytes and zeroed buffers, and the uppercase-with-trailing-dot case still answers through the same borrowed-or-owned path.
 
 **The serial pool fill.** A wide pool used to cost one full handshake window per tunnel, so eight tunnels took eight races before the pool was warm. `fill` now dials eight at a time and spreads each dial to a different starting entry, so the same pool costs one handshake window; a refusal still leaves the tunnels that did answer and the next cycle fills only the gap. The affinity lead and `EstablishTunnelPausePeriodSeconds` decide which server starts first and how long the warm loop waits between cycles.
 

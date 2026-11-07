@@ -6,6 +6,7 @@
 //! ordinary path pays no query. Every knob is opt-in; the defaults reproduce
 //! the previous behaviour byte for byte.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -728,26 +729,25 @@ impl Config {
 
     /// A random address from a matching preresolved CIDR for one record family.
     fn preresolve(&self, provider: Option<&str>, host: &str, want_v4: bool) -> Option<IpAddr> {
-        let name = host.trim_end_matches('.').to_ascii_lowercase();
+        let name = lower_ascii(host.trim_end_matches('.'));
+        let provider = provider.map(lower_ascii);
         let networks = provider
-            .and_then(|provider| self.preresolved_labels.get(&provider.to_ascii_lowercase()))
-            .or_else(|| self.preresolved_labels.get(&name))
+            .as_deref()
+            .and_then(|provider| self.preresolved_labels.get(provider))
+            .or_else(|| self.preresolved_labels.get(name.as_ref()))
             .or_else(|| self.preresolved_labels.get(""))?;
-        if networks.is_empty() {
+        let matches = || {
+            networks
+                .iter()
+                .filter(|(address, _)| address.is_ipv4() == want_v4)
+        };
+        let count = matches().count();
+        if count == 0 {
             return None;
         }
-        let candidates: Vec<&(IpAddr, u8)> = networks
-            .iter()
-            .filter(|(address, _)| address.is_ipv4() == want_v4)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        let index = usize::try_from(random_below(
-            u64::try_from(candidates.len()).unwrap_or(u64::MAX),
-        ))
-        .unwrap_or(0);
-        let (address, prefix) = *candidates[index];
+        let index =
+            usize::try_from(random_below(u64::try_from(count).unwrap_or(u64::MAX))).unwrap_or(0);
+        let (address, prefix) = *matches().nth(index)?;
         Some(random_in(address, prefix))
     }
 }
@@ -889,6 +889,15 @@ fn coin(probability: f64) -> bool {
         return true;
     }
     f64::from(u16::from_be_bytes(crate::psiphon_ssh::random::<2>())) / 65_536.0 < probability
+}
+
+/// `value` lowercased, borrowed when it already is, so a preresolved pick takes no string copy.
+fn lower_ascii(value: &str) -> Cow<'_, str> {
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(value.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 /// A random value in `0..bound`.
@@ -1322,6 +1331,26 @@ mod tests {
         assert!(config
             .preresolve(Some("provider-a"), "psiphon.test", true)
             .is_some());
+    }
+
+    #[test]
+    /// A preresolved pick allocates nothing: the host and provider stay borrowed when they are
+    /// already lowercase, and the family filter is counted and walked rather than collected.
+    fn a_preresolved_pick_takes_no_heap() {
+        let mut config = Config::from_servers(&[]);
+        config.preresolved_labels =
+            HashMap::from([(String::new(), Config::cidrs(&["203.0.113.0/24".to_owned()]))]);
+        assert!(config.preresolve(None, "PSIPHON.TEST.", true).is_some());
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                std::hint::black_box(config.preresolve(None, "psiphon.test", true));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 preresolved picks take no heap"
+        );
     }
 
     #[test]
