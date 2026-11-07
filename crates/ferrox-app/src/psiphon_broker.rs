@@ -130,26 +130,28 @@ pub(crate) fn cbor_tactics_to_json(bytes: &[u8]) -> Option<Json> {
     let Value::Map(entries) = value else {
         return None;
     };
-    let field = |name: &str, key: u64| {
-        entries
-            .iter()
-            .find_map(|(entry_key, value)| match entry_key {
-                Value::Text(text) if text == name => Some(value),
-                Value::UInt(number) if *number == key => Some(value),
-                _ => None,
-            })
-    };
-    let tag = field("Tag", 1)
-        .and_then(Value::text)
-        .unwrap_or("")
-        .to_owned();
-    let Some(tactics) = field("Tactics", 2) else {
+    let (mut tag, mut tactics, mut compression) = (None, None, None);
+    for (key, value) in &entries {
+        match key {
+            Value::Text(text) if text == "Tag" => tag = tag.or(Some(value)),
+            Value::Text(text) if text == "Tactics" => tactics = tactics.or(Some(value)),
+            Value::Text(text) if text == "TacticsCompression" => {
+                compression = compression.or(Some(value));
+            }
+            Value::UInt(1) => tag = tag.or(Some(value)),
+            Value::UInt(2) => tactics = tactics.or(Some(value)),
+            Value::UInt(3) => compression = compression.or(Some(value)),
+            _ => {}
+        }
+    }
+    let tag = tag.and_then(Value::text).unwrap_or("").to_owned();
+    let Some(tactics) = tactics else {
         return Some(Json::Obj(vec![("Tag".to_owned(), Json::Str(tag))]));
     };
     let tactics = match tactics {
         Value::Map(_) => value_to_json(tactics),
-        Value::Bytes(bytes) => tactics_bytes(bytes, field("TacticsCompression", 3))?,
-        Value::Text(text) => tactics_bytes(text.as_bytes(), field("TacticsCompression", 3))?,
+        Value::Bytes(bytes) => tactics_bytes(bytes, compression)?,
+        Value::Text(text) => tactics_bytes(text.as_bytes(), compression)?,
         _ => return None,
     };
     Some(Json::Obj(vec![
@@ -160,8 +162,8 @@ pub(crate) fn cbor_tactics_to_json(bytes: &[u8]) -> Option<Json> {
 
 fn tactics_bytes(bytes: &[u8], compression: Option<&Value>) -> Option<Json> {
     let compression = compression.and_then(Value::uint).unwrap_or(0);
-    let decoded = match compression {
-        0 => bytes.to_vec(),
+    match compression {
+        0 => parse_tactics(bytes),
         1 => {
             let mut out = Vec::new();
             let limit = u64::try_from(MAX_TACTICS_BYTES).ok()? + 1;
@@ -172,14 +174,17 @@ fn tactics_bytes(bytes: &[u8], compression: Option<&Value>) -> Option<Json> {
             if read > MAX_TACTICS_BYTES {
                 return None;
             }
-            out
+            parse_tactics(&out)
         }
-        _ => return None,
-    };
-    std::str::from_utf8(&decoded)
+        _ => None,
+    }
+}
+
+fn parse_tactics(bytes: &[u8]) -> Option<Json> {
+    std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| crate::json::parse(text).ok())
-        .or_else(|| cbor_to_json(&decoded))
+        .or_else(|| cbor_to_json(bytes))
 }
 
 /// A decoded record with its type stripped.
@@ -1813,6 +1818,24 @@ mod tests {
         assert_eq!(offer.answer_sdp, "answer");
         assert_eq!(offer.connection_id, vec![4; 32]);
         assert_eq!(offer.protocol_version, 2);
+    }
+
+    #[test]
+    fn a_compression_zero_tactics_payload_is_parsed_where_it_lies() {
+        let payload = br#"{"TTL":"2h"}"#;
+        let (direct, direct_counts) =
+            ferrox_core::alloc_count::measure(|| tactics_bytes(payload, None));
+        let (copied, copied_counts) = ferrox_core::alloc_count::measure(|| {
+            let copied = payload.to_vec();
+            parse_tactics(&copied)
+        });
+        assert_eq!(direct, copied);
+        assert_eq!(
+            copied_counts.allocs,
+            direct_counts.allocs + 1,
+            "the old path copied the tactics: {direct_counts:?} vs {copied_counts:?}"
+        );
+        assert_eq!(copied_counts.bytes, direct_counts.bytes + payload.len());
     }
 
     #[test]
