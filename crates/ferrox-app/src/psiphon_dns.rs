@@ -23,6 +23,12 @@ struct CacheEntry {
     expires: Instant,
 }
 
+struct SteeringEntry {
+    address: IpAddr,
+    expires: Instant,
+    active: bool,
+}
+
 /// The client DNS knobs; every default keeps the previous fallback behaviour.
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
@@ -38,7 +44,11 @@ pub(crate) struct Config {
     pub(crate) cache_extension: Duration,
     pub(crate) preresolved_labels: HashMap<String, Vec<(IpAddr, u8)>>,
     pub(crate) preresolved_probability: f64,
+    pub(crate) steering_ttl: Duration,
+    pub(crate) steering_probability: f64,
+    pub(crate) steering_max: usize,
     cache: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    steering: Arc<Mutex<HashMap<String, SteeringEntry>>>,
 }
 
 impl Config {
@@ -57,8 +67,62 @@ impl Config {
             cache_extension: Duration::ZERO,
             preresolved_labels: HashMap::new(),
             preresolved_probability: 0.0,
+            steering_ttl: Duration::from_secs(3600),
+            steering_probability: 1.0,
+            steering_max: 65_536,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            steering: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Cache a handshake steering IP for a fronting provider, keeping an entry
+    /// already in use active across a replacement.
+    pub(crate) fn remember_steering(&self, provider: &str, address: IpAddr) {
+        if provider.is_empty() {
+            return;
+        }
+        let Ok(mut cache) = self.steering.lock() else {
+            return;
+        };
+        if cache.len() >= self.steering_max && !cache.contains_key(provider) {
+            cache.retain(|_, entry| entry.expires > Instant::now());
+            if cache.len() >= self.steering_max {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+        }
+        let active = cache.get(provider).is_some_and(|entry| entry.active);
+        cache.insert(
+            provider.to_owned(),
+            SteeringEntry {
+                address,
+                expires: Instant::now() + self.steering_ttl.max(Duration::from_secs(1)),
+                active,
+            },
+        );
+    }
+
+    /// A live steering IP for a fronting provider, dropping an expired entry and
+    /// drawing the probability only until the provider is in use.
+    fn steering_get(&self, provider: &str) -> Option<IpAddr> {
+        let mut cache = self.steering.lock().ok()?;
+        let entry = cache.get_mut(provider)?;
+        if entry.expires <= Instant::now() {
+            cache.remove(provider);
+            return None;
+        }
+        if !entry.active {
+            if !coin(self.steering_probability) {
+                return None;
+            }
+            entry.active = true;
+        }
+        Some(entry.address)
     }
 
     /// Parse a CIDR list into networks; a bare address is a full-length prefix.
@@ -207,6 +271,9 @@ pub(crate) fn resolve_fronting(
     host: &str,
     port: u16,
 ) -> io::Result<Vec<SocketAddr>> {
+    if let Some(address) = provider.and_then(|provider| config.steering_get(provider)) {
+        return Ok(vec![SocketAddr::new(address, port)]);
+    }
     let mut addresses = Vec::new();
     if coin(config.preresolved_probability) {
         if let Some(address) = config.preresolve(provider, host, true) {
@@ -689,5 +756,34 @@ mod tests {
         reply.extend_from_slice(&[0, 1, 0, 1]);
         assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), false).is_ok());
         assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), true).is_err());
+    }
+
+    #[test]
+    /// A cached steering IP answers the fronting dial without a resolver query.
+    fn a_steering_ip_answers_a_fronting_dial() {
+        let config = Config::from_servers(&[]);
+        config.remember_steering("provider", "192.0.2.10".parse().expect("address"));
+        let addresses = super::resolve_fronting(&config, Some("provider"), "front.example", 443)
+            .expect("resolve");
+        assert_eq!(addresses, vec!["192.0.2.10:443".parse().expect("address")]);
+    }
+
+    #[test]
+    /// A zero probability keeps a cached steering IP unused until a draw starts it.
+    fn a_zero_probability_does_not_use_a_cached_steering_ip() {
+        let mut config = Config::from_servers(&[]);
+        config.steering_probability = 0.0;
+        config.remember_steering("provider", "192.0.2.10".parse().expect("address"));
+        assert!(config.steering_get("provider").is_none());
+        config.steering_probability = 1.0;
+        assert_eq!(
+            config.steering_get("provider"),
+            Some("192.0.2.10".parse().expect("address"))
+        );
+        config.steering_probability = 0.0;
+        assert_eq!(
+            config.steering_get("provider"),
+            Some("192.0.2.10".parse().expect("address"))
+        );
     }
 }
