@@ -76,6 +76,28 @@ def without_comment(line, in_block):
     return "".join(out), in_block
 
 
+def brace_delta(line):
+    delta = 0
+    quote = None
+    escaped = False
+    for char in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "`":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ('"', "'", '`'):
+            quote = char
+        elif char == "{":
+            delta += 1
+        elif char == "}":
+            delta -= 1
+    return delta
+
+
 def upstream_fields(root):
     path = os.path.join(root, CONFIG)
     if not os.path.isfile(path):
@@ -86,9 +108,48 @@ def upstream_fields(root):
     start = text.find(marker)
     if start < 0:
         return None
+    # Count braces outside Go comments so a brace in a comment cannot hide the end.
     depth = 0
-    end = start + len(marker) - 1
-    for index in range(start + len(marker) - 1, len(text)):
+    end = len(text)
+    in_block = False
+    in_line = False
+    quote = None
+    escaped = False
+    index = start + len(marker) - 1
+    while index < len(text):
+        if in_block:
+            if text[index:index + 2] == "*/":
+                in_block = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if in_line:
+            if text[index] == "\n":
+                in_line = False
+            index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif text[index] == "\\" and quote != "`":
+                escaped = True
+            elif text[index] == quote:
+                quote = None
+            index += 1
+            continue
+        if text[index:index + 2] == "//":
+            in_line = True
+            index += 2
+            continue
+        if text[index:index + 2] == "/*":
+            in_block = True
+            index += 2
+            continue
+        if text[index] in ('"', "'", '`'):
+            quote = text[index]
+            index += 1
+            continue
         if text[index] == "{":
             depth += 1
         elif text[index] == "}":
@@ -96,6 +157,7 @@ def upstream_fields(root):
             if depth == 0:
                 end = index
                 break
+        index += 1
     body = text[start + len(marker):end]
     fields = []
     depth = 0
@@ -104,7 +166,7 @@ def upstream_fields(root):
         line, in_block = without_comment(line, in_block)
         line = line.strip()
         top = depth == 0
-        depth += line.count("{") - line.count("}")
+        depth += brace_delta(line)
         if not top or not line:
             continue
         match = re.match(r"^([A-Z]\w*)\s+[^`]*(?:`([^`]*)`)?", line)
