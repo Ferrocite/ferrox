@@ -11322,7 +11322,10 @@ fn kcp_tls_session(
     ferrox_core::tls::ClientSession<KcpIo>,
 )> {
     let conn = kcp_dial_session(carrier, address, port)?;
-    let session = kcp_tls_connect(&conn, cfg)?;
+    let Some(session) = kcp_tls_connect(&conn, cfg) else {
+        conn.close();
+        return None;
+    };
     Some((conn, session))
 }
 
@@ -11343,12 +11346,15 @@ fn relay_kcp_under<S>(
         + 'static,
 {
     if session.write_all(header).is_err() || !ready(&mut session) {
+        conn.close();
         return;
     }
     let Ok(downstream) = client.try_clone() else {
+        conn.close();
         return;
     };
     if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        conn.close();
         return;
     }
     let close: Arc<dyn Fn() + Send + Sync> = {
@@ -11362,7 +11368,7 @@ fn relay_kcp_under<S>(
         })
     };
     let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
-    relay_shared(
+    relay_shared_late(
         Half::socket(downstream),
         Half::split(reader, writer),
         &close,
@@ -21444,6 +21450,7 @@ fn dial_socks_tls_client(
         let Some(tunnel) =
             crate::socks::connect(session, &socks.credential, destination, socks.version)
         else {
+            conn.close();
             return;
         };
         relay_kcp_under(client, &conn, tunnel, &[], |_| true);
@@ -25786,7 +25793,8 @@ fn http_connect<S, L>(
     http: &HttpOut,
     target: &Destination,
     lane: L,
-) where
+) -> bool
+where
     S: std::io::Read + std::io::Write + Send + 'static,
     L: FnOnce(S, Connection, std::sync::Arc<dyn Fn() + Send + Sync>) + Send + 'static,
 {
@@ -25794,12 +25802,12 @@ fn http_connect<S, L>(
     let mut req = Vec::new();
     http_connect_request(target, http, &mut req);
     if stream.write_all(&req).is_err() {
-        return;
+        return false;
     }
     // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
     let Some((head, at)) = read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
     else {
-        return;
+        return false;
     };
     let code = head[..at]
         .split(|b| *b == b'\n')
@@ -25809,17 +25817,17 @@ fn http_connect<S, L>(
         .and_then(|code| code.trim().parse::<u16>().ok())
         .unwrap_or(0);
     if code != 200 {
-        return;
+        return false;
     }
     let Ok(mut downstream) = client.try_clone() else {
-        return;
+        return false;
     };
     // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
     if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-        return;
+        return false;
     }
     if at < head.len() && downstream.write_all(&head[at..]).is_err() {
-        return;
+        return false;
     }
     let close_downstream = downstream.try_clone().ok();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
@@ -25828,6 +25836,7 @@ fn http_connect<S, L>(
         }
     });
     lane(stream, downstream, close);
+    true
 }
 
 fn dial_http_outbound(
@@ -25845,15 +25854,19 @@ fn dial_http_outbound(
             else {
                 return;
             };
-            http_connect(
+            let relay_conn = Arc::clone(&conn);
+            let relayed = http_connect(
                 client,
                 session,
                 http,
                 target,
                 move |stream, downstream, _| {
-                    relay_kcp_under(&downstream, &conn, stream, &[], |_| true);
+                    relay_kcp_under(&downstream, &relay_conn, stream, &[], |_| true);
                 },
             );
+            if !relayed {
+                conn.close();
+            }
             return;
         }
         if matches!(http.carrier, Carrier::Raw(_)) {
@@ -25863,7 +25876,7 @@ fn dial_http_outbound(
             let Some((reader, writer, _)) = session.into_halves() else {
                 return;
             };
-            http_connect(
+            let _ = http_connect(
                 client,
                 CarrierStream { reader, writer },
                 http,
@@ -25887,7 +25900,7 @@ fn dial_http_outbound(
     if s.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    http_connect(client, s, http, target, |stream, downstream, close| {
+    let _ = http_connect(client, s, http, target, |stream, downstream, close| {
         relay_shared(Half::socket(stream), Half::socket(downstream), &close);
     });
 }
@@ -43454,6 +43467,15 @@ mod tests {
         Some(())
     }
 
+    fn serve_fake_socks_late(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        thread::sleep(Duration::from_millis(200));
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
     fn socks_grant(stream: &mut FakeStream) -> Option<()> {
         let mut greeting = [0u8; 3];
         read_exact_stream(stream, &mut greeting)?;
@@ -43634,11 +43656,14 @@ mod tests {
         http_tls_over_carrier_reaches_echo(Some("/w"));
     }
 
-    #[test]
-    fn socks_tls_over_kcp_reaches_echo() {
+    fn socks_tls_over_kcp_echo(half_close: bool) {
         let (server_config, client_config) = carried_tls_configs();
-        let (kcp_port, done, server) = kcp_tls_serve(server_config, |stream| {
-            let _ = serve_fake_socks_once(stream);
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, move |stream| {
+            let _ = if half_close {
+                serve_fake_socks_late(stream)
+            } else {
+                serve_fake_socks_once(stream)
+            };
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
@@ -43668,6 +43693,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
         client.write_all(b"ping").expect("writes");
+        if half_close {
+            client.shutdown(Shutdown::Write).expect("half-closes");
+        }
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
@@ -43675,6 +43703,16 @@ mod tests {
         let _ = done.send(());
         server.join().expect("server joins");
         relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_reaches_echo() {
+        socks_tls_over_kcp_echo(false);
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_answers_after_the_client_half_closes() {
+        socks_tls_over_kcp_echo(true);
     }
 
     #[test]

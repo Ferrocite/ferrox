@@ -1,18 +1,18 @@
 # TLS client from config
 
-One dial owns the session: TCP is opened, the configured TLS handshake runs, and only
-then does the carrier open and the protocol header travel inside it.  The same shape
-serves every stream front that reads `tlsSettings`; the SOCKS and HTTP outbounds now
-join VLESS, VMess, Trojan and Shadowsocks instead of dialling their configured
-transport as a bare TCP socket.
+One dial owns the session: the transport is opened (TCP for the stream carriers, KCP
+over UDP for KCP), the configured TLS handshake runs inside it, and the protocol
+header then travels inside that session.  The same shape serves every stream front
+that reads `tlsSettings`; the SOCKS and HTTP outbounds now join VLESS, VMess, Trojan
+and Shadowsocks instead of dialling their configured transport as a bare TCP socket.
 
 `tls_carried_parts` reads `streamSettings.security = "tls"` into
 `(Carrier, server name, TlsConfig)`.  The carrier set is raw TCP, `ws`,
 `httpupgrade`, `grpc`, `xhttp`, the TCP `http` header and KCP; the SOCKS and HTTP
 outbound parsers refuse `quic`, `hysteria`, `masque`, `xdrive` and unknown networks
-rather than silently dialling them raw.  KCP wraps the connection, so its TLS
-handshake runs inside the KCP session and the front's header travels inside that
-session.  VLESS, VMess and Trojan keep the same `tls_carried_parts` path, and
+rather than silently dialling them raw.  KCP carries the session over UDP, so its
+TLS handshake runs inside the KCP connection and the front's header travels inside
+that session.  VLESS, VMess and Trojan keep the same `tls_carried_parts` path, and
 Shadowsocks its own KCP TLS lane.  The client loads named roots from `caCertFile`
 and `certificates`.
 It also loads system roots unless `disableSystemRoot` or `allowInsecure` is set, or
@@ -71,7 +71,7 @@ HTTP parsers the same test holds `quic` and `hysteria` refused; KCP is carried b
 `kcp_dial_session` and `kcp_tls_connect`, the same pair the VLESS, VMess, Trojan and
 Shadowsocks lanes use.  The echo rows run the real `dial_socks_outbound` or
 `dial_http_outbound` over a TLS echo listener; the carried rows reach the listener
-through a WebSocket upgrade or a KCP session inside TLS, not through a raw TCP
+through a WebSocket upgrade or a TLS session inside KCP, not through a raw TCP
 re-dial.
 
 ## Ops
