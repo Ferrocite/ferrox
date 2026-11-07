@@ -670,6 +670,8 @@ impl Flow {
                 let tag = match &self.aead {
                     Aead::Aes(aes) => aes.seal_from_uninit(nonce, b"", plain, &mut dst[..len]),
                     Aead::Chacha(key) => {
+                        // The ChaCha leg zeroes what it was handed, as `Vec::resize` did before spare capacity.
+                        unsafe { core::ptr::write_bytes(dst.as_mut_ptr(), 0, len) };
                         let dst = unsafe {
                             core::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), len)
                         };
