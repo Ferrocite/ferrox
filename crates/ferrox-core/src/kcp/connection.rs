@@ -495,10 +495,12 @@ impl Connection {
                     }
                     let mut receiving = self.receiving.lock().unwrap();
                     #[cfg(test)]
-                    self.pass_lock_gate("input");
+                    self.pass_lock_gate("receiving");
                     receiving.process_sending_next(c.sending_next);
                     drop(receiving);
                     let mut sending = self.sending.lock().unwrap();
+                    #[cfg(test)]
+                    self.pass_lock_gate("sending");
                     sending.process_receiving_next(c.receiving_next);
                     drop(sending);
                     self.ctx
@@ -857,18 +859,32 @@ mod tests {
             Box::new(|| {}),
             Config::default(),
         );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
         let weak = Arc::downgrade(&conn);
         conn.set_lock_gate(Some(Arc::new(move |site: &'static str| {
-            assert_eq!(site, "input");
             let conn = weak.upgrade().expect("the connection is alive");
-            assert!(
-                conn.sending.try_lock().is_ok(),
-                "input held the sending lock while taking the receiving lock"
-            );
+            match site {
+                "receiving" => {
+                    assert!(
+                        conn.sending.try_lock().is_ok(),
+                        "input held the sending lock while taking the receiving lock"
+                    );
+                }
+                "sending" => {
+                    assert!(
+                        conn.receiving.try_lock().is_ok(),
+                        "input held the receiving lock while taking the sending lock"
+                    );
+                }
+                _ => unreachable!("unknown lock site"),
+            }
+            recorded.lock().unwrap().push(site);
         })));
         let mut command = CmdOnlySegment::new();
         command.conv = 4;
         conn.input(&mut vec![Segment::CmdOnly(command)]);
+        assert_eq!(*events.lock().unwrap(), ["receiving", "sending"]);
     }
 
     #[test]
