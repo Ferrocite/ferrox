@@ -4717,10 +4717,6 @@ mod tests {
     /// A byte just inside each idle window still cannot outlive the hard body cap.
     #[test]
     fn a_drip_cannot_outlive_the_hard_body_cap() {
-        crate::budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(std::time::Duration::from_millis(30)),
-            ..Default::default()
-        });
         struct Drip;
         impl std::io::Read for Drip {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -4729,6 +4725,10 @@ mod tests {
                 Ok(1)
             }
         }
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_millis(30)),
+            ..Default::default()
+        });
         let mut drip = Drip;
         let started = std::time::Instant::now();
         let read = read_body(&mut drip, b"", 100, std::time::Duration::from_secs(60));
