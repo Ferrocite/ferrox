@@ -98,6 +98,7 @@ struct Inner {
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
     affinity: Mutex<Option<String>>,
+    moved_to_front: Mutex<HashSet<String>>,
     connecting: Mutex<()>,
     session_id: String,
     stopping: AtomicBool,
@@ -127,6 +128,44 @@ impl HoldOff {
                 .any(|name| name.eq_ignore_ascii_case(protocol))
             || !coin(self.probability)
         {
+            return Duration::ZERO;
+        }
+        let low = u64::try_from(self.min.as_millis()).unwrap_or(u64::MAX);
+        let high = u64::try_from(self.max.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(low);
+        let span = high.saturating_sub(low).saturating_add(1);
+        Duration::from_millis(low + u64::from_le_bytes(random::<8>()) % span)
+    }
+}
+
+/// The reference's provider-scoped hold-off: direct and inproxy key on provider/region,
+/// fronting keys on the fronting provider ID.
+#[derive(Clone, Debug, Default)]
+struct HoldOffClass {
+    providers: Vec<(String, Vec<String>)>,
+    region_scoped: bool,
+    probability: f64,
+    min: Duration,
+    max: Duration,
+}
+
+impl HoldOffClass {
+    fn delay(&self, provider: Option<&str>, region: Option<&str>) -> Duration {
+        if self.providers.is_empty() || !coin(self.probability) {
+            return Duration::ZERO;
+        }
+        let Some(provider) = provider else {
+            return Duration::ZERO;
+        };
+        let matched = self.providers.iter().any(|(id, regions)| {
+            id == provider
+                && (!self.region_scoped
+                    || regions
+                        .iter()
+                        .any(|allowed| allowed.is_empty() || Some(allowed.as_str()) == region))
+        });
+        if !matched {
             return Duration::ZERO;
         }
         let low = u64::try_from(self.min.as_millis()).unwrap_or(u64::MAX);
@@ -253,6 +292,18 @@ struct Settings {
     relay_buffer: usize,
     rate: Option<crate::psiphon_rate::Rate>,
     holdoff: HoldOff,
+    holdoff_direct: HoldOffClass,
+    holdoff_fronting: HoldOffClass,
+    holdoff_inproxy: HoldOffClass,
+    compress_tactics: bool,
+    server_entry_max_move_to_front: i64,
+    server_entry_reset_probability: f64,
+    restrict_direct_regions: Vec<(String, Vec<String>)>,
+    restrict_direct_probability: f64,
+    restrict_inproxy_regions: Vec<(String, Vec<String>)>,
+    restrict_inproxy_probability: f64,
+    restrict_fronting_ids: Vec<String>,
+    restrict_fronting_probability: f64,
     liveness: Liveness,
     dial_ports: Vec<(String, PortList)>,
     dial_ports_probability: f64,
@@ -384,6 +435,7 @@ impl PsiphonOut {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
+            moved_to_front: Mutex::new(HashSet::new()),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint,
@@ -530,10 +582,18 @@ impl Inner {
 
     /// The first entry to dial and the head start its affinity buys, read once per batch.
     fn start(&self) -> (usize, Duration) {
-        let entries = Arc::clone(&lock(&self.entries));
-        if entries.is_empty() {
-            return (0, Duration::ZERO);
-        }
+        let entries = {
+            let mut guard = lock(&self.entries);
+            if guard.is_empty() {
+                return (0, Duration::ZERO);
+            }
+            if coin(self.settings.server_entry_reset_probability) {
+                let entries = Arc::make_mut(&mut *guard);
+                shuffle(entries.as_mut_slice());
+                lock(&self.moved_to_front).clear();
+            }
+            Arc::clone(&*guard)
+        };
         let affinity = lock(&self.affinity).clone();
         match affinity.as_deref().and_then(|host| {
             entries
@@ -541,10 +601,24 @@ impl Inner {
                 .position(|entry| format!("{}:{}", entry.host, entry.port) == host)
         }) {
             Some(base) => (base, self.settings.affinity_grace),
-            None => (
-                u32::from_le_bytes(random::<4>()) as usize % entries.len(),
-                Duration::ZERO,
-            ),
+            None => (0, Duration::ZERO),
+        }
+    }
+
+    /// Record a live server: it becomes the affinity and, under the cap, the next first entry.
+    fn remember(&self, host: &str) {
+        *lock(&self.affinity) = Some(host.to_owned());
+        let mut guard = lock(&self.entries);
+        let max = self.settings.server_entry_max_move_to_front;
+        if max == 0 {
+            return;
+        }
+        let mut moved = lock(&self.moved_to_front);
+        if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
+            return;
+        }
+        if move_to_front(Arc::make_mut(&mut *guard), host) {
+            moved.insert(host.to_owned());
         }
     }
 
@@ -597,6 +671,13 @@ impl Inner {
             offset += taken;
             if taken == 0 {
                 break;
+            }
+            let batch: Vec<Server> = batch
+                .into_iter()
+                .filter(|server| !self.settings.restricted(server, self.settings.conduit))
+                .collect();
+            if batch.is_empty() {
+                continue;
             }
             let lead = if std::mem::take(&mut first_batch) {
                 affinity_lead
@@ -695,7 +776,16 @@ impl Inner {
                         return Err("psiphon: the lane is stopping".to_owned());
                     }
                     let protocol = session.protocol();
-                    let hold_off = self.settings.holdoff.duration(protocol);
+                    let hold_off =
+                        self.settings
+                            .holdoff
+                            .duration(protocol)
+                            .max(self.settings.holdoff_for(
+                                protocol,
+                                session.provider_id(),
+                                session.region(),
+                                session.fronting_provider_id(),
+                            ));
                     if !hold_off.is_zero() {
                         eprintln!(
                             "psiphon: holding off {protocol} for {} ms",
@@ -968,7 +1058,7 @@ impl Inner {
         }
         let (start, lead) = self.start();
         let session = self.connect_locked(start, lead, Some(connecting))?;
-        *lock(&self.affinity) = Some(session.server().to_owned());
+        self.remember(session.server());
         Ok(session)
     }
 
@@ -991,7 +1081,7 @@ impl Inner {
                 }
                 let (start, lead) = self.start();
                 let session = self.connect_locked(start, lead, Some(connecting))?;
-                *lock(&self.affinity) = Some(session.server().to_owned());
+                self.remember(session.server());
                 continue;
             }
             let width = missing.min(FILL_WORKERS);
@@ -1026,7 +1116,7 @@ impl Inner {
                 }
             }
             if let Some(host) = reached {
-                *lock(&self.affinity) = Some(host);
+                self.remember(&host);
             }
             if succeeded == 0 {
                 return Err(last);
@@ -2186,7 +2276,8 @@ impl Settings {
             "AETHER_PSIPHON_DISABLE_TIMEOUTS",
         );
         let latency = Latency::from_settings(settings, disable_timeouts);
-        let establish = number(settings, "EstablishTunnelTimeoutSeconds")
+        let establish = number(settings, "TunnelConnectTimeoutSeconds")
+            .or_else(|| number(settings, "EstablishTunnelTimeoutSeconds"))
             .map(|seconds| Duration::from_secs(seconds.clamp(1, 600)));
         let initial_protocols = protocol_list_named(settings, "InitialLimitTunnelProtocols");
         let initial_count = number(settings, "InitialLimitTunnelProtocolsCandidateCount")
@@ -2363,6 +2454,42 @@ impl Settings {
             relay_buffer,
             rate: rate_limits(settings),
             holdoff: holdoff(settings),
+            holdoff_direct: holdoff_class(settings, "Direct"),
+            holdoff_fronting: holdoff_class(settings, "Fronting"),
+            holdoff_inproxy: holdoff_class(settings, "Inproxy"),
+            compress_tactics: settings
+                .and_then(|settings| settings.get("CompressTactics"))
+                .and_then(Json::as_bool)
+                .unwrap_or(true),
+            server_entry_max_move_to_front: decimal(settings, "ServerEntryIteratorMaxMoveToFront")
+                .map_or(-1, |value| value as i64),
+            server_entry_reset_probability: decimal(
+                settings,
+                "ServerEntryIteratorResetProbability",
+            )
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+            restrict_direct_regions: key_strings(settings, "RestrictDirectProviderRegions"),
+            restrict_direct_probability: decimal(
+                settings,
+                "RestrictDirectProviderIDsClientProbability",
+            )
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+            restrict_inproxy_regions: key_strings(settings, "RestrictInproxyProviderRegions"),
+            restrict_inproxy_probability: decimal(
+                settings,
+                "RestrictInproxyProviderIDsClientProbability",
+            )
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+            restrict_fronting_ids: string_list(settings, "RestrictFrontingProviderIDs"),
+            restrict_fronting_probability: decimal(
+                settings,
+                "RestrictFrontingProviderIDsClientProbability",
+            )
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
             liveness: liveness(settings),
             dial_ports,
             dial_ports_probability,
@@ -2494,6 +2621,48 @@ impl Settings {
             .unwrap_or(DIAL_TIMEOUT)
             .mul_f64(self.latency.multiplier())
             .min(Duration::from_secs(600))
+    }
+
+    /// The longest provider-scoped hold-off that names this tunnel's class.
+    fn holdoff_for(
+        &self,
+        protocol: &str,
+        provider: Option<&str>,
+        region: Option<&str>,
+        fronting: Option<&str>,
+    ) -> Duration {
+        if protocol.starts_with("FRONTED-MEEK") {
+            self.holdoff_fronting.delay(fronting, region)
+        } else if protocol.starts_with("INPROXY-") {
+            self.holdoff_inproxy.delay(provider, region)
+        } else {
+            self.holdoff_direct.delay(provider, region)
+        }
+    }
+
+    /// Whether a client restriction skips this candidate; the reference coins per candidate.
+    fn restricted(&self, server: &Server, conduit: bool) -> bool {
+        if conduit && server.inproxy.is_some() {
+            return coin(self.restrict_inproxy_probability)
+                && region_restricted(
+                    &self.restrict_inproxy_regions,
+                    server.provider_id.as_deref(),
+                    server.region.as_deref(),
+                );
+        }
+        if server.meek.is_some() {
+            return coin(self.restrict_fronting_probability)
+                && server
+                    .fronting_provider_id
+                    .as_deref()
+                    .is_some_and(|id| self.restrict_fronting_ids.iter().any(|known| known == id));
+        }
+        coin(self.restrict_direct_probability)
+            && region_restricted(
+                &self.restrict_direct_regions,
+                server.provider_id.as_deref(),
+                server.region.as_deref(),
+            )
     }
 }
 
@@ -2650,6 +2819,75 @@ fn holdoff(settings: Option<&Json>) -> HoldOff {
         min,
         max,
     }
+}
+
+/// One provider-scoped hold-off class from `HoldOff{Direct,Fronting,Inproxy}Tunnel*`.
+fn holdoff_class(settings: Option<&Json>, kind: &str) -> HoldOffClass {
+    let clock = |suffix: &str| {
+        Duration::from_millis(
+            number(settings, &format!("HoldOff{kind}Tunnel{suffix}")).unwrap_or(0),
+        )
+        .min(HOLD_OFF_LIMIT)
+    };
+    let min = clock("MinDurationMilliseconds");
+    let max = clock("MaxDurationMilliseconds").max(min);
+    let region_scoped = kind != "Fronting";
+    let providers = if region_scoped {
+        key_strings(settings, &format!("HoldOff{kind}TunnelProviderRegions"))
+    } else {
+        string_list(settings, "HoldOffFrontingTunnelProviderIDs")
+            .into_iter()
+            .map(|id| (id, Vec::new()))
+            .collect()
+    };
+    HoldOffClass {
+        providers,
+        region_scoped,
+        probability: decimal(settings, &format!("HoldOff{kind}TunnelProbability"))
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        min,
+        max,
+    }
+}
+
+/// A JSON object of provider ID to region list, as the reference's `KeyStrings` fields carry.
+fn key_strings(settings: Option<&Json>, key: &str) -> Vec<(String, Vec<String>)> {
+    let Some(Json::Obj(pairs)) = settings.and_then(|settings| settings.get(key)) else {
+        return Vec::new();
+    };
+    pairs
+        .iter()
+        .map(|(provider, value)| {
+            let regions = match value {
+                Json::Arr(items) => items
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                Json::Str(region) => vec![region.clone()],
+                _ => Vec::new(),
+            };
+            (provider.clone(), regions)
+        })
+        .collect()
+}
+
+/// Whether a provider/region map names this provider with `""` or the entry's own region.
+fn region_restricted(
+    map: &[(String, Vec<String>)],
+    provider: Option<&str>,
+    region: Option<&str>,
+) -> bool {
+    let Some(provider) = provider else {
+        return false;
+    };
+    map.iter().any(|(id, regions)| {
+        id == provider
+            && regions
+                .iter()
+                .any(|allowed| allowed.is_empty() || Some(allowed.as_str()) == region)
+    })
 }
 
 /// The reference initial and periodic liveness probes.
@@ -3180,6 +3418,28 @@ const KNOWN_SETTINGS: &[&str] = &[
     "LimitIntensiveConnectionWorkers",
     "DisableConnectionWorkerPool",
     "EstablishTunnelTimeoutSeconds",
+    "TunnelConnectTimeoutSeconds",
+    "CompressTactics",
+    "ServerEntryIteratorMaxMoveToFront",
+    "ServerEntryIteratorResetProbability",
+    "RestrictDirectProviderIDsClientProbability",
+    "RestrictDirectProviderRegions",
+    "RestrictFrontingProviderIDs",
+    "RestrictFrontingProviderIDsClientProbability",
+    "RestrictInproxyProviderIDsClientProbability",
+    "RestrictInproxyProviderRegions",
+    "HoldOffDirectTunnelMinDurationMilliseconds",
+    "HoldOffDirectTunnelMaxDurationMilliseconds",
+    "HoldOffDirectTunnelProbability",
+    "HoldOffDirectTunnelProviderRegions",
+    "HoldOffFrontingTunnelMinDurationMilliseconds",
+    "HoldOffFrontingTunnelMaxDurationMilliseconds",
+    "HoldOffFrontingTunnelProbability",
+    "HoldOffFrontingTunnelProviderIDs",
+    "HoldOffInproxyTunnelMinDurationMilliseconds",
+    "HoldOffInproxyTunnelMaxDurationMilliseconds",
+    "HoldOffInproxyTunnelProbability",
+    "HoldOffInproxyTunnelProviderRegions",
     "EstablishTunnelPausePeriodSeconds",
     "EstablishTunnelServerAffinityGracePeriodMilliseconds",
     "StaggerConnectionWorkersMilliseconds",
@@ -3771,6 +4031,7 @@ fn fetch_tactics_from(
             timeout,
             settings.proxy.as_ref(),
             &settings.dns,
+            settings.compress_tactics,
         ) {
             Ok(tactics) => return Ok(tactics),
             Err(why) => {
@@ -5248,6 +5509,16 @@ fn decode_entry_with(
         .get("region")
         .and_then(Json::as_str)
         .map(str::to_owned);
+    let provider_id = entry
+        .get("providerID")
+        .and_then(Json::as_str)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_owned);
+    let fronting_provider_id = entry
+        .get("frontingProviderID")
+        .and_then(Json::as_str)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_owned);
     let mut meek = protocol.and_then(|protocol| meek_entry(&entry, &host, protocol));
     let mut unfronted_meek = protocol
         .filter(|protocol| protocol.starts_with("FRONTED-MEEK"))
@@ -5277,6 +5548,8 @@ fn decode_entry_with(
         tls_obfuscation_key,
         meek_obfuscated_key,
         region,
+        provider_id,
+        fronting_provider_id,
         direct,
         tls,
         tls_port,
@@ -5801,6 +6074,30 @@ fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("psiphon: system entropy");
     bytes
+}
+
+/// `Fisher-Yates` over the entry list, so a reset makes every position equally likely.
+fn shuffle<T>(items: &mut [T]) {
+    for at in (1..items.len()).rev() {
+        let pick = (u32::from_le_bytes(random::<4>()) as usize) % (at + 1);
+        items.swap(at, pick);
+    }
+}
+
+/// Move a live server to the front; returns whether it moved.
+fn move_to_front(entries: &mut Vec<Server>, host: &str) -> bool {
+    let Some(at) = entries
+        .iter()
+        .position(|entry| format!("{}:{}", entry.host, entry.port) == host)
+    else {
+        return false;
+    };
+    if at == 0 {
+        return false;
+    }
+    let entry = entries.remove(at);
+    entries.insert(0, entry);
+    true
 }
 
 /// The reference's resource-intensive protocols: meek, QUIC, and an in-proxy transport that is dialled.
@@ -7837,6 +8134,8 @@ mod tests {
             tls_obfuscation_key: None,
             meek_obfuscated_key: None,
             region: None,
+            provider_id: None,
+            fronting_provider_id: None,
             direct: true,
             tls: false,
             tls_port: None,
@@ -8866,6 +9165,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
+            moved_to_front: Mutex::new(HashSet::new()),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -8921,6 +9221,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
+            moved_to_front: Mutex::new(HashSet::new()),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -8994,6 +9295,8 @@ mod tests {
                 tls_obfuscation_key: None,
                 meek_obfuscated_key: None,
                 region: None,
+                provider_id: None,
+                fronting_provider_id: None,
                 direct: true,
                 tls: false,
                 tls_port: None,
@@ -9048,6 +9351,8 @@ mod tests {
                 tls_obfuscation_key: None,
                 meek_obfuscated_key: None,
                 region: None,
+                provider_id: None,
+                fronting_provider_id: None,
                 direct: true,
                 tls: false,
                 tls_port: None,
@@ -9258,6 +9563,127 @@ mod tests {
         assert!((5..=10).contains(&wait));
         let off = json::parse(r#"{"HoldOffTunnelProtocolNames":["SSH"]}"#).expect("settings");
         assert_eq!(holdoff(Some(&off)).duration("SSH"), Duration::ZERO);
+    }
+
+    fn test_meek() -> crate::psiphon_meek::Meek {
+        crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            shape: TlsShape::default(),
+        }
+    }
+
+    #[test]
+    fn the_provider_hold_off_classes_are_read() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"HoldOffDirectTunnelMinDurationMilliseconds":5,"HoldOffDirectTunnelMaxDurationMilliseconds":10,"HoldOffDirectTunnelProbability":1.0,"HoldOffDirectTunnelProviderRegions":{"P1":[""]},"HoldOffFrontingTunnelMinDurationMilliseconds":5,"HoldOffFrontingTunnelMaxDurationMilliseconds":10,"HoldOffFrontingTunnelProviderIDs":["F1"],"HoldOffFrontingTunnelProbability":1.0,"HoldOffInproxyTunnelMinDurationMilliseconds":5,"HoldOffInproxyTunnelMaxDurationMilliseconds":10,"HoldOffInproxyTunnelProviderRegions":{"P2":["US"]},"HoldOffInproxyTunnelProbability":1.0}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let direct = settings.holdoff_for("SSH", Some("P1"), Some("CA"), None);
+        assert!((5..=10).contains(&u64::try_from(direct.as_millis()).expect("millis")));
+        assert_eq!(
+            settings.holdoff_for("SSH", Some("P9"), Some("CA"), None),
+            Duration::ZERO
+        );
+        assert_eq!(
+            settings.holdoff_for("FRONTED-MEEK-OSSH", Some("P1"), None, Some("F9")),
+            Duration::ZERO
+        );
+        assert!(!settings
+            .holdoff_for("FRONTED-MEEK-OSSH", Some("P1"), None, Some("F1"))
+            .is_zero());
+        assert!(!settings
+            .holdoff_for("INPROXY-QUIC-OSSH", Some("P2"), Some("US"), None)
+            .is_zero());
+        assert_eq!(
+            settings.holdoff_for("INPROXY-QUIC-OSSH", Some("P2"), Some("CA"), None),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn the_client_restrictions_skip_matching_entries() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"RestrictDirectProviderIDsClientProbability":1.0,"RestrictDirectProviderRegions":{"P1":[""]},"RestrictFrontingProviderIDs":["F1"],"RestrictFrontingProviderIDsClientProbability":1.0,"RestrictInproxyProviderIDsClientProbability":1.0,"RestrictInproxyProviderRegions":{"P2":["US"]}}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(false);
+        server.provider_id = Some("P1".to_owned());
+        assert!(settings.restricted(&server, false));
+        server.provider_id = Some("P9".to_owned());
+        assert!(!settings.restricted(&server, false));
+        let mut fronted = test_server(false);
+        fronted.meek = Some(test_meek());
+        fronted.fronting_provider_id = Some("F1".to_owned());
+        assert!(settings.restricted(&fronted, false));
+        fronted.fronting_provider_id = Some("F9".to_owned());
+        assert!(!settings.restricted(&fronted, false));
+        let mut inproxy = test_server(false);
+        inproxy.inproxy = Some(crate::psiphon_broker::Destination {
+            address: "broker.example:443".to_owned(),
+            network_protocol: 0,
+            protocol: "INPROXY-QUIC-OSSH",
+            packed_server_entry: Vec::new(),
+        });
+        inproxy.provider_id = Some("P2".to_owned());
+        inproxy.region = Some("US".to_owned());
+        assert!(settings.restricted(&inproxy, true));
+        inproxy.region = Some("CA".to_owned());
+        assert!(!settings.restricted(&inproxy, true));
+    }
+
+    #[test]
+    fn the_server_entry_iterator_and_timeout_are_read() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"ServerEntryIteratorMaxMoveToFront":3,"ServerEntryIteratorResetProbability":0.25,"TunnelConnectTimeoutSeconds":45}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.server_entry_max_move_to_front, 3);
+        assert!((settings.server_entry_reset_probability - 0.25).abs() < f64::EPSILON);
+        assert_eq!(settings.establish, Some(Duration::from_secs(45)));
+        assert!(settings.compress_tactics);
+        let off = Settings::from_json(Some(
+            &json::parse(r#"{"CompressTactics":false}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(!off.compress_tactics);
+    }
+
+    #[test]
+    fn a_live_server_moves_to_the_front() {
+        let mut first = test_server(false);
+        first.host = "a".to_owned();
+        let mut second = test_server(false);
+        second.host = "b".to_owned();
+        let mut entries = vec![first, second];
+        assert!(move_to_front(&mut entries, "b:22"));
+        assert_eq!(entries[0].host, "b");
+        assert!(!move_to_front(&mut entries, "b:22"));
+        assert!(!move_to_front(&mut entries, "c:22"));
     }
 
     #[test]

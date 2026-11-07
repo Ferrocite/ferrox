@@ -55,6 +55,7 @@ impl Tactics {
         timeout: Duration,
         proxy: Option<&Proxy>,
         dns: &crate::psiphon_dns::Config,
+        compress_tactics: bool,
     ) -> Result<Self, String> {
         let keys = server
             .tactics
@@ -62,7 +63,7 @@ impl Tactics {
             .ok_or_else(|| "psiphon tactics: the entry has no tactics capability".to_owned())?;
         let keyword = ferrox_core::b64::decode(keys.obfuscated_key.as_bytes())
             .ok_or_else(|| "psiphon tactics: obfuscation key is not base64".to_owned())?;
-        let request = api_params(identity);
+        let request = api_params(identity, compress_tactics);
         let mut obfuscator = Obfuscator::new(&keyword, MAX_PADDING)?;
         let (mut boxed, ephemeral) = seal(&keys.public_key, request.as_bytes(), REQUEST_NONCE)?;
         obfuscator.obfuscate(&mut boxed);
@@ -197,7 +198,7 @@ fn nonce(byte: u8) -> [u8; 24] {
     bytes
 }
 
-fn api_params(identity: &Identity<'_>) -> String {
+fn api_params(identity: &Identity<'_>, compress_tactics: bool) -> String {
     let mut body = format!(
         r#"{{"session_id":"{}","propagation_channel_id":"{}","sponsor_id":"{}","client_version":"{}","client_platform":"{}","relay_protocol":"FRONTED-MEEK-OSSH","network_type":"unknown","stored_tactics_tag":"","speed_test_samples":[]"#,
         json_escape(identity.session_id),
@@ -245,14 +246,20 @@ fn api_params(identity: &Identity<'_>) -> String {
         body.push_str(&json_escape(region));
         body.push('"');
     }
+    if compress_tactics {
+        body.push_str(r#","psiphon_api_response_version":"1""#);
+    }
     body.push('}');
     body
 }
 
 fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
     let text = String::from_utf8_lossy(payload);
-    let payload =
-        json::parse(&text).map_err(|_| "psiphon tactics: response is not a payload".to_owned())?;
+    let payload = match json::parse(&text) {
+        Ok(payload) => payload,
+        Err(_) => crate::psiphon_broker::cbor_to_json(payload)
+            .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
+    };
     let tag = payload
         .get("Tag")
         .and_then(Json::as_str)
@@ -402,7 +409,8 @@ mod tests {
             split_tunnel: false,
             split_tunnel_regions: &[],
         };
-        assert!(api_params(&identity).contains(r#""authorizations":["a\"b"]"#));
+        assert!(api_params(&identity, false).contains(r#""authorizations":["a\"b"]"#));
+        assert!(api_params(&identity, true).contains(r#""psiphon_api_response_version":"1""#));
     }
 
     #[test]
@@ -513,6 +521,14 @@ mod tests {
     #[test]
     fn an_unchanged_payload_has_no_tactics() {
         let tactics = parse_payload(br#"{"Tag":"same"}"#).expect("payload");
+        assert_eq!(tactics.tag, "same");
+        assert_eq!(tactics.brokers, Vec::new());
+    }
+
+    #[test]
+    fn a_cbor_payload_names_the_same_tag() {
+        let payload = [0xa1, 0x63, b'T', b'a', b'g', 0x64, b's', b'a', b'm', b'e'];
+        let tactics = parse_payload(&payload).expect("payload");
         assert_eq!(tactics.tag, "same");
         assert_eq!(tactics.brokers, Vec::new());
     }
