@@ -196,12 +196,13 @@ impl Client {
 
     /// `GET /v1/{id}/events`, held open for the punches the rendezvous delivers. The returned
     /// stream is read line by line for `event: punch` and the `data:` JSON that follows. The read
-    /// has no timeout: an idle rendezvous heartbeats its own keep-alive comments, and the caller's
-    /// backoff is what closes a stream that has gone silent. A non-2xx reply ends the open instead of
+    /// times out at sixty seconds — longer than the rendezvous keep-alive comments — so a silent dead
+    /// connection ends the stream and the caller re-registers, rather than blocking the serve loop
+    /// forever. A non-2xx reply ends the open instead of
     /// the punches the loop would otherwise read off the error body.
     #[must_use]
     pub(crate) fn open_events(&self, id: &str, session: &str) -> Option<EventStream> {
-        let mut stream = self.open_with_timeout(None)?;
+        let mut stream = self.open_with_timeout(Some(Duration::from_secs(60)))?;
         let host_header = self.host_header();
         let path = join_path(id, "events");
         let mut request = Vec::with_capacity(128);
@@ -598,8 +599,9 @@ impl RealmState {
 
 /// Discover the reflexive addresses the rendezvous names to for this `config`, through the serve
 /// router's pending state rather than a second reader of the socket. The binding requests go out on
-/// the serve socket; each answer the demux names it is forwarded here. `None` answers only a fresh
-/// transaction the RNG fails to draw.
+/// the serve socket; each answer the demux names it is forwarded here. `None` answers a fresh
+/// transaction the RNG fails to draw, or a discovery that named no address at all — callers must
+/// not announce an empty list.
 #[must_use]
 pub(crate) fn stun_discover_via_state(
     state: &RealmState,
@@ -649,6 +651,9 @@ pub(crate) fn stun_discover_via_state(
         Family::V4 => results.retain(SocketAddr::is_ipv4),
         Family::V6 => results.retain(SocketAddr::is_ipv6),
         Family::Dual => {}
+    }
+    if results.is_empty() {
+        return None;
     }
     Some(results)
 }
@@ -842,6 +847,7 @@ pub(crate) fn serve_registration(
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         };
+        backoff = Duration::from_secs(1);
         while let Some((peer_addresses, meta)) = stream.next_punch() {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -859,7 +865,11 @@ pub(crate) fn serve_registration(
             let nonce_hex = realm::hex_encode(&meta.nonce);
             let _ =
                 events_client.connect_response(&config.id, &session, &nonce_hex, &current_locals);
-            let _ = punch_via_state(&state, &sock, &meta, &expanded);
+            let punch_state = std::sync::Arc::clone(&state);
+            let punch_sock = std::sync::Arc::clone(&sock);
+            std::thread::spawn(move || {
+                let _ = punch_via_state(&punch_state, &punch_sock, &meta, &expanded);
+            });
         }
         // The stream ended: re-register with the same backoff a refused register pays.
         session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
