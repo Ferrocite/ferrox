@@ -2700,6 +2700,57 @@ impl Settings {
     }
 }
 
+fn transform_specs(raw: Option<&Json>) -> Vec<(String, Vec<(String, String)>)> {
+    let Some(Json::Obj(specs)) =
+        raw.and_then(|settings| settings.get("DNSResolverProtocolTransformSpecs"))
+    else {
+        return Vec::new();
+    };
+    specs
+        .iter()
+        .filter_map(|(name, value)| {
+            let Json::Arr(transforms) = value else {
+                return None;
+            };
+            let pairs: Vec<(String, String)> = transforms
+                .iter()
+                .filter_map(|transform| {
+                    let Json::Arr(parts) = transform else {
+                        return None;
+                    };
+                    if parts.len() != 2 {
+                        return None;
+                    }
+                    Some((parts[0].as_str()?.to_owned(), parts[1].as_str()?.to_owned()))
+                })
+                .collect();
+            (!pairs.is_empty()).then(|| (name.clone(), pairs))
+        })
+        .collect()
+}
+
+fn transform_scopes(raw: Option<&Json>) -> Vec<(String, Vec<String>)> {
+    let Some(Json::Obj(scopes)) =
+        raw.and_then(|settings| settings.get("DNSResolverProtocolTransformScopedSpecNames"))
+    else {
+        return Vec::new();
+    };
+    scopes
+        .iter()
+        .map(|(scope, value)| {
+            let names = match value {
+                Json::Arr(items) => items
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (scope.clone(), names)
+        })
+        .collect()
+}
+
 /// Build the DNS fallback config from the reference's `DNSResolver*` fields.
 fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_dns::Config {
     let list = |key: &str| -> Vec<String> { string_list(raw, key) };
@@ -2738,6 +2789,19 @@ fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_
     config.cache_extension = Duration::from_millis(
         number(raw, "DNSResolverCacheExtensionInitialTTLMilliseconds").unwrap_or(0),
     );
+    config.cache_extension_verified = Duration::from_millis(
+        number(raw, "DNSResolverCacheExtensionVerifiedTTLMilliseconds").unwrap_or(0),
+    );
+    config.transform_probability = decimal(raw, "DNSResolverProtocolTransformProbability")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    config.qname_must_match_probability = decimal(raw, "DNSResolverQNameMustMatchProbability")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    config.transforms = Arc::new(crate::psiphon_dns::Transforms::new(
+        transform_specs(raw),
+        transform_scopes(raw),
+    ));
     config.preresolved_labels = if let Some(Json::Obj(labels)) =
         raw.and_then(|settings| settings.get("DNSResolverPreresolvedIPAddressCIDRs"))
     {
@@ -3621,6 +3685,11 @@ const KNOWN_SETTINGS: &[&str] = &[
     "DNSResolverAttemptsPerServer",
     "DNSResolverAwaitTimeoutMilliseconds",
     "DNSResolverCacheExtensionInitialTTLMilliseconds",
+    "DNSResolverCacheExtensionVerifiedTTLMilliseconds",
+    "DNSResolverProtocolTransformProbability",
+    "DNSResolverProtocolTransformScopedSpecNames",
+    "DNSResolverProtocolTransformSpecs",
+    "DNSResolverQNameMustMatchProbability",
     "DNSResolverIncludeEDNS0Probability",
     "DNSResolverPreferAlternateServerProbability",
     "DNSResolverPreferredAlternateServers",
@@ -8028,6 +8097,29 @@ mod tests {
                 SocketAddr::from(([192, 0, 2, 53], 53)),
                 SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 5353)),
             ]
+        );
+    }
+
+    #[test]
+    fn dns_transforms_and_the_verified_extension_are_parsed() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "DNSResolverProtocolTransformProbability": 1.0,
+                    "DNSResolverProtocolTransformSpecs": {"any": [["^12", "ef"]]},
+                    "DNSResolverProtocolTransformScopedSpecNames": {"": ["any"]},
+                    "DNSResolverQNameMustMatchProbability": 1.0,
+                    "DNSResolverCacheExtensionVerifiedTTLMilliseconds": 60000
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.dns.transform_probability, 1.0);
+        assert_eq!(settings.dns.qname_must_match_probability, 1.0);
+        assert_eq!(
+            settings.dns.cache_extension_verified,
+            std::time::Duration::from_secs(60)
         );
     }
 
