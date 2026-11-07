@@ -275,6 +275,7 @@ impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for GrpcReader<R
         self.poll = true;
     }
 
+    /// Reads the next carrier control frame: `Some(true)` progressed, `Some(false)` timed out, `None` at the end.
     fn pump_control(&mut self) -> Option<bool> {
         match self.pump() {
             Ok(Some(())) => Some(true),
@@ -2123,6 +2124,7 @@ impl GrpcService {
 }
 
 impl crate::xhttp_h2::H2Service for GrpcService {
+    /// Validates a VLESS gRPC request head and opens its reader and writer on the shared connection.
     fn open(
         &self,
         conn: &Arc<crate::xhttp_h2::H2Conn>,
@@ -2249,6 +2251,7 @@ impl VmGrpcService {
 }
 
 impl crate::xhttp_h2::H2Service for VmGrpcService {
+    /// Validates a `VMess` gRPC request head and hands the stream to the multiplexed handler.
     fn open(
         &self,
         conn: &Arc<crate::xhttp_h2::H2Conn>,
@@ -2297,6 +2300,7 @@ impl crate::xhttp_h2::H2Service for VmGrpcService {
     }
 }
 
+/// Serves a `VMess` gRPC listener as one HTTP/2 connection: every request block opens a stream on the shared demux.
 pub(crate) fn serve_muxed_vmess<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     read: R,
     write: W,
@@ -2320,6 +2324,7 @@ pub(crate) fn serve_muxed_vmess<R: Read + Send + 'static, W: FrameWrite + Send +
     );
 }
 
+/// `serve_muxed_vmess` over a plain connection, split into its read and write halves.
 pub(crate) fn serve_muxed_vmess_conn(
     read: Connection,
     write: Tail,
@@ -5067,6 +5072,7 @@ mod tests {
     struct EchoService;
 
     impl crate::xhttp_h2::H2Service for EchoService {
+        /// Answers every request head and echoes the body, for the muxed-connection tests.
         fn open(
             &self,
             conn: &Arc<crate::xhttp_h2::H2Conn>,

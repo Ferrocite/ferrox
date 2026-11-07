@@ -878,6 +878,7 @@ pub(crate) fn write_frame(
     write_frame_into(stream, send, plain, staging, pad)
 }
 
+/// Stages one `VMess` frame into `staging` and writes it, so the plaintext path can reuse its buffer.
 fn write_frame_into(
     stream: &mut dyn Write,
     send: &mut Flow,
@@ -945,6 +946,7 @@ fn stage_frames(
     stage_frames_into(stream, send, plain, staging, pad)
 }
 
+/// Stages up to `FRAMES_PER_WRITE` frames of one read into `staging` and writes them together.
 fn stage_frames_into(
     stream: &mut dyn Write,
     send: &mut Flow,
@@ -1999,6 +2001,7 @@ pub(crate) fn serve_decoded_with_finish<R, W>(
     serve_decoded_impl(reader, writer, close, decoded, freedom, finish, false);
 }
 
+/// Runs a decoded request over its uplink; `defer_prefix` holds the response head for the first body frame.
 fn serve_decoded_impl<R, W>(
     reader: R,
     mut writer: W,
@@ -2151,6 +2154,7 @@ pub(crate) fn serve_grpc_with(
     serve_decoded_deferred(reader, writer, &close, decoded, freedom);
 }
 
+/// Serves a TLS or REALITY gRPC listener as one muxed connection, arming the writer clock first.
 pub(crate) fn serve_grpc_muxed_split<R, W>(
     reader: R,
     mut writer: W,
@@ -2165,6 +2169,7 @@ pub(crate) fn serve_grpc_muxed_split<R, W>(
     crate::grpc::serve_muxed_vmess(reader, writer, settings, users, freedom);
 }
 
+/// Serves a plaintext gRPC listener as one muxed connection, with the socket read clock armed for the demux.
 pub(crate) fn serve_grpc_muxed_with(
     stream: Connection,
     settings: &crate::config::GrpcSettings,
