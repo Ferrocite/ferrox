@@ -560,6 +560,8 @@ carrier-hysteria masquerade-unix-origin-served-bytes 6 ferrox-app-proxy::tests::
 carrier-hysteria stun-binding-exchange-allocations 0 ferrox-core-stun::tests::a_binding_exchange_takes_no_heap
 carrier-hysteria realm-punch-allocations 0 ferrox-core-realm::tests::an_encoded_and_decoded_packet_takes_no_heap
 carrier-hysteria realm-configs-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_realm_rendezvous
+carrier-hysteria realm-candidate-sorts 1 ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice
+carrier-hysteria realm-expansion-sorts 2 ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -943,6 +945,7 @@ carrier-psiphon download-staging-copies-per-byte 0 ferrox-app-psiphon-ssh::tests
 carrier-psiphon ss-vectored-write-extra-buffers 0 ferrox-app-psiphon-shadowsocks::tests::a_vectored_write_allocates_only_the_wire_buffer
 carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
 carrier-psiphon affinity-lookup-allocations 0 ferrox-app-psiphon::tests::an_affinity_lookup_does_not_format_each_entry
+carrier-psiphon preresolved-pick-allocations 0 ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap
 carrier-psiphon ss-direct-write-probe-ops 47483770 scripts/count-ops.sh
 carrier-psiphon ss-flatten-write-probe-ops 47621538 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
