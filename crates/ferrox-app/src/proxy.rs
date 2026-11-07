@@ -39266,9 +39266,7 @@ mod tests {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 self.reads += 1;
                 if self.reads < 4 {
-                    if self.reads == 2 {
-                        self.progress.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.progress.fetch_add(1, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(60));
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
