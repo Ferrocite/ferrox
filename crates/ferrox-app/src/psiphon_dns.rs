@@ -1414,7 +1414,8 @@ mod tests {
     fn a_replacement_pattern_keeps_its_subgroup_reference() {
         let node = super::Node::parse(r"\$\{1\}0140".as_bytes()).expect("pattern");
         let mut out = Vec::new();
-        super::generate(&node, &mut out).expect("generate");
+        let mut work = 0;
+        super::generate(&node, &mut out, &mut work).expect("generate");
         assert_eq!(out, b"${1}0140");
     }
 
