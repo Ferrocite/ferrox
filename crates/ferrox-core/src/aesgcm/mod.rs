@@ -185,6 +185,7 @@ pub(crate) fn flush<V: Lanes>(hp: &[(V, V); 4], state: V, tail: &mut Tail<V>) ->
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)] // ctr, mask and the GHASH accumulators are one seal's calling convention
 pub(crate) fn ctr_ghash<V: Lanes>(
     rk: &[V; 11],
     hp: &[(V, V); 4],
@@ -975,6 +976,7 @@ pub(crate) fn powers_256<V: Lanes>(rk: &[V; 15]) -> [(V, V); 4] {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)] // ctr, mask and the GHASH accumulators are one seal's calling convention
 pub(crate) fn ctr_ghash_256<V: Lanes>(
     rk: &[V; 15],
     hp: &[(V, V); 4],
