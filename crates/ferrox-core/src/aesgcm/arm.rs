@@ -326,6 +326,7 @@ fn ctr_ghash8(
     buf: &mut [u8],
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
+    mask: uint8x16_t,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     if buf.len() <= SHORT_SEAL_BYTES {
@@ -357,7 +358,7 @@ fn ctr_ghash8(
         );
         ctr += 8;
     }
-    super::ctr_ghash(rk, h, template, state, &mut buf[done * 16..], tailq, ctr)
+    super::ctr_ghash(rk, h, template, state, &mut buf[done * 16..], tailq, ctr, mask)
 }
 
 #[inline(always)]
@@ -374,6 +375,7 @@ fn ctr_ghash8_from(
     dst: &mut [u8],
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
+    mask: uint8x16_t,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _rest_bytes) = src.as_chunks::<16>();
@@ -412,6 +414,7 @@ fn ctr_ghash8_from(
         &mut dst[done * 16..],
         tailq,
         ctr,
+        mask,
     )
 }
 
@@ -474,6 +477,7 @@ fn ctr_ghash8_256(
     buf: &mut [u8],
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
+    mask: uint8x16_t,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     if buf.len() <= SHORT_SEAL_BYTES {
@@ -505,7 +509,7 @@ fn ctr_ghash8_256(
         );
         ctr += 8;
     }
-    super::ctr_ghash_256(rk, h, template, state, &mut buf[done * 16..], tailq, ctr)
+    super::ctr_ghash_256(rk, h, template, state, &mut buf[done * 16..], tailq, ctr, mask)
 }
 
 #[inline(always)]
@@ -523,6 +527,7 @@ fn ctr_ghash8_from_256(
     dst: &mut [u8],
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
+    mask: uint8x16_t,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _) = src.as_chunks::<16>();
@@ -562,6 +567,7 @@ fn ctr_ghash8_from_256(
         &mut dst[done * 16..],
         tailq,
         ctr,
+        mask,
     )
 }
 
@@ -580,6 +586,7 @@ unsafe fn ctr_ghash8_from_256_uninit(
     dst: *mut u8,
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
+    mask: uint8x16_t,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _) = src.as_chunks::<16>();
@@ -625,6 +632,7 @@ unsafe fn ctr_ghash8_from_256_uninit(
             dst.add(done * 16),
             tailq,
             ctr,
+            mask,
         )
     }
 }
@@ -644,6 +652,7 @@ unsafe fn ctr_ghash8_from_uninit(
     dst: *mut u8,
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
+    mask: uint8x16_t,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _) = src.as_chunks::<16>();
@@ -689,6 +698,7 @@ unsafe fn ctr_ghash8_from_uninit(
             dst.add(done * 16),
             tailq,
             ctr,
+            mask,
         )
     }
 }
@@ -778,7 +788,7 @@ impl Engine {
     #[target_feature(enable = "aes,neon")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -787,7 +797,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8(&self.rk, self, template, state, buf, &mut tailq, 2);
+        let state = ctr_ghash8(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
@@ -808,7 +818,7 @@ impl Engine {
     ) -> [u8; 16] {
         debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -817,7 +827,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_from(&self.rk, self, template, state, src, dst, &mut tailq, 2);
+        let state = ctr_ghash8_from(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
@@ -838,7 +848,7 @@ impl Engine {
         dst: *mut u8,
     ) -> [u8; 16] {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -848,7 +858,7 @@ impl Engine {
         );
         let state = super::flush(&self.h, state, &mut tailq);
         let state = unsafe {
-            ctr_ghash8_from_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2)
+            ctr_ghash8_from_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask)
         };
         super::finish(
             &self.h,
@@ -988,7 +998,7 @@ impl Engine256 {
     #[target_feature(enable = "aes,neon")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -997,7 +1007,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_256(&self.rk, self, template, state, buf, &mut tailq, 2);
+        let state = ctr_ghash8_256(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
@@ -1019,7 +1029,7 @@ impl Engine256 {
     ) -> [u8; 16] {
         debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -1028,7 +1038,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_from_256(&self.rk, self, template, state, src, dst, &mut tailq, 2);
+        let state = ctr_ghash8_from_256(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
@@ -1049,7 +1059,7 @@ impl Engine256 {
         dst: *mut u8,
     ) -> [u8; 16] {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -1059,7 +1069,7 @@ impl Engine256 {
         );
         let state = super::flush(&self.h, state, &mut tailq);
         let state = unsafe {
-            ctr_ghash8_from_256_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2)
+            ctr_ghash8_from_256_uninit(&self.rk, self, template, state, src, dst, &mut tailq, 2, mask)
         };
         super::finish(
             &self.h,

@@ -200,6 +200,7 @@ impl Engine {
         mut state: __m128i,
         buf: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
+        mask: __m128i,
     ) -> __m128i {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
@@ -230,15 +231,7 @@ impl Engine {
                 );
                 ctr += 8;
             }
-            super::ctr_ghash(
-                &self.rk,
-                &self.h,
-                template,
-                state,
-                &mut buf[done..],
-                tailq,
-                ctr,
-            )
+            super::ctr_ghash(&self.rk, &self.h, template, state, &mut buf[done..], tailq, ctr, mask)
         }
     }
 
@@ -250,6 +243,7 @@ impl Engine {
         src: &[u8],
         dst: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
+        mask: __m128i,
     ) -> __m128i {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
@@ -291,6 +285,7 @@ impl Engine {
                 &mut dst[done..],
                 tailq,
                 ctr,
+                mask,
             )
         }
     }
@@ -314,7 +309,7 @@ impl Engine {
     #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         let template = super::counter_template::<__m128i>(nonce);
-        let mask = <__m128i as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -323,7 +318,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8(template, state, buf, &mut tailq);
+        let state = self.ctr_ghash8(template, state, buf, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -344,7 +339,7 @@ impl Engine {
     ) -> [u8; 16] {
         debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
         let template = super::counter_template::<__m128i>(nonce);
-        let mask = <__m128i as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -353,7 +348,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8_from(template, state, src, dst, &mut tailq);
+        let state = self.ctr_ghash8_from(template, state, src, dst, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -373,6 +368,7 @@ impl Engine {
         src: &[u8],
         dst: *mut u8,
         tailq: &mut super::Tail<__m128i>,
+        mask: __m128i,
     ) -> __m128i {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
@@ -416,6 +412,7 @@ impl Engine {
                 dst.add(done),
                 tailq,
                 ctr,
+                mask,
             )
         }
     }
@@ -430,7 +427,7 @@ impl Engine {
         dst: *mut u8,
     ) -> [u8; 16] {
         let template = super::counter_template::<__m128i>(nonce);
-        let mask = <__m128i as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -439,7 +436,9 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = unsafe { self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq) };
+        let state = unsafe {
+            self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq, mask)
+        };
         super::finish(
             &self.h,
             state,
@@ -553,6 +552,7 @@ impl Engine256 {
         mut state: __m128i,
         buf: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
+        mask: __m128i,
     ) -> __m128i {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
@@ -591,6 +591,7 @@ impl Engine256 {
                 &mut buf[done..],
                 tailq,
                 ctr,
+                mask,
             )
         }
     }
@@ -604,6 +605,7 @@ impl Engine256 {
         src: &[u8],
         dst: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
+        mask: __m128i,
     ) -> __m128i {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
@@ -646,6 +648,7 @@ impl Engine256 {
                 &mut dst[done..],
                 tailq,
                 ctr,
+                mask,
             )
         }
     }
@@ -659,6 +662,7 @@ impl Engine256 {
         src: &[u8],
         dst: *mut u8,
         tailq: &mut super::Tail<__m128i>,
+        mask: __m128i,
     ) -> __m128i {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
@@ -702,6 +706,7 @@ impl Engine256 {
                 dst.add(done),
                 tailq,
                 ctr,
+                mask,
             )
         }
     }
@@ -709,7 +714,7 @@ impl Engine256 {
     #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         let template = super::counter_template::<__m128i>(nonce);
-        let mask = <__m128i as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -718,7 +723,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8_256(template, state, buf, &mut tailq);
+        let state = self.ctr_ghash8_256(template, state, buf, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -740,7 +745,7 @@ impl Engine256 {
     ) -> [u8; 16] {
         debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
         let template = super::counter_template::<__m128i>(nonce);
-        let mask = <__m128i as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -749,7 +754,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8_from_256(template, state, src, dst, &mut tailq);
+        let state = self.ctr_ghash8_from_256(template, state, src, dst, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -770,7 +775,7 @@ impl Engine256 {
         dst: *mut u8,
     ) -> [u8; 16] {
         let template = super::counter_template::<__m128i>(nonce);
-        let mask = <__m128i as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
+        let mask = template.ctr_be(1);
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -779,8 +784,9 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state =
-            unsafe { self.ctr_ghash8_from_256_uninit(template, state, src, dst, &mut tailq) };
+        let state = unsafe {
+            self.ctr_ghash8_from_256_uninit(template, state, src, dst, &mut tailq, mask)
+        };
         super::finish(
             &self.h,
             state,
