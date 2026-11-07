@@ -568,6 +568,8 @@ tls-cipher-suites tls12-list-ids-equal-reference-in-order 1 ferrox-core-tls::rus
 tls-cipher-suites tls12-suite-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_tls12_dial_negotiates_the_configured_suite
 tls-cipher-suites mixed-list-dialer-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_mixed_list_keeps_the_reference_order_on_the_wire
 tls-cipher-suites mixed-list-negotiated-by-the-dialer 1 ferrox-core-tls::rustls_backend::tests::a_mixed_list_negotiates_a_tls12_suite
+tls-cipher-suites ech-list-ids-equal-reference-without-scsv 1 ferrox-core-tls::rustls_backend::tests::an_ech_list_keeps_the_configured_ids_without_an_scsv
+tls-cipher-suites ech-offer-accepted-on-the-stock-shaped-hello 1 ferrox-core-tls::rustls_backend::tests::an_ech_offer_rides_the_stock_shaped_hello
 tls-cipher-suites tls12-suite-negotiated-by-the-listener 1 ferrox-core-tls::rustls_backend::tests::a_tls_floor_and_suite_reach_the_negotiation
 tls-cipher-suites shaped-listener-negotiates-the-five-unreachable-ids 5 ferrox-core-tls::rustls_backend::tests::a_shaped_listener_serves_the_five_ids_neither_backend_has
 tls-cipher-suites mixed-max-hellos-routed-by-the-peek 2 ferrox-core-tls::rustls_backend::tests::a_mixed_max_listener_peeks_the_hello_before_choosing_an_engine

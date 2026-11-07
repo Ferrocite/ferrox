@@ -824,16 +824,15 @@ pub fn connect<S: Stream + RecordAlignment>(
         Some(_) => Ok(ClientSession::Shaped(Box::new(shaped::Session::connect(
             cfg, io,
         )?))),
-        // A list naming an id both backends lack, or both versions, rides the shaped stock hello.
-        None if cfg.ech_config_list.is_none()
-            && (shaped::needs_stock_hello(&cfg.cipher_suites)
-                || cipher_suites::mixed(&cfg.cipher_suites)) =>
+        // A list both backends lack, or both versions, rides the stock hello, which appends a real ECH slot.
+        None if shaped::needs_stock_hello(&cfg.cipher_suites)
+            || cipher_suites::mixed(&cfg.cipher_suites) =>
         {
             Ok(ClientSession::Shaped(Box::new(
                 shaped::Session::connect_stock(cfg, io)?,
             )))
         }
-        // ECH is rustls's lane here, so a config naming both keeps ECH and leaves CBC to it.
+        // The legacy lane carries no ECH, so an ECH config keeps the rustls lane.
         None if cfg.ech_config_list.is_none() && legacy::dial_needed(&cfg.cipher_suites) => Ok(
             ClientSession::Legacy(Box::new(legacy::Session::connect(cfg, io)?)),
         ),

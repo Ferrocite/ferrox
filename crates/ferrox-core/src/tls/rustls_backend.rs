@@ -2522,6 +2522,96 @@ mod tests {
         );
     }
 
+    /// An ECH offer on a stock fingerprint still writes the configured TLS 1.2 ids, including a
+    /// CBC one, and appends no SCSV: the offer rides the shaped hello rather than rustls's lane.
+    #[cfg_attr(miri, ignore = "needs a loopback socket")]
+    #[test]
+    fn an_ech_list_keeps_the_configured_ids_without_an_scsv() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let capture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 5];
+            stream.read_exact(&mut head).expect("record header");
+            let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+            let mut record = head.to_vec();
+            record.resize(5 + len, 0);
+            stream.read_exact(&mut record[5..]).expect("record body");
+            record
+        });
+        let mut cfg = client("hidden.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::stock());
+        cfg.ech_config_list = Some(list.into());
+        cfg.cipher_suites = crate::tls::cipher_suites::hello_ids(
+            &crate::tls::cipher_suites::parse("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"),
+            0x0303,
+            0x0304,
+            true,
+        )
+        .into();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        assert!(
+            matches!(&session, crate::tls::ClientSession::Shaped(_)),
+            "an ECH offer with a TLS 1.2 id rides the shaped stock hello"
+        );
+        let _ = session.handshake();
+        let record = capture.join().expect("joins");
+        let want = crate::tls::cipher_suites::field_bytes(&cfg.cipher_suites);
+        assert_eq!(
+            hello_cipher_suites(&record),
+            want.as_slice(),
+            "the ECH hello keeps the CBC id and appends no SCSV"
+        );
+    }
+
+    /// The same stock hello with an ECH offer finishes the handshake, so routing it off rustls's
+    /// lane does not trade the CBC field for a broken offer.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and BoringSSL's assembly behind it"
+    )]
+    #[test]
+    fn an_ech_offer_rides_the_stock_shaped_hello() {
+        let (list, keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
+        let mut identity = plain_identity();
+        identity.ech_server_keys = Some(keys.into());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                assert!(server.ech_accepted(), "the offer was accepted");
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let mut cfg = client("tls.test", &[]);
+            cfg.fingerprint = Some(crate::tls::Fingerprint::stock());
+            cfg.ech_config_list = Some(list.into());
+            cfg.cipher_suites = crate::tls::cipher_suites::hello_ids(
+                &crate::tls::cipher_suites::parse("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"),
+                0x0303,
+                0x0304,
+                true,
+            )
+            .into();
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+            assert!(matches!(&session, crate::tls::ClientSession::Shaped(_)));
+            session.handshake().expect("handshakes");
+            session.write_all(b"ping").expect("writes");
+            session.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            session.read_exact(&mut buf).expect("reads");
+            assert_eq!(&buf, b"ping");
+        });
+    }
+
     /// The provider's reachable set: the TLS 1.3 trio and ring's six TLS 1.2 AEAD suites, no CBC or static-RSA id.
     #[test]
     fn the_reachable_set_is_the_tls13_trio_and_ring_s_six_tls12_aead_suites() {

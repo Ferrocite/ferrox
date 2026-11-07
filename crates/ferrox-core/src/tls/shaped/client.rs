@@ -193,7 +193,11 @@ impl<S: Stream> Session<S> {
             hello.set_padding(usize::from(padding));
         }
         if let Some(list) = &cfg.ech_config_list {
-            hello.enable_ech(list)?;
+            if stock {
+                hello.enable_stock_ech(list)?;
+            } else {
+                hello.enable_ech(list)?;
+            }
         }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
