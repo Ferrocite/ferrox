@@ -97,7 +97,7 @@ struct Inner {
     last_osl: Mutex<Option<Instant>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
-    affinity: Mutex<Option<String>>,
+    affinity: Mutex<Option<(String, u16)>>,
     moved_to_front: Mutex<HashSet<String>>,
     connecting: Mutex<()>,
     session_id: String,
@@ -594,12 +594,8 @@ impl Inner {
             }
             Arc::clone(&*guard)
         };
-        let affinity = lock(&self.affinity).clone();
-        match affinity.as_deref().and_then(|host| {
-            entries
-                .iter()
-                .position(|entry| format!("{}:{}", entry.host, entry.port) == host)
-        }) {
+        let affinity = lock(&self.affinity);
+        match affinity_index(&entries, affinity.as_ref()) {
             Some(base) => (base, self.settings.affinity_grace),
             None => (0, Duration::ZERO),
         }
@@ -607,7 +603,12 @@ impl Inner {
 
     /// Record a live server: it becomes the affinity and, under the cap, the next first entry.
     fn remember(&self, host: &str) {
-        *lock(&self.affinity) = Some(host.to_owned());
+        if let Some((host, port)) = host
+            .rsplit_once(':')
+            .and_then(|(host, port)| port.parse().ok().map(|port| (host, port)))
+        {
+            *lock(&self.affinity) = Some((host.to_owned(), port));
+        }
         let mut guard = lock(&self.entries);
         let max = self.settings.server_entry_max_move_to_front;
         if max == 0 {
@@ -6315,6 +6316,15 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The entry an affinity names, compared by host and port.
+fn affinity_index(entries: &[Server], affinity: Option<&(String, u16)>) -> Option<usize> {
+    affinity.and_then(|affinity| {
+        entries
+            .iter()
+            .position(|entry| entry.host == affinity.0 && entry.port == affinity.1)
+    })
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -9749,6 +9759,66 @@ mod tests {
         ))
         .expect("settings");
         assert!(!off.compress_tactics);
+    }
+
+    /// The affinity lookup compares the entry's own fields, so a dial does not
+    /// format a `host:port` string for every server it scans past.
+    #[test]
+    fn an_affinity_lookup_does_not_format_each_entry() {
+        let mut entries: Vec<Server> = (0..64).map(|_| test_server(false)).collect();
+        for (at, entry) in entries.iter_mut().enumerate() {
+            entry.host = "192.0.2.1".to_owned();
+            entry.port = 10_000 + at as u16;
+        }
+        let affinity = ("192.0.2.1".to_owned(), 10_042);
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"ServerEntryIteratorResetProbability":0}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let inner = Inner {
+            session_id: String::new(),
+            settings,
+            entries: Mutex::new(Arc::new(entries.clone())),
+            sloks: crate::psiphon_osl::SlokStore::open(None),
+            requests: Arc::new(crate::psiphon_osl::ServerEvents {
+                sloks: crate::psiphon_osl::SlokStore::open(None),
+                seeded: Arc::new(AtomicBool::new(false)),
+                emit_alerts: false,
+                emit_sloks: false,
+            }),
+            osl_seeded: Arc::new(AtomicBool::new(false)),
+            last_osl: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
+            next_session: AtomicUsize::new(0),
+            affinity: Mutex::new(Some(affinity.clone())),
+            moved_to_front: Mutex::new(HashSet::new()),
+            connecting: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+            endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
+            http_endpoint: None,
+            udpgw: Mutex::new(None),
+            conduit: Mutex::new(None),
+            split_untunneled: Mutex::new(HashMap::new()),
+        };
+        let (at, _) = inner.start();
+        assert_eq!(at, 42, "start uses the shared lookup");
+        let ((), new) = ferrox_core::alloc_count::measure(|| {
+            let at = affinity_index(&entries, Some(&affinity));
+            assert_eq!(at, Some(42));
+        });
+        assert_eq!(new.allocs, 0, "the field compare takes no heap: {new:?}");
+
+        let ((), old) = ferrox_core::alloc_count::measure(|| {
+            let host = format!("{}:{}", affinity.0, affinity.1);
+            let at = entries
+                .iter()
+                .position(|entry| format!("{}:{}", entry.host, entry.port) == host);
+            assert_eq!(at, Some(42));
+        });
+        assert_eq!(
+            old.allocs, 88,
+            "the old scan formatted the target and every entry it passed: {old:?}"
+        );
     }
 
     #[test]
