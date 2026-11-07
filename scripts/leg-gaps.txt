@@ -3,6 +3,8 @@
 # base|leg|ratio|issue|basis, where basis is raw (default) or ceiling.
 vless-hysteria-down-8|server|0.04|670
 masque-down-8|server|0.15|861
+# The WARP server leg loses the same way the MASQUE one does: 37.8 MiB/s against xray-core's 209.8 MiB/s with an xray client, 0.18x of the ceiling.
+wireguard-raw-down-8|server|0.18|861|ceiling
 masque-down-8|server-threads|1.40|861
 shadowsocks-raw-duplex-8|client|0.84|696
 shadowsocks2022-raw-up-1|server|0.72|696
