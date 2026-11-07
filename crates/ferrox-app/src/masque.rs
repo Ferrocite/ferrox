@@ -2529,22 +2529,29 @@ fn service(
     }
 }
 
-/// Parses the request head once its HEADERS frame is whole; `false` leaves the
-/// bytes for the next read.
+/// Parses the request head once its HEADERS frame is whole, walking past the
+/// reserved frames a greasing peer sends first; `false` leaves the bytes for
+/// the next read.
 fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
-    let mut at = tunnel.at;
-    let Some(frame) = frames::h3_frame(&tunnel.buf, &mut at) else {
-        return false;
+    let block = loop {
+        let mut at = tunnel.at;
+        let Some(frame) = frames::h3_frame(&tunnel.buf, &mut at) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(frame.length) else {
+            return false;
+        };
+        let Some(end) = at.checked_add(length) else {
+            return false;
+        };
+        let Some(payload) = tunnel.buf.get(at..end) else {
+            return false;
+        };
+        tunnel.at = end;
+        if frame.kind == frames::H3_HEADERS {
+            break payload;
+        }
     };
-    if frame.kind != frames::H3_HEADERS {
-        return false;
-    }
-    let length = frame.length as usize;
-    let Some(block) = tunnel.buf.get(at..at + length) else {
-        return false;
-    };
-    at += length;
-    tunnel.at = at;
     let Some(fields) = hpack::qpack_fields(block) else {
         return false;
     };
@@ -4174,6 +4181,79 @@ mod tests {
         assert!(spec.request_authenticated(b"connect-ip", header));
         assert!(ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#)).is_ok());
         assert!(ServerSpec::from(&inbound(r#"{"address":["10.14.0.1/24"]}"#)).is_err());
+    }
+
+    fn head_tunnel(buf: Vec<u8>) -> Tunnel {
+        let (sender, outgoing) = mpsc::sync_channel(1);
+        let (tx, _rx) = mpsc::channel();
+        Tunnel {
+            stream: Some(0),
+            buf,
+            at: 0,
+            headers: false,
+            capsules: Vec::new(),
+            capsule_at: 0,
+            opened: false,
+            rejected: false,
+            settings_sent: false,
+            pending: None,
+            unsent: None,
+            outgoing,
+            queue: TunnelQueue::new(sender, Some(tx)),
+            addrs: Vec::new(),
+            granted: None,
+            registered: Vec::new(),
+        }
+    }
+
+    /// quiche greases a request stream before the HEADERS frame; a peer that stops at the first
+    /// frame refuses a head xray never sends and the client waits on a status that never comes.
+    #[test]
+    fn a_greased_head_is_read_after_the_reserved_frames() {
+        let spec = ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#))
+            .expect("a warp server spec");
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "CONNECT"),
+                (":protocol", "cf-connect-ip"),
+                (":scheme", "https"),
+                (":authority", "cloudflareaccess.com"),
+                (":path", "/"),
+                ("user-agent", ""),
+                ("capsule-protocol", "?1"),
+            ],
+            &mut block,
+        );
+        let mut buf = Vec::new();
+        frames::quic_varint(&mut buf, 0x21);
+        frames::quic_varint(&mut buf, 0);
+        frames::quic_varint(&mut buf, 0x33);
+        frames::quic_varint(&mut buf, b"GREASE is the word".len() as u64);
+        buf.extend_from_slice(b"GREASE is the word");
+        frames::quic_varint(&mut buf, frames::H3_HEADERS);
+        frames::quic_varint(&mut buf, block.len() as u64);
+        buf.extend_from_slice(&block);
+        let mut tunnel = head_tunnel(buf);
+        assert!(parse_head(&mut tunnel, &spec));
+        assert!(tunnel.headers);
+        assert!(!tunnel.rejected);
+    }
+
+    #[test]
+    fn an_incomplete_grease_frame_leaves_the_head_to_the_next_read() {
+        let spec = ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#))
+            .expect("a warp server spec");
+        let mut buf = Vec::new();
+        frames::quic_varint(&mut buf, 0x33);
+        frames::quic_varint(&mut buf, 4);
+        buf.extend_from_slice(b"GRE");
+        let mut tunnel = head_tunnel(buf);
+        assert!(!parse_head(&mut tunnel, &spec));
+        assert_eq!(tunnel.at, 0);
+        tunnel.buf.push(b'A');
+        assert!(!parse_head(&mut tunnel, &spec));
+        assert_eq!(tunnel.at, 6, "the whole grease frame was walked past");
     }
 
     #[test]
