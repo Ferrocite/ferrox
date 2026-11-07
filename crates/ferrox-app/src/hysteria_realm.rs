@@ -80,12 +80,16 @@ impl Client {
     /// server name is the authority host and the roots are the platform anchors, verified unless the
     /// rendezvous itself names `http` — the scheme already chose which one travels.
     fn open(&self) -> Option<DynStream> {
+        self.open_with_timeout(Some(Duration::from_secs(5)))
+    }
+
+    fn open_with_timeout(&self, read_timeout: Option<Duration>) -> Option<DynStream> {
         let address: SocketAddr = format!("{}:{}", self.host, self.port)
             .to_socket_addrs()
             .ok()?
             .next()?;
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_read_timeout(read_timeout);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         if !self.is_https() {
             return Some(Box::new(stream));
@@ -191,10 +195,13 @@ impl Client {
     }
 
     /// `GET /v1/{id}/events`, held open for the punches the rendezvous delivers. The returned
-    /// stream is read line by line for `event: punch` and the `data:` JSON that follows.
+    /// stream is read line by line for `event: punch` and the `data:` JSON that follows. The read
+    /// has no timeout: an idle rendezvous heartbeats its own keep-alive comments, and the caller's
+    /// backoff is what closes a stream that has gone silent. A non-2xx reply ends the open instead of
+    /// the punches the loop would otherwise read off the error body.
     #[must_use]
     pub(crate) fn open_events(&self, id: &str, session: &str) -> Option<EventStream> {
-        let mut stream = self.open()?;
+        let mut stream = self.open_with_timeout(None)?;
         let host_header = self.host_header();
         let path = join_path(id, "events");
         let mut request = Vec::with_capacity(128);
@@ -205,8 +212,22 @@ impl Client {
         let _ = write!(request, "Connection: close\r\n\r\n");
         stream.write_all(&request).ok()?;
         stream.flush().ok()?;
+        let mut reader = BufReader::new(stream);
+        let mut head = String::new();
+        reader.read_line(&mut head).ok()?;
+        let status = head.split_whitespace().nth(1)?.parse::<u16>().ok()?;
+        if !(200..300).contains(&status) {
+            return None;
+        }
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+        }
         Some(EventStream {
-            reader: BufReader::new(stream),
+            reader,
             event: String::new(),
             data: String::new(),
         })
@@ -417,20 +438,26 @@ fn json_addr_list(body: &str, key: &str) -> Vec<SocketAddr> {
     let Some(at) = body.find(&needle) else {
         return Vec::new();
     };
-    let rest = &body[at + needle.len()..];
-    let rest = rest.trim_start();
-    let Some(inside) = rest
-        .strip_prefix('[')
-        .and_then(|rest| rest.split(']').next())
-    else {
+    let Some(mut rest) = body[at + needle.len()..].trim_start().strip_prefix('[') else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for part in inside.split(',') {
-        let part = part.trim().trim_matches('"');
-        if let Ok(addr) = part.parse::<SocketAddr>() {
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '\n', '\r', ',']);
+        if rest.starts_with(']') || rest.is_empty() {
+            break;
+        }
+        let Some(quoted) = rest.strip_prefix('"') else {
+            break;
+        };
+        let Some(end) = quoted.find('"') else {
+            break;
+        };
+        let raw = &quoted[..end];
+        if let Ok(addr) = raw.parse::<SocketAddr>() {
             out.push(addr);
         }
+        rest = &quoted[end + 1..];
     }
     out
 }
@@ -730,7 +757,11 @@ pub(crate) fn demux(
 /// answers its `connect_response` before its hello walk begins. A rendezvous that refuses is
 /// logged and retried — the direct lane still serves — while a punch that times out simply ends its
 /// visit: the peer punches again and the demux hands the next answer to the next attempt.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::never_loop
+)]
 pub(crate) fn serve_registration(
     sock: std::sync::Arc<crate::quic::Datagram>,
     config: &Config,
@@ -782,6 +813,8 @@ pub(crate) fn serve_registration(
         let heartbeat_servers = config.stun_servers.clone();
         let heartbeat_family = config.family;
         let ttl_for_heartbeat = ttl;
+        let session_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat_session_stop = std::sync::Arc::clone(&session_stop);
         std::thread::spawn(move || {
             heartbeat_loop(
                 heartbeat_client,
@@ -794,40 +827,44 @@ pub(crate) fn serve_registration(
                 heartbeat_family,
                 ttl_for_heartbeat,
                 heartbeat_stop,
+                heartbeat_session_stop,
             );
         });
-        let mut events = client.clone();
-        let mut event_client = client.clone();
-        loop {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = events.deregister(&config.id, &session);
-                return;
-            }
-            let Some(mut stream) = event_client.open_events(&config.id, &session) else {
-                std::thread::sleep(Duration::from_secs(1));
-                event_client = client.clone();
-                events = client.clone();
-                continue;
-            };
-            while let Some((peer_addresses, meta)) = stream.next_punch() {
-                if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                let current_locals = shared_locals
-                    .lock()
-                    .ok()
-                    .map_or_else(|| locals.clone(), |guard| guard.clone());
-                let filtered =
-                    realm::candidate_addrs(&current_locals, &peer_addresses, config.family);
-                let expanded = realm::expand_symmetric(&filtered);
-                if expanded.is_empty() {
-                    continue;
-                }
-                let nonce_hex = realm::hex_encode(&meta.nonce);
-                let _ = events.connect_response(&config.id, &session, &nonce_hex, &current_locals);
-                let _ = punch_via_state(&state, &sock, &meta, &expanded);
-            }
+        let events_client = client.clone();
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = events_client.deregister(&config.id, &session);
+            return;
         }
+        let Some(mut stream) = events_client.open_events(&config.id, &session) else {
+            session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(backoff.min(Duration::from_secs(30)));
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+            continue;
+        };
+        while let Some((peer_addresses, meta)) = stream.next_punch() {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+            let current_locals = shared_locals
+                .lock()
+                .ok()
+                .map_or_else(|| locals.clone(), |guard| guard.clone());
+            let filtered = realm::candidate_addrs(&current_locals, &peer_addresses, config.family);
+            let expanded = realm::expand_symmetric(&filtered);
+            if expanded.is_empty() {
+                continue;
+            }
+            let nonce_hex = realm::hex_encode(&meta.nonce);
+            let _ =
+                events_client.connect_response(&config.id, &session, &nonce_hex, &current_locals);
+            let _ = punch_via_state(&state, &sock, &meta, &expanded);
+        }
+        // The stream ended: re-register with the same backoff a refused register pays.
+        session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(backoff.min(Duration::from_secs(30)));
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -845,6 +882,7 @@ fn heartbeat_loop(
     family: Family,
     ttl: u64,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    session_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let interval = if ttl > 0 {
         Duration::from_secs(ttl / 2).max(Duration::from_secs(1))
@@ -852,7 +890,9 @@ fn heartbeat_loop(
         Duration::from_secs(15)
     };
     loop {
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        if stop.load(std::sync::atomic::Ordering::Relaxed)
+            || session_stop.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         std::thread::sleep(interval);
