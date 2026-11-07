@@ -30,7 +30,7 @@ struct CacheEntry {
 #[derive(Debug)]
 struct SteeringEntry {
     address: IpAddr,
-    expires: Instant,
+    expires: Option<Instant>,
     active: bool,
 }
 
@@ -638,11 +638,12 @@ impl Config {
             return;
         };
         if cache.len() >= self.steering_max && !cache.contains_key(provider) {
-            cache.retain(|_, entry| entry.expires > Instant::now());
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires.is_none_or(|expires| expires > now));
             if cache.len() >= self.steering_max {
                 if let Some(oldest) = cache
                     .iter()
-                    .min_by_key(|(_, entry)| entry.expires)
+                    .min_by_key(|(_, entry)| (entry.expires.is_none(), entry.expires))
                     .map(|(key, _)| key.clone())
                 {
                     cache.remove(&oldest);
@@ -650,11 +651,12 @@ impl Config {
             }
         }
         let active = cache.get(provider).is_some_and(|entry| entry.active);
+        let ttl = self.steering_ttl.max(Duration::from_secs(1));
         cache.insert(
             provider.to_owned(),
             SteeringEntry {
                 address,
-                expires: Instant::now() + self.steering_ttl.max(Duration::from_secs(1)),
+                expires: Instant::now().checked_add(ttl),
                 active,
             },
         );
@@ -665,7 +667,10 @@ impl Config {
     fn steering_get(&self, provider: &str) -> Option<IpAddr> {
         let mut cache = self.steering.lock().ok()?;
         let entry = cache.get_mut(provider)?;
-        if entry.expires <= Instant::now() {
+        if entry
+            .expires
+            .is_some_and(|expires| expires <= Instant::now())
+        {
             cache.remove(provider);
             return None;
         }
@@ -1465,6 +1470,18 @@ mod tests {
             Some("192.0.2.10".parse().expect("address"))
         );
         config.steering_probability = 0.0;
+        assert_eq!(
+            config.steering_get("provider"),
+            Some("192.0.2.10".parse().expect("address"))
+        );
+    }
+
+    #[test]
+    /// A TTL `Instant` cannot represent leaves the entry live instead of panicking.
+    fn an_unrepresentable_steering_ttl_never_expires() {
+        let mut config = Config::from_servers(&[]);
+        config.steering_ttl = std::time::Duration::from_secs(u64::MAX);
+        config.remember_steering("provider", "192.0.2.10".parse().expect("address"));
         assert_eq!(
             config.steering_get("provider"),
             Some("192.0.2.10".parse().expect("address"))

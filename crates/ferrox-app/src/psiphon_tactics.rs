@@ -257,7 +257,7 @@ fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
     let text = String::from_utf8_lossy(payload);
     let payload = match json::parse(&text) {
         Ok(payload) => payload,
-        Err(_) => crate::psiphon_broker::cbor_to_json(payload)
+        Err(_) => crate::psiphon_broker::cbor_tactics_to_json(payload)
             .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
     };
     let tag = payload
@@ -531,5 +531,47 @@ mod tests {
         let tactics = parse_payload(&payload).expect("payload");
         assert_eq!(tactics.tag, "same");
         assert_eq!(tactics.brokers, Vec::new());
+    }
+
+    #[test]
+    fn a_cbor_payload_reads_integer_keys_and_decompresses_the_tactics() {
+        use std::io::Write as _;
+
+        fn text(out: &mut Vec<u8>, text: &str) {
+            assert!(text.len() < 24);
+            out.push(0x60 | text.len() as u8);
+            out.extend_from_slice(text.as_bytes());
+        }
+        fn bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+            if bytes.len() < 24 {
+                out.push(0x40 | bytes.len() as u8);
+            } else if let Ok(len) = u8::try_from(bytes.len()) {
+                out.extend_from_slice(&[0x58, len]);
+            } else {
+                let len = u16::try_from(bytes.len()).expect("test payload fits");
+                out.push(0x59);
+                out.extend_from_slice(&len.to_be_bytes());
+            }
+            out.extend_from_slice(bytes);
+        }
+
+        let json = br#"{"TTL":"2h","Parameters":{"InproxyCommonCompartmentIDs":["c1"]}}"#;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(json).expect("compresses");
+        let compressed = encoder.finish().expect("finishes");
+
+        let mut payload = vec![0xa3];
+        payload.push(1);
+        text(&mut payload, "tag");
+        payload.push(2);
+        bytes(&mut payload, &compressed);
+        payload.push(3);
+        payload.push(1);
+
+        let tactics = parse_payload(&payload).expect("payload");
+        assert_eq!(tactics.tag, "tag");
+        assert_eq!(tactics.ttl, "2h");
+        assert_eq!(tactics.compartments, vec!["c1".to_owned()]);
     }
 }

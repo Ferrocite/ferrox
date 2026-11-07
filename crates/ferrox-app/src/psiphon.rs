@@ -69,7 +69,7 @@ const BUILTIN_CDN_SNIS: &[&str] = &[
 const MAX_REQUEST: usize = 16 * 1024;
 const DIAL_ATTEMPTS: usize = 64;
 const DIAL_WORKERS: usize = 10;
-const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 const HOLD_OFF_LIMIT: Duration = Duration::from_secs(60);
 const FLOW_STACK: usize = 128 * 1024;
 
@@ -2876,11 +2876,8 @@ fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_
     config.preresolved_probability = decimal(raw, "DNSResolverPreresolvedIPAddressProbability")
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
-    config.steering_ttl = Duration::from_secs(
-        number(raw, "SteeringIPCacheTTLSeconds")
-            .unwrap_or(3600)
-            .clamp(0, 86_400),
-    );
+    config.steering_ttl =
+        Duration::from_secs(number(raw, "SteeringIPCacheTTLSeconds").unwrap_or(3600));
     config.steering_probability = decimal(raw, "SteeringIPProbability")
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
@@ -9047,6 +9044,19 @@ mod tests {
         });
         assert!(!server_is_intensive(&inproxy, false));
         assert!(server_is_intensive(&inproxy, true));
+    }
+
+    #[test]
+    fn the_default_dial_budget_is_twenty_seconds() {
+        let settings = Settings::from_json(None).expect("settings");
+        assert_eq!(settings.dial_timeout(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_steering_ttl_longer_than_a_day_is_kept() {
+        let settings = json::parse(r#"{"SteeringIPCacheTTLSeconds":172800}"#).expect("settings");
+        let config = dns_config(Some(&settings), &[]);
+        assert_eq!(config.steering_ttl, Duration::from_hours(48));
     }
 
     #[test]
