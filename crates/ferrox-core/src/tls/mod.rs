@@ -834,7 +834,7 @@ pub fn connect<S: Stream + RecordAlignment>(
             )))
         }
         // ECH is rustls's lane here, so a config naming both keeps ECH and leaves CBC to it.
-        None if cfg.ech_config_list.is_none() && legacy::needed(&cfg.cipher_suites) => Ok(
+        None if cfg.ech_config_list.is_none() && legacy::dial_needed(&cfg.cipher_suites) => Ok(
             ClientSession::Legacy(Box::new(legacy::Session::connect(cfg, io)?)),
         ),
         None => Ok(ClientSession::Stock(Box::new(RustlsProvider::connect(

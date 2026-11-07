@@ -150,6 +150,11 @@ pub(crate) fn offers_tls13(ids: &[u16]) -> bool {
     ids.iter().any(|id| (0x1301..=0x1303).contains(id))
 }
 
+/// Whether a derived field offers a TLS 1.2 suite.
+pub(crate) fn offers_tls12(ids: &[u16]) -> bool {
+    ids.iter().any(|id| !(0x1301..=0x1303).contains(id))
+}
+
 /// Whether a list names both halves, where `BoringSSL` leads with the trio and rustls adds SCSV,
 /// so neither stock lane writes the reference's field.
 pub(crate) fn mixed(ids: &[u16]) -> bool {
