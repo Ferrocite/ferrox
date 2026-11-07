@@ -2013,6 +2013,7 @@ fn abandon(close: &Close, abort: &mut Option<Abort>) {
 }
 
 /// Runs a decoded request over its uplink; `defer_prefix` holds the response head for the first body frame.
+#[allow(clippy::too_many_arguments)]
 fn serve_decoded_impl<R, W>(
     reader: R,
     mut writer: W,
