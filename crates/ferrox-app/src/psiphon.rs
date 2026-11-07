@@ -2769,22 +2769,16 @@ fn dns_config(raw: Option<&Json>, dns_servers: &[SocketAddr]) -> crate::psiphon_
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
     config.steering_ttl = Duration::from_secs(
-        u64::try_from(
-            number(raw, "SteeringIPCacheTTLSeconds")
-                .unwrap_or(3600)
-                .clamp(0, 86_400),
-        )
-        .unwrap_or(3600),
+        number(raw, "SteeringIPCacheTTLSeconds")
+            .unwrap_or(3600)
+            .clamp(0, 86_400),
     );
     config.steering_probability = decimal(raw, "SteeringIPProbability")
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
-    config.steering_max = usize::try_from(
-        number(raw, "SteeringIPCacheMaxEntries")
-            .unwrap_or(65_536)
-            .max(0),
-    )
-    .unwrap_or(65_536);
+    config.steering_max =
+        usize::try_from(number(raw, "SteeringIPCacheMaxEntries").unwrap_or(65_536))
+            .unwrap_or(65_536);
     config
 }
 
