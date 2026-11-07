@@ -76,10 +76,12 @@ pub struct Hop {
 impl Hop {
     /// The distinct ports the plan covers, ascending, an overlap named once.
     /// Expanded once per dial so the rotation and the wire's source-port check
-    /// share one view of the set. The set is opened at its exact total so the
-    /// plan pays one allocation, then sorted once and overlapped away by `dedup`
-    /// — the old `contains`-per-port scan paid one linear check per new port
-    /// on top of its growth reallocations.
+    /// share one view of the set. The set is opened at the ranges' total
+    /// capped at the distinct-port ceiling (65,536), so a plan whose pushed
+    /// ports stay under the ceiling pays one allocation; a plan that pushes
+    /// past it grows before `dedup` and its allocation count is not claimed.
+    /// The sorted pass replaces the old `contains`-per-port scan's linear
+    /// check per new port on top of its growth reallocations.
     #[must_use]
     pub fn ports(&self) -> Vec<u16> {
         let total = self
@@ -89,7 +91,6 @@ impl Hop {
                 usize::from(range.end)
                     .checked_sub(usize::from(range.start))
                     .map_or(0, |span| span + 1)
-                    .min(65536)
             })
             .sum::<usize>()
             .min(65536);
@@ -113,6 +114,14 @@ impl Hop {
 /// port's place is one binary search, and the reply is one modulo plus one
 /// skip, where the old form filtered the set twice and walked it a second
 /// time to land the index.
+///
+/// # Contract
+///
+/// `ports` must be strictly ascending and distinct, as `Hop::ports` returns
+/// and `Hopper::open` restores. An unsorted or duplicate set violates the
+/// contract: in debug builds the `debug_assert` below panics, and in release
+/// builds `binary_search` answers without an error, so callers must not hand
+/// one in.
 #[must_use]
 pub fn pick_next(ports: &[u16], avoid: u16, roll: usize) -> u16 {
     debug_assert!(ports.windows(2).all(|w| w[0] < w[1]));
@@ -148,6 +157,14 @@ pub fn stay_ms(interval: (u64, u64), roll: u64) -> u64 {
 /// `ports` is the sorted distinct set `Hop::ports` hands out, so membership
 /// is one binary search per datagram where the old linear scan paid one
 /// compare per port of the plan.
+///
+/// # Contract
+///
+/// `ports` must be strictly ascending and distinct, as `Hop::ports` returns
+/// and `Hopper::open` restores. An unsorted or duplicate set violates the
+/// contract: in debug builds the `debug_assert` below panics, and in release
+/// builds `binary_search` answers without an error, so callers must not hand
+/// one in.
 #[must_use]
 pub fn is_hop_port(ports: &[u16], nominal: u16, port: u16) -> bool {
     debug_assert!(ports.windows(2).all(|w| w[0] < w[1]));
