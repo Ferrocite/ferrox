@@ -1885,6 +1885,22 @@ impl Settings {
             MAX_PADDING,
             obfuscated_min_padding,
         );
+        let meek_limit = |key: &str| {
+            let max = crate::psiphon_meek::MAX_REQUEST_PAYLOAD as u64;
+            let raw = number(settings, key).unwrap_or(max);
+            let value = raw.clamp(1, max) as usize;
+            if raw != value as u64 {
+                eprintln!("psiphon: {key} clamped to {value}");
+            }
+            value
+        };
+        let meek_min_limit_request = meek_limit("MeekMinLimitRequestPayloadLength");
+        let meek_max_limit_request = meek_limit("MeekMaxLimitRequestPayloadLength");
+        if meek_min_limit_request > meek_max_limit_request {
+            eprintln!(
+                "psiphon: MeekMinLimitRequestPayloadLength exceeds MeekMaxLimitRequestPayloadLength; using the minimum for both"
+            );
+        }
         let tls_shape = TlsShape {
             min_padding: u16::try_from(
                 number(settings, "TLSTunnelMinTLSPadding")
@@ -1910,6 +1926,24 @@ impl Settings {
             ossh_prefix: ossh_prefix(settings),
             obfuscated_min_padding,
             obfuscated_max_padding,
+            meek_alternate_cookie_name: decimal(settings, "MeekAlternateCookieNameProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            meek_alternate_content_type: decimal(settings, "MeekAlternateContentTypeProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            meek_traffic_shaping: decimal(settings, "MeekTrafficShapingProbability")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
+            meek_traffic_shaping_protocols: protocol_list_named(
+                settings,
+                "MeekTrafficShapingLimitProtocols",
+            ),
+            meek_min_limit_request,
+            meek_max_limit_request,
+            meek_redial_tls: decimal(settings, "MeekRedialTLSProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
             fragmentor: crate::psiphon_fragment::Fragmentor::new(
                 decimal(settings, "FragmentorProbability").unwrap_or(0.5),
                 protocol_list_named(settings, "FragmentorLimitProtocols"),
@@ -3106,6 +3140,13 @@ const KNOWN_SETTINGS: &[&str] = &[
     "TLSTunnelMaxTLSPadding",
     "MeekMinTLSPadding",
     "MeekMaxTLSPadding",
+    "MeekTrafficShapingProbability",
+    "MeekTrafficShapingLimitProtocols",
+    "MeekMinLimitRequestPayloadLength",
+    "MeekMaxLimitRequestPayloadLength",
+    "MeekRedialTLSProbability",
+    "MeekAlternateCookieNameProbability",
+    "MeekAlternateContentTypeProbability",
     "TLSTunnelTrafficShapingProbability",
     "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",
@@ -8475,6 +8516,7 @@ mod tests {
         );
     }
 
+    /// Limited TLS profiles and meek padding reach every TLS shape.
     #[test]
     fn a_limited_tls_profile_reaches_every_tls_shape() {
         let settings = Settings::from_json(Some(
@@ -8519,6 +8561,28 @@ mod tests {
             .padding()
             .expect("meek padding");
         assert!((23..=29).contains(&padding));
+    }
+
+    /// The reference meek shaping keys reach the lane shape.
+    #[test]
+    fn the_meek_shaping_settings_reach_the_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"MeekAlternateCookieNameProbability":0.25,"MeekAlternateContentTypeProbability":0.5,"MeekTrafficShapingProbability":0.75,"MeekTrafficShapingLimitProtocols":["fronted-meek-ossh"],"MeekMinLimitRequestPayloadLength":1024,"MeekMaxLimitRequestPayloadLength":4096,"MeekRedialTLSProbability":0.125}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.meek_alternate_cookie_name, 0.25);
+        assert_eq!(settings.tls_shape.meek_alternate_content_type, 0.5);
+        assert_eq!(settings.tls_shape.meek_traffic_shaping, 0.75);
+        assert_eq!(
+            settings.tls_shape.meek_traffic_shaping_protocols,
+            vec!["FRONTED-MEEK-OSSH"]
+        );
+        assert_eq!(settings.tls_shape.meek_min_limit_request, 1024);
+        assert_eq!(settings.tls_shape.meek_max_limit_request, 4096);
+        assert_eq!(settings.tls_shape.meek_redial_tls, 0.125);
     }
 
     #[test]
