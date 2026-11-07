@@ -128,7 +128,9 @@ backend carries. Twenty of the reference's twenty-five ids are reachable.
   cannot use either stock lane: BoringSSL writes its trio first and rustls appends SCSV, so
   neither writes the reference's field. The stock shaped hello writes the derived field
   verbatim (`a_mixed_list_keeps_the_reference_order_on_the_wire`) and still finishes a TLS 1.2
-  handshake on the CBC id the list carries (`a_mixed_list_negotiates_a_tls12_suite`). The legacy
+  handshake on the CBC id the list carries (`a_mixed_list_negotiates_a_tls12_suite`). A server
+  pick is checked against that field, so a suite this tree implements but the list omits is
+  refused (`a_server_may_not_select_an_unoffered_suite`). The legacy
   lane is selected only for a list whose max is below 1.3, so its cap makes that field exact
   (`a_legacy_dial_offers_the_reference_cipher_ids_in_order`).
 - **Two named limits on the legacy lane.** An ECH config keeps the rustls lane (ECH is stronger
