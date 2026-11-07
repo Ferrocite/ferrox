@@ -543,6 +543,7 @@ carrier-hysteria masquerade-static-answer-allocations 2 ferrox-app-hysteria::tes
 carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
 carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
 carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
+carrier-hysteria hop-port-expansion-allocations 1 ferrox-core-hysteria::tests::every_plan_expands_to_the_bytes_the_contains_scan_wrote
 carrier-hysteria hop-config-forms-parsed 2 ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan
 carrier-hysteria hop-plan-pool-keys 2 ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key
 carrier-hysteria hopped-datagrams-delivered 200 ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port
