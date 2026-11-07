@@ -186,6 +186,7 @@ fn context(cfg: &TlsConfig) -> Result<Arc<SslContext>, TlsError> {
     Ok(built)
 }
 
+/// Builds the `BoringSSL` context for one config, capped at TLS 1.2 when the list names no TLS 1.3 id.
 fn build_context(cfg: &TlsConfig) -> Result<SslContext, TlsError> {
     let name = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
         .map_err(|e| TlsError::Other(format!("tls server name: {e}")))?;

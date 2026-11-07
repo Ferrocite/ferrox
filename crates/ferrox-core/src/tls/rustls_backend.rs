@@ -4119,7 +4119,7 @@ mod tests {
             record
         });
         let mut cfg = client("tls.test", &[]);
-        cfg.cipher_suites = vec![0x1301, 0x1302, 0x1303, 0xc009, 0x002f].into();
+        cfg.cipher_suites = vec![0xc009, 0x002f, 0x1301, 0x1302, 0x1303].into();
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let mut session = crate::tls::connect(&cfg, stream).expect("dials");
         let _ = session.handshake();
@@ -4129,7 +4129,7 @@ mod tests {
         assert_eq!(
             hello_cipher_suites(&record),
             want.as_slice(),
-            "BoringSSL's trio leads a mixed list, its named ceiling"
+            "BoringSSL's trio leads even a list that names the 1.2 ids first"
         );
     }
 
