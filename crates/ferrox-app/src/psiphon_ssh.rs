@@ -1343,6 +1343,7 @@ pub(crate) struct Identity<'a> {
 
 /// The server's handshake reply: new server entries, client region, tactics and steering IP.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct HandshakeState {
     pub(crate) homepages: Vec<String>,
     pub(crate) upgrade_client_version: Option<String>,
