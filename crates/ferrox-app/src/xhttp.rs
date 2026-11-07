@@ -2641,6 +2641,7 @@ fn read_body<R: Read>(read: &mut R, prefix: &[u8], n: usize) -> Option<(Vec<u8>,
     let mut at = pre;
     while at < n {
         match read.read(&mut buf[at..]) {
+            Err(error) if crate::proxy::is_timeout(&error) => {}
             Ok(0) | Err(_) => return None,
             Ok(r) => at += r,
         }
@@ -2668,6 +2669,7 @@ fn drain_body(read: &mut dyn Read, cap: usize) -> Drained {
     let mut buf = [0u8; 8192];
     loop {
         match read.read(&mut buf) {
+            Err(error) if crate::proxy::is_timeout(&error) => {}
             Ok(0) => return Drained::Done(body),
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
@@ -4535,6 +4537,38 @@ mod tests {
         want.extend_from_slice(&wire[..23]);
         assert_eq!(body, want, "the bytes are the body");
         assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+    }
+
+    /// A poll grain on an armed socket is not the body's end: a POST whose body arrives late still lands.
+    #[test]
+    fn a_body_read_waits_out_a_poll_grain() {
+        struct Late {
+            grains: usize,
+            body: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for Late {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.grains > 0 {
+                    self.grains -= 1;
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                self.body.read(buf)
+            }
+        }
+        let mut late = Late {
+            grains: 2,
+            body: std::io::Cursor::new(b"body".to_vec()),
+        };
+        let (body, pre) = read_body(&mut late, b"", 4).expect("the body");
+        assert_eq!((body, pre), (b"body".to_vec(), 0));
+        let mut late = Late {
+            grains: 2,
+            body: std::io::Cursor::new(b"later".to_vec()),
+        };
+        match drain_body(&mut late, 64) {
+            Drained::Done(body) => assert_eq!(body, b"later"),
+            _ => panic!("the drain gave up on a poll grain"),
+        }
     }
 
     /// What a body read leaves behind is the next request's head; it moves down inside the head's buffer, where the old shape copied it into a fresh one.

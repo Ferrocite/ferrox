@@ -8194,13 +8194,7 @@ fn serve_vless_xhttp(
         return;
     };
     if !h2 {
-        // Packet-up reads its body before its session opens, so only the stream shapes park on the socket.
-        if matches!(
-            settings.mode,
-            crate::xhttp::XhttpMode::StreamOne | crate::xhttp::XhttpMode::StreamUp
-        ) {
-            chained.arm_relay_poll();
-        }
+        chained.arm_relay_poll();
         // An H1 stream-up GET waits for its POST, the POST for the session's end: neither keeps a setup lane.
         if settings.mode == crate::xhttp::XhttpMode::StreamUp {
             let settings = settings.clone();
@@ -42584,13 +42578,10 @@ mod tests {
     /// An H1 stream-one session arms the relay poll on its socket before it relays, so an upload leg
     /// waiting for payload parks instead of pinning one of the few relay workers the download legs need.
     #[cfg(unix)]
-    #[test]
-    fn an_h1_xhttp_session_arms_the_relay_poll_before_it_relays() {
+    fn assert_h1_arms(settings: Box<crate::xhttp::XhttpSettings>) {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
-        let id = [0xaau8; 16];
-        let settings = xhttp_settings("/share");
-        let users = one_vless_user(&id);
+        let users = one_vless_user(&[0xaau8; 16]);
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -42616,6 +42607,23 @@ mod tests {
         }
         drop(peer);
         serving.join().expect("joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_h1_xhttp_session_arms_the_relay_poll_before_it_relays() {
+        assert_h1_arms(xhttp_settings("/share"));
+    }
+
+    /// Automatic mode resolves to packet-up, yet the same hub serves a stream-one POST; its upload must not pin a worker either.
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_h1_stream_one_post_arms_the_relay_poll() {
+        assert_h1_arms(Box::new(crate::xhttp::XhttpSettings {
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..*xhttp_settings("/share")
+        }));
     }
 
     /// Raw HTTP/1.1 clients for the three xhttp modes, padded, with session and seq in the path.
