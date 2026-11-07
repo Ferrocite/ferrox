@@ -2638,17 +2638,41 @@ fn keeps_alive(text: &str) -> bool {
     keep
 }
 
-/// Clears the body deadline however the read ends, so a later request on the same thread does not inherit it.
-struct BodyDeadlineGuard;
+/// A body's arrival window: an idle budget each byte moves out, inside a hard cap no byte moves, so a drip cannot hold an unauthenticated handler.
+struct BodyArrival {
+    budget: std::time::Duration,
+    idle: std::time::Instant,
+    hard: std::time::Instant,
+}
 
-impl BodyDeadlineGuard {
-    fn until(until: std::time::Instant) -> Self {
-        crate::proxy::set_body_deadline(Some(until));
-        Self
+impl BodyArrival {
+    fn new(budget: std::time::Duration) -> Self {
+        let now = std::time::Instant::now();
+        let arrival = Self {
+            budget,
+            idle: now + budget,
+            hard: now + crate::budgets::relay_stall(),
+        };
+        arrival.publish();
+        arrival
+    }
+
+    fn publish(&self) {
+        crate::proxy::set_body_deadline(Some(self.idle.min(self.hard)));
+    }
+
+    fn advanced(&mut self) {
+        self.idle = std::time::Instant::now() + self.budget;
+        self.publish();
+    }
+
+    fn passed(&self) -> bool {
+        let now = std::time::Instant::now();
+        now >= self.idle || now >= self.hard
     }
 }
 
-impl Drop for BodyDeadlineGuard {
+impl Drop for BodyArrival {
     fn drop(&mut self) {
         crate::proxy::set_body_deadline(None);
     }
@@ -2665,20 +2689,23 @@ fn read_body<R: Read>(
     let pre = prefix.len().min(n);
     buf[..pre].copy_from_slice(&prefix[..pre]);
     let mut at = pre;
-    let mut until = std::time::Instant::now() + budget;
-    let _deadline = BodyDeadlineGuard::until(until);
+    let mut arrival = BodyArrival::new(budget);
     while at < n {
         match read.read(&mut buf[at..]) {
             Err(error) if crate::proxy::is_timeout(&error) => {
-                if std::time::Instant::now() >= until {
+                if arrival.passed() {
                     return None;
                 }
             }
             Ok(0) | Err(_) => return None,
             Ok(r) => {
                 at += r;
-                until = std::time::Instant::now() + budget;
-                crate::proxy::set_body_deadline(Some(until));
+                if at < n {
+                    arrival.advanced();
+                    if arrival.passed() {
+                        return None;
+                    }
+                }
             }
         }
     }
@@ -2703,22 +2730,23 @@ enum Drained {
 fn drain_body(read: &mut dyn Read, cap: usize, budget: std::time::Duration) -> Drained {
     let mut body = Vec::new();
     let mut buf = [0u8; 8192];
-    let mut until = std::time::Instant::now() + budget;
-    let _deadline = BodyDeadlineGuard::until(until);
+    let mut arrival = BodyArrival::new(budget);
     loop {
         match read.read(&mut buf) {
             Err(error) if crate::proxy::is_timeout(&error) => {
-                if std::time::Instant::now() >= until {
+                if arrival.passed() {
                     return Drained::Broken;
                 }
             }
             Ok(0) => return Drained::Done(body),
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
-                until = std::time::Instant::now() + budget;
-                crate::proxy::set_body_deadline(Some(until));
                 if body.len() > cap {
                     return Drained::Over;
+                }
+                arrival.advanced();
+                if arrival.passed() {
+                    return Drained::Broken;
                 }
             }
             Err(_) => return Drained::Broken,
@@ -4684,6 +4712,37 @@ mod tests {
             "the deadline ends the framing read, not the poll sleep"
         );
         assert!(framed.reads > 0, "the framing read reached the source");
+    }
+
+    /// A byte just inside each idle window still cannot outlive the hard body cap.
+    #[test]
+    fn a_drip_cannot_outlive_the_hard_body_cap() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_millis(30)),
+            ..Default::default()
+        });
+        struct Drip;
+        impl std::io::Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                buf[0] = 0;
+                Ok(1)
+            }
+        }
+        let mut drip = Drip;
+        let started = std::time::Instant::now();
+        let read = read_body(&mut drip, b"", 100, std::time::Duration::from_secs(60));
+        let drained = drain_body(&mut drip, usize::MAX, std::time::Duration::from_secs(60));
+        crate::budgets::clear();
+        assert!(read.is_none(), "the hard cap ends a dripped body");
+        assert!(
+            matches!(drained, Drained::Broken),
+            "the hard cap ends a dripped stream"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "both end at the hard cap, not the idle budget"
+        );
     }
 
     /// What a body read leaves behind is the next request's head; it moves down inside the head's buffer, where the old shape copied it into a fresh one.
