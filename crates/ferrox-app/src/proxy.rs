@@ -50930,19 +50930,18 @@ mod tests {
     fn eight_packet_up_trojan_h2_downloads_complete() {
         const BULK: usize = 16 * 1024 * 1024;
         const FLOWS: usize = 8;
-        let (server_config, client_config) = carried_tls_configs();
+        let (server_config, mut client_config) = carried_tls_configs();
         let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
             alpn: vec![b"h2".to_vec()],
             ..(*server_config).clone()
         });
+        client_config.alpn = vec![b"h2".to_vec()].into();
         let key = trojan_key("packet-up-h2-eight-flows");
         let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds sink");
         let sink_addr: SocketAddr = sink.local_addr().expect("addr");
-        eprintln!("eight: sink={sink_addr}");
         thread::spawn(move || {
-            for i in 0..FLOWS {
-                let (mut stream, peer) = sink.accept().expect("accepts sink");
-                eprintln!("sink-accept {i} {peer}");
+            for _ in 0..FLOWS {
+                let (mut stream, _) = sink.accept().expect("accepts sink");
                 thread::spawn(move || {
                     let chunk = vec![0x6Bu8; 65536];
                     let mut left = BULK;
@@ -50959,7 +50958,6 @@ mod tests {
         });
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        eprintln!("eight: server={port}");
         let settings = Box::new(crate::xhttp::XhttpSettings {
             path: "/share".to_owned(),
             mode: crate::xhttp::XhttpMode::PacketUp,
@@ -50969,21 +50967,18 @@ mod tests {
         let server_settings = (*settings).clone();
         let keys = vec![key];
         thread::spawn(move || {
-            for i in 0..FLOWS {
-                let (stream, peer) = listener.accept().expect("accepts");
-                eprintln!("srv-accept {i} {peer}");
+            for _ in 0..FLOWS {
+                let (stream, _) = listener.accept().expect("accepts");
                 stream.set_read_timeout(Some(RELAY_POLL)).expect("poll");
                 let Ok(out) = stream.try_clone() else {
                     continue;
                 };
                 let Ok(session) = ferrox_core::tls::accept(&server_config, stream) else {
-                    eprintln!("srv-tls-fail {i}");
                     continue;
                 };
                 let settings = server_settings.clone();
                 let keys = keys.clone();
                 run_tls_handshake(session, move |session, prefix| {
-                    eprintln!("srv-serve {i}");
                     let _flow = lane_flow(None, None, "", 0);
                     let (reader, writer) = session_halves(session, out);
                     let reader = crate::xhttp::ChainReader::new(prefix, reader);
@@ -50993,11 +50988,9 @@ mod tests {
         });
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds downstream");
         let dport = downstream.local_addr().expect("addr").port();
-        eprintln!("eight: downstream={dport}");
         thread::spawn(move || {
-            for i in 0..FLOWS {
+            for _ in 0..FLOWS {
                 let (client, _) = downstream.accept().expect("accepts");
-                eprintln!("cli-accept {i}");
                 let out = tls_trojan_out(
                     port,
                     key,
@@ -51008,7 +51001,6 @@ mod tests {
                 );
                 let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
                 thread::spawn(move || {
-                    eprintln!("cli-dial {i} -> {server}");
                     dial_socks_outbound(&client, &out, &server, &Destination::from(sink_addr));
                 });
             }
