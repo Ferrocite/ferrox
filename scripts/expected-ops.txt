@@ -217,6 +217,9 @@ grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_s
 # Re-blessed 1220 after the TLS 1.2 carrier and psiphon config-gap landings
 # moved this frame's thin-LTO layout again; sniff.rs, the warm probe and the
 # bytes are unchanged.
+# Re-blessed 1228 by psiphon-ss-vectored: the vectored Shadowsocks seal and its
+# probes in the same app binary move this frame's thin-LTO layout by eight;
+# sniff.rs, the warm probe and the bytes are unchanged.
 # The wireguard routing test runs both lookups over 512 peers: the peer-by-peer
 # scan and the prefix table for the same destination. Both rows come from one
 # test and one binary, so their difference is the lookup and not the build.
@@ -227,4 +230,9 @@ ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_
 # values, offsets and refusals are unchanged.
 # (The byte row stays in scripts/method-ops.txt as the comparison.)
 ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
-ferrox_app::sniff::Sniffing::inspect 1220 sniff::tests::a_warm_probe_costs_the_documented_instructions
+# The four-slice SSH packet sealed 4096 times through the direct write reports
+# 47483770 against 47621538 for the flatten it replaced, so the staging copy
+# and its loop take 137768 (0.29%) out. The bytes and their order are unchanged.
+ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+ferrox_app::sniff::Sniffing::inspect 1228 sniff::tests::a_warm_probe_costs_the_documented_instructions
