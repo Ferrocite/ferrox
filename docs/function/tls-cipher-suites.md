@@ -18,9 +18,9 @@ graph TD
     M -->|yes| G["shaped stock hello:<br/>the derived field verbatim"]
     M -->|no| K{"an id neither ring<br/>nor BoringSSL carries?"}
     K -->|yes| G
-    K -->|no| S{"an id ring has not?"}
-    S -->|no| B["rustls provider sorted to<br/>the crafted order"]
-    S -->|yes| L["BoringSSL cipher list in<br/>the config's order, capped at<br/>1.2 when no TLS 1.3 id is named"]
+    K -->|no| Q{"names only TLS 1.2 ids?"}
+    Q -->|yes| L["BoringSSL cipher list in<br/>the config's order, capped at<br/>1.2 when no TLS 1.3 id is named"]
+    Q -->|no| B["rustls provider sorted to<br/>the crafted order"]
     G --> W
     E --> X{"listener names a<br/>shaped-only id?"}
     X -->|no| B
