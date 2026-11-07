@@ -61,7 +61,7 @@ impl Transforms {
     /// with one line rather than refusing the lane.
     pub(crate) fn new(
         specs: Vec<(String, Vec<(String, String)>)>,
-        scoped: Vec<(String, Vec<String>)>,
+        scope_names: Vec<(String, Vec<String>)>,
     ) -> Self {
         let mut compiled = HashMap::new();
         for (name, transforms) in specs {
@@ -81,8 +81,8 @@ impl Transforms {
                 compiled.insert(name, Arc::new(items));
             }
         }
-        let mut by_scope = HashMap::new();
-        for (scope, names) in scoped {
+        let mut scope_map = HashMap::new();
+        for (scope, names) in scope_names {
             let mut kept = Vec::new();
             for name in names {
                 if compiled.contains_key(&name) {
@@ -91,11 +91,11 @@ impl Transforms {
                     eprintln!("psiphon: ignoring DNS transform scope {scope}: undefined {name}");
                 }
             }
-            by_scope.insert(scope, kept);
+            scope_map.insert(scope, kept);
         }
         Self {
             specs: compiled,
-            scoped: by_scope,
+            scoped: scope_map,
         }
     }
 
