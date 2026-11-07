@@ -209,7 +209,10 @@ fn check_gates(prompt: &Prompt, root: &Path, verify_paths: bool, findings: &mut 
         for token in trimmed.split(|character: char| character.is_whitespace() || character == ',')
         {
             // A `§`-prefixed gate is the conditional form: it names the same workflow.
-            let name = token.trim_matches('`').strip_prefix('§').unwrap_or_else(|| token.trim_matches('`'));
+            let name = token
+                .trim_matches('`')
+                .strip_prefix('§')
+                .unwrap_or_else(|| token.trim_matches('`'));
             // Case-insensitive: `CI.yml` and `ci.yml` are one workflow to the author, two strings to a byte compare.
             let extension = Path::new(name)
                 .extension()
