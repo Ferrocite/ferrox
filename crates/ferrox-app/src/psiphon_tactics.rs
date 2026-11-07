@@ -254,25 +254,34 @@ fn api_params(identity: &Identity<'_>, compress_tactics: bool) -> String {
 }
 
 fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
-    let text = String::from_utf8_lossy(payload);
-    let payload = match json::parse(&text) {
-        Ok(payload) => payload,
-        Err(_) => crate::psiphon_broker::cbor_tactics_to_json(payload)
-            .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
+    let payload = if payload.first().is_some_and(|byte| *byte >= 0x80) {
+        crate::psiphon_broker::cbor_tactics_to_json(payload)
+            .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?
+    } else {
+        let text = String::from_utf8_lossy(payload);
+        match json::parse(&text) {
+            Ok(payload) => payload,
+            Err(_) => crate::psiphon_broker::cbor_tactics_to_json(payload)
+                .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
+        }
     };
+    Ok(tactics_from_json(&payload))
+}
+
+fn tactics_from_json(payload: &Json) -> Tactics {
     let tag = payload
         .get("Tag")
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_owned();
     let Some(tactics) = payload.get("Tactics") else {
-        return Ok(Tactics {
+        return Tactics {
             tag,
             ttl: String::new(),
             brokers: Vec::new(),
             compartments: Vec::new(),
             stun_servers: Vec::new(),
-        });
+        };
     };
     let ttl = tactics
         .get("TTL")
@@ -312,13 +321,13 @@ fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Tactics {
+    Tactics {
         tag,
         ttl,
         brokers,
         compartments,
         stun_servers,
-    })
+    }
 }
 
 fn broker(spec: &Json) -> Option<Broker> {
@@ -523,6 +532,36 @@ mod tests {
         let tactics = parse_payload(br#"{"Tag":"same"}"#).expect("payload");
         assert_eq!(tactics.tag, "same");
         assert_eq!(tactics.brokers, Vec::new());
+    }
+
+    #[test]
+    fn a_text_payload_keeps_the_json_path_for_non_ascii() {
+        let tactics = parse_payload(r#"{"Tag":"é"}"#.as_bytes()).expect("payload");
+        assert_eq!(tactics.tag, "é");
+    }
+
+    fn parse_payload_json_first(payload: &[u8]) -> Result<Tactics, String> {
+        let text = String::from_utf8_lossy(payload);
+        let payload = match crate::json::parse(&text) {
+            Ok(payload) => payload,
+            Err(_) => crate::psiphon_broker::cbor_tactics_to_json(payload)
+                .ok_or_else(|| "psiphon tactics: response is not a payload".to_owned())?,
+        };
+        Ok(tactics_from_json(&payload))
+    }
+
+    #[test]
+    fn a_binary_cbor_payload_skips_the_lossy_text_copy() {
+        let payload = [0xa1, 0x63, b'T', b'a', b'g', 0x64, b's', b'a', b'm', b'e'];
+        let (new, new_counts) = ferrox_core::alloc_count::measure(|| parse_payload(&payload));
+        let (old, old_counts) =
+            ferrox_core::alloc_count::measure(|| parse_payload_json_first(&payload));
+        assert_eq!(new.expect("new"), old.expect("old"));
+        assert!(
+            old_counts.allocs > new_counts.allocs,
+            "the old path copied the binary payload through a lossy string: {new_counts:?} vs {old_counts:?}"
+        );
+        assert!(old_counts.bytes > new_counts.bytes);
     }
 
     #[test]
