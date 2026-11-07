@@ -5079,7 +5079,7 @@ mod tests {
             let mut pad = PadSource::fresh().expect("entropy");
             let mut writer = Collected(std::sync::Arc::clone(&out));
             let mut done = false;
-            let mut head = None;
+            let mut deferred = None;
             for _ in 0..4 {
                 let (next, _) = forward_step(
                     &mut plain,
@@ -5087,7 +5087,7 @@ mod tests {
                     &mut writer,
                     &mut send,
                     &mut staging,
-                    &mut head,
+                    &mut deferred,
                     &mut pad,
                     &close,
                     &flow,

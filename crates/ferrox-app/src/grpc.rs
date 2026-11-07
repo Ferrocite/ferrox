@@ -1533,7 +1533,7 @@ impl GrpcWriter {
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        (*init).min(65_535).max(1)
+        (*init).clamp(1, 65_535)
     }
 
     /// Writes one message, splitting it only when it exceeds `max` bytes.
@@ -1548,10 +1548,12 @@ impl GrpcWriter {
             return false;
         }
         if total <= max {
-            if !reserved && batch.credit > 0 && batch.credit + total as u64 > self.hunk_cap() {
-                if !batch.flush_blocking(&self.shared) {
-                    return false;
-                }
+            if !reserved
+                && batch.credit > 0
+                && batch.credit + total as u64 > self.hunk_cap()
+                && !batch.flush_blocking(&self.shared)
+            {
+                return false;
             }
             if !reserved && !self.credit(batch, total as u64) {
                 return false;
