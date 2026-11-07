@@ -2634,16 +2634,29 @@ fn keeps_alive(text: &str) -> bool {
 }
 
 /// The body of `n` bytes, and how much of the bytes already read as the head it used; the rest of those belong to the next request on this connection.
-fn read_body<R: Read>(read: &mut R, prefix: &[u8], n: usize) -> Option<(Vec<u8>, usize)> {
+fn read_body<R: Read>(
+    read: &mut R,
+    prefix: &[u8],
+    n: usize,
+    budget: std::time::Duration,
+) -> Option<(Vec<u8>, usize)> {
     let mut buf = crate::proxy::unfilled(n);
     let pre = prefix.len().min(n);
     buf[..pre].copy_from_slice(&prefix[..pre]);
     let mut at = pre;
+    let mut until = std::time::Instant::now() + budget;
     while at < n {
         match read.read(&mut buf[at..]) {
-            Err(error) if crate::proxy::is_timeout(&error) => {}
+            Err(error) if crate::proxy::is_timeout(&error) => {
+                if std::time::Instant::now() >= until {
+                    return None;
+                }
+            }
             Ok(0) | Err(_) => return None,
-            Ok(r) => at += r,
+            Ok(r) => {
+                at += r;
+                until = std::time::Instant::now() + budget;
+            }
         }
     }
     Some((buf, pre))
@@ -2664,15 +2677,21 @@ enum Drained {
 }
 
 /// The body until the stream ends, with `Over` naming a payload past the per-request cap.
-fn drain_body(read: &mut dyn Read, cap: usize) -> Drained {
+fn drain_body(read: &mut dyn Read, cap: usize, budget: std::time::Duration) -> Drained {
     let mut body = Vec::new();
     let mut buf = [0u8; 8192];
+    let mut until = std::time::Instant::now() + budget;
     loop {
         match read.read(&mut buf) {
-            Err(error) if crate::proxy::is_timeout(&error) => {}
+            Err(error) if crate::proxy::is_timeout(&error) => {
+                if std::time::Instant::now() >= until {
+                    return Drained::Broken;
+                }
+            }
             Ok(0) => return Drained::Done(body),
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
+                until = std::time::Instant::now() + budget;
                 if body.len() > cap {
                     return Drained::Over;
                 }
@@ -2873,7 +2892,9 @@ pub(crate) fn accept_core<
                     emit_413(&mut write);
                     return Served::Closed;
                 }
-                let Some((buf, pre)) = read_body(&mut read, &prefix, n) else {
+                let Some((buf, pre)) =
+                    read_body(&mut read, &prefix, n, crate::budgets::head_arrival())
+                else {
                     return Served::Closed;
                 };
                 carry = carry_tail(prefix, pre);
@@ -2885,7 +2906,11 @@ pub(crate) fn accept_core<
                 resumable = false;
                 let mut chain = ChainReader::new(prefix, &mut read);
                 let drained = if h2.is_some() {
-                    drain_body(&mut chain, settings.sc_max_each_post)
+                    drain_body(
+                        &mut chain,
+                        settings.sc_max_each_post,
+                        crate::budgets::head_arrival(),
+                    )
                 } else {
                     let mut framed = Reader {
                         read: &mut chain,
@@ -2898,7 +2923,11 @@ pub(crate) fn accept_core<
                         head_progress: None,
                         chunk: Chunk::Body,
                     };
-                    drain_body(&mut framed, settings.sc_max_each_post)
+                    drain_body(
+                        &mut framed,
+                        settings.sc_max_each_post,
+                        crate::budgets::head_arrival(),
+                    )
                 };
                 match drained {
                     Drained::Done(buf) => body = buf,
@@ -4529,8 +4558,14 @@ mod tests {
     fn a_body_read_lands_in_room_it_never_zeroes() {
         let wire = [0x5Au8; 64];
         let mut source = std::io::Cursor::new(&wire[..]);
-        let (read, counts) =
-            ferrox_core::alloc_count::measure(|| read_body(&mut source, b"head-tail", 32));
+        let (read, counts) = ferrox_core::alloc_count::measure(|| {
+            read_body(
+                &mut source,
+                b"head-tail",
+                32,
+                crate::budgets::head_arrival(),
+            )
+        });
         let (body, pre) = read.expect("the body");
         assert_eq!(pre, 9, "what the head left over is the body's own head");
         let mut want = b"head-tail".to_vec();
@@ -4559,16 +4594,36 @@ mod tests {
             grains: 2,
             body: std::io::Cursor::new(b"body".to_vec()),
         };
-        let (body, pre) = read_body(&mut late, b"", 4).expect("the body");
+        let (body, pre) =
+            read_body(&mut late, b"", 4, std::time::Duration::from_secs(1)).expect("the body");
         assert_eq!((body, pre), (b"body".to_vec(), 0));
         let mut late = Late {
             grains: 2,
             body: std::io::Cursor::new(b"later".to_vec()),
         };
-        match drain_body(&mut late, 64) {
+        match drain_body(&mut late, 64, std::time::Duration::from_secs(1)) {
             Drained::Done(body) => assert_eq!(body, b"later"),
             _ => panic!("the drain gave up on a poll grain"),
         }
+        let mut late = Late {
+            grains: usize::MAX,
+            body: std::io::Cursor::new(Vec::new()),
+        };
+        assert!(
+            read_body(&mut late, b"", 4, std::time::Duration::from_millis(5)).is_none(),
+            "a withheld body ends at its deadline"
+        );
+        let mut late = Late {
+            grains: usize::MAX,
+            body: std::io::Cursor::new(Vec::new()),
+        };
+        assert!(
+            matches!(
+                drain_body(&mut late, 64, std::time::Duration::from_millis(5)),
+                Drained::Broken
+            ),
+            "a withheld stream ends at its deadline"
+        );
     }
 
     /// What a body read leaves behind is the next request's head; it moves down inside the head's buffer, where the old shape copied it into a fresh one.
