@@ -186,6 +186,7 @@ fn context(cfg: &TlsConfig) -> Result<Arc<SslContext>, TlsError> {
     Ok(built)
 }
 
+/// Builds the `BoringSSL` context for one config, capped at TLS 1.2 when the list names no TLS 1.3 id.
 fn build_context(cfg: &TlsConfig) -> Result<SslContext, TlsError> {
     let name = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
         .map_err(|e| TlsError::Other(format!("tls server name: {e}")))?;
@@ -226,6 +227,12 @@ fn build_context(cfg: &TlsConfig) -> Result<SslContext, TlsError> {
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_2))
         .map_err(|e| error_stack(&e))?;
+    // No TLS 1.3 id means the reference's max is below 1.3; the cap drops BoringSSL's fixed trio.
+    if !crate::tls::cipher_suites::offers_tls13(&cfg.cipher_suites) {
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| error_stack(&e))?;
+    }
     let curves = curve_list(&cfg.curves);
     if !curves.is_empty() {
         builder

@@ -4070,8 +4070,8 @@ mod tests {
         }
     }
 
-    /// The dial's hello carries the reference's TLS 1.2 ids in its order. `BoringSSL` puts its own
-    /// TLS 1.3 trio in front of them, where `crypto/tls` appends that trio after the list.
+    /// The dial's hello carries the reference's TLS 1.2 field exactly when the list offers no
+    /// TLS 1.3: capping `BoringSSL` at 1.2 drops its fixed trio, so nothing precedes the list.
     #[cfg_attr(miri, ignore = "needs a loopback socket")]
     #[test]
     fn a_legacy_dial_offers_the_reference_cipher_ids_in_order() {
@@ -4093,13 +4093,43 @@ mod tests {
         let mut session = crate::tls::connect(&cfg, stream).expect("dials");
         let _ = session.handshake();
         let record = capture.join().expect("joins");
-        let want = crate::tls::cipher_suites::field_bytes(&[
-            0x1301, 0x1302, 0x1303, 0xc009, 0xc013, 0x002f, 0x0035, 0xc02b,
-        ]);
+        let want = crate::tls::cipher_suites::field_bytes(&cfg.cipher_suites);
         assert_eq!(
             hello_cipher_suites(&record),
             want.as_slice(),
-            "the TLS 1.2 ids keep the config's order, with BoringSSL's trio in front"
+            "a TLS 1.2-only list is the reference field byte for byte"
+        );
+    }
+
+    /// A list that also offers TLS 1.3 keeps `BoringSSL`'s own hello: its trio leads where
+    /// `crypto/tls` appends it, so this lane is exact only inside the TLS 1.2 ids.
+    #[cfg_attr(miri, ignore = "needs a loopback socket")]
+    #[test]
+    fn a_legacy_mixed_list_keeps_boringssls_trio_before_the_tls12_ids() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let capture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 5];
+            stream.read_exact(&mut head).expect("record header");
+            let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+            let mut record = head.to_vec();
+            record.resize(5 + len, 0);
+            stream.read_exact(&mut record[5..]).expect("record body");
+            record
+        });
+        let mut cfg = client("tls.test", &[]);
+        cfg.cipher_suites = vec![0xc009, 0x002f, 0x1301, 0x1302, 0x1303].into();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        let _ = session.handshake();
+        let record = capture.join().expect("joins");
+        let want =
+            crate::tls::cipher_suites::field_bytes(&[0x1301, 0x1302, 0x1303, 0xc009, 0x002f]);
+        assert_eq!(
+            hello_cipher_suites(&record),
+            want.as_slice(),
+            "BoringSSL's trio leads even a list that names the 1.2 ids first"
         );
     }
 

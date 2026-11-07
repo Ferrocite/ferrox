@@ -144,6 +144,12 @@ pub fn field_bytes(ids: &[u16]) -> Vec<u8> {
     bytes
 }
 
+/// Whether a derived field offers TLS 1.3: the trio the reference appends when its `maxVersion`
+/// reaches 1.3, and the only TLS 1.3 ids `crypto/tls` ever puts in a configured list.
+pub(crate) fn offers_tls13(ids: &[u16]) -> bool {
+    ids.iter().any(|id| (0x1301..=0x1303).contains(id))
+}
+
 /// The suites neither ring nor the legacy lane carries on either role.
 const SHAPED_ONLY: [u16; 5] = [0x003c, 0xc012, 0x0005, 0xc007, 0xc011];
 

@@ -160,11 +160,7 @@ impl<S: Stream> Session<S> {
     /// The stock hello a config's `cipherSuites` rides when ring and `BoringSSL` carry none of it:
     /// Go's own extension table, with the config's list in place of a preset's.
     pub(crate) fn connect_stock(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
-        let profile = if cfg
-            .cipher_suites
-            .iter()
-            .any(|id| (0x1301..=0x1303).contains(id))
-        {
+        let profile = if crate::tls::cipher_suites::offers_tls13(&cfg.cipher_suites) {
             &super::GO_STOCK
         } else {
             &super::GO_STOCK_12
