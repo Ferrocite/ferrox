@@ -2296,6 +2296,7 @@ fn serve_stream(
     );
 }
 
+/// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence.
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
@@ -2366,10 +2367,9 @@ fn open_stream(
         .ok()
         .zip(std::str::from_utf8(&target).ok())
         .is_some_and(|(text, target)| {
-            method.as_slice() == settings.uplink_method.as_bytes()
-                && crate::xhttp::extract_meta(text, target, settings)
-                    .1
-                    .is_none()
+            crate::xhttp::extract_meta(text, target, settings)
+                .1
+                .is_none()
         });
     let upload = if windowed {
         crate::xhttp::Upload::Window(Box::new(reader))
@@ -3782,6 +3782,60 @@ mod tests {
         );
         drop(client);
         server.join().expect("joins");
+    }
+
+    /// The h2 body is selected by the request's shape, not its method: a hub configured for a PUT uplink still hands a POST stream-up body over as a window instead of chunk-framing it.
+    #[test]
+    fn a_stream_up_post_under_a_put_uplink_method_keeps_its_body() {
+        const BODY: &[u8] = b"put-uplink body";
+        let front = test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let got = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let read = stream.try_clone().expect("clone");
+            let mut settings = test_settings("stream-up");
+            settings.uplink_method = "PUT".to_owned();
+            let service = XhttpSessionService::new(
+                settings,
+                Arc::new(move |mut reader, mut writer, _decryption| {
+                    let mut body = Vec::new();
+                    let mut chunk = [0u8; 32];
+                    while body.len() < BODY.len() {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if crate::proxy::is_timeout(&e) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    *got.lock().expect("seen") = body.clone();
+                    let _ = writer.write_all(&body);
+                    writer.finish();
+                }),
+            );
+            serve_h2_service(read, stream, &service, None);
+        });
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers("GET", "/up/put-uplink", &[("referer", pad.as_str())], true);
+        assert_eq!(client.response_head(down), 200);
+        let up = client.headers(
+            "POST",
+            "/up/put-uplink",
+            &[
+                ("referer", pad.as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        client.data(up, BODY, true);
+        assert_eq!(client.response_head(up), 200);
+        drop(client);
+        server.join().expect("joins");
+        assert_eq!(seen.lock().expect("seen").as_slice(), BODY);
     }
 
     /// A padded DATA frame is queued as exactly its payload: the pad-length byte and the pad tail are gone before the chunk reaches the session, so an echo over the padded uplink round-trips the payload untouched.

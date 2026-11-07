@@ -1816,6 +1816,7 @@ fn extract_padding<'a>(
     query_param(target, &settings.x_padding_key)
 }
 
+/// Reads the session id and packet sequence from one request target.
 pub(crate) fn extract_meta<'a>(
     text: &'a str,
     target: &'a str,
@@ -2087,6 +2088,7 @@ fn bound_session(
 }
 
 impl Session {
+    /// Test seam: attaches a copied reader through the windowed upload slot.
     #[cfg(test)]
     fn set_upload(&self, reader: Box<dyn Read + Send>, fd: Option<crate::proxy::WaitFd>) -> bool {
         self.set_upload_window(Box::new(crate::proxy::Copied::new(reader)), fd)
@@ -2212,6 +2214,7 @@ impl SessionReader {
         self.session.state.lock().expect("session lock").last_seen = std::time::Instant::now();
     }
 
+    /// Moves the session's upload into this reader once, refusing a second or finished one.
     fn take_upload(&mut self) -> bool {
         let mut st = self.session.state.lock().expect("session lock");
         if st.ended || st.upload_done {
@@ -2268,6 +2271,7 @@ fn map_upload_error(
     error
 }
 
+/// Records that the upload ended without ending the session's downlink.
 fn note_upload_done(session: &Session) {
     session.state.lock().expect("session lock").upload_done = true;
     session.cv.notify_all();
@@ -2348,6 +2352,7 @@ impl Read for SessionReader {
 }
 
 impl crate::proxy::WindowRead for SessionReader {
+    /// Returns the next packet or upload frame as a window, copying only packet storage.
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         loop {
             if self.cur_at < self.cur.len() {
@@ -2630,6 +2635,7 @@ pub(crate) enum Upload<R> {
 }
 
 impl<R: Read + Send + 'static> Upload<R> {
+    /// Borrows the body through the ordinary `Read` path.
     fn as_read(&mut self) -> &mut dyn Read {
         match self {
             Self::Read(read) => read,
@@ -2655,6 +2661,7 @@ impl<R: Read + Send + 'static> Upload<R> {
         }
     }
 
+    /// Returns the H1 reader, or `None` when the body is a window that cannot rewind to the socket.
     fn into_h1(self) -> Option<R> {
         match self {
             Self::Read(read) => Some(read),
@@ -2815,6 +2822,7 @@ fn drain_body(read: &mut dyn Read, cap: usize, budget: std::time::Duration) -> D
     }
 }
 
+/// Dispatches one parsed request to the session or connection shape it names.
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per method and session shape; the dispatch is the function"
