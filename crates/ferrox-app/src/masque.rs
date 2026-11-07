@@ -1841,6 +1841,7 @@ pub(crate) struct ServerSpec {
     pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
+    warp: bool,
 }
 
 impl ServerSpec {
@@ -1853,20 +1854,27 @@ impl ServerSpec {
             .get("users")
             .or_else(|| settings.get("clients"))
             .and_then(Json::as_arr)
-            .ok_or("masque inbound has no `users` or `clients`")?
-            .iter()
-            .filter_map(|user| {
-                let email = user.get("email").and_then(Json::as_str)?.to_owned();
-                let password = user
-                    .get("pass")
-                    .and_then(Json::as_str)
-                    .or_else(|| user.get("password").and_then(Json::as_str))
-                    .or_else(|| user.get("account")?.get("password")?.as_str())?
-                    .to_owned();
-                Some((email, password))
+            .map(|users| {
+                users
+                    .iter()
+                    .filter_map(|user| {
+                        let email = user.get("email").and_then(Json::as_str)?.to_owned();
+                        let password = user
+                            .get("pass")
+                            .and_then(Json::as_str)
+                            .or_else(|| user.get("password").and_then(Json::as_str))
+                            .or_else(|| user.get("account")?.get("password")?.as_str())?
+                            .to_owned();
+                        Some((email, password))
+                    })
+                    .collect()
             })
-            .collect();
-        if users.is_empty() {
+            .unwrap_or_default();
+        let warp = settings
+            .get("warp")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        if users.is_empty() && !warp {
             return Err("masque inbound has no user with a password".to_owned());
         }
         let addresses: Vec<String> = settings
@@ -1898,7 +1906,23 @@ impl ServerSpec {
             path,
             pool,
             mtu,
+            warp,
         })
+    }
+
+    fn accepts_protocol(&self, protocol: &[u8]) -> bool {
+        protocol == b"connect-ip" || (self.warp && protocol == WARP_PROTOCOL)
+    }
+
+    fn path_matches(&self, path: &[u8], protocol: &[u8]) -> bool {
+        if self.warp && protocol == WARP_PROTOCOL {
+            return path_matches(path, "/");
+        }
+        path_matches(path, &self.path)
+    }
+
+    fn request_authenticated(&self, protocol: &[u8], header: Option<&[u8]>) -> bool {
+        (self.warp && protocol == WARP_PROTOCOL) || self.authenticates(header)
     }
 
     pub(crate) fn authenticates(&self, header: Option<&[u8]>) -> bool {
@@ -2090,6 +2114,7 @@ pub(crate) fn test_spec() -> ServerSpec {
         path: DEFAULT_PATH.to_owned(),
         pool: test_pool(),
         mtu: DEFAULT_MTU,
+        warp: false,
     }
 }
 
@@ -2391,7 +2416,7 @@ fn worker(
         }
         if conn.is_established() {
             if !tunnel.settings_sent {
-                send_server_settings(&mut conn, 3, 7, 11, false).ok();
+                send_server_settings(&mut conn, 3, 7, 11, spec.warp).ok();
                 tunnel.settings_sent = true;
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
@@ -2529,9 +2554,11 @@ fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_slice())
     };
-    let path_ok = field(b":path").is_some_and(|path| path_matches(path, &spec.path));
     let method_ok = field(b":method") == Some(b"CONNECT");
-    let protocol_ok = field(b":protocol") == Some(b"connect-ip");
+    let protocol = field(b":protocol");
+    let protocol_ok = protocol.is_some_and(|protocol| spec.accepts_protocol(protocol));
+    let path_ok = field(b":path")
+        .is_some_and(|path| protocol.is_some_and(|protocol| spec.path_matches(path, protocol)));
     let capsules_ok = field(b"capsule-protocol")
         .and_then(|value| value.strip_prefix(b"?"))
         .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
@@ -2542,7 +2569,9 @@ fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
     } else if !method_ok || !protocol_ok || !capsules_ok {
         reject(tunnel, 400);
         tunnel.rejected = true;
-    } else if !spec.authenticates(field(b"authorization")) {
+    } else if !protocol
+        .is_some_and(|protocol| spec.request_authenticated(protocol, field(b"authorization")))
+    {
         reject_auth(tunnel);
         tunnel.rejected = true;
     }
@@ -3133,6 +3162,7 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             pool: AddressPool::default(),
             mtu: DEFAULT_MTU,
+            warp: false,
         };
         let victim: IpAddr = "10.14.0.3".parse().expect("an address");
         let (to_victim, forwarded) = mpsc::sync_channel(4);
@@ -3207,6 +3237,7 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             pool: AddressPool::default(),
             mtu: DEFAULT_MTU,
+            warp: false,
         };
         let owner: IpAddr = "10.14.0.2".parse().expect("an address");
         let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
@@ -4125,6 +4156,24 @@ mod tests {
             let spec = ServerSpec::from(&inbound(settings)).expect("a spec");
             assert!(spec.authenticates(header), "{settings}");
         }
+    }
+
+    #[test]
+    fn a_warp_server_accepts_the_cloudflare_dialect_without_basic_auth() {
+        let header = Some(&b"Basic dUBleGFtcGxlLmNvbTpw"[..]);
+        let spec = ServerSpec::from(&inbound(
+            r#"{"warp":true,"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
+        ))
+        .expect("a warp server spec");
+        assert!(spec.accepts_protocol(WARP_PROTOCOL));
+        assert!(spec.accepts_protocol(b"connect-ip"));
+        assert!(spec.path_matches(b"/", WARP_PROTOCOL));
+        assert!(!spec.path_matches(b"/", b"connect-ip"));
+        assert!(spec.request_authenticated(WARP_PROTOCOL, None));
+        assert!(!spec.request_authenticated(b"connect-ip", None));
+        assert!(spec.request_authenticated(b"connect-ip", header));
+        assert!(ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#)).is_ok());
+        assert!(ServerSpec::from(&inbound(r#"{"address":["10.14.0.1/24"]}"#)).is_err());
     }
 
     #[test]
