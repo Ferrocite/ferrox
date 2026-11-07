@@ -2357,17 +2357,25 @@ impl crate::proxy::WindowRead for SessionReader {
                     let upload = self.upload.as_mut().expect("upload");
                     upload.read_window()
                 };
-                let window = match window {
-                    Ok(window) => window,
-                    Err(error) => return Err(self.upload_error(error)),
+                let outcome = match window {
+                    Ok(window) if window.is_empty() => {
+                        drop(window);
+                        Ok(())
+                    }
+                    Ok(window) => {
+                        session.state.lock().expect("session lock").last_seen =
+                            std::time::Instant::now();
+                        return Ok(window);
+                    }
+                    Err(error) => Err(error),
                 };
-                if window.is_empty() {
-                    drop(window);
-                    self.finish_upload();
-                    return Ok(crate::proxy::Window::empty());
-                }
-                session.state.lock().expect("session lock").last_seen = std::time::Instant::now();
-                return Ok(window);
+                return match outcome {
+                    Ok(()) => {
+                        self.finish_upload();
+                        Ok(crate::proxy::Window::empty())
+                    }
+                    Err(error) => Err(self.upload_error(error)),
+                };
             }
             let mut st = self.session.state.lock().expect("session lock");
             if let Some(pkt) = {
@@ -2622,7 +2630,7 @@ pub(crate) enum Upload<R> {
     Window(Box<dyn crate::proxy::WindowRead + Send>),
 }
 
-impl<R: Read> Upload<R> {
+impl<R: Read + Send> Upload<R> {
     fn as_read(&mut self) -> &mut dyn Read {
         match self {
             Self::Read(read) => read,
@@ -2972,9 +2980,12 @@ pub(crate) fn accept_core<
                     emit_413(&mut write);
                     return Served::Closed;
                 }
-                let Some((buf, pre)) =
-                    read_body(upload.as_read(), &prefix, n, crate::budgets::head_arrival())
-                else {
+                let Some((buf, pre)) = read_body(
+                    &mut upload.as_read(),
+                    &prefix,
+                    n,
+                    crate::budgets::head_arrival(),
+                ) else {
                     return Served::Closed;
                 };
                 carry = carry_tail(prefix, pre);
@@ -6397,7 +6408,7 @@ mod tests {
         let session = get_or_create_session("windowed-upload-test");
         session.state.lock().expect("session lock").upload = Some(Box::new(source));
         let mut reader = SessionReader::new(Arc::clone(&session), String::new());
-        let window = reader.read_window().expect("window");
+        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("window");
         assert_eq!(window.bytes(), &[1, 2, 3, 4]);
         assert_eq!(
             window.bytes().as_ptr(),
@@ -6405,7 +6416,9 @@ mod tests {
             "the relay writes the upload's own bytes"
         );
         drop(window);
-        assert!(reader.read_window().expect("empty").is_empty());
+        assert!(crate::proxy::WindowRead::read_window(&mut reader)
+            .expect("empty")
+            .is_empty());
         close_session(&session);
     }
 
