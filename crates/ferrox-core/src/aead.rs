@@ -86,9 +86,8 @@ pub fn chacha20_poly1305_seal_from_uninit(
     );
     let mut one_time = [0u8; 32];
     // SAFETY: `fill_exact_with_head_from` writes every wrapped byte through `xor_chunk_from`, which stores a value plus the keystream word minus nothing — the payload is read from `src`, never written back to `dst`'s staging. Every byte is written before it returns.
-    let dst_initialized = unsafe {
-        std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len())
-    };
+    let dst_initialized =
+        unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
     crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst_initialized);
 
     let mut state = Poly1305::new(&one_time);
@@ -172,9 +171,8 @@ mod tests {
             let got = chacha20_poly1305_seal_from_uninit(&key, &nonce, aad, &plain, &mut uninit);
             assert_eq!(got, want, "uninit tag at length {len}");
             // SAFETY: seal_from_uninit wrote every byte of the destination.
-            let uninit = unsafe {
-                std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len())
-            };
+            let uninit =
+                unsafe { std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len()) };
             assert_eq!(uninit, in_place, "uninit ciphertext at length {len}");
             assert_eq!(plain, original, "source at length {len}");
         }

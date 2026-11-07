@@ -669,15 +669,13 @@ impl Flow {
                 );
                 let tag = match &self.aead {
                     Aead::Aes(aes) => aes.seal_from_uninit(nonce, b"", plain, &mut dst[..len]),
-                    Aead::Chacha(key) => {
-                        ferrox_core::aead::chacha20_poly1305_seal_from_uninit(
-                            key,
-                            nonce,
-                            b"",
-                            plain,
-                            &mut dst[..len],
-                        )
-                    }
+                    Aead::Chacha(key) => ferrox_core::aead::chacha20_poly1305_seal_from_uninit(
+                        key,
+                        nonce,
+                        b"",
+                        plain,
+                        &mut dst[..len],
+                    ),
                     Aead::Plain => unreachable!("the arm above rules the plain leg out"),
                 };
                 unsafe { out.set_len(at + plain.len()) };
