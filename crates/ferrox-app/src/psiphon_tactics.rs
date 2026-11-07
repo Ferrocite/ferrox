@@ -555,7 +555,7 @@ mod tests {
             out.extend_from_slice(bytes);
         }
 
-        let json = br#"{"Tag":"tag","Tactics":{"TTL":"2h","Parameters":{"InproxyCommonCompartmentIDs":["c1"]}}}"#;
+        let json = br#"{"TTL":"2h","Parameters":{"InproxyCommonCompartmentIDs":["c1"]}}"#;
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(json).expect("compresses");
