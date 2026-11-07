@@ -1816,7 +1816,8 @@ fn extract_padding<'a>(
     query_param(target, &settings.x_padding_key)
 }
 
-fn extract_meta<'a>(
+/// Reads the session id and packet sequence from one request target.
+pub(crate) fn extract_meta<'a>(
     text: &'a str,
     target: &'a str,
     settings: &XhttpSettings,
@@ -1872,7 +1873,7 @@ struct DeferredResponse {
 
 #[allow(clippy::struct_excessive_bools)]
 struct SessionState {
-    upload: Option<Box<dyn Read + Send>>,
+    upload: Option<Box<dyn crate::proxy::WindowRead + Send>>,
     upload_attached: bool,
     upload_done: bool,
     upload_fd: Option<crate::proxy::WaitFd>,
@@ -2087,9 +2088,19 @@ fn bound_session(
 }
 
 impl Session {
+    /// Test seam: attaches a copied reader through the windowed upload slot.
+    #[cfg(test)]
+    fn set_upload(&self, reader: Box<dyn Read + Send>, fd: Option<crate::proxy::WaitFd>) -> bool {
+        self.set_upload_window(Box::new(crate::proxy::Copied::new(reader)), fd)
+    }
+
     /// One stream-up body per session, the reference's `uploadQueue.Push`: a second reader is
     /// refused so the caller can answer 409 before its bytes are promised.
-    fn set_upload(&self, reader: Box<dyn Read + Send>, fd: Option<crate::proxy::WaitFd>) -> bool {
+    fn set_upload_window(
+        &self,
+        reader: Box<dyn crate::proxy::WindowRead + Send>,
+        fd: Option<crate::proxy::WaitFd>,
+    ) -> bool {
         let mut st = self.state.lock().expect("session lock");
         if st.upload_attached || st.ended {
             return false;
@@ -2183,9 +2194,8 @@ struct SessionReader {
     id: String,
     cur: Vec<u8>,
     cur_at: usize,
-    upload: Option<Box<dyn Read + Send>>,
+    upload: Option<Box<dyn crate::proxy::WindowRead + Send>>,
     upload_fd: Option<crate::proxy::WaitFd>,
-    scratch: crate::proxy::RelayBuf,
 }
 
 impl SessionReader {
@@ -2197,7 +2207,6 @@ impl SessionReader {
             cur_at: 0,
             upload: None,
             upload_fd: None,
-            scratch: crate::proxy::RelayBuf::new(),
         }
     }
 
@@ -2205,9 +2214,10 @@ impl SessionReader {
         self.session.state.lock().expect("session lock").last_seen = std::time::Instant::now();
     }
 
+    /// Moves the session's upload into this reader once, refusing a second or finished one.
     fn take_upload(&mut self) -> bool {
         let mut st = self.session.state.lock().expect("session lock");
-        if st.ended {
+        if st.ended || st.upload_done {
             self.upload = None;
             return false;
         }
@@ -2220,45 +2230,51 @@ impl SessionReader {
         self.upload.is_some()
     }
 
-    fn end_upload(&mut self) {
-        self.upload = None;
-        let mut st = self.session.state.lock().expect("session lock");
-        st.ended = true;
-        self.session.cv.notify_all();
-    }
-
     /// The upload reached its own end, so the reader reports EOF but the session keeps the downlink
     /// it is still relaying: a hard read error still ends the whole session instead.
     fn finish_upload(&mut self) {
+        note_upload_done(&self.session);
         self.upload = None;
-        let mut st = self.session.state.lock().expect("session lock");
-        st.upload_done = true;
-        self.session.cv.notify_all();
     }
 
-    /// A timeout on the upload's own socket is the lane's poll, not the session's end: the lane parks
-    /// on that descriptor and the client's next byte wakes it, so an idle upload holds no relay worker.
     fn upload_error(&mut self, error: std::io::Error) -> std::io::Error {
-        let mapped = error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<ferrox_core::tls::TlsError>())
-            .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout));
-        let pending = cfg!(windows) && error.raw_os_error() == Some(997);
-        if ferrox_core::tls::TlsError::is_timeout(&error) {
-            if let Some(fd) = self.upload_fd {
-                crate::proxy::note_wait_fd(fd);
-                return std::io::Error::from(std::io::ErrorKind::WouldBlock);
-            }
-            if mapped || pending {
-                return error;
-            }
+        map_upload_error(&self.session, self.upload_fd, error)
+    }
+}
+
+/// A timeout on the upload's own socket is the lane's poll, not the session's end: the lane parks
+/// on that descriptor and the client's next byte wakes it, so an idle upload holds no relay worker.
+fn map_upload_error(
+    session: &Session,
+    fd: Option<crate::proxy::WaitFd>,
+    error: std::io::Error,
+) -> std::io::Error {
+    let mapped = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ferrox_core::tls::TlsError>())
+        .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout));
+    let pending = cfg!(windows) && error.raw_os_error() == Some(997);
+    if ferrox_core::tls::TlsError::is_timeout(&error) {
+        if let Some(fd) = fd {
+            crate::proxy::note_wait_fd(fd);
+            return std::io::Error::from(std::io::ErrorKind::WouldBlock);
         }
-        if poll_grain(&error) {
+        if mapped || pending {
             return error;
         }
-        self.end_upload();
-        error
     }
+    if poll_grain(&error) {
+        return error;
+    }
+    session.state.lock().expect("session lock").ended = true;
+    session.cv.notify_all();
+    error
+}
+
+/// Records that the upload ended without ending the session's downlink.
+fn note_upload_done(session: &Session) {
+    session.state.lock().expect("session lock").upload_done = true;
+    session.cv.notify_all();
 }
 
 /// A poll grain is the reader's own wake-up, not a socket deadline, so it ends no session.
@@ -2336,6 +2352,7 @@ impl Read for SessionReader {
 }
 
 impl crate::proxy::WindowRead for SessionReader {
+    /// Returns the next packet or upload frame as a window, copying only packet storage.
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         loop {
             if self.cur_at < self.cur.len() {
@@ -2345,19 +2362,24 @@ impl crate::proxy::WindowRead for SessionReader {
                 return Ok(crate::proxy::Window::one(&self.cur[start..]));
             }
             if self.take_upload() {
-                self.touch();
-                let got = {
+                let session = Arc::clone(&self.session);
+                let upload_fd = self.upload_fd;
+                let window = {
                     let upload = self.upload.as_mut().expect("upload");
-                    upload.read(self.scratch.as_mut())
+                    upload.read_window()
                 };
-                return match got {
-                    Ok(0) => {
-                        self.finish_upload();
-                        Ok(crate::proxy::Window::empty())
+                match window {
+                    Ok(window) if window.is_empty() => {
+                        note_upload_done(&session);
+                        return Ok(crate::proxy::Window::empty());
                     }
-                    Ok(n) => Ok(crate::proxy::Window::one(self.scratch.filled(n))),
-                    Err(e) => Err(self.upload_error(e)),
-                };
+                    Ok(window) => {
+                        session.state.lock().expect("session lock").last_seen =
+                            std::time::Instant::now();
+                        return Ok(window);
+                    }
+                    Err(error) => return Err(map_upload_error(&session, upload_fd, error)),
+                }
             }
             let mut st = self.session.state.lock().expect("session lock");
             if let Some(pkt) = {
@@ -2583,7 +2605,7 @@ pub(crate) fn accept_split_with_settings<
             crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
         let prefix = head.split_off(at);
-        match accept_core(&head, prefix, read, write, settings, None, fd) {
+        match accept_core(&head, prefix, Upload::Read(read), write, settings, None, fd) {
             Served::Session(reader, writer) => return Some((reader, writer)),
             Served::Again(next, next_write, carry) => {
                 read = next;
@@ -2604,6 +2626,48 @@ fn writer_for<W: crate::proxy::FrameWrite + Send + 'static>(
         writer.set_h2(h);
     }
     writer
+}
+
+/// The bytes an accepted request reads next: an H2 stream can hand its frame window over without a copy, while an H1 socket is wrapped in the chunked reader the session already used.
+pub(crate) enum Upload<R> {
+    Read(R),
+    Window(Box<dyn crate::proxy::WindowRead + Send>),
+}
+
+impl<R: Read + Send + 'static> Upload<R> {
+    /// Borrows the body through the ordinary `Read` path.
+    fn as_read(&mut self) -> &mut dyn Read {
+        match self {
+            Self::Read(read) => read,
+            Self::Window(window) => window,
+        }
+    }
+
+    /// The body as a windowed reader: an H1 source is framed, an H2 source is the frame it already owns.
+    fn into_window(self, prefix: Vec<u8>) -> Box<dyn crate::proxy::WindowRead + Send> {
+        match self {
+            Self::Read(read) => Box::new(Reader {
+                read,
+                prefix,
+                at: 0,
+                left: 0,
+                ended: false,
+                reads: 0,
+                pending_head: false,
+                head_progress: None,
+                chunk: Chunk::Body,
+            }),
+            Self::Window(window) => window,
+        }
+    }
+
+    /// Returns the H1 reader, or `None` when the body is a window that cannot rewind to the socket.
+    fn into_h1(self) -> Option<R> {
+        match self {
+            Self::Read(read) => Some(read),
+            Self::Window(_) => None,
+        }
+    }
 }
 
 /// What one request leaves the connection to. `Session` hands both halves to a session that owns them for as long as the stream lives; `Again` gives them back, with the bytes that came with this request but belong to the next; `Closed` is the end of the connection.
@@ -2758,6 +2822,7 @@ fn drain_body(read: &mut dyn Read, cap: usize, budget: std::time::Duration) -> D
     }
 }
 
+/// Dispatches one parsed request to the session or connection shape it names.
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per method and session shape; the dispatch is the function"
@@ -2768,7 +2833,7 @@ pub(crate) fn accept_core<
 >(
     head: &[u8],
     prefix: Vec<u8>,
-    mut read: R,
+    mut upload: Upload<R>,
     mut write: W,
     settings: &XhttpSettings,
     h2: Option<crate::xhttp_h2::H2StreamOut>,
@@ -2805,7 +2870,9 @@ pub(crate) fn accept_core<
         resp.push_str("Content-Length: 0\r\nConnection: keep-alive\r\n\r\n");
         let _ = write.write_all(resp.as_bytes());
         if h2.is_none() && alive {
-            return Served::Again(read, write, prefix);
+            if let Some(read) = upload.into_h1() {
+                return Served::Again(read, write, prefix);
+            }
         }
         return Served::Closed;
     }
@@ -2852,21 +2919,7 @@ pub(crate) fn accept_core<
                     return Served::Closed;
                 }
                 sse_ok(&mut write, settings, &padded);
-                let reader: Box<dyn crate::proxy::WindowRead + Send> = if h2.is_some() {
-                    Box::new(crate::proxy::Copied::new(read))
-                } else {
-                    Box::new(Reader {
-                        read,
-                        prefix,
-                        at: 0,
-                        left: 0,
-                        ended: false,
-                        reads: 0,
-                        pending_head: false,
-                        head_progress: None,
-                        chunk: Chunk::Body,
-                    })
-                };
+                let reader = upload.into_window(prefix);
                 let writer = writer_for(write, h2);
                 return Served::Session(reader, writer);
             }
@@ -2898,22 +2951,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             let session = bound_session(sid, None, false);
-            let upload: Box<dyn Read + Send> = if h2.is_some() {
-                Box::new(read)
-            } else {
-                Box::new(Reader {
-                    read,
-                    prefix,
-                    at: 0,
-                    left: 0,
-                    ended: false,
-                    reads: 0,
-                    pending_head: false,
-                    head_progress: None,
-                    chunk: Chunk::Body,
-                })
-            };
-            if !session.set_upload(upload, fd) {
+            if !session.set_upload_window(upload.into_window(prefix), fd) {
                 emit_409(&mut write);
                 return Served::Closed;
             }
@@ -2949,9 +2987,12 @@ pub(crate) fn accept_core<
                     emit_413(&mut write);
                     return Served::Closed;
                 }
-                let Some((buf, pre)) =
-                    read_body(&mut read, &prefix, n, crate::budgets::head_arrival())
-                else {
+                let Some((buf, pre)) = read_body(
+                    &mut upload.as_read(),
+                    &prefix,
+                    n,
+                    crate::budgets::head_arrival(),
+                ) else {
                     return Served::Closed;
                 };
                 carry = carry_tail(prefix, pre);
@@ -2961,7 +3002,7 @@ pub(crate) fn accept_core<
             {
                 // A chunked body leaves no length behind that the next request's head could be found after.
                 resumable = false;
-                let mut chain = ChainReader::new(prefix, &mut read);
+                let mut chain = ChainReader::new(prefix, upload.as_read());
                 let drained = if h2.is_some() {
                     drain_body(
                         &mut chain,
@@ -3018,7 +3059,9 @@ pub(crate) fn accept_core<
             }
             plain_ok(&mut write, settings, &padded);
             if resumable && h2.is_none() && keeps_alive(text) {
-                return Served::Again(read, write, carry);
+                if let Some(read) = upload.into_h1() {
+                    return Served::Again(read, write, carry);
+                }
             }
             Served::Closed
         }
@@ -4434,7 +4477,7 @@ mod tests {
         let _ = accept_core(
             head.as_bytes(),
             Vec::new(),
-            std::io::Cursor::new(vec![0u8; 1]),
+            Upload::Read(std::io::Cursor::new(vec![0u8; 1])),
             Sink(Arc::clone(&seen)),
             settings,
             None,
@@ -5483,9 +5526,15 @@ mod tests {
                 )
                 .expect("head");
                 let prefix = head.split_off(at);
-                if let Served::Session(mut reader, writer) =
-                    accept_core(&head, prefix, read, stream, &settings, None, None)
-                {
+                if let Served::Session(mut reader, writer) = accept_core(
+                    &head,
+                    prefix,
+                    Upload::Read(read),
+                    stream,
+                    &settings,
+                    None,
+                    None,
+                ) {
                     let mut drained = Vec::new();
                     let _ = reader.read_to_end(&mut drained);
                     writer.finish();
@@ -5545,9 +5594,15 @@ mod tests {
                 )
                 .expect("head");
                 let prefix = head.split_off(at);
-                if let Served::Session(mut reader, writer) =
-                    accept_core(&head, prefix, read, stream, &settings, None, None)
-                {
+                if let Served::Session(mut reader, writer) = accept_core(
+                    &head,
+                    prefix,
+                    Upload::Read(read),
+                    stream,
+                    &settings,
+                    None,
+                    None,
+                ) {
                     let mut buf = [0u8; 64];
                     loop {
                         match reader.read(&mut buf) {
@@ -5802,9 +5857,15 @@ mod tests {
                 )
                 .expect("head");
                 let prefix = head.split_off(at);
-                let Served::Session(mut reader, writer) =
-                    accept_core(&head, prefix, read, stream, &settings, None, None)
-                else {
+                let Served::Session(mut reader, writer) = accept_core(
+                    &head,
+                    prefix,
+                    Upload::Read(read),
+                    stream,
+                    &settings,
+                    None,
+                    None,
+                ) else {
                     panic!("the downlink was not a session");
                 };
                 let mut buf = [0u8; 64];
@@ -5835,7 +5896,15 @@ mod tests {
                 )
                 .expect("head");
                 let prefix = head.split_off(at);
-                let _ = accept_core(&head, prefix, read, stream, &settings, None, None);
+                let _ = accept_core(
+                    &head,
+                    prefix,
+                    Upload::Read(read),
+                    stream,
+                    &settings,
+                    None,
+                    None,
+                );
             })
         };
 
@@ -6049,7 +6118,7 @@ mod tests {
                 accept_core(
                     head.as_bytes(),
                     Vec::new(),
-                    std::io::Cursor::new(vec![30u8]),
+                    Upload::Read(std::io::Cursor::new(vec![30u8])),
                     Sink(Arc::clone(&seen)),
                     &settings,
                     None,
@@ -6141,7 +6210,7 @@ mod tests {
                     accept_core(
                         head.as_bytes(),
                         Vec::new(),
-                        std::io::Cursor::new(Vec::new()),
+                        Upload::Read(std::io::Cursor::new(Vec::new())),
                         Sink(Arc::clone(&seen)),
                         &settings,
                         None,
@@ -6314,6 +6383,53 @@ mod tests {
         close_session(&session);
     }
 
+    /// A windowed upload hands the relay its own bytes: the read must not route through the copy buffer.
+    #[test]
+    fn a_windowed_upload_reads_without_a_copy() {
+        struct Windowed {
+            bytes: Vec<u8>,
+            at: usize,
+        }
+
+        impl std::io::Read for Windowed {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the window path read through the copy");
+            }
+        }
+
+        impl crate::proxy::WindowRead for Windowed {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                if self.at < self.bytes.len() {
+                    self.at = self.bytes.len();
+                    return Ok(crate::proxy::Window::one(&self.bytes));
+                }
+                Ok(crate::proxy::Window::empty())
+            }
+        }
+
+        let source = Windowed {
+            bytes: vec![1, 2, 3, 4],
+            at: 0,
+        };
+        let expected = source.bytes.as_ptr();
+        let session = get_or_create_session("windowed-upload-test");
+        session.state.lock().expect("session lock").upload = Some(Box::new(source));
+        let mut reader = SessionReader::new(Arc::clone(&session), String::new());
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("window");
+            assert_eq!(window.bytes(), &[1, 2, 3, 4]);
+            assert_eq!(
+                window.bytes().as_ptr(),
+                expected,
+                "the relay writes the upload's own bytes"
+            );
+        }
+        assert!(crate::proxy::WindowRead::read_window(&mut reader)
+            .expect("empty")
+            .is_empty());
+        close_session(&session);
+    }
+
     /// A finished downlink has already ended the session; a later read must not touch an upload whose peer is gone.
     #[test]
     fn an_ended_session_does_not_read_its_upload() {
@@ -6327,7 +6443,7 @@ mod tests {
 
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
-                upload: Some(Box::new(Blocked)),
+                upload: Some(Box::new(crate::proxy::Copied::new(Blocked))),
                 upload_attached: false,
                 upload_done: false,
                 upload_fd: None,
@@ -6366,7 +6482,7 @@ mod tests {
             id: String::new(),
         });
         let mut reader = SessionReader::new(session, String::new());
-        reader.upload = Some(Box::new(Blocked));
+        reader.upload = Some(Box::new(crate::proxy::Copied::new(Blocked)));
         assert_eq!(
             reader.read(&mut byte).expect("ends"),
             0,
