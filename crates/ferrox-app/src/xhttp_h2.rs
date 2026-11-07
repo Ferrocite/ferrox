@@ -480,6 +480,25 @@ impl H2StreamReader {
     }
 }
 
+/// The next body wait: the remaining arrival budget when one is set, bounded by the stall.
+fn body_wait(stall: std::time::Duration) -> std::time::Duration {
+    let Some(until) = crate::proxy::body_deadline() else {
+        return stall;
+    };
+    until
+        .saturating_duration_since(std::time::Instant::now())
+        .min(stall)
+}
+
+/// The error a body wait ends with: a poll grain while the arrival budget remains, else the stall's end.
+fn body_wait_timeout() -> std::io::Error {
+    if crate::proxy::body_deadline().is_some_and(|until| std::time::Instant::now() >= until) {
+        std::io::Error::from(std::io::ErrorKind::WouldBlock)
+    } else {
+        std::io::Error::other("h2 body stalled")
+    }
+}
+
 impl Read for H2StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
@@ -563,32 +582,16 @@ impl Read for H2StreamReader {
                 continue;
             }
             // A body read carries its arrival deadline, so a withheld DATA frame ends there instead of at the stall.
-            let deadline = crate::proxy::body_deadline();
-            let wait_for = match deadline {
-                Some(until) => {
-                    let left = until.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
-                        drop(st);
-                        self.conn.forget_upload(self.id);
-                        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-                    }
-                    left.min(crate::budgets::relay_stall())
-                }
-                None => crate::budgets::relay_stall(),
-            };
             let (next, wait) = self
                 .stream
                 .cv
-                .wait_timeout(st, wait_for)
+                .wait_timeout(st, body_wait(crate::budgets::relay_stall()))
                 .unwrap_or_else(PoisonError::into_inner);
             st = next;
             if wait.timed_out() {
                 drop(st);
                 self.conn.forget_upload(self.id);
-                if deadline.is_some_and(|until| std::time::Instant::now() >= until) {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-                }
-                return Err(std::io::Error::other("h2 body stalled"));
+                return Err(body_wait_timeout());
             }
         }
     }
