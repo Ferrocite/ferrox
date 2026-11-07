@@ -166,6 +166,11 @@ carrier-hysteria  hysteria::tests::the_word_extension_key_costs_the_word_and_not
 carrier-hysteria  hysteria::tests::the_lowercase_extension_key_costs_the_same_answer  ferrox_core::hysteria::tests::the_lowercase_extension_key_costs_the_same_answer
 carrier-hysteria  hysteria::tests::the_block_answer_costs_the_bytes_it_copies  ferrox_core::hysteria::tests::the_block_answer_costs_the_bytes_it_copies
 carrier-hysteria  hysteria::tests::the_direct_answer_costs_the_same_bytes_once  ferrox_core::hysteria::tests::the_direct_answer_costs_the_same_bytes_once
+# The hop pick and reply membership, 512 picks and memberships over a thousand-port plan, and
+# the two filters with the linear scan that walked the same 512: one ops job reports both
+# frames, and only their difference is a claim about the searches.
+carrier-hysteria  hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else  ferrox_core::hysteria::tests::the_binary_pick_and_membership_costs_the_search_and_nothing_else
+carrier-hysteria  hysteria::tests::the_linear_scan_costs_the_same_answer  ferrox_core::hysteria::tests::the_linear_scan_costs_the_same_answer
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
