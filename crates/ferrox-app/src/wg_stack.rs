@@ -642,24 +642,7 @@ impl Reassembly {
             if !self.make_room(end, key) {
                 return Reassembled::Held;
             }
-            let started = StdInstant::now();
-            self.parts.insert(
-                key,
-                FragmentSet {
-                    at,
-                    header: Vec::new(),
-                    next_header: 0,
-                    payload: Vec::new(),
-                    ranges: Vec::new(),
-                    last: None,
-                    started,
-                },
-            );
-            self.peers.entry(key.peer()).or_default().sets += 1;
-            let expiry = started + REASSEMBLY_TIMEOUT;
-            if self.next_expiry.is_none_or(|next| expiry < next) {
-                self.next_expiry = Some(expiry);
-            }
+            self.insert_set(key, at, StdInstant::now());
         }
         if self.parts.get(&key).is_some_and(|part| part.at != at) {
             self.remove(&key);
@@ -861,15 +844,34 @@ impl Reassembly {
         let before = self.parts.len();
         self.parts
             .retain(|_, part| now.duration_since(part.started) <= REASSEMBLY_TIMEOUT);
-        if self.parts.len() != before {
-            self.rebuild_usage();
-        } else {
+        if self.parts.len() == before {
             self.next_expiry = self
                 .parts
                 .values()
                 .map(|part| part.started + REASSEMBLY_TIMEOUT)
                 .min();
+        } else {
+            self.rebuild_usage();
         }
+    }
+
+    /// Admit one set and move the next timeout walk to its expiry if earlier.
+    fn insert_set(&mut self, key: FragmentKey, at: usize, started: StdInstant) {
+        self.parts.insert(
+            key,
+            FragmentSet {
+                at,
+                header: Vec::new(),
+                next_header: 0,
+                payload: Vec::new(),
+                ranges: Vec::new(),
+                last: None,
+                started,
+            },
+        );
+        self.peers.entry(key.peer()).or_default().sets += 1;
+        let expiry = started + REASSEMBLY_TIMEOUT;
+        self.next_expiry = Some(self.next_expiry.map_or(expiry, |next| next.min(expiry)));
     }
 
     /// Recompute the peer table and byte total from the sets that remain.
