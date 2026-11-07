@@ -3,9 +3,12 @@
 
 use crate::psiphon_ssh::{derive_key, random, Proxy, Rc4, TlsShape, MAGIC, SEED_LENGTH};
 use crate::psiphon_webrtc::WebRtcStream;
+use aes::cipher::{KeyIvInit, StreamCipher};
 use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use ferrox_core::tls::{ClientSession, RecordAlignment as _, TlsConfig, TlsProvider as _};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
@@ -40,6 +43,120 @@ struct Profile {
     request_limit: usize,
     /// The chance a successful round trip drops the connection.
     redial_tls: f64,
+    /// The payload padding this connection selected.
+    payload_padding: Option<PaddingConfig>,
+}
+
+/// The padding sizes and omission chance one connection drew.
+#[derive(Clone, Copy, Debug)]
+struct PaddingConfig {
+    omit: f64,
+    min: usize,
+    max: usize,
+}
+
+type PaddingCipher = ctr::Ctr128BE<aes::Aes256>;
+
+/// Derive one direction's padding header stream from the obfuscated key and cookie.
+fn padding_cipher(
+    obfuscated_key: &str,
+    cookie: &str,
+    direction: &[u8],
+) -> Result<PaddingCipher, String> {
+    let hkdf = Hkdf::<Sha256>::new(Some(cookie.as_bytes()), obfuscated_key.as_bytes());
+    let mut key = [0u8; 32];
+    hkdf.expand(direction, &mut key)
+        .map_err(|_| "psiphon meek padding key".to_owned())?;
+    PaddingCipher::new_from_slices(&key, &[0u8; 16])
+        .map_err(|_| "psiphon meek padding cipher".to_owned())
+}
+
+/// Prepend padding to a request body, advancing the request cipher once per payload.
+struct PaddingSender {
+    cipher: PaddingCipher,
+    config: PaddingConfig,
+}
+
+impl PaddingSender {
+    fn new(
+        obfuscated_key: &str,
+        cookie: &str,
+        direction: &[u8],
+        config: PaddingConfig,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            cipher: padding_cipher(obfuscated_key, cookie, direction)?,
+            config,
+        })
+    }
+
+    /// A non-empty payload gets the no-padding prefix; an empty one may be padded or omitted.
+    fn pad(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+        if body.is_empty() {
+            if coin_probability(self.config.omit) {
+                return Ok(Vec::new());
+            }
+            let span = self.config.max - self.config.min + 1;
+            let size = self.config.min
+                + usize::try_from(random_below(u64::try_from(span).unwrap_or(1))).unwrap_or(0);
+            let mut header = [1u8, (size >> 8) as u8, size as u8];
+            self.cipher.apply_keystream(&mut header);
+            let mut out = Vec::with_capacity(header.len() + size);
+            out.extend_from_slice(&header);
+            out.resize(header.len() + size, 0);
+            getrandom::fill(&mut out[header.len()..])
+                .map_err(|error| format!("psiphon meek padding entropy: {error}"))?;
+            return Ok(out);
+        }
+        let mut prefix = [0u8];
+        self.cipher.apply_keystream(&mut prefix);
+        let mut out = Vec::with_capacity(1 + body.len());
+        out.push(prefix[0]);
+        out.extend_from_slice(body);
+        Ok(out)
+    }
+}
+
+/// Strip padding from the start of a response body, advancing the response cipher.
+struct PaddingReceiver {
+    cipher: PaddingCipher,
+}
+
+impl PaddingReceiver {
+    fn new(obfuscated_key: &str, cookie: &str, direction: &[u8]) -> Result<Self, String> {
+        Ok(Self {
+            cipher: padding_cipher(obfuscated_key, cookie, direction)?,
+        })
+    }
+
+    fn strip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+        let mut at = 0;
+        loop {
+            if at >= body.len() {
+                return Ok(Vec::new());
+            }
+            let mut prefix = [body[at]];
+            self.cipher.apply_keystream(&mut prefix);
+            at += 1;
+            match prefix[0] {
+                0 => return Ok(body[at..].to_vec()),
+                1 => {
+                    let Some(size) = body.get(at..at + 2) else {
+                        return Err("psiphon meek padding: truncated size".to_owned());
+                    };
+                    let mut size = [size[0], size[1]];
+                    self.cipher.apply_keystream(&mut size);
+                    at += 2;
+                    let size = usize::from(u16::from_be_bytes(size));
+                    if at + size > body.len() {
+                        return Err("psiphon meek padding: truncated padding".to_owned());
+                    }
+                    at += size;
+                }
+                _ => return Err("psiphon meek padding: unknown prefix".to_owned()),
+            }
+        }
+    }
 }
 
 /// One random coin with the given probability.
@@ -106,11 +223,28 @@ fn profile(shape: &TlsShape, protocol: &str) -> Profile {
     } else {
         (MAX_REQUEST_PAYLOAD, 0.0)
     };
+    let payload_padding =
+        if protocol.contains("MEEK") && coin_probability(shape.meek_payload_padding) {
+            let min = shape.meek_payload_padding_min.min(65_533);
+            Some(PaddingConfig {
+                omit: shape.meek_payload_padding_omit,
+                min,
+                max: shape.meek_payload_padding_max.min(65_533).max(min),
+            })
+        } else {
+            None
+        };
+    let request_limit = if payload_padding.is_some() {
+        request_limit.saturating_sub(1).max(1)
+    } else {
+        request_limit
+    };
     Profile {
         cookie_name,
         content_type,
         request_limit,
         redial_tls,
+        payload_padding,
     }
 }
 
@@ -520,6 +654,8 @@ pub(crate) struct MeekHttp {
     stream: Option<MeekStream>,
     cookie: Option<(String, String)>,
     profile: Profile,
+    request_padding: Option<PaddingSender>,
+    response_padding: Option<PaddingReceiver>,
     http_transform: Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>>,
     front_index: usize,
     alpn_warned: bool,
@@ -539,7 +675,29 @@ impl MeekHttp {
     ) -> Result<Self, String> {
         let chosen = profile(&meek.shape, meek.protocol);
         let transform = http_transform(&meek);
-        let cookie = Some(make_cookie(&meek, endpoint, &chosen.cookie_name)?);
+        let padding = chosen.payload_padding.filter(|_| endpoint.is_none());
+        let cookie = Some(make_cookie(
+            &meek,
+            endpoint,
+            &chosen.cookie_name,
+            padding.is_some(),
+        )?);
+        let (request_padding, response_padding) = match (&cookie, padding) {
+            (Some((_, value)), Some(config)) => (
+                Some(PaddingSender::new(
+                    &meek.obfuscated_key,
+                    value,
+                    b"meek-payload-padding-requests",
+                    config,
+                )?),
+                Some(PaddingReceiver::new(
+                    &meek.obfuscated_key,
+                    value,
+                    b"meek-payload-padding-responses",
+                )?),
+            ),
+            _ => (None, None),
+        };
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
             meek,
@@ -549,6 +707,8 @@ impl MeekHttp {
             stream: None,
             cookie,
             profile: chosen,
+            request_padding,
+            response_padding,
             http_transform: transform,
             front_index: 0,
             alpn_warned: false,
@@ -570,6 +730,7 @@ impl MeekHttp {
             content_type: ALTERNATE_CONTENT_TYPES[0],
             request_limit: MAX_REQUEST_PAYLOAD,
             redial_tls: 0.0,
+            payload_padding: None,
         };
         let transform = http_transform(&meek);
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
@@ -581,6 +742,8 @@ impl MeekHttp {
             stream: None,
             cookie: None,
             profile: chosen,
+            request_padding: None,
+            response_padding: None,
             http_transform: transform,
             front_index: 0,
             alpn_warned: false,
@@ -599,7 +762,28 @@ impl MeekHttp {
     ) -> Result<Self, String> {
         let chosen = profile(&meek.shape, meek.protocol);
         let transform = http_transform(&meek);
-        let cookie = Some(make_cookie(&meek, None, &chosen.cookie_name)?);
+        let cookie = Some(make_cookie(
+            &meek,
+            None,
+            &chosen.cookie_name,
+            chosen.payload_padding.is_some(),
+        )?);
+        let (request_padding, response_padding) = match (&cookie, chosen.payload_padding) {
+            (Some((_, value)), Some(config)) => (
+                Some(PaddingSender::new(
+                    &meek.obfuscated_key,
+                    value,
+                    b"meek-payload-padding-requests",
+                    config,
+                )?),
+                Some(PaddingReceiver::new(
+                    &meek.obfuscated_key,
+                    value,
+                    b"meek-payload-padding-responses",
+                )?),
+            ),
+            _ => (None, None),
+        };
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
         Ok(Self {
             meek,
@@ -609,6 +793,8 @@ impl MeekHttp {
             stream: Some(stream),
             cookie,
             profile: chosen,
+            request_padding,
+            response_padding,
             http_transform: transform,
             front_index: 0,
             alpn_warned: false,
@@ -652,9 +838,17 @@ impl MeekHttp {
         if self.stream.is_none() {
             self.open()?;
         }
+        let poll = body.is_empty();
+        let padded;
+        let body = if let Some(sender) = self.request_padding.as_mut() {
+            padded = sender.pad(body)?;
+            padded.as_slice()
+        } else {
+            body
+        };
         let reply = match self.exchange(body) {
             Ok(reply) => reply,
-            Err(why) if body.is_empty() && !self.preconnected => {
+            Err(why) if poll && !self.preconnected => {
                 self.stream = None;
                 self.open()?;
                 self.exchange(body).map_err(|_| why)?
@@ -876,7 +1070,11 @@ impl MeekHttp {
                 return Err(format!("psiphon meek status {}", reply.status));
             }
             self.absorb_cookie(&reply.headers);
-            return Ok(reply.body);
+            let mut body = reply.body;
+            if let Some(receiver) = self.response_padding.as_mut() {
+                body = receiver.strip(&body)?;
+            }
+            return Ok(body);
         }
         let mut head =
             crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
@@ -905,7 +1103,11 @@ impl MeekHttp {
         {
             self.stream = None;
         }
-        Ok(reply.body)
+        let mut body = reply.body;
+        if let Some(receiver) = self.response_padding.as_mut() {
+            body = receiver.strip(&body)?;
+        }
+        Ok(body)
     }
 
     /// Take a renewed meek cookie from a response.
@@ -940,11 +1142,25 @@ fn cookie_protocol(protocol: &str) -> String {
     protocol.replacen("-CDN", "", 1)
 }
 
+/// The JSON a meek cookie carries before encryption.
+fn cookie_plaintext(protocol: &str, endpoint: Option<&str>, padding: bool) -> String {
+    let protocol = cookie_protocol(protocol);
+    match (padding, endpoint) {
+        (true, Some(endpoint)) => {
+            format!(r#"{{"v":4,"p":true,"t":"{protocol}","e":"{endpoint}"}}"#)
+        }
+        (true, None) => format!(r#"{{"v":4,"p":true,"t":"{protocol}"}}"#),
+        (false, Some(endpoint)) => format!(r#"{{"v":4,"t":"{protocol}","e":"{endpoint}"}}"#),
+        (false, None) => format!(r#"{{"v":4,"t":"{protocol}"}}"#),
+    }
+}
+
 /// Build the cookie header for a meek request with the profile's cookie name.
 fn make_cookie(
     meek: &Meek,
     endpoint: Option<&str>,
     name: &str,
+    padding: bool,
 ) -> Result<(String, String), String> {
     let key = ferrox_core::b64::decode(meek.public_key.as_bytes())
         .ok_or_else(|| "psiphon meek cookie key is not base64".to_owned())?;
@@ -955,14 +1171,7 @@ fn make_cookie(
     let ephemeral = secret.public_key();
     let boxed = SalsaBox::new(&key, &secret);
     let nonce = crypto_box::aead::Nonce::<SalsaBox>::from_slice(&[0u8; 24]);
-    let plaintext = match endpoint {
-        Some(endpoint) => format!(
-            r#"{{"v":4,"t":"{}","e":"{}"}}"#,
-            cookie_protocol(meek.protocol),
-            endpoint
-        ),
-        None => format!(r#"{{"v":4,"t":"{}"}}"#, cookie_protocol(meek.protocol)),
-    };
+    let plaintext = cookie_plaintext(meek.protocol, endpoint, padding);
     let sealed = boxed
         .encrypt(nonce, plaintext.as_bytes())
         .map_err(|_| "psiphon meek cookie encryption".to_owned())?;
@@ -1052,7 +1261,7 @@ mod tests {
     fn a_cookie_carries_a_seed_then_an_encrypted_payload() {
         let meek = entry();
         let chosen = profile(&meek.shape, meek.protocol);
-        let (name, value) = make_cookie(&meek, None, &chosen.cookie_name).expect("cookie");
+        let (name, value) = make_cookie(&meek, None, &chosen.cookie_name, false).expect("cookie");
         assert_eq!(name, chosen.cookie_name);
         assert!(name.as_bytes()[0].is_ascii_uppercase());
         let bytes = ferrox_core::b64::decode(value.as_bytes()).expect("base64");
@@ -1064,7 +1273,7 @@ mod tests {
     fn the_cookie_name_is_one_letter_when_the_alternate_coin_fails() {
         let meek = entry();
         let chosen = profile(&meek.shape, meek.protocol);
-        let (name, _) = make_cookie(&meek, None, &chosen.cookie_name).expect("cookie");
+        let (name, _) = make_cookie(&meek, None, &chosen.cookie_name, false).expect("cookie");
         assert_eq!(name.len(), 1);
     }
 
@@ -1173,6 +1382,85 @@ mod tests {
         meek.write_parts(&[&head, &body]).expect("writes");
         meek.flush().expect("flushes");
         assert_eq!(reader.join().expect("joins"), want);
+    }
+
+    /// Padding is selected only for a MEEK protocol and only when its coin lands.
+    #[test]
+    fn payload_padding_is_selected_only_for_meek_when_the_coin_lands() {
+        let shape = TlsShape {
+            meek_payload_padding: 1.0,
+            meek_payload_padding_min: 8,
+            meek_payload_padding_max: 16,
+            ..TlsShape::default()
+        };
+        let chosen = profile(&shape, "FRONTED-MEEK-OSSH");
+        assert!(chosen.payload_padding.is_some());
+        assert_eq!(chosen.request_limit, MAX_REQUEST_PAYLOAD - 1);
+        assert!(profile(&shape, "TLS-OSSH").payload_padding.is_none());
+        let off = TlsShape {
+            meek_payload_padding: 0.0,
+            ..TlsShape::default()
+        };
+        assert!(profile(&off, "FRONTED-MEEK-OSSH").payload_padding.is_none());
+    }
+
+    fn padding_pair(omit: f64) -> (PaddingSender, PaddingReceiver) {
+        let config = PaddingConfig {
+            omit,
+            min: 8,
+            max: 16,
+        };
+        (
+            PaddingSender::new("key", "cookie", b"requests", config).expect("sender"),
+            PaddingReceiver::new("key", "cookie", b"requests").expect("receiver"),
+        )
+    }
+
+    /// A non-empty payload carries the no-padding prefix and is restored byte for byte.
+    #[test]
+    fn a_padded_payload_round_trips_through_the_sender_and_receiver() {
+        for len in [1usize, 17, 4096] {
+            let (mut sender, mut receiver) = padding_pair(0.0);
+            let body = vec![0x5au8; len];
+            let padded = sender.pad(&body).expect("pads");
+            assert_eq!(padded.len(), len + 1);
+            assert_eq!(receiver.strip(&padded).expect("strips"), body);
+        }
+    }
+
+    /// An empty payload is either a full padding frame or omitted entirely.
+    #[test]
+    fn an_empty_payload_is_padded_or_omitted() {
+        let (mut sender, mut receiver) = padding_pair(0.0);
+        let padded = sender.pad(&[]).expect("pads");
+        assert!((3 + 8..=3 + 16).contains(&padded.len()));
+        assert_eq!(receiver.strip(&padded).expect("strips"), [] as [u8; 0]);
+
+        let (mut sender, _) = padding_pair(1.0);
+        assert_eq!(sender.pad(&[]).expect("pads"), [] as [u8; 0]);
+    }
+
+    /// Consecutive padded frames are consumed until the payload begins.
+    #[test]
+    fn a_padding_receiver_consumes_every_frame_before_the_payload() {
+        let (mut sender, mut receiver) = padding_pair(0.0);
+        let mut frames = sender.pad(&[]).expect("pads");
+        frames.extend(sender.pad(&[]).expect("pads"));
+        frames.extend(sender.pad(&[0x42, 0x43]).expect("pads"));
+        assert_eq!(receiver.strip(&frames).expect("strips"), [0x42, 0x43]);
+    }
+
+    /// The cookie signals payload padding only when the profile selected it.
+    #[test]
+    fn the_cookie_signals_payload_padding() {
+        assert_eq!(
+            cookie_plaintext("FRONTED-MEEK-OSSH", None, false),
+            r#"{"v":4,"t":"FRONTED-MEEK-OSSH"}"#
+        );
+        assert_eq!(
+            cookie_plaintext("FRONTED-MEEK-CDN-OSSH", Some("endpoint"), true),
+            r#"{"v":4,"p":true,"t":"FRONTED-MEEK-OSSH","e":"endpoint"}"#
+        );
     }
 
     #[test]
