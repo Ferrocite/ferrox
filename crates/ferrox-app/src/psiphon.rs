@@ -8908,7 +8908,7 @@ mod tests {
     fn a_steering_ttl_longer_than_a_day_is_kept() {
         let settings = json::parse(r#"{"SteeringIPCacheTTLSeconds":172800}"#).expect("settings");
         let config = dns_config(Some(&settings), &[]);
-        assert_eq!(config.steering_ttl, Duration::from_secs(172_800));
+        assert_eq!(config.steering_ttl, Duration::from_hours(48));
     }
 
     #[test]
