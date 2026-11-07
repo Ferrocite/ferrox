@@ -2218,8 +2218,8 @@ pub(crate) fn serve_muxed_conn(
     );
 }
 
-/// The same connection, many gRPC streams, for VMess: each request block opens one stream and runs
-/// the VMess handler on its own reader and writer pair, so a client that shares one `ClientConn`
+/// The same connection, many gRPC streams, for `VMess`: each request block opens one stream and runs
+/// the `VMess` handler on its own reader and writer pair, so a client that shares one `ClientConn`
 /// across its flows is served concurrently instead of having the next stream refused.
 pub(crate) struct VmGrpcService {
     path: String,

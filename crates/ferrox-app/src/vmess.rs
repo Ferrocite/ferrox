@@ -2185,7 +2185,7 @@ pub(crate) fn serve_grpc_muxed_with(
 }
 
 /// One gRPC stream of a shared connection: the demux has already answered the HTTP/2 head, so this
-/// decodes the VMess header and runs the same codec and relay the single-stream carrier does, on
+/// decodes the `VMess` header and runs the same codec and relay the single-stream carrier does, on
 /// its own reader and writer pair. Closing here sends the stream's end, never the connection's.
 pub(crate) fn serve_grpc_muxed(
     mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
