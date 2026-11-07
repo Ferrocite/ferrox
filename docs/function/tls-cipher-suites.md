@@ -132,13 +132,14 @@ ids are reachable.
   that id on a server. BoringSSL appends no SCSV, so a TLS 1.2-only dial without an ECH config
   now rides the legacy lane; `a_tls12_list_keeps_the_reference_ids_and_order_on_the_wire`
   captures that hello and asserts the exact field, with no SCSV. A mixed list with an ECH config
-  rides the stock shaped hello, which appends the offer in a slot of its own and carries no
-  SCSV; `an_ech_list_keeps_the_configured_ids_without_an_scsv` builds its list with `hello_ids`,
-  so the TLS 1.3 trio joined to the CBC id selects that lane with or without a profile. When ECH
+  and no shaped profile rides the stock shaped hello, which appends the offer in a slot of its
+  own and carries no SCSV; `an_ech_list_keeps_the_configured_ids_without_an_scsv` builds its
+  list with `hello_ids`, so the TLS 1.3 trio joined to the CBC id selects that lane. When ECH
   does reach rustls, `with_ech` enables only TLS 1.3, so that path appends no SCSV either. Only
   a TLS 1.3-only list still matches id-for-id on the rustls lane.
-- **Mixed lists ride the stock shaped hello.** A list that names a TLS 1.3 and a TLS 1.2 id
-  cannot use either stock lane: BoringSSL writes its trio first and rustls appends SCSV, so
+- **A mixed list with no shaped profile rides the stock shaped hello.** A list that names a
+  TLS 1.3 and a TLS 1.2 id cannot use either stock lane: BoringSSL writes its trio first and
+  rustls appends SCSV, so
   neither writes the reference's field. The stock shaped hello writes the derived field
   verbatim (`a_mixed_list_keeps_the_reference_order_on_the_wire`) and still finishes a TLS 1.2
   handshake on the CBC id the list carries (`a_mixed_list_negotiates_a_tls12_suite`). A server
@@ -150,9 +151,12 @@ ids are reachable.
   session cache, so `enableSessionResumption` does not carry there; it is not a refusal, and the
   limit is named rather than silent. ECH is no longer a second limit for a mixed list: a dial
   with an ECH list and a TLS 1.2 id normally also names the TLS 1.3 trio `hello_ids` appends, so
-  it rides the shaped hello with or without a profile; its slot is appended last and its offer
-  completes (`an_ech_offer_rides_the_stock_shaped_hello`). A TLS 1.2-only list with an ECH
-  config stays on rustls unless it names an id neither backend carries, such as `0xc007`, which
+  the stock shaped hello carries it when no shaped profile is configured; its slot is appended
+  last and its offer completes (`an_ech_offer_rides_the_stock_shaped_hello`, which dials with
+  `Fingerprint::stock()`). A preset shapes its own hello and accepts ECH only when the preset
+  has an ECH slot: `hellochrome_58` has none and its offer is refused before the handshake
+  (`a_profile_without_an_ech_slot_is_refused`). A TLS 1.2-only list with an ECH config stays on
+  rustls unless it names an id neither backend carries, such as `0xc007`, which
   `needs_stock_hello` sends to the stock shaped hello before the ECH check. An ECH config whose
   maximum is below TLS 1.3 also stays on rustls, where `with_ech` enables only TLS 1.3. That is
   the remaining ECH boundary.
