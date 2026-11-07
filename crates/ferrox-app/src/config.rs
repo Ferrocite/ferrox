@@ -4473,7 +4473,7 @@ mod tests {
     #[test]
     fn an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it() {
         let minted = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
-        let esc = |pem: &str| format!("\"{}\"", pem.replace('\n', "\\n"));
+        let esc = |pem: &str| format!("\"{}\"", pem.replace('\r', "\\r").replace('\n', "\\n"));
         let config = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}, "ocspStapling": 9}}]}}}}}}"#,
             esc(&minted.cert.pem()),

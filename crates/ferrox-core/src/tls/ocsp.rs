@@ -68,8 +68,7 @@ fn tbs_children(cert: &[u8]) -> Option<Vec<(usize, usize)>> {
 #[allow(clippy::type_complexity)]
 fn aia_uris(cert: &[u8]) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
     let tbs = tbs_children(cert)?;
-    // The extensions live in `[3]` at the end of the TBS, so the tail is the anchor rather than
-    // the index: a v1 certificate with no version field shifts every earlier child by one.
+    // The `[3]` tail anchors the extensions, because v1 certificates shift every child by one.
     let (extensions_at, _) = tbs
         .iter()
         .rev()
@@ -166,8 +165,7 @@ fn sequence(out: &mut Vec<u8>, body: &[u8]) {
 fn ocsp_request(leaf: &[u8], issuer: &[u8]) -> Option<Vec<u8>> {
     let serial = serial(leaf)?;
     let issuer_tbs = tbs_children(issuer)?;
-    // A `[0]` version field is the first child when there is one; without it every index
-    // shifts by one, so the subject is counted from the version rather than fixed.
+    // A `[0]` version field shifts the subject index, so it is counted, not fixed.
     let versioned = usize::from(
         issuer_tbs
             .first()
