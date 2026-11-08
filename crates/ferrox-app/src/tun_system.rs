@@ -398,6 +398,25 @@ fn nat_peer(address: IpAddr, prefix: u8) -> Option<IpAddr> {
 }
 
 #[cfg(target_os = "linux")]
+fn listener_address(local: IpAddr, name: &str) -> io::Result<SocketAddr> {
+    let IpAddr::V6(address) = local else {
+        return Ok(SocketAddr::new(local, 0));
+    };
+    if !address.is_unicast_link_local() {
+        return Ok(SocketAddr::new(local, 0));
+    }
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::other("interface name contains a NUL"))?;
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+        address, 0, 0, index,
+    )))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn serve(
     spec: &crate::tun::Spec,
     out: &crate::proxy::Outbound,
@@ -423,7 +442,7 @@ pub(crate) fn serve(
         )
     })?;
     let device = Arc::new(tun_stack::build(spec, false, false)?.0);
-    let listener = std::net::TcpListener::bind(SocketAddr::new(local, 0))?;
+    let listener = std::net::TcpListener::bind(listener_address(local, &device.name()?)?)?;
     listener.set_nonblocking(true)?;
     let listener_port = listener.local_addr()?.port();
     if spec.queues() > 1 {
