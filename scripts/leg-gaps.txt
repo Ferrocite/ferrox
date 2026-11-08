@@ -7,6 +7,9 @@ masque-down-8|server|0.15|861
 wireguard-raw-down-8|server|0.18|861|ceiling
 masque-down-8|server-threads|1.40|861
 shadowsocks-raw-duplex-8|client|0.84|696
+# Serving the xray client's shared gRPC connection reveals the cost the single-stream row never produced: one control thread per connection and the xray client's small stream window, both #696.
+shadowsocks-grpc-down-8|server-cpu|1.50|696
+shadowsocks-grpc-down-8|server-threads|1.08|696
 shadowsocks2022-raw-up-1|server|0.72|696
 vless-hysteria-down-8|server-threads|1.09|696
 vless-grpc-down-8|server-threads|1.14|696
