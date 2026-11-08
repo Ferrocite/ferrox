@@ -31175,7 +31175,7 @@ pub(crate) fn send_two(socket: &UdpSocket, first: &[u8], second: &[u8]) -> std::
 
 /// One datagram as its two parts to `dest`. The server's answer socket is not connected, so the
 /// address rides the same call.
-fn send_to_two(
+pub(crate) fn send_to_two(
     socket: &UdpSocket,
     first: &[u8],
     second: &[u8],
@@ -31224,15 +31224,9 @@ fn send_parts(
     }
     #[cfg(windows)]
     {
-        if let Some(dest) = dest {
-            let mut one = Vec::with_capacity(first.len() + second.len());
-            one.extend_from_slice(first);
-            one.extend_from_slice(second);
-            return socket.send_to(&one, dest);
-        }
         use std::os::windows::io::AsRawSocket as _;
         use windows_sys::Win32::Networking::WinSock::{
-            WSAGetLastError, WSASend, SOCKET, SOCKET_ERROR, WSABUF,
+            WSAGetLastError, WSASend, WSASendTo, SOCKADDR, SOCKET, SOCKET_ERROR, WSABUF,
         };
         let parts = [
             WSABUF {
@@ -31247,16 +31241,34 @@ fn send_parts(
         loop {
             let mut sent = 0u32;
             // SAFETY: `parts` describes the caller's buffers, live and read-only for the call; a blocking socket takes no overlapped or completion routine.
-            let code = unsafe {
-                WSASend(
-                    socket.as_raw_socket() as SOCKET,
-                    parts.as_ptr(),
-                    parts.len() as u32,
-                    &raw mut sent,
-                    0,
-                    std::ptr::null_mut(),
-                    None,
-                )
+            let code = if let Some(dest) = dest {
+                let (storage, len) = windows_sockaddr_of(dest);
+                // SAFETY: the storage holds the address the length describes, live for the call.
+                unsafe {
+                    WSASendTo(
+                        socket.as_raw_socket() as SOCKET,
+                        parts.as_ptr(),
+                        parts.len() as u32,
+                        &raw mut sent,
+                        0,
+                        (&raw const storage).cast::<SOCKADDR>(),
+                        len,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                }
+            } else {
+                unsafe {
+                    WSASend(
+                        socket.as_raw_socket() as SOCKET,
+                        parts.as_ptr(),
+                        parts.len() as u32,
+                        &raw mut sent,
+                        0,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                }
             };
             if code == SOCKET_ERROR {
                 let error = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
@@ -31276,6 +31288,55 @@ fn send_parts(
         match dest {
             Some(dest) => socket.send_to(&one, dest),
             None => socket.send(&one),
+        }
+    }
+}
+
+/// The `sockaddr` a datagram goes to, and its length, in the storage `WSASendTo` reads it from.
+#[cfg(windows)]
+fn windows_sockaddr_of(
+    addr: SocketAddr,
+) -> (
+    windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE,
+    i32,
+) {
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_IN6,
+        SOCKADDR_STORAGE,
+    };
+    let mut storage = SOCKADDR_STORAGE::default();
+    match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: a `sockaddr_in` is shorter and no more aligned than the storage it is built in.
+            let sin = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_IN>() };
+            sin.sin_family = AF_INET;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+            };
+            (
+                storage,
+                i32::try_from(std::mem::size_of::<SOCKADDR_IN>()).expect("sockaddr fits"),
+            )
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: a `sockaddr_in6` is shorter and no more aligned than the storage it is built in.
+            let sin6 = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_IN6>() };
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_addr = IN6_ADDR {
+                u: IN6_ADDR_0 {
+                    Byte: v6.ip().octets(),
+                },
+            };
+            sin6.Anonymous.sin6_scope_id = v6.scope_id();
+            (
+                storage,
+                i32::try_from(std::mem::size_of::<SOCKADDR_IN6>()).expect("sockaddr fits"),
+            )
         }
     }
 }
