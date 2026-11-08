@@ -13,6 +13,7 @@ use ring::signature;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -91,6 +92,7 @@ pub(crate) struct PsiphonOut {
 
 struct Inner {
     settings: Settings,
+    config_state: u64,
     entries: Mutex<Arc<Vec<Server>>>,
     sloks: Arc<crate::psiphon_osl::SlokStore>,
     requests: Arc<crate::psiphon_osl::ServerEvents>,
@@ -108,6 +110,7 @@ struct Inner {
     udpgw: Mutex<Option<Arc<UdpGateway>>>,
     conduit: Mutex<Option<Arc<crate::psiphon_webrtc::Conduit>>>,
     split_untunneled: Mutex<HashMap<String, Instant>>,
+    replay: Arc<crate::psiphon_replay::Cache>,
 }
 
 /// The reference's protocol hold-off: a jittered delay before a new tunnel is activated.
@@ -312,6 +315,7 @@ struct Settings {
     prioritize_probability: f64,
     limit_protocols_probability: f64,
     initial_limit_probability: f64,
+    replay: crate::psiphon_replay::Settings,
     disable_tactics: bool,
     meek_headers: Vec<(String, String)>,
     ssh_channel_window: u32,
@@ -424,9 +428,12 @@ impl PsiphonOut {
             .session_id
             .clone()
             .unwrap_or_else(|| hex(&random::<16>()));
+        let config_state = settings.config_state();
+        let replay = Arc::new(crate::psiphon_replay::Cache::new(settings.replay.clone()));
         let inner = Arc::new(Inner {
             session_id,
             settings,
+            config_state,
             entries: Mutex::new(Arc::new(entries)),
             sloks,
             requests,
@@ -443,6 +450,7 @@ impl PsiphonOut {
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
             split_untunneled: Mutex::new(HashMap::new()),
+            replay,
         });
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
         let weak = Arc::downgrade(&inner);
@@ -565,6 +573,7 @@ impl Inner {
     /// Live sessions, with dead ones retired before any count is read.
     fn live(&self) -> usize {
         let mut sessions = lock(&self.sessions);
+        self.replay.promote(sessions.as_slice());
         sessions.retain(|session| !session.is_closed());
         sessions.len()
     }
@@ -572,6 +581,7 @@ impl Inner {
     /// Spread flows over the pool round-robin, so one tunnel's window is not a global cap.
     fn pick(&self) -> Option<Arc<Session>> {
         let mut sessions = lock(&self.sessions);
+        self.replay.promote(sessions.as_slice());
         sessions.retain(|session| !session.is_closed());
         if sessions.is_empty() {
             return None;
@@ -630,17 +640,41 @@ impl Inner {
     #[allow(clippy::too_many_lines)]
     fn connect_locked(
         &self,
-        start: usize,
+        mut start: usize,
         affinity_lead: Duration,
         mut connecting: Option<std::sync::MutexGuard<'_, ()>>,
     ) -> Result<Arc<Session>, String> {
         if self.stopping.load(Ordering::Acquire) {
             return Err("psiphon: the lane is stopping".to_owned());
         }
+        {
+            let sessions = lock(&self.sessions);
+            self.replay.promote(sessions.as_slice());
+        }
         let entries = Arc::clone(&lock(&self.entries));
         if entries.is_empty() {
             return Err("psiphon: the server list holds no SSH entries".to_owned());
         }
+        let entries = if self.replay.wants_move_to_front() {
+            let mut reordered = (*entries).clone();
+            self.replay.move_to_front(&mut reordered);
+            let affinity = lock(&self.affinity);
+            if let (Some(old), Some(new)) = (
+                affinity_index(&entries, affinity.as_ref()),
+                affinity_index(&reordered, affinity.as_ref()),
+            ) {
+                let count = reordered.len();
+                if count != 0 {
+                    let offset = (start + count - old) % count;
+                    let preferred = reordered.remove(new);
+                    reordered.insert(0, preferred);
+                    start = offset % count;
+                }
+            }
+            Arc::new(reordered)
+        } else {
+            entries
+        };
         let deadline = Instant::now() + self.settings.ready;
         let limit = entries.len().min(DIAL_ATTEMPTS);
         let conduit_timeout = self.settings.conduit_timeout;
@@ -724,6 +758,8 @@ impl Inner {
             let keepalive = self.settings.keepalive;
             let limit_meek_buffers = self.settings.limit_meek_buffers;
             let tls_shape = self.settings.tls_shape.clone();
+            let config_state = self.config_state;
+            let replay = Arc::clone(&self.replay);
             let conduit =
                 if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
                     match self.conduit() {
@@ -739,7 +775,10 @@ impl Inner {
             let requests =
                 Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
             let attempt = move |server: &Server| {
-                let timeout = if conduit.is_some() && server.inproxy.is_some() {
+                let lease = replay.begin(server, config_state);
+                let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());
+                let selected = lease.server();
+                let timeout = if conduit.is_some() && selected.inproxy.is_some() {
                     conduit_timeout
                 } else {
                     dial_timeout
@@ -758,8 +797,8 @@ impl Inner {
                     split_tunnel,
                     split_tunnel_regions: &split_tunnel_regions,
                 };
-                Session::connect(
-                    server,
+                match Session::connect(
+                    selected,
                     &identity,
                     timeout,
                     proxy.as_ref(),
@@ -769,10 +808,16 @@ impl Inner {
                     &tls_shape,
                     limit_meek_buffers,
                     Some(Arc::clone(&requests)),
-                )
+                ) {
+                    Ok(session) => Ok((session, lease)),
+                    Err(why) => {
+                        lease.failed();
+                        Err(why)
+                    }
+                }
             };
             match race(batch, attempt, budget, stagger, lead) {
-                Ok(session) => {
+                Ok((session, lease)) => {
                     drop(connecting.take());
                     if self.stopping.load(Ordering::Acquire) {
                         session.close();
@@ -818,10 +863,12 @@ impl Inner {
                             self.settings.dial_timeout(),
                         ) {
                             session.close();
+                            lease.failed();
                             last = format!("psiphon: liveness test on {protocol}: {why}");
                             continue;
                         }
                     }
+                    lease.succeeded(session.id());
                     let session = Arc::new(session);
                     eprintln!(
                         "psiphon: tunnel up via {} {}",
@@ -834,6 +881,7 @@ impl Inner {
                         let at = self.next_session.fetch_add(1, Ordering::Relaxed) % sessions.len();
                         let existing = Arc::clone(&sessions[at]);
                         drop(sessions);
+                        self.replay.promote(std::slice::from_ref(&session));
                         session.close();
                         return Ok(existing);
                     }
@@ -1016,6 +1064,7 @@ impl Inner {
     }
 
     fn retire(&self, session: &Arc<Session>) {
+        self.replay.promote(std::slice::from_ref(session));
         session.close();
         lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, session));
     }
@@ -1092,6 +1141,7 @@ impl Inner {
         if let Some(session) = self.pick() {
             return Ok(session);
         }
+        self.replay.start_pass();
         let (start, lead) = self.start();
         let session = self.connect_locked(start, lead, Some(connecting))?;
         self.remember(session.server());
@@ -1102,6 +1152,8 @@ impl Inner {
     /// one handshake window instead of one per tunnel.
     fn fill(self: &Arc<Self>) -> Result<(), String> {
         const FILL_WORKERS: usize = 8;
+        self.replay.start_pass();
+        let mut first_round = true;
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 return Err("psiphon: the lane is stopping".to_owned());
@@ -1109,6 +1161,9 @@ impl Inner {
             let missing = self.settings.pool.saturating_sub(self.live());
             if missing == 0 {
                 return Ok(());
+            }
+            if !std::mem::take(&mut first_round) {
+                self.replay.next_round();
             }
             if missing == 1 {
                 let connecting = lock(&self.connecting);
@@ -2571,6 +2626,7 @@ impl Settings {
             prioritize_probability,
             limit_protocols_probability,
             initial_limit_probability,
+            replay: replay_settings(settings),
             keepalive,
             disable_tactics: flag(settings, "DisableTactics", "AETHER_PSIPHON_DISABLE_TACTICS"),
             meek_headers: dial_headers(settings),
@@ -2711,6 +2767,50 @@ impl Settings {
         } else {
             self.holdoff_direct.delay(provider, region)
         }
+    }
+
+    /// A hash of the fields that change a dial's selected parameters.
+    fn config_state(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.protocols.hash(&mut hasher);
+        self.initial_protocols.hash(&mut hasher);
+        self.fronted.hash(&mut hasher);
+        self.fronted_fallback.hash(&mut hasher);
+        self.cdn_ips.hash(&mut hasher);
+        self.cdn_snis.hash(&mut hasher);
+        format!("{:?}", self.fronted_overrides).hash(&mut hasher);
+        self.region.hash(&mut hasher);
+        self.conduit.hash(&mut hasher);
+        self.conduit_protocols.hash(&mut hasher);
+        self.limit_quic_versions.hash(&mut hasher);
+        self.quic_noise.hash(&mut hasher);
+        self.meek_headers.hash(&mut hasher);
+        self.headers.hash(&mut hasher);
+        self.authorizations.hash(&mut hasher);
+        self.proxy_user.hash(&mut hasher);
+        self.proxy_pass.hash(&mut hasher);
+        self.device_region.hash(&mut hasher);
+        self.client_features.hash(&mut hasher);
+        self.prioritize_protocols.hash(&mut hasher);
+        self.prioritize_count.hash(&mut hasher);
+        self.restrict_direct_regions.hash(&mut hasher);
+        self.restrict_inproxy_regions.hash(&mut hasher);
+        self.restrict_fronting_ids.hash(&mut hasher);
+        format!("{:?}", self.tls_shape).hash(&mut hasher);
+        format!("{:?}", self.proxy).hash(&mut hasher);
+        format!("{:?}", self.dial_ports).hash(&mut hasher);
+        self.dial_ports_probability.to_bits().hash(&mut hasher);
+        self.limit_protocols_probability.to_bits().hash(&mut hasher);
+        self.initial_limit_probability.to_bits().hash(&mut hasher);
+        self.prioritize_probability.to_bits().hash(&mut hasher);
+        self.restrict_direct_probability.to_bits().hash(&mut hasher);
+        self.restrict_inproxy_probability
+            .to_bits()
+            .hash(&mut hasher);
+        self.restrict_fronting_probability
+            .to_bits()
+            .hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Whether a client restriction skips this candidate; the reference coins per candidate.
@@ -3129,6 +3229,14 @@ fn number(settings: Option<&Json>, key: &str) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
 }
 
+/// Read an integer field from settings.
+fn integer(settings: Option<&Json>, key: &str) -> Option<i64> {
+    let value = settings.and_then(|settings| settings.get(key))?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
 fn decimal(settings: Option<&Json>, key: &str) -> Option<f64> {
     let value = settings.and_then(|settings| settings.get(key))?;
     match value {
@@ -3143,6 +3251,7 @@ fn probability(settings: Option<&Json>, key: &str) -> f64 {
     decimal(settings, key).unwrap_or(1.0).clamp(0.0, 1.0)
 }
 
+/// One weighted coin, with the reference's inclusive endpoints.
 fn coin(probability: f64) -> bool {
     if probability >= 1.0 {
         return true;
@@ -3176,6 +3285,38 @@ fn keepalive(settings: Option<&Json>) -> KeepAlive {
         padding_max,
         inactive: millis("SSHKeepAlivePeriodicInactivePeriodMilliseconds", 10_000),
         timeout: millis("SSHKeepAlivePeriodicTimeoutMilliseconds", 30_000),
+    }
+}
+
+/// The reference's `Replay*` settings, with its defaults and clamps.
+fn replay_settings(settings: Option<&Json>) -> crate::psiphon_replay::Settings {
+    let seconds = |key, default| Duration::from_secs(number(settings, key).unwrap_or(default));
+    let probability = |key, default| decimal(settings, key).unwrap_or(default).clamp(0.0, 1.0);
+    crate::psiphon_replay::Settings {
+        disable: flag(settings, "DisableReplay", "AETHER_PSIPHON_DISABLE_REPLAY"),
+        candidate_count: integer(settings, "ReplayCandidateCount").unwrap_or(10),
+        ttl: seconds("ReplayDialParametersTTLSeconds", 86_400),
+        target_upstream: number(settings, "ReplayTargetUpstreamBytes").unwrap_or(0),
+        target_downstream: number(settings, "ReplayTargetDownstreamBytes").unwrap_or(0),
+        target_duration: seconds("ReplayTargetTunnelDurationSeconds", 1),
+        later_round_move_to_front: probability("ReplayLaterRoundMoveToFrontProbability", 0.0),
+        retain_failed: probability("ReplayRetainFailedProbability", 0.5),
+        ignore_changed_config_state: probability("ReplayIgnoreChangedConfigStateProbability", 0.0),
+        fronted_ttl: seconds("FrontedHTTPClientReplayDialParametersTTLSeconds", 86_400),
+        fronted_update_frequency: seconds("FrontedHTTPClientReplayUpdateFrequencySeconds", 300),
+        fronted_probability: probability("FrontedHTTPClientReplayDialParametersProbability", 1.0),
+        fronted_retain_failed: probability("FrontedHTTPClientReplayRetainFailedProbability", 0.5),
+        inproxy_broker_ttl: seconds("InproxyReplayBrokerDialParametersTTLSeconds", 86_400),
+        inproxy_broker_update_frequency: seconds("InproxyReplayBrokerUpdateFrequencySeconds", 300),
+        inproxy_broker_probability: probability(
+            "InproxyReplayBrokerDialParametersProbability",
+            1.0,
+        ),
+        inproxy_broker_retain_failed: probability(
+            "InproxyReplayBrokerRetainFailedProbability",
+            0.5,
+        ),
+        inproxy_retain_failed: probability("InproxyReplayRetainFailedProbability", 1.0),
     }
 }
 
@@ -3672,6 +3813,24 @@ const KNOWN_SETTINGS: &[&str] = &[
     "AdditionalParameters",
     "additionalParameters",
     "DisableTactics",
+    "DisableReplay",
+    "FrontedHTTPClientReplayDialParametersProbability",
+    "FrontedHTTPClientReplayDialParametersTTLSeconds",
+    "FrontedHTTPClientReplayRetainFailedProbability",
+    "FrontedHTTPClientReplayUpdateFrequencySeconds",
+    "InproxyReplayBrokerDialParametersProbability",
+    "InproxyReplayBrokerDialParametersTTLSeconds",
+    "InproxyReplayBrokerRetainFailedProbability",
+    "InproxyReplayBrokerUpdateFrequencySeconds",
+    "InproxyReplayRetainFailedProbability",
+    "ReplayCandidateCount",
+    "ReplayDialParametersTTLSeconds",
+    "ReplayIgnoreChangedConfigStateProbability",
+    "ReplayLaterRoundMoveToFrontProbability",
+    "ReplayRetainFailedProbability",
+    "ReplayTargetDownstreamBytes",
+    "ReplayTargetTunnelDurationSeconds",
+    "ReplayTargetUpstreamBytes",
     "MeekAdditionalHeaders",
     "SSHChannelWindowSize",
     "LimitQUICVersions",
@@ -9564,6 +9723,7 @@ mod tests {
         let inner = Inner {
             session_id: String::new(),
             settings,
+            config_state: 0,
             entries: Mutex::new(Arc::new(Vec::new())),
             sloks: crate::psiphon_osl::SlokStore::open(None),
             requests: Arc::new(crate::psiphon_osl::ServerEvents {
@@ -9585,6 +9745,9 @@ mod tests {
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
             split_untunneled: Mutex::new(HashMap::new()),
+            replay: Arc::new(crate::psiphon_replay::Cache::new(
+                crate::psiphon_replay::Settings::default(),
+            )),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -9620,6 +9783,7 @@ mod tests {
         let inner = Inner {
             session_id: String::new(),
             settings,
+            config_state: 0,
             entries: Mutex::new(Arc::new(Vec::new())),
             sloks: crate::psiphon_osl::SlokStore::open(None),
             requests: Arc::new(crate::psiphon_osl::ServerEvents {
@@ -9641,6 +9805,9 @@ mod tests {
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
             split_untunneled: Mutex::new(HashMap::new()),
+            replay: Arc::new(crate::psiphon_replay::Cache::new(
+                crate::psiphon_replay::Settings::default(),
+            )),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -10131,6 +10298,7 @@ mod tests {
         let inner = Inner {
             session_id: String::new(),
             settings,
+            config_state: 0,
             entries: Mutex::new(Arc::new(entries.clone())),
             sloks: crate::psiphon_osl::SlokStore::open(None),
             requests: Arc::new(crate::psiphon_osl::ServerEvents {
@@ -10152,6 +10320,9 @@ mod tests {
             udpgw: Mutex::new(None),
             conduit: Mutex::new(None),
             split_untunneled: Mutex::new(HashMap::new()),
+            replay: Arc::new(crate::psiphon_replay::Cache::new(
+                crate::psiphon_replay::Settings::default(),
+            )),
         };
         let (at, _) = inner.start();
         assert_eq!(at, 42, "start uses the shared lookup");

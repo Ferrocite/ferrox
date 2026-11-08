@@ -58,6 +58,7 @@ mod psiphon_meek;
 mod psiphon_osl;
 mod psiphon_quic;
 mod psiphon_rate;
+mod psiphon_replay;
 mod psiphon_shadowsocks;
 mod psiphon_ssh;
 mod psiphon_tactics;

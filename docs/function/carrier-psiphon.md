@@ -4,6 +4,8 @@ The lane no longer starts `psiphon-tunnel-core`. It fetches the signed server li
 
 **Obfuscated server lists and server alerts.** The SSH session advertises `server-requests` and answers the server's `psiphon-osl` and `psiphon-alert` global requests, whether they arrive during the handshake or on the open session; an unknown request is logged and failed without retiring the tunnel. `psiphon-osl` persists each seeded SLOK (base64 ID and key) under the lane's state directory, clears them on `clear_local_sloks`, and a newly seeded SLOK forces a registry fetch. `ObfuscatedServerListRootURLs` names the roots in the reference's transfer-URL form (the `URL` value is base64) or as plain strings, with the deprecated single `ObfuscatedServerListRootURL` as the fallback. The lane fetches `osl-registry`, verifies it with `RemoteServerListSignaturePublicKey`, walks each `FileSpecs` entry's `KeyShares` tree, reassembles the file key from seeded SLOKs by Shamir interpolation at zero over GF(256) with the AES polynomial, opens the OSL file with NaCl secretbox and a zero nonce, verifies the inner signed package, and imports the server entries through the same decoder, protocol selection and fronting/session overrides as the signed list. An imported entry is deduplicated by its identity fields through one hash set, so a refresh neither scans the live list per entry nor clones it when nothing is new; `new_entries_keep_the_first_copy_of_each_server` holds the first copy and the order. `EmitSLOKs` and `EmitServerAlerts` turn the notice lines on. Refreshes are throttled to one attempt per five minutes unless a new SLOK forces one; OSL downloads are direct HTTPS only, with no ETag, resume cache, per-URL `RequestHeaders`/`SkipVerify`, or `MD5Sum` skip yet.
 
+**Dial-parameter replay.** A successful dial stores the selected server variant and a 32-byte dial-shape seed per host. The seed drives every shape draw made during the dial: the TLS fingerprint and randomized-profile coin, SNI and hostname transforms, TLS and OSSH/Shadowsocks prefixes and split delays, fragmentor plan and pauses, meek padding/cookie/header/User-Agent choices, and the broker/STUN/WebRTC padding and labels. A later dial reuses that server and seed while the entry hash, config-state hash, TTL and candidate budget still match; `ReplayIgnoreChangedConfigStateProbability` can override the config hash, and `ReplayRetainFailedProbability` keeps a failed replay. Direct entries use `ReplayDialParametersTTLSeconds` and the target bytes/duration promotion gate; fronted entries use the `FrontedHTTPClientReplay*` window and in-proxy destinations use the `InproxyReplayBroker*` window, with `InproxyReplayRetainFailedProbability` governing in-proxy failures. `ReplayCandidateCount` bounds how many candidates in a round may replay (`-1` is unlimited), and `ReplayLaterRoundMoveToFrontProbability` controls whether stored candidates are moved to the front after the first round. The cache is in-process; it does not persist across a client restart.
+
 ## Data path
 
 ```mermaid
@@ -11,6 +13,7 @@ graph TD
     A["outbound JSON: listen, region, readySeconds,<br/>serverList, serverListURLs,<br/>localProxyUsername/localProxyPassword,<br/>LocalHttpProxyPort, UpstreamProxyURL,<br/>LimitTunnelProtocols, LimitTunnelDialPortNumbers,<br/>PrioritizeTunnelProtocols, ObfuscatedSSHMinPadding/MaxPadding,<br/>TargetServerEntry, CustomHeaders"] --> B["Settings: one read of every field<br/>env fallbacks only when the field holds no usable value"]
     B --> C["fetch_list: zlib, JSON package,<br/>SHA-256 key digest, RSA PKCS#1 v1.5 signature,<br/>custom request headers"]
     B --> B2["identity: PropagationChannelId,<br/>ClientPlatform, ClientVersion,<br/>DeviceRegion, DeviceLocation, ClientFeatures;<br/>pause and affinity grace"]
+    B --> B3["replay: per-host server variant + shape seed,<br/>config/TTL/candidate gates,<br/>target bytes and duration promotion"]
     C --> D["decode_entry: hex, five fields, JSON entry"]
     D --> E["Server: host, port, user, password,<br/>host key, OSSH key, region,<br/>capability names without -OSSH"]
     E --> E2["meek: fronted loopback relay or direct unfronted,<br/>HTTP or HTTPS, version-4 NaCl cookie + OSSH RC4"]
@@ -23,6 +26,7 @@ graph TD
     E5 --> F
     E --> F["Session::connect: ConnectionWorkerPoolSize servers raced,<br/>optional upstream CONNECT or SOCKS5 hop,<br/>OSSH preamble, curve25519 KEX, host-key check,<br/>password auth, identity handshake"]
     B2 --> F
+    B3 --> F
     F --> P["TunnelPoolSize: 1..32 sessions filled eight at a time,<br/>last good server first, flows spread round-robin"]
     P --> G["Psiphon local SOCKS listener"]
     G --> H["SOCKS4/4a CONNECT or SOCKS5 CONNECT"]
