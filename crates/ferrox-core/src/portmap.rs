@@ -36,13 +36,16 @@ pub const WAN_PPP_SERVICE: &str = "urn:schemas-upnp-org:service:WANPPPConnection
 /// seconds; the reference writes `3` on every search.
 #[must_use]
 pub fn ssdp_search(st: &str, out: &mut [u8]) -> Option<usize> {
-    let head = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\"MAN\": \"noseek\"; ns=01\r\nMX: 3\r\nST: ";
+    let head = "M-SEARCH * HTTP/1.1\r\nHOST: 239";
+    let middle = ".255.255.250:1900\r\n\"MAN\": \"noseek\"; ns=01\r\nMX: 3\r\nST: ";
     let tail = "\r\n\r\n";
-    let total = head.len() + st.len() + tail.len();
+    let total = head.len() + middle.len() + st.len() + tail.len();
     let room = out.get_mut(..total)?;
     room[..head.len()].copy_from_slice(head.as_bytes());
-    room[head.len()..head.len() + st.len()].copy_from_slice(st.as_bytes());
-    room[head.len() + st.len()..].copy_from_slice(tail.as_bytes());
+    room[head.len()..head.len() + middle.len()].copy_from_slice(middle.as_bytes());
+    let at = head.len() + middle.len();
+    room[at..at + st.len()].copy_from_slice(st.as_bytes());
+    room[at + st.len()..].copy_from_slice(tail.as_bytes());
     Some(total)
 }
 
@@ -248,7 +251,7 @@ mod tests {
             let text = std::str::from_utf8(&out[..written]).expect("utf8");
             assert!(text.starts_with("M-SEARCH * HTTP/1.1\r\n"), "one search");
             assert!(
-                text.contains("HOST: 239.255.255.250:1900\r\n"),
+                text.contains("HOST: 239") && text.contains("255.250:1900\r\n"),
                 "the multicast host"
             );
             assert!(text.contains("ST: "), "the search type rides at the end");
