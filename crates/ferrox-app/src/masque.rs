@@ -4371,6 +4371,7 @@ mod tests {
         assert!(warp_addresses(&twice).is_err());
     }
 
+    /// Encode one ADDRESS_ASSIGN capsule as the client's stream parser sees it.
     fn assignment(addrs: &[IpAddr]) -> Owned {
         let mut wire = Vec::new();
         connectip::address_assign_encode(&grants(addrs, 0), &mut wire);

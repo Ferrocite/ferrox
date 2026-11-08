@@ -2442,6 +2442,7 @@ mod tests {
         established_with(echo, false)
     }
 
+    /// Open a tunnel to the h2 listener, in the WARP dialect when asked.
     fn established_with(
         echo: SocketAddr,
         warp: bool,
