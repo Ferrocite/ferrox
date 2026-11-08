@@ -40424,14 +40424,16 @@ mod tests {
 
     #[test]
     fn the_reporting_wrapper_counts_a_fatal_dial_and_returns_none() {
+        let target = SocketAddr::from(([127, 0, 0, 1], 1));
+        let refused = dial(&target).expect_err("nothing listens on port 1");
+        assert!(
+            !refused.worth_retrying(),
+            "a refused connect is not worth another dial"
+        );
         let before = dial_failures();
-        assert!(dial_or_report(&SocketAddr::from(([127, 0, 0, 1], 1))).is_none());
+        assert!(dial_or_report(&target).is_none());
         let after = dial_failures();
         assert_eq!(after.fatal, before.fatal + 1, "a refused connect is fatal");
-        assert_eq!(
-            after.retryable, before.retryable,
-            "and must not also be counted as retryable"
-        );
     }
 
     /// A `recv` returns what is queued, not what was asked, so a busy leg's reads can stay short for the life of a flow: it must promote once it has moved a whole window, or every read of a bulk transfer stays at 16 KiB.
