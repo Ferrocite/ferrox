@@ -653,7 +653,7 @@ fn remote_dns(settings: &Json) -> Result<Vec<IpAddr>, String> {
 /// Cloudflare's WARP dialect of the same tunnel: the config carries the key
 /// pair instead of a password, the client mints its own certificate from that
 /// key, the endpoint authenticates by its public key rather than a chain, and
-/// the static addresses replace the proxy's assignment.
+/// the static addresses stand in when the proxy assigns none.
 #[derive(Debug, Clone)]
 pub(crate) struct Warp {
     public_key: Vec<u8>,
@@ -1056,10 +1056,15 @@ fn attempt(
         return Err(format!("masque: the edge answered {status}"));
     }
     if let Some(warp) = &spec.warp {
+        let mut addresses = assigned(&mut stream);
+        if addresses.is_none() {
+            stream.poll(&mut conn, sock, local, TICK)?;
+            addresses = assigned(&mut stream);
+        }
         return Ok(Lane {
             conn,
             stream: stream.id,
-            addresses: warp.local_addresses(),
+            addresses: addresses.unwrap_or_else(|| warp.local_addresses()),
             mtu: DEFAULT_MTU,
             packets: stream.packets,
             alive: Arc::new(AtomicBool::new(true)),
@@ -1091,6 +1096,23 @@ fn attempt(
         mtu: DEFAULT_MTU,
         packets: stream.packets,
         alive: Arc::new(AtomicBool::new(true)),
+    })
+}
+
+/// The first non-empty assignment the edge sent, so a WARP client uses the
+/// address the server routes rather than the one it was configured with.
+fn assigned(stream: &mut Stream) -> Option<Vec<IpAddr>> {
+    stream.take_capsules().into_iter().find_map(|capsule| {
+        let Owned::AddressAssign(body) = capsule else {
+            return None;
+        };
+        let mut grants = Vec::new();
+        connectip::address_assign(&body, &mut grants)?;
+        let addresses: Vec<IpAddr> = grants
+            .iter()
+            .filter_map(|grant| (!grant.refused()).then(|| address_of(grant)).flatten())
+            .collect();
+        (!addresses.is_empty()).then_some(addresses)
     })
 }
 
@@ -4332,6 +4354,24 @@ mod tests {
             Json::Str("172.16.0.3/32".to_owned()),
         ];
         assert!(warp_addresses(&twice).is_err());
+    }
+
+    #[test]
+    fn a_warp_client_takes_the_address_the_edge_assigns() {
+        let want = vec!["172.16.0.9".parse::<IpAddr>().expect("v4")];
+        let mut wire = Vec::new();
+        connectip::address_assign_encode(&grants(&want, 0), &mut wire);
+        let (_, connectip::Capsule::AddressAssign(body)) =
+            connectip::capsule_split(&wire).expect("a capsule")
+        else {
+            panic!("an assignment capsule");
+        };
+        let mut stream = Stream {
+            pending: vec![Owned::AddressAssign(body.to_vec())],
+            ..Stream::default()
+        };
+        assert_eq!(assigned(&mut stream), Some(want));
+        assert_eq!(assigned(&mut stream), None);
     }
 
     #[test]

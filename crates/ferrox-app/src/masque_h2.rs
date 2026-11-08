@@ -589,7 +589,13 @@ fn handshake(
         return Err(format!("the edge answered {status}"));
     }
     if let Some(warp) = warp {
-        client.addresses = warp.local_addresses();
+        if client.addresses.is_empty() {
+            client.wire.fill();
+            client.pump();
+        }
+        if client.addresses.is_empty() {
+            client.addresses = warp.local_addresses();
+        }
     } else {
         client.request_addresses()?;
     }
