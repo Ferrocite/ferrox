@@ -57,6 +57,7 @@ graph TD
 | flow-clone-allocations | 0 | ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words |
 | affinity-lookup-allocations | 0 | ferrox-app-psiphon::tests::an_affinity_lookup_does_not_format_each_entry |
 | move-to-front-allocations | 0 | ferrox-app-psiphon::tests::a_live_server_moves_to_the_front |
+| capability-name-allocations | 0 | ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed |
 | preresolved-pick-allocations | 0 | ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap |
 | ss-direct-write-probe-ops | 47483770 | scripts/count-ops.sh |
 | ss-flatten-write-probe-ops | 47621538 | scripts/count-ops.sh |
@@ -123,6 +124,8 @@ The protocol reference is the pinned `psiphon-tunnel-core` console client; both 
 **The single tunnel.** The lane used to replace its one session on every reconnect, so every flow shared one TCP connection and one send window. `TunnelPoolSize` keeps up to thirty-two live sessions and picks one per flow round-robin; a flow is still one `direct-tcpip` channel on one session, so byte order and the SSH stream are unchanged, while independent flows use independent connections. `TargetServerEntry` pins the pool to one, as the reference does. The live workflow takes a `pool` dispatch input and, above one, runs eight parallel downloads as the aggregate gate.
 
 **The affinity string per entry.** The first-entry lookup and the move-to-front scan used to format `host:port` for every server they scanned past, then compare the strings. Both now keep the affinity as the entry's host and port and compare those fields, so a dial with an affinity set allocates nothing while it finds the last good server; `an_affinity_lookup_does_not_format_each_entry` measures 88 allocations for the old scan and zero for the field compare over the same 64 entries, with the same index chosen, and `a_live_server_moves_to_the_front` holds the move itself at zero allocations.
+
+**The capability mask.** A capability name that needs no `-OSSH`, `-PASSTHROUGH` or CDN mapping is borrowed, and `capability_protocol` walks the entry's capability array in place instead of collecting it first, so the common server entry allocates nothing while it is matched; `capability_names_borrow_when_no_mask_is_needed` holds those comparisons at zero allocations and the masked forms at the same verdicts.
 
 **The preresolved pick.** A preresolved CIDR answer used to collect its matching family into a `Vec` and lowercase the host and provider into fresh strings. The host and provider now stay borrowed when they are already lowercase, and the family is counted and walked rather than collected, so a pick takes no heap at all; `preresolved-pick-allocations` holds 4,096 picks at zero allocations, bytes and zeroed buffers, and the uppercase-with-trailing-dot case still answers through the same borrowed-or-owned path.
 
