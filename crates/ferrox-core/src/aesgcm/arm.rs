@@ -318,6 +318,7 @@ impl Lanes for uint8x16_t {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn ctr_ghash8(
     rk: &[uint8x16_t; 11],
     ghash: &impl GhashTables,
@@ -481,6 +482,7 @@ fn sub_word(w: u32) -> u32 {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn ctr_ghash8_256(
     rk: &[uint8x16_t; 15],
     ghash: &impl GhashTables,
