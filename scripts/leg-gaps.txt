@@ -46,6 +46,8 @@ vless-xhttp-streamone-down-8|server|0.59|486|ceiling
 vless-tls-xhttp-h2-down-8|server-threads|1.85|696
 # The muxed gRPC server starts one h2 control thread per connection and pays the xray client's small stream window, the same #696 cost its vless and vmess siblings file.
 trojan-grpc-down-8|server-cpu|1.30|696
+trojan-grpc-down-8|server-threads|1.08|696
+trojan-tls-grpc-down-8|server-cpu|1.09|696
 trojan-tls-grpc-down-8|server-threads|1.15|696
 trojan-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-xhttp-h2-down-8|server-threads|1.70|696
