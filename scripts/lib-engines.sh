@@ -140,6 +140,23 @@ build() {
       leaf_cli="$(built "$engine_dir/leaf-target/release/leaf")" || return 1
       cp "$leaf_cli" "$binary" || return 1
       ;;
+    aether)
+      case "$(uname -s)" in
+        Linux | Darwin) ;;
+        *)
+          note "aether's benchmark adapter is POSIX-only"
+          return 1
+          ;;
+      esac
+      note "building the pinned Aether at $rev (long: BoringSSL, quiche)"
+      (cd "upstream/$name/aether" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/aether-target" \
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release --locked --bin aether) || return 1
+      local aether_bin
+      aether_bin="$(built "$engine_dir/aether-target/release/aether")" || return 1
+      cp "$aether_bin" "$engine_dir/aether-bin" || return 1
+      cp scripts/run-aether.py "$binary" || return 1
+      chmod +x "$binary"
+      ;;
     *)
       fail "unknown engine source `$name`"
       ;;

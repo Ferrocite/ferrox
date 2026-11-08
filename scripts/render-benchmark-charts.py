@@ -99,6 +99,7 @@ SETUP_PANELS = (
 ENGINE_ORDER = [
     "xray-core",
     "ferrox",
+    "aether",
     "xray-core-rust",
     "zeronet",
     "sing-box",
@@ -108,6 +109,7 @@ ENGINE_ORDER = [
 PALETTE = {
     "xray-core": "#4C78A8",
     "ferrox": "#F58518",
+    "aether": "#9467BD",
     "xray-core-rust": "#72B7B2",
     "zeronet": "#54A24B",
     "sing-box": "#B279A2",
@@ -402,6 +404,7 @@ def setup_chart(cells, setup_index, path, foot):
     )
 
     def draw(ax, specs):
+        """Draw each engine's setup stages as grouped bars on one axes."""
         bar_height = 0.68 / max(1, len(present))
         row_height = 0.82 / max(1, len(present))
         for index, engine in enumerate(present):
@@ -600,12 +603,15 @@ def scenario_family_chart(base, group, path, foot, setup_index):
         references[key] = benchstats.median(samples) if samples else None
 
     def server_shade(index):
+        """The bar shade for a server index."""
         return max(0.40, 0.95 - 0.22 * index)
 
     def row_label(engine, server):
+        """The y-axis label for an engine and its optional server."""
         return engine if not server else f"{engine} · {server}"
 
     def finish(ax, index):
+        """Apply the shared axes styling for one panel."""
         if index % columns == 0:
             ax.set_yticks(range(len(rows)))
             ax.set_yticklabels([row_label(*row[:2]) for row in rows])
@@ -1072,6 +1078,7 @@ def leg_tables(results):
         server = xray_on_ferrox / xray_ref if xray_on_ferrox and xray_ref else None
         rust = ferrox_on_xray / rust_on_xray if ferrox_on_xray and rust_on_xray else None
         def cell(value, measured):
+            """Render one ratio cell or its missing/gap marker."""
             if value is None:
                 return "missing **gap**" if measured else "\u2014"
             mark = " **gap**" if value < HARNESS_BOUND else ""

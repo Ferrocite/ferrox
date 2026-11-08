@@ -27,6 +27,7 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 /// A held datagram retries inside one poll grain, so a full queue never waits out a tick.
 const RETRY: Duration = Duration::from_millis(1);
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
@@ -37,7 +38,7 @@ const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 /// The authority and path xray's WARP transport dials when the config names none.
 const WARP_HOST: &str = "cloudflareaccess.com";
-const WARP_PROTOCOL: &[u8] = b"cf-connect-ip";
+pub(crate) const WARP_PROTOCOL: &[u8] = b"cf-connect-ip";
 /// The draft-datagram setting Cloudflare's endpoint reads.
 const SETTINGS_DATAGRAM_DRAFT: u64 = 0x276;
 /// The resolvers xray's MASQUE client asks when `remoteDNS` names none.
@@ -653,7 +654,7 @@ fn remote_dns(settings: &Json) -> Result<Vec<IpAddr>, String> {
 /// Cloudflare's WARP dialect of the same tunnel: the config carries the key
 /// pair instead of a password, the client mints its own certificate from that
 /// key, the endpoint authenticates by its public key rather than a chain, and
-/// the static addresses replace the proxy's assignment.
+/// the static addresses stand in when the proxy assigns none.
 #[derive(Debug, Clone)]
 pub(crate) struct Warp {
     public_key: Vec<u8>,
@@ -1056,10 +1057,16 @@ fn attempt(
         return Err(format!("masque: the edge answered {status}"));
     }
     if let Some(warp) = &spec.warp {
+        let deadline = Instant::now() + WARP_ASSIGN_WAIT;
+        let mut addresses = assigned(&mut stream);
+        while addresses.is_none() && Instant::now() < deadline {
+            stream.poll(&mut conn, sock, local, TICK)?;
+            addresses = assigned(&mut stream);
+        }
         return Ok(Lane {
             conn,
             stream: stream.id,
-            addresses: warp.local_addresses(),
+            addresses: addresses.unwrap_or_else(|| warp.local_addresses()),
             mtu: DEFAULT_MTU,
             packets: stream.packets,
             alive: Arc::new(AtomicBool::new(true)),
@@ -1092,6 +1099,36 @@ fn attempt(
         packets: stream.packets,
         alive: Arc::new(AtomicBool::new(true)),
     })
+}
+
+/// Every assignment the edge sent, in order: a WARP client uses the addresses
+/// the server routes rather than the ones it was configured with.
+fn assigned(stream: &mut Stream) -> Option<Vec<IpAddr>> {
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    for capsule in stream.take_capsules() {
+        let Owned::AddressAssign(body) = capsule else {
+            continue;
+        };
+        let mut grants = Vec::new();
+        if connectip::address_assign(&body, &mut grants).is_none() {
+            continue;
+        }
+        for version in [4, 6] {
+            if !grants.iter().any(|grant| grant.version == version) {
+                continue;
+            }
+            addresses.retain(|address| {
+                let family = if address.is_ipv4() { 4 } else { 6 };
+                family != version
+            });
+            addresses.extend(grants.iter().filter_map(|grant| {
+                (grant.version == version && !grant.refused())
+                    .then(|| address_of(grant))
+                    .flatten()
+            }));
+        }
+    }
+    (!addresses.is_empty()).then_some(addresses)
 }
 
 /// Check the WARP public key or the configured certificate pins.
@@ -1841,6 +1878,7 @@ pub(crate) struct ServerSpec {
     pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
+    pub(crate) warp: bool,
 }
 
 impl ServerSpec {
@@ -1853,20 +1891,27 @@ impl ServerSpec {
             .get("users")
             .or_else(|| settings.get("clients"))
             .and_then(Json::as_arr)
-            .ok_or("masque inbound has no `users` or `clients`")?
-            .iter()
-            .filter_map(|user| {
-                let email = user.get("email").and_then(Json::as_str)?.to_owned();
-                let password = user
-                    .get("pass")
-                    .and_then(Json::as_str)
-                    .or_else(|| user.get("password").and_then(Json::as_str))
-                    .or_else(|| user.get("account")?.get("password")?.as_str())?
-                    .to_owned();
-                Some((email, password))
+            .map(|users| {
+                users
+                    .iter()
+                    .filter_map(|user| {
+                        let email = user.get("email").and_then(Json::as_str)?.to_owned();
+                        let password = user
+                            .get("pass")
+                            .and_then(Json::as_str)
+                            .or_else(|| user.get("password").and_then(Json::as_str))
+                            .or_else(|| user.get("account")?.get("password")?.as_str())?
+                            .to_owned();
+                        Some((email, password))
+                    })
+                    .collect()
             })
-            .collect();
-        if users.is_empty() {
+            .unwrap_or_default();
+        let warp = settings
+            .get("warp")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        if users.is_empty() && !warp {
             return Err("masque inbound has no user with a password".to_owned());
         }
         let addresses: Vec<String> = settings
@@ -1898,7 +1943,23 @@ impl ServerSpec {
             path,
             pool,
             mtu,
+            warp,
         })
+    }
+
+    pub(crate) fn accepts_protocol(&self, protocol: &[u8]) -> bool {
+        protocol == b"connect-ip" || (self.warp && protocol == WARP_PROTOCOL)
+    }
+
+    pub(crate) fn path_matches(&self, path: &[u8], protocol: &[u8]) -> bool {
+        if self.warp && protocol == WARP_PROTOCOL {
+            return path_matches(path, "/");
+        }
+        path_matches(path, &self.path)
+    }
+
+    pub(crate) fn request_authenticated(&self, protocol: &[u8], header: Option<&[u8]>) -> bool {
+        (self.warp && protocol == WARP_PROTOCOL) || self.authenticates(header)
     }
 
     pub(crate) fn authenticates(&self, header: Option<&[u8]>) -> bool {
@@ -2090,6 +2151,7 @@ pub(crate) fn test_spec() -> ServerSpec {
         path: DEFAULT_PATH.to_owned(),
         pool: test_pool(),
         mtu: DEFAULT_MTU,
+        warp: false,
     }
 }
 
@@ -2391,7 +2453,7 @@ fn worker(
         }
         if conn.is_established() {
             if !tunnel.settings_sent {
-                send_server_settings(&mut conn, 3, 7, 11, false).ok();
+                send_server_settings(&mut conn, 3, 7, 11, spec.warp).ok();
                 tunnel.settings_sent = true;
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
@@ -2504,34 +2566,46 @@ fn service(
     }
 }
 
-/// Parses the request head once its HEADERS frame is whole; `false` leaves the
-/// bytes for the next read.
+/// Parses the request head once its HEADERS frame is whole, walking past the
+/// reserved frames a greasing peer sends first; `false` leaves the bytes for
+/// the next read.
 fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
-    let mut at = tunnel.at;
-    let Some(frame) = frames::h3_frame(&tunnel.buf, &mut at) else {
-        return false;
+    let block = loop {
+        let mut at = tunnel.at;
+        let Some(frame) = frames::h3_frame(&tunnel.buf, &mut at) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(frame.length) else {
+            return false;
+        };
+        let Some(end) = at.checked_add(length) else {
+            return false;
+        };
+        let Some(payload) = tunnel.buf.get(at..end) else {
+            return false;
+        };
+        tunnel.at = end;
+        if frame.kind == frames::H3_HEADERS {
+            break payload;
+        }
     };
-    if frame.kind != frames::H3_HEADERS {
-        return false;
-    }
-    let length = frame.length as usize;
-    let Some(block) = tunnel.buf.get(at..at + length) else {
-        return false;
-    };
-    at += length;
-    tunnel.at = at;
     let Some(fields) = hpack::qpack_fields(block) else {
         return false;
     };
+    tunnel.buf.drain(..tunnel.at);
+    tunnel.buf.shrink_to_fit();
+    tunnel.at = 0;
     let field = |name: &[u8]| {
         fields
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_slice())
     };
-    let path_ok = field(b":path").is_some_and(|path| path_matches(path, &spec.path));
     let method_ok = field(b":method") == Some(b"CONNECT");
-    let protocol_ok = field(b":protocol") == Some(b"connect-ip");
+    let protocol = field(b":protocol");
+    let protocol_ok = protocol.is_some_and(|protocol| spec.accepts_protocol(protocol));
+    let path_ok = field(b":path")
+        .is_some_and(|path| protocol.is_some_and(|protocol| spec.path_matches(path, protocol)));
     let capsules_ok = field(b"capsule-protocol")
         .and_then(|value| value.strip_prefix(b"?"))
         .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
@@ -2542,7 +2616,9 @@ fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
     } else if !method_ok || !protocol_ok || !capsules_ok {
         reject(tunnel, 400);
         tunnel.rejected = true;
-    } else if !spec.authenticates(field(b"authorization")) {
+    } else if !protocol
+        .is_some_and(|protocol| spec.request_authenticated(protocol, field(b"authorization")))
+    {
         reject_auth(tunnel);
         tunnel.rejected = true;
     }
@@ -3133,6 +3209,7 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             pool: AddressPool::default(),
             mtu: DEFAULT_MTU,
+            warp: false,
         };
         let victim: IpAddr = "10.14.0.3".parse().expect("an address");
         let (to_victim, forwarded) = mpsc::sync_channel(4);
@@ -3207,6 +3284,7 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             pool: AddressPool::default(),
             mtu: DEFAULT_MTU,
+            warp: false,
         };
         let owner: IpAddr = "10.14.0.2".parse().expect("an address");
         let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
@@ -4128,6 +4206,99 @@ mod tests {
     }
 
     #[test]
+    fn a_warp_server_accepts_the_cloudflare_dialect_without_basic_auth() {
+        let header = Some(&b"Basic dUBleGFtcGxlLmNvbTpw"[..]);
+        let spec = ServerSpec::from(&inbound(
+            r#"{"warp":true,"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
+        ))
+        .expect("a warp server spec");
+        assert!(spec.accepts_protocol(WARP_PROTOCOL));
+        assert!(spec.accepts_protocol(b"connect-ip"));
+        assert!(spec.path_matches(b"/", WARP_PROTOCOL));
+        assert!(!spec.path_matches(b"/", b"connect-ip"));
+        assert!(spec.request_authenticated(WARP_PROTOCOL, None));
+        assert!(!spec.request_authenticated(b"connect-ip", None));
+        assert!(spec.request_authenticated(b"connect-ip", header));
+        assert!(ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#)).is_ok());
+        assert!(ServerSpec::from(&inbound(r#"{"address":["10.14.0.1/24"]}"#)).is_err());
+    }
+
+    fn head_tunnel(buf: Vec<u8>) -> Tunnel {
+        let (sender, outgoing) = mpsc::sync_channel(1);
+        let (tx, _rx) = mpsc::channel();
+        Tunnel {
+            stream: Some(0),
+            buf,
+            at: 0,
+            headers: false,
+            capsules: Vec::new(),
+            capsule_at: 0,
+            opened: false,
+            rejected: false,
+            settings_sent: false,
+            pending: None,
+            unsent: None,
+            outgoing,
+            queue: TunnelQueue::new(sender, Some(tx)),
+            addrs: Vec::new(),
+            granted: None,
+            registered: Vec::new(),
+        }
+    }
+
+    /// quiche greases a request stream before the HEADERS frame; a peer that stops at the first
+    /// frame refuses a head xray never sends and the client waits on a status that never comes.
+    #[test]
+    fn a_greased_head_is_read_after_the_reserved_frames() {
+        let spec = ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#))
+            .expect("a warp server spec");
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "CONNECT"),
+                (":protocol", "cf-connect-ip"),
+                (":scheme", "https"),
+                (":authority", "cloudflareaccess.com"),
+                (":path", "/"),
+                ("user-agent", ""),
+                ("capsule-protocol", "?1"),
+            ],
+            &mut block,
+        );
+        let mut buf = Vec::new();
+        frames::quic_varint(&mut buf, 0x21);
+        frames::quic_varint(&mut buf, 0);
+        frames::quic_varint(&mut buf, 0x33);
+        frames::quic_varint(&mut buf, b"GREASE is the word".len() as u64);
+        buf.extend_from_slice(b"GREASE is the word");
+        frames::quic_varint(&mut buf, frames::H3_HEADERS);
+        frames::quic_varint(&mut buf, block.len() as u64);
+        buf.extend_from_slice(&block);
+        let mut tunnel = head_tunnel(buf);
+        assert!(parse_head(&mut tunnel, &spec));
+        assert!(tunnel.headers);
+        assert!(!tunnel.rejected);
+        assert_eq!(tunnel.at, 0);
+        assert!(!tunnel.buf.windows(6).any(|window| window == b"GREASE"));
+    }
+
+    #[test]
+    fn an_incomplete_grease_frame_leaves_the_head_to_the_next_read() {
+        let spec = ServerSpec::from(&inbound(r#"{"warp":true,"address":["10.14.0.1/24"]}"#))
+            .expect("a warp server spec");
+        let mut buf = Vec::new();
+        frames::quic_varint(&mut buf, 0x33);
+        frames::quic_varint(&mut buf, 4);
+        buf.extend_from_slice(b"GRE");
+        let mut tunnel = head_tunnel(buf);
+        assert!(!parse_head(&mut tunnel, &spec));
+        assert_eq!(tunnel.at, 0);
+        tunnel.buf.push(b'A');
+        assert!(!parse_head(&mut tunnel, &spec));
+        assert_eq!(tunnel.at, 6, "the whole grease frame was walked past");
+    }
+
+    #[test]
     fn a_request_path_reads_the_way_xray_parses_it() {
         assert!(path_matches(b"/.well-known/masque/ip/*/*/", DEFAULT_PATH));
         assert!(path_matches(
@@ -4198,6 +4369,53 @@ mod tests {
             Json::Str("172.16.0.3/32".to_owned()),
         ];
         assert!(warp_addresses(&twice).is_err());
+    }
+
+    /// Encode one `ADDRESS_ASSIGN` capsule as the client's stream parser sees it.
+    fn assignment(addrs: &[IpAddr]) -> Owned {
+        let mut wire = Vec::new();
+        connectip::address_assign_encode(&grants(addrs, 0), &mut wire);
+        let (_, connectip::Capsule::AddressAssign(body)) =
+            connectip::capsule_split(&wire).expect("a capsule")
+        else {
+            panic!("an assignment capsule");
+        };
+        Owned::AddressAssign(body.to_vec())
+    }
+
+    #[test]
+    fn a_warp_client_takes_every_address_the_edge_assigns() {
+        let v4 = "172.16.0.9".parse::<IpAddr>().expect("v4");
+        let v6 = "fd00::9".parse::<IpAddr>().expect("v6");
+        let mut stream = Stream {
+            pending: vec![assignment(&[v4]), assignment(&[v6])],
+            ..Stream::default()
+        };
+        assert_eq!(assigned(&mut stream), Some(vec![v4, v6]));
+        assert_eq!(assigned(&mut stream), None);
+
+        let refused = connectip::Assigned {
+            request_id: 0,
+            version: 4,
+            address: [0u8; 16],
+            prefix: 32,
+        };
+        let mut wire = Vec::new();
+        connectip::address_assign_encode(&[refused], &mut wire);
+        let (_, connectip::Capsule::AddressAssign(body)) =
+            connectip::capsule_split(&wire).expect("a capsule")
+        else {
+            panic!("an assignment capsule");
+        };
+        let mut stream = Stream {
+            pending: vec![
+                assignment(&[v4]),
+                assignment(&[v6]),
+                Owned::AddressAssign(body.to_vec()),
+            ],
+            ..Stream::default()
+        };
+        assert_eq!(assigned(&mut stream), Some(vec![v6]));
     }
 
     #[test]

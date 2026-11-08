@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["upstream"]
 members = [
   "crates/ferrox-core",
   "crates/ferrox-bench",
