@@ -20131,7 +20131,7 @@ fn serve_trojan_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_trojan_xhttp(reader, writer, settings, key, freedom);
+            serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom);
         }
         Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -20639,6 +20639,7 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     if !h2 {
         return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
     }
+    // The demux parks on the socket between frames, so eight connections add lanes, not threads.
     let keys: Vec<[u8; 56]> = key.to_vec();
     let service = crate::xhttp_h2::XhttpSessionService::new(
         settings.clone(),
@@ -20646,7 +20647,19 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
             serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
         }),
     );
-    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+    let until = Instant::now() + crate::budgets::handshake();
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut step = crate::xhttp_h2::h2_lane(chained, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    lane_pool::submit_demux(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
 }
 
 fn serve_trojan_xhttp_accepted(
@@ -50831,6 +50844,188 @@ mod tests {
             },
             tls_xhttp_accept,
         );
+    }
+
+    /// The benchmark's trojan/`xhttp`/h2 row writes `mode: auto`, which the reference resolves to
+    /// packet-up on a TLS carrier: one GET downlink and a POST stream per packet on the one h2
+    /// connection. The download has to cross the 4 MiB stream window and keep flowing, so a body
+    /// past that window proves both the client's reader and the server's writer replenish it.
+    #[test]
+    fn a_packet_up_trojan_h2_download_crosses_the_stream_window() {
+        const BULK: usize = 16 * 1024 * 1024;
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let key = trojan_key("packet-up-h2-bulk-download");
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds sink");
+        let sink_addr: SocketAddr = sink.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            let chunk = vec![0x5Au8; 65536];
+            let mut left = BULK;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                stream.write_all(&chunk[..n]).expect("writes the bulk");
+                left -= n;
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut rest = [0u8; 1024];
+            while stream.read(&mut rest).unwrap_or(0) != 0 {}
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            path: "/share".to_owned(),
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        });
+        let server_settings = settings.clone();
+        let serving = Arc::clone(&server_config);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_tls(
+                stream,
+                &[key],
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                true,
+                &serving,
+                None,
+            );
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds downstream");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            dial_socks_outbound(
+                &client,
+                &tls_trojan_out(port, key, Carrier::Xhttp { settings }, client_config),
+                &server,
+                &Destination::from(sink_addr),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 65536];
+        while got < BULK {
+            let n = sock
+                .read(&mut buf)
+                .expect("the packet-up h2 download must not stall");
+            assert!(n > 0, "the download ended early at {got} of {BULK}");
+            got += n;
+        }
+        assert_eq!(got, BULK);
+    }
+
+    /// The benchmark's download opens eight connections at once, and every one must finish: one
+    /// flow can hide lane starvation that eight expose. Crossing the window is the single-flow
+    /// test's claim; this one only has to see all eight relays get a turn.
+    #[test]
+    fn eight_packet_up_trojan_h2_downloads_complete() {
+        const BULK: usize = 256 * 1024;
+        const FLOWS: usize = 8;
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let key = trojan_key("packet-up-h2-eight-flows");
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds sink");
+        let sink_addr: SocketAddr = sink.local_addr().expect("addr");
+        thread::spawn(move || {
+            for _ in 0..FLOWS {
+                let (mut stream, _) = sink.accept().expect("accepts sink");
+                thread::spawn(move || {
+                    let chunk = vec![0x6Bu8; 65536];
+                    let mut left = BULK;
+                    while left > 0 {
+                        let n = left.min(chunk.len());
+                        stream.write_all(&chunk[..n]).expect("writes the bulk");
+                        left -= n;
+                    }
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let mut rest = [0u8; 1024];
+                    while stream.read(&mut rest).unwrap_or(0) != 0 {}
+                });
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            path: "/share".to_owned(),
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        });
+        let server_settings = (*settings).clone();
+        let keys = vec![key];
+        thread::spawn(move || {
+            for _ in 0..FLOWS {
+                let (stream, _) = listener.accept().expect("accepts");
+                stream.set_read_timeout(Some(RELAY_POLL)).expect("poll");
+                let Ok(out) = stream.try_clone() else {
+                    continue;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server_config, stream) else {
+                    continue;
+                };
+                let settings = server_settings.clone();
+                let keys = keys.clone();
+                run_tls_handshake(session, move |session, prefix| {
+                    let _flow = lane_flow(None, None, "", 0);
+                    let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
+                    serve_trojan_xhttp_carrier(reader, writer, &settings, &keys, true);
+                });
+            }
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds downstream");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for _ in 0..FLOWS {
+                let (client, _) = downstream.accept().expect("accepts");
+                let out = tls_trojan_out(
+                    port,
+                    key,
+                    Carrier::Xhttp {
+                        settings: settings.clone(),
+                    },
+                    client_config.clone(),
+                );
+                let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+                thread::spawn(move || {
+                    dial_socks_outbound(&client, &out, &server, &Destination::from(sink_addr));
+                });
+            }
+        });
+        let mut readers = Vec::new();
+        for _ in 0..FLOWS {
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("timeout");
+            readers.push(thread::spawn(move || {
+                let mut got = 0usize;
+                let mut buf = vec![0u8; 65536];
+                while got < BULK {
+                    let n = sock.read(&mut buf).expect("the download must not stall");
+                    assert!(n > 0, "a flow ended early at {got} of {BULK}");
+                    got += n;
+                }
+                got
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.join().expect("flow"), BULK);
+        }
     }
 
     #[test]
