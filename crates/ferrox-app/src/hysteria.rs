@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,6 +126,21 @@ impl Driver {
             return wake;
         }
         StreamWake::new()
+    }
+
+    /// The wake of a stream this driver has not seen, or `None` when one is already registered: the served side uses the map itself as its served set, so a packet that names an already-running stream costs one probe, not a separate set's probe and then this map's.
+    pub(crate) fn claim(&self, stream: u64) -> Option<Arc<StreamWake>> {
+        let Ok(mut streams) = self.streams.lock() else {
+            return None;
+        };
+        match streams.entry(stream) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let wake = StreamWake::new();
+                slot.insert(Arc::clone(&wake));
+                Some(wake)
+            }
+        }
     }
 
     /// Binds this reader to a session and starts it: the session, its flows and its writers all hold one driver.
@@ -1230,7 +1245,6 @@ struct Inbound {
     settings_sent: bool,
     settings_done: bool,
     auth_buf: Vec<u8>,
-    served: HashSet<u64>,
     wakes: Arc<Driver>,
     udp: HashMap<u32, UdpFlow>,
     /// The listener's `brutalDown`, answered as this client's `hysteria-cc-rx` hint.
@@ -2049,22 +2063,18 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
 
 /// Fold every datagram that arrived on this connection into its session's reassembly and relay the whole messages to their target sockets, raising an association on a session's first datagram. A datagram before auth is not for the lane yet, and a reassembly that rejects a forged fragment retires its session.
 fn relay_datagrams(
-    routes: &mut HashMap<Vec<u8>, Inbound>,
+    inbound: &mut Inbound,
     sock: &Arc<crate::quic::Datagram>,
     shared: &Arc<Mutex<quiche::Connection>>,
-    dcid: &[u8],
     conn: &mut quiche::Connection,
 ) {
+    if !inbound.authed {
+        return;
+    }
     while let Ok(data) = conn.dgram_recv_buf() {
         let Ok(message) = hysteria::decode_udp(&data) else {
             continue;
         };
-        let Some(inbound) = routes.get_mut(dcid) else {
-            return;
-        };
-        if !inbound.authed {
-            continue;
-        }
         let session = message.session;
         let flow = match inbound.udp.entry(session) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -2211,7 +2221,6 @@ impl Router<'_> {
             settings_sent: false,
             settings_done: false,
             auth_buf: Vec::new(),
-            served: HashSet::new(),
             wakes: Driver::new(),
             udp: HashMap::new(),
             cc_rx: self.cc_rx,
@@ -2276,9 +2285,10 @@ impl Router<'_> {
             local,
             ..
         } = self;
-        let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
+        let Some(inbound) = routes.get_mut(dcid) else {
             return;
         };
+        let shared = Arc::clone(&inbound.conn);
         let info = quiche::RecvInfo { from, to: *local };
         {
             let Ok(mut conn) = shared.lock() else {
@@ -2292,35 +2302,19 @@ impl Router<'_> {
                 crate::quic::flush_egress(&mut conn, sock);
                 return;
             }
-            let Some((mut settings_done, settings_sent, authed)) = routes
-                .get(dcid)
-                .map(|i| (i.settings_done, i.settings_sent, i.authed))
-            else {
-                return;
-            };
-            if !settings_done {
-                settings_done = drain_settings(&mut conn);
-                if settings_done {
-                    if let Some(inbound) = routes.get_mut(dcid) {
-                        inbound.settings_done = true;
-                    }
-                }
+            if !inbound.settings_done {
+                inbound.settings_done = drain_settings(&mut conn);
             }
             // The server's SETTINGS go out before its auth answer: a client whose H3 stack waits for them, as the pinned one does, posts its auth only after they arrive.
-            if !settings_sent {
+            if !inbound.settings_sent {
                 let mut settings = Vec::new();
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
                 let _ = conn.stream_send(3, &settings, true);
                 crate::quic::flush_egress(&mut conn, sock);
-                if let Some(inbound) = routes.get_mut(dcid) {
-                    inbound.settings_sent = true;
-                }
+                inbound.settings_sent = true;
             }
-            if !authed {
-                let Some(inbound) = routes.get_mut(dcid) else {
-                    return;
-                };
+            if !inbound.authed {
                 let Some(ok) = auth_exchange(sock, &mut conn, auths, inbound, from, masq) else {
                     return;
                 };
@@ -2334,14 +2328,9 @@ impl Router<'_> {
                 if id < FIRST_FLOW_STREAM || id % 4 != 0 {
                     continue;
                 }
-                let Some(inbound) = routes.get_mut(dcid) else {
-                    return;
-                };
-                let wake = inbound.wakes.register(id);
-                if inbound.served.contains(&id) {
+                let Some(wake) = inbound.wakes.claim(id) else {
                     continue;
-                }
-                inbound.served.insert(id);
+                };
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
@@ -2361,7 +2350,7 @@ impl Router<'_> {
                     );
                 });
             }
-            relay_datagrams(routes, sock, &shared, dcid, &mut conn);
+            relay_datagrams(inbound, sock, &shared, &mut conn);
         }
     }
 
@@ -3124,7 +3113,6 @@ mod tests {
                     settings_sent: true,
                     settings_done: true,
                     auth_buf: Vec::new(),
-                    served: HashSet::new(),
                     wakes: Driver::new(),
                     udp,
                     cc_rx: 0,
@@ -3307,7 +3295,6 @@ mod tests {
                     settings_sent: false,
                     settings_done: false,
                     auth_buf: Vec::new(),
-                    served: HashSet::new(),
                     wakes: Driver::new(),
                     udp: HashMap::new(),
                     cc_rx: 0,
@@ -3387,6 +3374,22 @@ mod tests {
             "the payload stayed where it arrived"
         );
         assert_eq!(&flow.backlog[flow.at..], payload);
+    }
+
+    /// A stream is served by the turn that first claims it, and a second claim leaves the pump's wake alone.
+    #[test]
+    fn a_stream_is_claimed_by_the_turn_that_serves_it() {
+        let driver = Driver::new();
+        let wake = driver.claim(4).expect("the first claim serves the stream");
+        assert!(
+            driver.claim(4).is_none(),
+            "a served stream is not served twice"
+        );
+        assert!(
+            Arc::ptr_eq(&wake, &driver.register(4)),
+            "the claim left the wake the pump bumps"
+        );
+        assert!(driver.claim(8).is_some(), "another stream is its own claim");
     }
 
     #[test]
