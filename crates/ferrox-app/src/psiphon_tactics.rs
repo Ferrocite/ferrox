@@ -253,6 +253,7 @@ fn api_params(identity: &Identity<'_>, compress_tactics: bool) -> String {
     body
 }
 
+/// Parse a broker response, sending binary CBOR straight to the CBOR decoder.
 fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
     let payload = if payload.first().is_some_and(|byte| *byte >= 0x80) {
         crate::psiphon_broker::cbor_tactics_to_json(payload)
@@ -268,6 +269,7 @@ fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
     Ok(tactics_from_json(&payload))
 }
 
+/// Read the `Tactics` value from the JSON view of a broker response.
 fn tactics_from_json(payload: &Json) -> Tactics {
     let tag = payload
         .get("Tag")
