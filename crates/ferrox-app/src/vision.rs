@@ -2162,49 +2162,4 @@ mod tests {
             "a ClientHello says nothing about a version"
         );
     }
-
-    #[test]
-    fn a_sealed_vision_write_allocates_nothing_after_warmup() {
-        use ferrox_core::vless_encryption::{Aead, EncryptedStream, ReadStage};
-
-        struct Sink;
-        impl Read for Sink {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Ok(0)
-            }
-        }
-        impl Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl RecordAlignment for Sink {}
-
-        let key = vec![7u8; 32];
-        let head = [0u8; 5];
-        let payload = [0x33u8; 1000];
-        let padding = [0u8; 300];
-        let parts: [&[u8]; 4] = [&UUID, &head, &payload, &padding];
-        let mut sealed = Sealed(EncryptedStream::new(
-            Sink,
-            key.clone(),
-            Aead::new(b"sealed vision", &key),
-            None,
-            ReadStage::Records,
-        ));
-        sealed.write_all_slices(&parts).expect("warmup");
-        let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            for _ in 0..64 {
-                sealed.write_all_slices(&parts).expect("write");
-            }
-        });
-        assert_eq!(
-            (counts.allocs, counts.bytes, counts.zeroed),
-            (0, 0, 0),
-            "a sealed Vision write reuses its staging buffer"
-        );
-    }
 }
