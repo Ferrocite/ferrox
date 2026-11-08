@@ -707,15 +707,15 @@ impl Config {
         networks
     }
 
-    /// A live cached answer, dropping an expired entry.
-    fn cache_get(&self, host: &str) -> Option<Vec<IpAddr>> {
+    /// A live cached answer as sockets, dropping an expired entry and copying no address vector.
+    fn cache_addrs(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
         let mut cache = self.cache.lock().ok()?;
         let entry = cache.get(host)?;
         if entry.expires <= Instant::now() {
             cache.remove(host);
             return None;
         }
-        Some(entry.addresses.clone())
+        Some(with_port(&entry.addresses, port))
     }
 
     /// Cache an answer for its TTL, evicting expired entries at the limit.
@@ -747,16 +747,16 @@ impl Config {
         if self.cache_extension_verified.is_zero() || host.parse::<IpAddr>().is_ok() {
             return;
         }
-        let name = host.trim_end_matches('.').to_ascii_lowercase();
+        let name = lower_ascii(host.trim_end_matches('.'));
         let Ok(mut cache) = self.cache.lock() else {
             return;
         };
-        let Some(entry) = cache.get_mut(&name) else {
+        let Some(entry) = cache.get_mut(name.as_ref()) else {
             return;
         };
         let now = Instant::now();
         if entry.expires <= now {
-            cache.remove(&name);
+            cache.remove(name.as_ref());
             return;
         }
         let extended = now + self.cache_extension_verified;
@@ -796,9 +796,9 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
     if let Ok(address) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(address, port)]);
     }
-    let name = host.trim_end_matches('.').to_ascii_lowercase();
-    if let Some(addresses) = config.cache_get(&name) {
-        return Ok(with_port(addresses, port));
+    let name = lower_ascii(host.trim_end_matches('.'));
+    if let Some(addresses) = config.cache_addrs(name.as_ref(), port) {
+        return Ok(addresses);
     }
     let prefer_alternate = coin(config.prefer_alternate_probability);
     if !prefer_alternate {
@@ -847,10 +847,17 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
             } else {
                 QuestionMatch::None
             };
-            match query(&name, *server, config, use_transform, question_match) {
+            match query(
+                name.as_ref(),
+                *server,
+                config,
+                use_transform,
+                question_match,
+            ) {
                 Ok((addresses, ttl)) if !addresses.is_empty() => {
-                    config.cache_put(&name, addresses.clone(), ttl);
-                    return Ok(with_port(addresses, port));
+                    let sockets = with_port(&addresses, port);
+                    config.cache_put(name.as_ref(), addresses, ttl);
+                    return Ok(sockets);
                 }
                 Ok(_) => {
                     last = io::Error::new(
@@ -895,7 +902,7 @@ pub(crate) fn resolve_fronting(
     if addresses.is_empty() {
         resolve_with(config, host, port)
     } else {
-        Ok(with_port(addresses, port))
+        Ok(with_port(&addresses, port))
     }
 }
 
@@ -911,11 +918,11 @@ fn alternate_servers(config: &Config) -> Vec<SocketAddr> {
     servers
 }
 
-/// Pair every address with the requested port.
-fn with_port(addresses: Vec<IpAddr>, port: u16) -> Vec<SocketAddr> {
+/// Pair every address with the requested port without taking ownership of the address vector.
+fn with_port(addresses: &[IpAddr], port: u16) -> Vec<SocketAddr> {
     addresses
-        .into_iter()
-        .map(|address| SocketAddr::new(address, port))
+        .iter()
+        .map(|address| SocketAddr::new(*address, port))
         .collect()
 }
 
@@ -1344,6 +1351,29 @@ mod tests {
         responder.join().expect("responder");
         let second = resolve_with(&config, "psiphon.test", 443).expect("cached");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    /// A cached answer builds one socket vector: the lowercase name stays borrowed and the
+    /// cached addresses are read in place rather than cloned.
+    fn a_cached_answer_takes_one_vector() {
+        let config = Config::from_servers(&[]);
+        config.cache_put(
+            "psiphon.test",
+            vec![
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+                "2001:db8::7".parse().expect("v6"),
+            ],
+            std::time::Duration::from_secs(60),
+        );
+        let (addresses, counts) = ferrox_core::alloc_count::measure(|| {
+            resolve_with(&config, "psiphon.test", 443).expect("cached")
+        });
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(
+            counts.allocs, 1,
+            "a cached answer allocated more than its socket vector"
+        );
     }
 
     #[test]
