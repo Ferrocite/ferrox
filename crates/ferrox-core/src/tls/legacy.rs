@@ -355,6 +355,7 @@ pub struct Session<S: Stream> {
     handshake: Option<MidHandshakeSslStream<S>>,
     stream: Option<SslStream<S>>,
     leaf: Vec<u8>,
+    ocsp: Vec<u8>,
     suites: Vec<u16>,
     resume: Option<Key>,
     eof: bool,
@@ -375,6 +376,9 @@ impl<S: Stream> Session<S> {
     pub fn connect(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
         let ctx = context(cfg)?;
         let mut ssl = Ssl::new(&ctx).map_err(|e| error_stack(&e))?;
+        // Ask for the status the listener staples: BoringSSL only answers a request it saw.
+        ssl.set_status_type(boring::ssl::StatusType::OCSP)
+            .map_err(|e| error_stack(&e))?;
         let resume = cfg.resumption.then(|| key(cfg));
         if let Some(session) = resume.as_ref().and_then(take_session) {
             // SAFETY: the session and the context are keyed by the same inputs, so the context minted it.
@@ -391,6 +395,7 @@ impl<S: Stream> Session<S> {
             handshake: Some(ssl.setup_connect(io)),
             stream: None,
             leaf: Vec::new(),
+            ocsp: Vec::new(),
             suites: cfg.cipher_suites.to_vec(),
             resume,
             eof: false,
@@ -450,6 +455,11 @@ impl<S: Stream> TlsProvider for Session<S> {
                     .peer_certificate()
                     .and_then(|cert| cert.to_der().ok())
                     .unwrap_or_default();
+                self.ocsp = done
+                    .ssl()
+                    .ocsp_status()
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default();
                 if let Some(key) = &self.resume {
                     if let Some(session) = done.ssl().session() {
                         keep_session(key, session.to_owned());
@@ -494,6 +504,10 @@ impl<S: Stream> TlsProvider for Session<S> {
 
     fn peer_leaf(&self) -> Option<&[u8]> {
         (!self.leaf.is_empty()).then_some(self.leaf.as_slice())
+    }
+
+    fn peer_ocsp(&self) -> Option<&[u8]> {
+        (!self.ocsp.is_empty()).then_some(self.ocsp.as_slice())
     }
 }
 

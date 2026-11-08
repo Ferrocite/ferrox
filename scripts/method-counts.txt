@@ -591,9 +591,9 @@ ocsp-stapling-anti-replay-time-window-caches ops-retired-instructions UNBLESSED 
 ocsp-stapling-anti-replay-time-window-caches syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
 ocsp-stapling-anti-replay-time-window-caches relay-staging-copies-per-byte UNBLESSED not measured
 ocsp-stapling-anti-replay-time-window-caches seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
-ocsp-stapling-anti-replay-time-window-caches ocsp-fetch-unit-tests 8 ferrox-core-tls::ocsp::tests
+ocsp-stapling-anti-replay-time-window-caches ocsp-fetch-unit-tests 11 ferrox-core-tls::ocsp::tests
 ocsp-stapling-anti-replay-time-window-caches ocsp-handshake-witness-tests 5 ferrox-core-tls::rustls_backend::tests::a_stapled_identity_reaches_the_client_and_is_checked
-ocsp-stapling-anti-replay-time-window-caches vmess-history-tests 3 ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime
+ocsp-stapling-anti-replay-time-window-caches vmess-history-tests 4 ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime
 ocsp-stapling-anti-replay-time-window-caches ocsp-config-tests 1 ferrox-app-config::tests::an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it
 
 # --- uTLS-shaped ClientHello (matrix row 38) --------------------------------

@@ -14,7 +14,8 @@ the CertID xray's `ocsp.CreateRequest` builds — SHA-1 over the issuer's subjec
 key, the leaf's serial — and posts it over plain HTTP. `TlsServerConfig.renew` re-fetches on the
 existing ticker and swaps the staple only when the bytes change, so a steady responder never
 rebuilds the listener; the config preloads once at identity build the way xray-core-rust's stapler
-`preload`s, rather than waiting an interval for the first status. `VMess::SessionHistory` was the
+`preload`s, rather than waiting an interval for the first status. `oneTimeLoading` pins the
+identity as read, so an entry naming both staples nothing. `VMess::SessionHistory` was the
 one cache this tree did not carry: `accept_request` now refuses a header whose user, body key and
 body IV were admitted inside the lifetime, with the sweep folded into the admission so no second
 thread exists.
@@ -48,9 +49,9 @@ graph TD
 | syscalls-per-relayed-megabyte | UNBLESSED | scripts/count-ops.sh |
 | relay-staging-copies-per-byte | UNBLESSED | not measured |
 | seconds-per-relayed-megabyte | UNBLESSED | .github/workflows/bench.yml |
-| ocsp-fetch-unit-tests | 8 | ferrox-core-tls::ocsp::tests |
+| ocsp-fetch-unit-tests | 11 | ferrox-core-tls::ocsp::tests |
 | ocsp-handshake-witness-tests | 5 | ferrox-core-tls::rustls_backend::tests::a_stapled_identity_reaches_the_client_and_is_checked |
-| vmess-history-tests | 3 | ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime |
+| vmess-history-tests | 4 | ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime |
 | ocsp-config-tests | 1 | ferrox-app-config::tests::an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it |
 <!-- counts:end -->
 
@@ -58,7 +59,7 @@ graph TD
 
 ```bash
 ./scripts/count-ops.sh report \
-  tls::ocsp::tests::a_chain_staples_from_a_loopback_responder
+  tls::ocsp::tests::a_chain_staples_from_a_loopback_responder 'ocsp::staple_for'
 ```
 
 `UNBLESSED`. The fetch runs once per interval at config time, not per byte relayed; its cost is a
@@ -89,12 +90,16 @@ artefact has been read. The benchmark is the dispatch, never a laptop run.
 - **No second stapling mechanism.** xray-core-rust wraps the resolver in `ocsp-stapler`'s
   background worker; this tree staples by attaching the response to the `CertifiedKey` every lane
   already builds, and refreshes through the cert ticker it already runs. The costs that were *not*
-  removed: BoringSSL validates the staple where the rustls webpki build only traces it, and the
-  configured `https` responder is refused — Go's `http.Post` would dial it, and this fetch is
-  `http`-only, so a cert naming only `https` responders staples nothing, warned once at load.
-- **The fetch does not wait out Go's deadline-free dial.** xray's fetch blocks dialing with no
-  bound; the fetch here is bounded at 10 s. That is the named ceiling: a slower responder gives up
-  where Go holds.
+  removed: no client lane in this tree validates the staple — the rustls verifier traces it, the
+  Boring lane passes an empty response to its verify callback, and the shaped client carries it to
+  the same chain verifier — and the configured `https` responder is refused: Go's `http.Post`
+  would dial it, and this fetch is `http`-only, so a cert naming only `https` responders staples
+  nothing, warned once at load.
+- **The fetch is bounded once connected, not in total.** xray's fetch blocks dialing with no
+  bound; the fetch here bounds each read and write at 10 s and caps the response at 64 KiB, and
+  the connect runs on the process's own timeout the way `reality`'s splice dials, so a slow drip
+  responder can hold the ticker thread far longer than any one timeout. That is the named ceiling:
+  a slower responder gives up where Go holds a single write open.
 
 ## Pins
 

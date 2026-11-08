@@ -1095,12 +1095,13 @@ impl<S: Stream> RustlsServerProvider<S> {
             let ctx = cached_ech_server_context(&cfg)?;
             let mut ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
             if let Some(response) = cfg
-                .certs
+                .served_entries()
                 .first()
                 .and_then(|entry| entry.ocsp.as_ref())
                 .and_then(|ocsp| ocsp.response.as_ref())
+                .cloned()
             {
-                ssl.set_ocsp_status(response).ok();
+                ssl.set_ocsp_status(&response).ok();
             }
             return Ok(Self {
                 inner: ServerInner::Boring {
@@ -1124,12 +1125,13 @@ impl<S: Stream> RustlsServerProvider<S> {
             let ctx = crate::tls::legacy::server_context(&cfg)?;
             let mut ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
             if let Some(response) = cfg
-                .certs
+                .served_entries()
                 .first()
                 .and_then(|entry| entry.ocsp.as_ref())
                 .and_then(|ocsp| ocsp.response.as_ref())
+                .cloned()
             {
-                ssl.set_ocsp_status(response).ok();
+                ssl.set_ocsp_status(&response).ok();
             }
             return Ok(Self {
                 inner: ServerInner::Boring {
@@ -4317,7 +4319,7 @@ mod tests {
     /// client the same way.
     #[cfg_attr(miri, ignore = "needs a loopback socket")]
     #[test]
-    fn a_legacy_listener_staples_and_a_stock_client_checks_it() {
+    fn a_legacy_listener_staples_and_a_boring_client_reads_it() {
         let mut identity = plain_identity();
         identity.certs[0].ocsp = Some(garbage_staple());
         identity.cipher_suites = vec![0xc009];
@@ -4329,11 +4331,15 @@ mod tests {
                 let mut server = RustlsServerProvider::accept(identity, stream).expect("settles");
                 let _ = server.handshake();
             });
-            let mut client = stock_session(stock_client(&[&rustls::version::TLS12]));
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-            assert!(
-                client.complete_io(&mut stream).is_err(),
-                "the legacy staple must reach and fail the stock client"
+            let mut config = client("tls.test", &[]);
+            config.cipher_suites = vec![0xc009].into();
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut session = crate::tls::connect(&config, stream).expect("dials");
+            session.handshake().expect("handshakes");
+            assert_eq!(
+                session.peer_ocsp(),
+                Some(&b"not an OCSP response"[..]),
+                "the legacy staple reached the client verbatim"
             );
         });
     }

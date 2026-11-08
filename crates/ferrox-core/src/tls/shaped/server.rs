@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 const CURVES: [u16; 4] = [0x001d, 0x0017, 0x0018, 0x0019];
 
 /// A parsed `ClientHello`: the fields a TLS 1.2 full handshake reads.
+#[allow(clippy::struct_excessive_bools)]
 struct Hello {
     version: u16,
     random: [u8; 32],
@@ -31,6 +32,7 @@ struct Hello {
     point_formats: bool,
     versions: Option<Vec<u16>>,
     secure: bool,
+    ocsp_requested: bool,
 }
 
 impl Hello {
@@ -61,6 +63,7 @@ impl Hello {
             point_formats: true,
             versions: None,
             secure: false,
+            ocsp_requested: false,
         };
         if r.done() {
             return Ok(out);
@@ -100,6 +103,7 @@ impl Hello {
                         out.alpn.push(names.vec8()?.to_vec());
                     }
                 }
+                0x0005 => out.ocsp_requested = true,
                 0x0017 => out.ems = true,
                 0x002b => {
                     let mut v = Reader::new(value);
@@ -309,8 +313,9 @@ impl<S: Stream> Server<S> {
         hello.tls12()?;
         self.sni = hello.sni.as_ref().map(|name| name.as_bytes().to_vec());
 
-        let cert = self.pick_cert(hello.sni.as_deref())?;
-        let key = PKey::private_key_from_der(&self.cfg.certs[cert].key_der)
+        let certs = self.cfg.served_entries();
+        let cert = self.pick_cert(&certs, hello.sni.as_deref())?;
+        let key = PKey::private_key_from_der(&certs[cert].key_der)
             .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
         let rsa = key.rsa().is_ok();
         let suite_id = crate::tls::cipher_suites::server_pick(
@@ -349,22 +354,24 @@ impl<S: Stream> Server<S> {
         let mut transcript = Vec::new();
         transcript.extend_from_slice(&hello_message);
         transcript.extend_from_slice(&flight);
-        let certificate = certificate_message(&self.cfg.certs[cert].cert_chain);
+        let certificate = certificate_message(&certs[cert].cert_chain);
         transcript.extend_from_slice(&certificate);
         flight.extend_from_slice(&certificate);
-        // The staple rides after the chain, the order a Go server answers a `status_request` with.
-        if let Some(response) = self.cfg.certs[cert]
-            .ocsp
-            .as_ref()
-            .and_then(|ocsp| ocsp.response.as_ref())
-        {
-            let mut status = Vec::with_capacity(4 + response.len());
-            status.push(1);
-            status.extend_from_slice(&(response.len() as u32).to_be_bytes()[1..]);
-            status.extend_from_slice(response);
-            let status = message(22, &status);
-            transcript.extend_from_slice(&status);
-            flight.extend_from_slice(&status);
+        // The staple rides after the chain, only for a client that requested it.
+        if hello.ocsp_requested {
+            if let Some(response) = certs[cert]
+                .ocsp
+                .as_ref()
+                .and_then(|ocsp| ocsp.response.as_ref())
+            {
+                let mut status = Vec::with_capacity(4 + response.len());
+                status.push(1);
+                status.extend_from_slice(&(response.len() as u32).to_be_bytes()[1..]);
+                status.extend_from_slice(response);
+                let status = message(22, &status);
+                transcript.extend_from_slice(&status);
+                flight.extend_from_slice(&status);
+            }
         }
         if let Some(share) = &share {
             let exchange = self.key_exchange(&hello, share, &random)?;
@@ -462,9 +469,13 @@ impl<S: Stream> Server<S> {
         self.flush()
     }
 
-    fn pick_cert(&self, sni: Option<&str>) -> Result<usize, TlsError> {
+    fn pick_cert(
+        &self,
+        certs: &[crate::tls::CertEntry],
+        sni: Option<&str>,
+    ) -> Result<usize, TlsError> {
         if let Some(name) = sni {
-            if let Some(at) = self.cfg.certs.iter().position(|entry| {
+            if let Some(at) = certs.iter().position(|entry| {
                 entry.cert_chain.first().is_some_and(|leaf| {
                     crate::tls::rustls_backend::sni_matches(
                         &crate::tls::rustls_backend::certificate_names(leaf),
@@ -480,7 +491,7 @@ impl<S: Stream> Server<S> {
                 ));
             }
         }
-        if self.cfg.certs.is_empty() {
+        if certs.is_empty() {
             return Err(TlsError::Other(
                 "the listener serves no identity".to_owned(),
             ));
@@ -490,6 +501,10 @@ impl<S: Stream> Server<S> {
 
     fn server_hello(&self, hello: &Hello, suite: u16, random: &[u8; 32], ecdhe: bool) -> Vec<u8> {
         let mut ext = Vec::new();
+        if hello.ocsp_requested {
+            // Acknowledged with the extension; the status rides later, gated on this request.
+            extension(&mut ext, 0x0005, &[]);
+        }
         if hello.secure() {
             extension(&mut ext, 0xff01, &[0]);
         }

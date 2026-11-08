@@ -1607,10 +1607,11 @@ fn leaf_ocsp(body: &[u8]) -> Result<Vec<u8>, TlsError> {
     while !extensions.done() {
         let kind = extensions.u16()?;
         let value = extensions.vec16()?;
-        if kind == 0x0005 && value.first() == Some(&1) && value.len() >= 3 {
-            let length = usize::from(u16::from_be_bytes([value[1], value[2]]));
+        if kind == 0x0005 && value.first() == Some(&1) && value.len() >= 4 {
+            // RFC 8446 `opaque<1..2^24-1>`: the response rides a three-byte length.
+            let length = u32::from_be_bytes([0, value[1], value[2], value[3]]) as usize;
             return value
-                .get(3..3 + length)
+                .get(4..4 + length)
                 .map(<[u8]>::to_vec)
                 .ok_or_else(|| TlsError::Other("truncated OCSP status".to_owned()));
         }

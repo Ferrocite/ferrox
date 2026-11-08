@@ -188,6 +188,13 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
         None
     }
 
+    /// The OCSP response the peer stapled to its chain, once the handshake has
+    /// completed. Only the Boring lane can reach it; the stock lanes hand the
+    /// bytes to their verifier instead, so they answer `None`.
+    fn peer_ocsp(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// The ciphertext the caller read from the transport is decrypted, and the plaintext comes
     /// out: the caller read the transport itself, so the wait for the peer's bytes happened
     /// outside this session's lock, and only the decryption is under it. The plaintext's length
@@ -475,14 +482,28 @@ impl TlsServerConfig {
             .min()
     }
 
+    /// The identities the listener serves now: what the last `renew` landed, or the config it
+    /// was built from when none landed yet.
+    pub fn served_entries(&self) -> Vec<CertEntry> {
+        self.server_config_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .served
+            .clone()
+            .unwrap_or_else(|| self.certs.clone())
+    }
+
     /// Swap the live listener onto identities re-read from disk; `false` when a read failed
     /// or the bytes match what the listener already serves.
     pub fn renew(&self) -> bool {
-        let mut guard = self
-            .server_config_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let served = guard.served.clone().unwrap_or_else(|| self.certs.clone());
+        // The fetch runs outside the cache lock, which only guards the snapshot and the landing.
+        let served = {
+            let guard = self
+                .server_config_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.served.clone().unwrap_or_else(|| self.certs.clone())
+        };
         let Some(entries) = self.reread(&served) else {
             return false;
         };
@@ -496,6 +517,15 @@ impl TlsServerConfig {
                 Err(_) => return false,
             }
         };
+        let mut guard = self
+            .server_config_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another renew landed while we fetched: the listener serves it, so ours must not roll it back.
+        let landing = guard.served.clone().unwrap_or_else(|| self.certs.clone());
+        if landing != served {
+            return false;
+        }
         guard.served = Some(entries);
         guard.legacy = None;
         guard.ech = None;
@@ -529,7 +559,13 @@ impl TlsServerConfig {
                 changed |= served.get(index).is_none_or(|was| {
                     fetched.as_ref() != was.ocsp.as_ref().and_then(|was| was.response.as_ref())
                 });
-                ocsp.response = fetched.or_else(|| ocsp.response.clone());
+                // A failed fetch keeps the served response, not the startup one it would roll back to.
+                ocsp.response = fetched.or_else(|| {
+                    served
+                        .get(index)
+                        .and_then(|was| was.ocsp.as_ref())
+                        .and_then(|was| was.response.clone())
+                });
             }
             entries.push(entry);
         }
@@ -768,6 +804,14 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
             Self::Stock(session) => session.peer_leaf(),
             Self::Shaped(session) => session.peer_leaf(),
             Self::Legacy(session) => session.peer_leaf(),
+        }
+    }
+
+    fn peer_ocsp(&self) -> Option<&[u8]> {
+        match self {
+            Self::Stock(session) => session.peer_ocsp(),
+            Self::Shaped(session) => session.peer_ocsp(),
+            Self::Legacy(session) => session.peer_ocsp(),
         }
     }
 

@@ -92,6 +92,9 @@ fn replay_seen(id: &[u8; AUTH_LEN]) -> bool {
 const SESSION_LIFETIME: u64 = 180;
 const SESSION_SWEEP: u64 = 30;
 
+/// Sessions one sweep can be holding at once: the flood bound the sweep interval alone leaves open.
+const SESSION_KEYS: usize = 64 * 1024;
+
 /// Whether the session this header opens was already admitted: the user, the request body key
 /// and the request body IV, the reference's session id, refused while it is still live.
 fn session_seen(user: &[u8; 16], key: &[u8; 16], iv: &[u8; 16]) -> bool {
@@ -126,8 +129,13 @@ impl SessionHistory {
         if now.wrapping_sub(self.swept) >= SESSION_SWEEP {
             self.live.retain(|_, expires| *expires > now);
             self.swept = now;
+            self.live.shrink_to_fit();
         }
         if self.live.get(session).is_some_and(|expires| *expires > now) {
+            return true;
+        }
+        // A flood cannot grow the history past the cap, so a full one refuses a new session.
+        if !self.live.contains_key(session) && self.live.len() >= SESSION_KEYS {
             return true;
         }
         self.live.insert(*session, now + SESSION_LIFETIME);
@@ -4198,6 +4206,31 @@ mod tests {
     }
 
     #[test]
+    fn the_history_refuses_a_new_session_past_the_cap_without_evicting_a_live_one() {
+        let mut history = SessionHistory::new(10_000);
+        for index in 0..SESSION_KEYS {
+            let mut session = [0u8; 48];
+            session[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert!(!history.seen(&session, 10_000));
+        }
+        let mut fresh = [0u8; 48];
+        fresh[0] = 0xff;
+        assert!(
+            history.seen(&fresh, 10_000),
+            "a full history refuses the new session"
+        );
+        assert_eq!(
+            history.live.len(),
+            SESSION_KEYS,
+            "nothing was evicted for it"
+        );
+        assert!(
+            history.seen(&[0u8; 48], 10_000),
+            "a live record still reads as seen"
+        );
+    }
+
+    #[test]
     fn the_history_sweeps_its_expired_entries() {
         let mut history = SessionHistory::new(10_000);
         let session = [0x33u8; 48];
@@ -4212,6 +4245,10 @@ mod tests {
             history.live.len(),
             1,
             "the sweep frees before the fresh insert"
+        );
+        assert!(
+            history.live.capacity() < 64,
+            "the sweep shrinks the map toward what it holds"
         );
     }
 

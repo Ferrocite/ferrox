@@ -10,8 +10,12 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::time::Duration;
 
-/// How long one stapling fetch may take before the listener serves without a staple.
+/// How long one read or write may take before the listener serves without a staple.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most response bytes one fetch may read: an OCSP answer is a few KiB, so a responder
+/// sending more is broken or hostile, and reading it all would let it decide our memory.
+const FETCH_MAX_BYTES: usize = 64 * 1024;
 
 /// The OCSP responder every certificate's Authority Information Access extension names.
 const AIA_OID: &[u8] = &[0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
@@ -218,6 +222,7 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
         Some((name, port)) => (name, port.parse::<u16>().ok()?),
         None => (host, 80),
     };
+    // The dial resolves the way `reality`'s splice does: one path, whatever the host names.
     let mut stream = TcpStream::connect((host, port)).ok()?;
     stream.set_read_timeout(Some(FETCH_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(FETCH_TIMEOUT)).ok()?;
@@ -234,7 +239,13 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
     }
     stream.write_all(&request).ok()?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
+    stream
+        .take(u64::try_from(FETCH_MAX_BYTES).ok()?)
+        .read_to_end(&mut response)
+        .ok()?;
+    if response.len() >= FETCH_MAX_BYTES {
+        return None;
+    }
     let head_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")?;
@@ -264,19 +275,29 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         let mut at = 0usize;
         while let Some(line_end) = body[at..].windows(2).position(|w| w == b"\r\n") {
-            let size = std::str::from_utf8(&body[at..at + line_end])
-                .ok()?
-                .split(';')
-                .next()?
-                .trim()
-                .parse::<usize>()
-                .ok()?;
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&body[at..at + line_end])
+                    .ok()?
+                    .split(';')
+                    .next()?
+                    .trim(),
+                16,
+            )
+            .ok()?;
             if size == 0 {
                 break;
             }
-            at += line_end + 2;
-            out.extend_from_slice(body.get(at..at.checked_add(size)?)?);
-            at += size + 2;
+            at = at.checked_add(line_end)?.checked_add(2)?;
+            let end = at.checked_add(size)?;
+            out.extend_from_slice(body.get(at..end)?);
+            // A chunk without its trailing CRLF is a truncated stream, not a full chunk.
+            if end
+                .checked_add(2)
+                .is_none_or(|next| body.get(end..next) != Some(b"\r\n"))
+            {
+                return None;
+            }
+            at = end.checked_add(2)?;
         }
         return Some(out);
     }
@@ -342,6 +363,73 @@ mod tests {
     #[test]
     fn fetch_refuses_a_dead_responder() {
         assert!(http("http://127.0.0.1:1/ocsp", "GET", None).is_none());
+    }
+
+    /// A one-shot responder that answers with a hand-written response body.
+    fn raw_responder(answer_head: String, answer_body: Vec<u8>) -> u16 {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(FETCH_TIMEOUT))
+                .expect("timeout");
+            let mut buffer = [0u8; 8192];
+            let _ = socket.read(&mut buffer);
+            let mut answer = answer_head.into_bytes();
+            answer.extend_from_slice(&answer_body);
+            socket.write_all(&answer).expect("answer");
+        });
+        port
+    }
+
+    #[test]
+    fn a_chunked_response_reads_its_hex_sizes() {
+        // `2b` hex is 43: a decimal parse would fail outright on the letter.
+        let payload = vec![b'a'; 43];
+        let mut body = b"2b\r\n".to_vec();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let port = raw_responder(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_owned(),
+            body,
+        );
+        let got = http(&format!("http://127.0.0.1:{port}/ocsp"), "GET", None);
+        assert_eq!(
+            got.as_deref(),
+            Some(payload.as_slice()),
+            "the chunks decode by their hex size"
+        );
+    }
+
+    #[test]
+    fn a_chunk_without_its_crlf_is_not_a_full_chunk() {
+        // The declared size is satisfied, but the terminator is missing: truncated, not full.
+        let body = b"5\r\nabcdeXX0\r\n\r\n".to_vec();
+        let port = raw_responder(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_owned(),
+            body,
+        );
+        assert!(
+            http(&format!("http://127.0.0.1:{port}/ocsp"), "GET", None).is_none(),
+            "a chunk missing its CRLF answers nothing"
+        );
+    }
+
+    #[test]
+    fn an_oversized_response_answers_nothing() {
+        let port = raw_responder(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                FETCH_MAX_BYTES + 1
+            ),
+            vec![0u8; FETCH_MAX_BYTES + 1],
+        );
+        assert!(
+            http(&format!("http://127.0.0.1:{port}/ocsp"), "GET", None).is_none(),
+            "past the cap there is no staple"
+        );
     }
 
     fn name(display: &str) -> boring::x509::X509Name {
