@@ -19996,11 +19996,11 @@ pub(crate) fn serve_trojan_grpc_muxed(
         return;
     };
     opened.store(true, std::sync::atomic::Ordering::Relaxed);
-    crate::accesslog::record_current(&target);
     if !freedom {
         reader.abort();
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
         spawn_trojan_udp(reader, writer, move || closer.close());
