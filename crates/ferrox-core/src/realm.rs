@@ -342,7 +342,7 @@ pub fn punch_salt_key(packet: &[u8], obfs: &[u8; OBFS_SIZE]) -> Option<[u8; 32]>
 #[must_use]
 pub fn magic_matches(packet: &[u8], key: &[u8; 32]) -> bool {
     for (at, &want) in MAGIC.iter().enumerate() {
-        if unmasked(packet[SALT_LEN + at], *key, at) != want {
+        if unmasked(packet[SALT_LEN + at], key, at) != want {
             return false;
         }
     }
