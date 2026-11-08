@@ -2210,6 +2210,13 @@ impl Settings {
             user_agent_probability: decimal(settings, "PickUserAgentProbability")
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0),
+            quic_dial_early: decimal(settings, "QUICDialEarlyProbability")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
+            quic_disable_path_mtu: decimal(settings, "QUICDisablePathMTUDiscoveryProbability")
+                .or_else(|| decimal(settings, "QUICDisableClientPathMTUDiscoveryProbability"))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
             fragmentor: crate::psiphon_fragment::Fragmentor::new(
                 decimal(settings, "FragmentorProbability").unwrap_or(0.5),
                 protocol_list_named(settings, "FragmentorLimitProtocols"),
@@ -3711,6 +3718,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "TLSFragmentClientHelloProbability",
     "TLSFragmentClientHelloLimitProtocols",
     "PickUserAgentProbability",
+    "QUICDialEarlyProbability",
+    "QUICDisablePathMTUDiscoveryProbability",
+    "QUICDisableClientPathMTUDiscoveryProbability",
     "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",
     "TLSOSSHSNIServerNames",
@@ -9855,7 +9865,7 @@ mod tests {
     fn the_tls_fragment_and_user_agent_settings_reach_the_shape() {
         let settings = Settings::from_json(Some(
             &json::parse(
-                r#"{"TLSFragmentClientHelloProbability":0.25,"TLSFragmentClientHelloLimitProtocols":["tls-ossh"],"PickUserAgentProbability":0.0}"#,
+                r#"{"TLSFragmentClientHelloProbability":0.25,"TLSFragmentClientHelloLimitProtocols":["tls-ossh"],"PickUserAgentProbability":0.0,"QUICDialEarlyProbability":0.25,"QUICDisableClientPathMTUDiscoveryProbability":0.75}"#,
             )
             .expect("settings"),
         ))
@@ -9866,6 +9876,8 @@ mod tests {
             vec!["TLS-OSSH"]
         );
         assert_eq!(settings.tls_shape.user_agent_probability, 0.0);
+        assert_eq!(settings.tls_shape.quic_dial_early, 0.25);
+        assert_eq!(settings.tls_shape.quic_disable_path_mtu, 0.75);
         assert!(!settings.tls_shape.fragment_client_hello("SSH"));
         let always = Settings::from_json(Some(
             &json::parse(
