@@ -845,7 +845,7 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
                 *server,
                 config,
                 use_transform,
-                first_attempt && must_match,
+                use_transform.is_none() || (first_attempt && must_match),
             ) {
                 Ok((addresses, ttl)) if !addresses.is_empty() => {
                     config.cache_put(&name, addresses.clone(), ttl);

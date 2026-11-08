@@ -222,7 +222,9 @@ impl Client {
         }
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).ok()?;
+            if reader.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
             if line == "\r\n" || line == "\n" {
                 break;
             }
@@ -330,7 +332,9 @@ fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
     let mut chunked = false;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
         if line == "\r\n" || line == "\n" {
             break;
         }
