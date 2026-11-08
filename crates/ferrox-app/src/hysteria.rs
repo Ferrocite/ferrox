@@ -2197,6 +2197,8 @@ impl Router<'_> {
         if conn.recv(packet, info).is_err() {
             return;
         }
+        let mut out = [0u8; crate::quic::MAX_DATAGRAM];
+        crate::quic::issue_spare_scids(&mut conn, &self.sock, &mut out);
         crate::quic::flush_egress(&mut conn, &self.sock);
         let key = scid.to_vec();
         let inbound = Inbound {
@@ -2219,7 +2221,17 @@ impl Router<'_> {
             self.by_client_cid.insert(client_cid.to_vec(), key.clone());
         }
         if !initial_dcid.is_empty() {
-            self.by_initial_dcid.insert(initial_dcid.to_vec(), key);
+            self.by_initial_dcid
+                .insert(initial_dcid.to_vec(), key.clone());
+        }
+        if let Some(inbound) = self.routes.get(&key) {
+            if let Ok(guard) = inbound.conn.lock() {
+                let ids: Vec<_> = guard.source_ids().collect();
+                for id in ids {
+                    self.by_initial_dcid
+                        .insert(id.as_ref().to_vec(), key.clone());
+                }
+            }
         }
     }
 
@@ -2471,8 +2483,10 @@ fn route_packet(
         } else {
             router.accept(packet, from, template, peer_cid, dcid);
         }
-    } else {
+    } else if router.routes.contains_key(dcid) {
         router.drive(dcid, packet, from);
+    } else if let Some(key) = router.initial_route(dcid, peer_cid) {
+        router.drive(&key, packet, from);
     }
 }
 
@@ -3241,7 +3255,7 @@ mod tests {
         let mut wire = initial;
         route_packet(&mut router, &mut template, &mut wire, client_addr);
         assert_eq!(router.routes.len(), 1, "a retransmit adds no route");
-        assert_eq!(router.by_initial_dcid.len(), 1);
+        assert!(!router.by_initial_dcid.is_empty());
         assert_eq!(router.by_client_cid.len(), 1);
     }
 

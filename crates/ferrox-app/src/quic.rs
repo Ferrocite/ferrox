@@ -56,7 +56,7 @@ pub(crate) struct QuicDial {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct QuicServer {
+pub(crate) struct QuicServer {
     address: std::sync::Arc<str>,
     port: u16,
     host: std::sync::Arc<str>,
@@ -128,6 +128,36 @@ impl PooledStream {
     /// Stops this stream in both directions: an unreset flow keeps being filled into a window nobody drains, charged to the account.
     pub(crate) fn cancel(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
+    }
+
+    /// Move this lease's connection to `new_local`: the path the next packet takes carries the new
+    /// source, and the peer's path validation makes the old path dead without a new handshake. The
+    /// migration issues spare SCIDs first, so a fresh path has IDs to walk on; lanes the pool handed
+    /// out keep the same connection and the same stream id.
+    #[allow(dead_code)]
+    pub(crate) fn migrate_source(&self, new_local: SocketAddr) -> std::io::Result<u64> {
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("quic connection lock poisoned"));
+        };
+        for _ in 0..2 {
+            if conn.active_scids() >= 2 {
+                break;
+            }
+            let mut scid = [0u8; 16];
+            getrandom::fill(&mut scid)
+                .map_err(|error| std::io::Error::other(format!("quic scid: {error}")))?;
+            conn.new_scid(
+                &quiche::ConnectionId::from_ref(&scid),
+                u128::from_le_bytes(scid),
+                true,
+            )
+            .map_err(|error| std::io::Error::other(format!("quic scid: {error:?}")))?;
+        }
+        let at = conn
+            .migrate_source(new_local)
+            .map_err(|error| std::io::Error::other(format!("quic migrate: {error:?}")))?;
+        flush_egress(&mut conn, &self.sock);
+        Ok(at)
     }
 
     /// A byte-stream handle on this lease: the same connection and id, without a second lease, so the caller keeps this one alive until both directions end.
@@ -542,6 +572,11 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
 /// The datagram is the whole arithmetic of a QUIC lane's syscall count. A packet carries 1350 bytes of UDP payload instead of the 1200 quiche defaults to, so a megabyte leaves in 776 datagrams rather than 874 — 11.2 percent fewer sends, fewer ACKs, and fewer receive interrupts for the same bytes, and the lane's own receive buffer is already exactly this wide, so what it advertises is what it can hold.
 pub(crate) fn tune_transport(config: &mut quiche::Config) {
     config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
+    // Resumption rides one stored session per edge, so a later dial leaves with 0-RTT.
+    config.enable_early_data();
+    // Four spare source IDs let a queued lane migrate without asking for identifiers mid-move.
+    config.set_active_connection_id_limit(4);
+    let _ = config.set_ticket_key(ticket_key());
     config.set_initial_max_data(MAX_DATA);
     config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
     config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_DATA);
@@ -2963,7 +2998,45 @@ pub(crate) fn udp_to_server(
     Some((sock, peer, local))
 }
 
+/// The in-process resumption blobs: one captured session per edge, so a later dial can offer
+/// it for 0-RTT. The pool's key is what a session belongs to: edge, trust and ECH together,
+/// the same identity the pool deduplicates on.
+static RESUMPTION: OnceLock<Mutex<HashMap<QuicServer, Vec<u8>>>> = OnceLock::new();
+
+/// One ticket key for the process, so a server issues a ticket a later dial can offer.
+static TICKET_KEY: OnceLock<[u8; 48]> = OnceLock::new();
+
+fn ticket_key() -> &'static [u8; 48] {
+    TICKET_KEY.get_or_init(|| {
+        let mut key = [0u8; 48];
+        getrandom::fill(&mut key).expect("random");
+        key
+    })
+}
+
+/// A captured session for this edge, if an earlier dial's peer issued a ticket.
+fn resumption_entry(key: &QuicServer) -> Option<Vec<u8>> {
+    let entries = RESUMPTION.get_or_init(Default::default).lock().ok()?;
+    entries.get(key).cloned()
+}
+
+/// Keep the ticket a completed handshake read, already stamped with the keys of that handshake.
+/// A peer that issues none leaves nothing behind, and a later dial retries the cold path.
+fn resumption_remember(key: &QuicServer, conn: &quiche::Connection) {
+    let Some(blob) = conn.session().map(<[u8]>::to_vec) else {
+        return;
+    };
+    if let Ok(mut entries) = RESUMPTION.get_or_init(Default::default).lock() {
+        entries.insert(key.clone(), blob);
+    }
+}
+
 /// Handshake under the caller's budget: a probe pays it once for silence, a named carrier gets the full budget.
+///
+/// With `resume`, a captured session for this edge is offered before any packet is sent, and
+/// the h3 opening rides 0-RTT whenever the resumption landed; the returned `bool` says whether
+/// it was sent that early, so the caller does not send it twice.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handshake_within(
     sock: &Datagram,
     peer: SocketAddr,
@@ -2972,7 +3045,8 @@ pub(crate) fn handshake_within(
     roots: &[Vec<u8>],
     ech_config_list: Option<&[u8]>,
     budget: Duration,
-) -> Option<quiche::Connection> {
+    resume: Option<&QuicServer>,
+) -> Option<(quiche::Connection, bool)> {
     let mut scid = [0u8; SCID_LEN];
     getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
@@ -2982,8 +3056,34 @@ pub(crate) fn handshake_within(
     if let Some(list) = ech_config_list {
         conn.as_mut().set_ech_config_list(list).ok()?;
     }
+    // The session is offered before the first packet, or the dialer reads no 0-RTT for it.
+    if let Some(key) = resume {
+        if let Some(blob) = resumption_entry(key) {
+            let _ = conn.set_session(&blob);
+        }
+    }
+    // Emit the handshake first: `is_in_early_data` turns after it, then the h3 opening rides 0-RTT.
+    let mut first = [0u8; MAX_DATAGRAM];
+    if let Ok((written, info)) = conn.send(&mut first) {
+        let _ = sock.send_to(&first[..written], info.to);
+    }
+    let opened_early = conn.is_in_early_data() && send_h3_opening(&mut conn, sock);
     drive_handshake_by(&mut conn, sock, local, budget)?;
-    Some(conn)
+    if !opened_early && !send_h3_opening(&mut conn, sock) {
+        return None;
+    }
+    if let Some(key) = resume {
+        // Capture waits for the ticket after the handshake: none is issued, nothing is stored.
+        let start = Instant::now();
+        while conn.session().is_none() && start.elapsed() < Duration::from_millis(200) {
+            let left = Duration::from_millis(200).saturating_sub(start.elapsed());
+            if !pump_once(&mut conn, sock, local, left.min(Duration::from_millis(50))) {
+                break;
+            }
+        }
+        resumption_remember(key, &conn);
+    }
+    Some((conn, opened_early))
 }
 
 /// The leases a readable stream belongs to: a stream nobody rides is drained here, so its bytes do not sit on a connection waiting for a flow that already ended.
@@ -3504,7 +3604,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             None => Datagram::plain(sock),
         };
         let bound = resolved.map(|_| Instant::now());
-        let Some(mut conn) = handshake_within(
+        let Some((conn, _early)) = handshake_within(
             &sock,
             peer,
             local,
@@ -3512,13 +3612,11 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             roots,
             dial.ech_config_list.as_deref(),
             budget,
+            Some(&QuicServer::of(dial)),
         ) else {
             continue;
         };
         let handed = bound.map(|_| Instant::now());
-        if !send_h3_opening(&mut conn, &sock) {
-            continue;
-        }
         let table = Arc::new(Mutex::new(PooledState {
             sessions: HashMap::new(),
             opening: HashSet::new(),
@@ -3664,6 +3762,35 @@ impl QuicStream {
     /// The request clock this stream's two directions share.
     pub(crate) fn activity(&self) -> Arc<Activity> {
         Arc::clone(&self.activity)
+    }
+
+    /// Move this stream's connection to `new_local`, as a pooled lease can: spare SCIDs are issued
+    /// first, so a fresh path has IDs to walk on, and the packet the next drive flushes leaves from
+    /// the new source while the stream id survives.
+    #[allow(dead_code)]
+    pub(crate) fn migrate_source(&self, new_local: SocketAddr) -> std::io::Result<u64> {
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("quic connection lock poisoned"));
+        };
+        for _ in 0..2 {
+            if conn.active_scids() >= 2 {
+                break;
+            }
+            let mut scid = [0u8; 16];
+            getrandom::fill(&mut scid)
+                .map_err(|error| std::io::Error::other(format!("quic scid: {error}")))?;
+            conn.new_scid(
+                &quiche::ConnectionId::from_ref(&scid),
+                u128::from_le_bytes(scid),
+                true,
+            )
+            .map_err(|error| std::io::Error::other(format!("quic scid: {error:?}")))?;
+        }
+        let at = conn
+            .migrate_source(new_local)
+            .map_err(|error| std::io::Error::other(format!("quic migrate: {error:?}")))?;
+        flush_egress(&mut conn, &self.sock);
+        Ok(at)
     }
 
     /// Counts both directions against the caller's meters, keeping any an earlier layer already set.
@@ -3976,6 +4103,7 @@ fn route(
     if conn.recv(buf, info).is_err() {
         return;
     }
+    issue_spare_scids(&mut conn, sock, out);
     flush_egress(&mut conn, sock);
     let state = Arc::new(ServerConn {
         conn: Arc::new(Mutex::new(conn)),
@@ -3985,6 +4113,9 @@ fn route(
         prefaced: Arc::new(AtomicBool::new(false)),
         stop: Arc::new(AtomicBool::new(false)),
     });
+    if let Ok(guard) = state.conn.lock() {
+        learn_ids(conns, &state, &guard);
+    }
     conns.insert(scid.to_vec(), Arc::clone(&state));
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
@@ -4151,10 +4282,16 @@ pub(crate) fn direct_stream_on(
     host: &str,
     roots: &[Vec<u8>],
 ) -> Option<PooledStream> {
-    let mut conn = handshake_within(&sock, peer, local, host, roots, None, HANDSHAKE_TIMEOUT)?;
-    if !send_h3_opening(&mut conn, &sock) {
-        return None;
-    }
+    let (conn, _early) = handshake_within(
+        &sock,
+        peer,
+        local,
+        host,
+        roots,
+        None,
+        HANDSHAKE_TIMEOUT,
+        None,
+    )?;
     Some(PooledStream {
         conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
         sock: std::sync::Arc::new(sock),
@@ -4235,6 +4372,34 @@ pub(crate) fn server_accept(
         }
     }
     conn
+}
+
+/// Issue spare source IDs a client can walk onto a migrated path with: without them a fresh path
+/// has no destination ID to name it. Two per established connection is the number the migration
+/// tests and the references walk; the transport limit `4` keeps a third spare if one retires.
+pub(crate) fn issue_spare_scids(conn: &mut quiche::Connection, sock: &Datagram, out: &mut [u8]) {
+    for _ in 0..2 {
+        if conn.active_scids() >= 2 {
+            break;
+        }
+        let mut scid = [0u8; 16];
+        if getrandom::fill(&mut scid).is_err() {
+            break;
+        }
+        if conn
+            .new_scid(
+                &quiche::ConnectionId::from_ref(&scid),
+                u128::from_le_bytes(scid),
+                true,
+            )
+            .is_err()
+        {
+            break;
+        }
+    }
+    while let Ok((written, info)) = conn.send(out) {
+        let _ = sock.send_to(&out[..written], info.to);
+    }
 }
 
 #[cfg(test)]
@@ -5560,6 +5725,24 @@ mod tests {
                 break;
             }
         }
+        let mut spare = [0u8; MAX_DATAGRAM];
+        issue_spare_scids(&mut server.conn, &server.sock, &mut spare);
+        for _ in 0..4 {
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+        }
         (client, server)
     }
 
@@ -5691,6 +5874,150 @@ mod tests {
         assert_eq!(&after[..got], b"after");
     }
 
+    /// The client side of a move is callable as part of the lane, not only by hand: it issues its
+    /// spare IDs, migrates the connection it carries to the new local address, and the server reads
+    /// the same stream on the new path.
+    #[test]
+    fn a_stream_migrates_its_connection_to_a_new_local() {
+        let (client, mut server) = lane_pair();
+        let conn = std::sync::Arc::new(std::sync::Mutex::new(client.conn));
+        let stream = QuicStream {
+            conn: std::sync::Arc::clone(&conn),
+            sock: std::sync::Arc::new(client.sock),
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let moved_addr = moved.local_addr().expect("addr");
+        stream.migrate_source(moved_addr).expect("migrates");
+        let moved_sock = std::sync::Arc::new(moved);
+        {
+            let mut guard = conn.lock().expect("lock");
+            guard.stream_send(0, b"after", false).expect("sends");
+            flush_egress(&mut guard, &moved_sock);
+        }
+        let mut after = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            let mut guard = conn.lock().expect("lock");
+            pass(
+                &mut guard,
+                &moved_sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            drop(guard);
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut conn.lock().expect("lock"),
+                &moved_sock,
+                moved_addr,
+            );
+            match server.conn.stream_recv(0, &mut after) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads after the move: {error:?}"),
+            }
+        }
+        assert_eq!(&after[..got], b"after");
+    }
+
+    /// A first dial leaves a session the store keeps: the second dial to the same edge offers it,
+    /// opens the h3 opening with 0-RTT, and the server reads those bytes of the same stream id.
+    #[test]
+    fn a_second_dial_to_an_edge_leaves_with_early_data() {
+        let identity = minted_identity();
+        let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let server_addr = server_sock.local_addr().expect("addr");
+        let mut server_config = serve_config(&identity).expect("serves");
+        let server = std::thread::spawn(move || {
+            let server_once = |server_sock: &Datagram, server_config: &mut quiche::Config| {
+                let mut conn = server_accept(
+                    server_sock,
+                    server_sock.local_addr().expect("addr"),
+                    server_config,
+                );
+                let resumed = conn.is_resumed();
+                let mut opened = Vec::new();
+                let mut chunk = [0u8; 1024];
+                for _ in 0..40 {
+                    let mut buf = [0u8; MAX_DATAGRAM];
+                    if let Some((n, from)) = server_poll(server_sock, &mut buf) {
+                        let info = quiche::RecvInfo {
+                            from,
+                            to: server_sock.local_addr().expect("addr"),
+                        };
+                        let _ = conn.recv(&mut buf[..n], info);
+                    }
+                    server_idle(&mut conn, server_sock, &mut [0u8; MAX_DATAGRAM]);
+                    while let Ok((n, _)) = conn.stream_recv(2, &mut chunk) {
+                        opened.extend_from_slice(&chunk[..n]);
+                    }
+                    if !opened.is_empty() {
+                        break;
+                    }
+                }
+                (resumed, opened)
+            };
+            let first = server_once(&server_sock, &mut server_config);
+            let second = server_once(&server_sock, &mut server_config);
+            (first, second)
+        });
+        let key = QuicServer {
+            address: std::sync::Arc::from("127.0.0.1"),
+            port: server_addr.port(),
+            host: std::sync::Arc::from("quic.test"),
+            upstream: None,
+            roots: None,
+            ech_config_list: None,
+        };
+        let roots = identity.certs[0].cert_chain.clone();
+        let client_one = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let local_one = client_one.local_addr().expect("addr");
+        let (client_one_conn, early_one) = handshake_within(
+            &client_one,
+            server_addr,
+            local_one,
+            "quic.test",
+            &roots,
+            None,
+            Duration::from_secs(5),
+            Some(&key),
+        )
+        .expect("first handshakes");
+        assert!(!early_one, "the first dial has no session to offer");
+        drop(client_one_conn);
+        let client_two = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let local_two = client_two.local_addr().expect("addr");
+        let (client_two_conn, early_two) = handshake_within(
+            &client_two,
+            server_addr,
+            local_two,
+            "quic.test",
+            &roots,
+            None,
+            Duration::from_secs(5),
+            Some(&key),
+        )
+        .expect("second handshakes");
+        assert!(early_two, "the second dial left with 0-RTT");
+        assert!(client_two_conn.is_resumed(), "the second dial resumed");
+        let (first, second) = server.join().expect("joins");
+        assert!(!first.0, "the first peer did not resume");
+        assert!(second.0, "the server saw the resumption");
+        let want = crate::foxy::H3::h3_opening()[0].1.clone();
+        assert_eq!(second.1, want, "the early bytes are the opening itself");
+    }
+
     /// The production dial hands the offer to the connection before its first packet, not only the
     /// test helper: a config that names ECH is what makes both ends report acceptance.
     #[test]
@@ -5706,7 +6033,7 @@ mod tests {
         let client_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let local = client_sock.local_addr().expect("addr");
         let list = ech_client_list();
-        let mut client = handshake_within(
+        let (mut client, _early) = handshake_within(
             &client_sock,
             server_addr,
             local,
@@ -5714,6 +6041,7 @@ mod tests {
             &identity.certs[0].cert_chain,
             Some(&list),
             Duration::from_secs(5),
+            None,
         )
         .expect("handshakes");
         assert!(
