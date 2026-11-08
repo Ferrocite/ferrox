@@ -160,6 +160,7 @@ pub(crate) fn cbor_tactics_to_json(bytes: &[u8]) -> Option<Json> {
     ]))
 }
 
+/// Decode the inner tactics bytes, inflating them first when the compression field says zlib.
 fn tactics_bytes(bytes: &[u8], compression: Option<&Value>) -> Option<Json> {
     let compression = compression.and_then(Value::uint).unwrap_or(0);
     match compression {
@@ -180,6 +181,7 @@ fn tactics_bytes(bytes: &[u8], compression: Option<&Value>) -> Option<Json> {
     }
 }
 
+/// Parse tactics bytes as JSON, falling back to the CBOR view.
 fn parse_tactics(bytes: &[u8]) -> Option<Json> {
     std::str::from_utf8(bytes)
         .ok()
