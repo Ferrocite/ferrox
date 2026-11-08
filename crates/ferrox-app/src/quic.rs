@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// A connection's last moved byte, so a quiet direction does not idle a tunnel whose other direction is busy.
+/// One request stream's last moved byte, so a quiet direction does not idle a tunnel whose other direction is busy.
 #[derive(Debug)]
 pub(crate) struct Activity {
     base: Instant,
@@ -23,7 +23,7 @@ impl Activity {
         }
     }
 
-    /// Records a byte this connection moved in either direction.
+    /// Records a byte this request moved in either direction.
     pub(crate) fn touch(&self) {
         let millis = Instant::now()
             .saturating_duration_since(self.base)
@@ -31,7 +31,7 @@ impl Activity {
         self.last_ms.store(millis as u64, Ordering::Relaxed);
     }
 
-    /// How long since this connection last moved a byte.
+    /// How long since this request last moved a byte.
     pub(crate) fn age(&self) -> Duration {
         let now = Instant::now()
             .saturating_duration_since(self.base)
@@ -3550,7 +3550,7 @@ pub(crate) struct QuicStream {
     /// One H3 server preface per connection: the first request stream sends it, and a client-side
     /// handle starts true because it must never send one.
     prefaced: Arc<AtomicBool>,
-    /// The connection clock this stream's reads and writes refresh.
+    /// The request clock this stream's reads and writes refresh.
     activity: Arc<Activity>,
     /// Set by the serving driver when it stops: a worker parked in a read or write leaves instead of holding the socket past the loop.
     stop: Arc<AtomicBool>,
@@ -3577,9 +3577,6 @@ impl Read for QuicStream {
         loop {
             match self.conn.lock() {
                 Ok(mut conn) => {
-                    if conn.is_closed() {
-                        return Ok(0);
-                    }
                     let (n, fin) = match conn.stream_recv(self.id, buf) {
                         Ok(got) => got,
                         Err(quiche::Error::Done) => (0, false),
@@ -3599,6 +3596,9 @@ impl Read for QuicStream {
                     if fin {
                         self.peer_fin.store(true, Ordering::Relaxed);
                         return Ok(0);
+                    }
+                    if conn.is_closed() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
                     }
                 }
                 Err(_) => {
@@ -3661,7 +3661,7 @@ impl crate::proxy::Duplicate for QuicStream {
 }
 
 impl QuicStream {
-    /// The connection clock this stream and its siblings share.
+    /// The request clock this stream's two directions share.
     pub(crate) fn activity(&self) -> Arc<Activity> {
         Arc::clone(&self.activity)
     }
@@ -3748,8 +3748,6 @@ struct ServerConn {
     visit: AtomicU64,
     gone: AtomicBool,
     prefaced: Arc<AtomicBool>,
-    /// The clock every stream this connection serves shares.
-    activity: Arc<Activity>,
     /// The serving loop's stop, so every stream on this connection leaves with the driver.
     stop: Arc<AtomicBool>,
 }
@@ -3757,12 +3755,11 @@ struct ServerConn {
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
-/// One stream a reap hands to a new worker: the connection, the stream id, the preface flag and the clock they share.
+/// One stream a reap hands to a new worker: the connection, the stream id, the preface flag and the driver's stop.
 type FreshStream = (
     Arc<Mutex<quiche::Connection>>,
     u64,
     Arc<AtomicBool>,
-    Arc<Activity>,
     Arc<AtomicBool>,
 );
 
@@ -3874,8 +3871,13 @@ pub(crate) fn serve_loop(
             flush_egress(&mut conn, sock.as_ref());
         }
     }
-    while live.load(Ordering::SeqCst) != 0 {
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while live.load(Ordering::SeqCst) != 0 && Instant::now() < drain_deadline {
         std::thread::sleep(Duration::from_millis(1));
+    }
+    let left = live.load(Ordering::SeqCst);
+    if left != 0 {
+        eprintln!("quic: {left} stream handlers still running at shutdown");
     }
 }
 
@@ -3981,7 +3983,6 @@ fn route(
         visit: AtomicU64::new(0),
         gone: AtomicBool::new(false),
         prefaced: Arc::new(AtomicBool::new(false)),
-        activity: Arc::new(Activity::new()),
         stop: Arc::new(AtomicBool::new(false)),
     });
     conns.insert(scid.to_vec(), Arc::clone(&state));
@@ -4091,7 +4092,6 @@ fn reap(
                     Arc::clone(&state.conn),
                     stream,
                     Arc::clone(&state.prefaced),
-                    Arc::clone(&state.activity),
                     Arc::clone(&state.stop),
                 ));
                 spawned = true;
@@ -4109,7 +4109,7 @@ fn reap(
     for key in scratch.closed.drain(..) {
         conns.remove(&key);
     }
-    for (conn, stream, prefaced, activity, stop) in scratch.fresh.drain(..) {
+    for (conn, stream, prefaced, stop) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
@@ -4117,7 +4117,7 @@ fn reap(
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::clone(&prefaced),
-            activity: Arc::clone(&activity),
+            activity: Arc::new(Activity::new()),
             stop,
         };
         let serve = Arc::clone(serve);

@@ -175,6 +175,9 @@ impl H3Reader {
                 continue;
             }
             self.parse()?;
+            if self.expect_request && self.head.is_some() {
+                return Ok(());
+            }
             if self.frame_left > 0 {
                 self.fill_data()?;
                 if !self.payload.is_empty() {
@@ -200,6 +203,9 @@ impl H3Reader {
                     self.idle_since = None;
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
+                    if crate::proxy::body_deadline().is_some_and(|until| Instant::now() >= until) {
+                        return Err(error);
+                    }
                     let since = *self.idle_since.get_or_insert_with(Instant::now);
                     if self.idle_expired(since) {
                         return Err(std::io::Error::other("h3 request stalled"));
@@ -322,6 +328,9 @@ impl H3Reader {
                     return Ok(());
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
+                    if crate::proxy::body_deadline().is_some_and(|until| Instant::now() >= until) {
+                        return Err(error);
+                    }
                     let since = *self.idle_since.get_or_insert_with(Instant::now);
                     if self.idle_expired(since) {
                         return Err(std::io::Error::other("h3 request stalled"));
@@ -818,7 +827,6 @@ pub(crate) struct H3Client {
     sock: Arc<Datagram>,
     next: AtomicU64,
     dead: Arc<AtomicBool>,
-    activity: Arc<Activity>,
 }
 
 impl Drop for H3Client {
@@ -893,11 +901,19 @@ impl H3Client {
             sock,
             next: AtomicU64::new(0),
             dead,
-            activity: Arc::new(Activity::new()),
         }))
     }
 
     fn open(self: &Arc<Self>, block: &[u8], end_request: bool) -> Option<(H3Reader, H3StreamOut)> {
+        self.open_with(block, end_request, Arc::new(Activity::new()))
+    }
+
+    fn open_with(
+        self: &Arc<Self>,
+        block: &[u8],
+        end_request: bool,
+        activity: Arc<Activity>,
+    ) -> Option<(H3Reader, H3StreamOut)> {
         if self.dead.load(Ordering::Relaxed) {
             return None;
         }
@@ -908,7 +924,7 @@ impl H3Client {
             sock: Arc::clone(&self.sock),
             id,
             peer_fin: Arc::new(AtomicBool::new(false)),
-            activity: Arc::clone(&self.activity),
+            activity,
         });
         let mut frame = Vec::with_capacity(block.len() + 9);
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
@@ -934,10 +950,10 @@ impl H3Client {
     ) -> bool {
         let (head, body) = crate::xhttp::packet_head(host, settings, session, seq, piece);
         let block = block_from_text(&head, host, "https");
+        let deadline = Instant::now() + crate::budgets::relay_stall();
         let Some((mut reader, out)) = self.open(&block, false) else {
             return false;
         };
-        let deadline = Instant::now() + crate::budgets::relay_stall();
         reader.set_deadline(deadline);
         if let Some(body) = body {
             if !out.data(body) {
@@ -950,10 +966,9 @@ impl H3Client {
         loop {
             match reader.read(&mut sink) {
                 Ok(0) => {
-                    return Instant::now() < deadline
-                        && reader
-                            .status()
-                            .is_some_and(|code| (200..300).contains(&code));
+                    return reader
+                        .status()
+                        .is_some_and(|code| (200..300).contains(&code));
                 }
                 Ok(_) => {}
                 Err(error) if crate::proxy::is_timeout(&error) => {}
@@ -1078,13 +1093,14 @@ pub(crate) fn connect_dual_split(
     let session = settings.session_id();
     let down = crate::xhttp::downlink_head(host, settings, &session);
     let block = block_from_text(&down, host, "https");
-    let (reader, _) = client.open(&block, true)?;
+    let activity = Arc::new(Activity::new());
+    let (reader, _) = client.open_with(&block, true, Arc::clone(&activity))?;
     let writer = if settings.mode == XhttpMode::PacketUp {
         crate::xhttp::XhttpWriter::packets_h3(Arc::clone(&client), host, settings, session)
     } else {
         let up = crate::xhttp::dial_head(host, settings, &session, None);
         let block = block_from_text(&up, host, "https");
-        let (_, out) = client.open(&block, false)?;
+        let (_, out) = client.open_with(&block, false, activity)?;
         let writer = crate::xhttp::XhttpWriter::new(NullWrite);
         writer.set_stream(crate::xhttp::StreamOut::H3(out));
         writer
@@ -1229,7 +1245,7 @@ mod tests {
             sock: Arc::clone(&client.sock),
             id,
             peer_fin: Arc::new(AtomicBool::new(false)),
-            activity: Arc::clone(&client.activity),
+            activity: Arc::new(Activity::new()),
         })
     }
 
