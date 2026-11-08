@@ -599,6 +599,12 @@ ocsp-stapling-anti-replay-time-window-caches ocsp-handshake-witness-tests 5 ferr
 ocsp-stapling-anti-replay-time-window-caches vmess-history-tests 4 ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime
 ocsp-stapling-anti-replay-time-window-caches ocsp-config-tests 1 ferrox-app-config::tests::an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it
 
+# --- Multipath QUIC (matrix row 78) -----------------------------------------
+multipath-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
+multipath-quic syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+multipath-quic relay-staging-copies-per-byte UNBLESSED not measured
+multipath-quic seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
+
 # --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
 security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 security-utls oracle-cases-replayed-byte-identical 50 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
