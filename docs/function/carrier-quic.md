@@ -28,9 +28,18 @@ graph TD
     P --> Q{"live connection with a flow to lend?"}
     Q -- yes --> U["ride it: 0 handshakes"]
     Q -- no --> D["quiche dial, ALPN h3,<br/>roots from caCertFile"]
-    D --> R0{"stored session for this edge?<br/>offer it, then h3 opening rides 0-RTT"}
-    R0 -- no --> U
-    R0 -- yes --> U
+    D --> N{"roots missing?"}
+    N -- yes --> X["return None, send nothing"]
+    N -- no --> R0{"stored session for this edge?"}
+    R0 -- "stored" --> S0["offer it: set_session, best effort"]
+    R0 -- "none" --> H0["send initial handshake datagram"]
+    S0 --> H0
+    H0 --> EA{"is_in_early_data()?"}
+    EA -- yes --> EA0["send h3 opening as 0-RTT"]
+    EA -- no --> EA1["complete handshake,<br/>then send h3 opening"]
+    EA0 --> C0["new connection: one handshake"]
+    EA1 --> C0
+    C0 --> V
     U --> V{"can the pump hand this<br/>lease its bytes?"}
     V -- "session: id in sessions" --> W["one pump restarted if parked"]
     V -- "VLESS UDP/mux lease" --> W2["one pump drives the lane<br/>until the lease drops"]
@@ -39,8 +48,6 @@ graph TD
     W2 --> K
     Y --> K
     K --> Q
-    D --> N{"roots missing?"}
-    N -- yes --> X["return None, send nothing"]
     D -. "one built config per trust bundle,<br/>not one per connection" .-> CF["quiche::Config, shared"]
     H(["server role"]) --> E{"decryption named?"}
     E -- yes --> ES["seal the stream, then<br/>TCP, UDP or mux"]

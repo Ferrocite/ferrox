@@ -1404,6 +1404,8 @@ struct WriteSide {
     pre_write: Vec<u8>,
     out: Vec<u8>,
     direct: bool,
+    #[cfg(test)]
+    last_slices: Vec<(*const u8, usize)>,
 }
 
 fn copy_from_parts(parts: &[&[u8]], mut at: usize, mut len: usize, out: &mut Vec<u8>) {
@@ -1459,6 +1461,12 @@ impl WriteSide {
     }
 
     fn write_all_slices<W: Write>(&mut self, inner: &mut W, parts: &[&[u8]]) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.last_slices.clear();
+            self.last_slices
+                .extend(parts.iter().map(|part| (part.as_ptr(), part.len())));
+        }
         let total = parts.iter().map(|part| part.len()).sum::<usize>();
         let mut at = 0;
         while at < total {
@@ -1550,6 +1558,8 @@ impl<S> EncryptedStream<S> {
                 pre_write: Vec::new(),
                 out: Vec::new(),
                 direct: false,
+                #[cfg(test)]
+                last_slices: Vec::new(),
             },
         }
     }
@@ -2365,6 +2375,14 @@ mod tests {
         );
         sliced.write_all_slices(&parts).unwrap();
 
+        let want: Vec<_> = parts
+            .iter()
+            .map(|part| (part.as_ptr(), part.len()))
+            .collect();
+        assert_eq!(
+            sliced.write.last_slices, want,
+            "the caller's parts reached the record layer by pointer"
+        );
         assert_eq!(sliced.get_ref().wire, control.get_ref().wire);
         assert_eq!(sliced.get_ref().calls, control.get_ref().calls);
 
@@ -2388,6 +2406,10 @@ mod tests {
         direct_sliced.enter_direct_mode();
         direct_sliced.write_all_slices(&parts).unwrap();
 
+        assert_eq!(
+            direct_sliced.write.last_slices, want,
+            "direct mode keeps the caller's parts by pointer"
+        );
         assert_eq!(direct_sliced.get_ref().wire, direct_control.get_ref().wire);
         assert_eq!(
             direct_sliced.get_ref().calls,
