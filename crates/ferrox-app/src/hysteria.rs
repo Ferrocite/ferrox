@@ -3376,6 +3376,7 @@ mod tests {
         assert_eq!(&flow.backlog[flow.at..], payload);
     }
 
+    /// A stream is served by the turn that first claims it, and a second claim leaves the pump's wake alone.
     #[test]
     fn a_stream_is_claimed_by_the_turn_that_serves_it() {
         let driver = Driver::new();
