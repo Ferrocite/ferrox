@@ -3,9 +3,43 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// A connection's last moved byte, so a quiet direction does not idle a tunnel whose other direction is busy.
+#[derive(Debug)]
+pub(crate) struct Activity {
+    base: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    /// A clock whose first byte counts from now.
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Records a byte this connection moved in either direction.
+    pub(crate) fn touch(&self) {
+        let millis = Instant::now()
+            .saturating_duration_since(self.base)
+            .as_millis();
+        self.last_ms.store(millis as u64, Ordering::Relaxed);
+    }
+
+    /// How long since this connection last moved a byte.
+    pub(crate) fn age(&self) -> Duration {
+        let now = Instant::now()
+            .saturating_duration_since(self.base)
+            .as_millis() as u64;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now.saturating_sub(last))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct QuicDial {
@@ -65,6 +99,8 @@ pub(crate) struct PooledStream {
     pub(crate) sock: Arc<Datagram>,
     pub(crate) local: SocketAddr,
     pub(crate) id: u64,
+    /// The connection clock this lease's stream handles share.
+    activity: Arc<Activity>,
     /// The pool entry the stream was taken from, or none when it was built outside the pool: dropping the stream is what hands the id back, so no path that ends a flow has to remember to.
     entry: Option<PooledConn>,
 }
@@ -103,6 +139,7 @@ impl PooledStream {
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::new(AtomicBool::new(true)),
+            activity: Arc::clone(&self.activity),
         }
     }
 }
@@ -3391,6 +3428,7 @@ fn lease_within(dial: &QuicDial, budget: Duration, drive: bool) -> Option<Pooled
         sock: Arc::clone(&pooled.sock),
         local,
         id,
+        activity: Arc::new(Activity::new()),
         entry: Some(pooled),
     })
 }
@@ -3511,6 +3549,8 @@ pub(crate) struct QuicStream {
     /// One H3 server preface per connection: the first request stream sends it, and a client-side
     /// handle starts true because it must never send one.
     prefaced: Arc<AtomicBool>,
+    /// The connection clock this stream's reads and writes refresh.
+    activity: Arc<Activity>,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -3545,6 +3585,7 @@ impl Read for QuicStream {
                     };
                     if n > 0 {
                         self.peer_fin.store(fin, Ordering::Relaxed);
+                        self.activity.touch();
                         flush_egress(&mut conn, &self.sock);
                         self.meter.read(n);
                         return Ok(n);
@@ -3584,6 +3625,7 @@ impl Write for QuicStream {
                 }
                 Ok(n) => {
                     self.meter.write(n);
+                    self.activity.touch();
                     rest = &rest[n..];
                 }
                 Err(error) => return Err(error),
@@ -3610,6 +3652,11 @@ impl crate::proxy::Duplicate for QuicStream {
 }
 
 impl QuicStream {
+    /// The connection clock this stream and its siblings share.
+    pub(crate) fn activity(&self) -> Arc<Activity> {
+        Arc::clone(&self.activity)
+    }
+
     /// Counts both directions against the caller's meters, keeping any an earlier layer already set.
     /// Adds counters to the stream while keeping the ones it already carries.
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
@@ -3692,6 +3739,8 @@ struct ServerConn {
     visit: AtomicU64,
     gone: AtomicBool,
     prefaced: Arc<AtomicBool>,
+    /// The clock every stream this connection serves shares.
+    activity: Arc<Activity>,
 }
 
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
@@ -3701,7 +3750,12 @@ pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
-    fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64, Arc<AtomicBool>)>,
+    fresh: Vec<(
+        Arc<Mutex<quiche::Connection>>,
+        u64,
+        Arc<AtomicBool>,
+        Arc<Activity>,
+    )>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
     /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
@@ -3721,6 +3775,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let sock = Arc::new(sock);
+    let live = Arc::new(AtomicUsize::new(0));
     let mut conns: HashMap<Vec<u8>, Arc<ServerConn>> = HashMap::new();
     let mut scratch = Scratch {
         buf: [0u8; MAX_DATAGRAM],
@@ -3759,12 +3814,12 @@ pub(crate) fn serve_loop(
                     &mut batch,
                     &mut scratch.out,
                 );
-                reap(serve, &sock, &mut conns, &mut scratch);
+                reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
             Drain::Empty => {
                 run_timers(&mut conns, &sock, start.elapsed());
-                reap(serve, &sock, &mut conns, &mut scratch);
+                reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
             Drain::Unbatchable => {}
@@ -3786,7 +3841,16 @@ pub(crate) fn serve_loop(
             }
             Err(_) => return,
         }
-        reap(serve, &sock, &mut conns, &mut scratch);
+        reap(serve, &sock, &mut conns, &mut scratch, &live);
+    }
+    for state in conns.values() {
+        if let Ok(mut conn) = state.conn.lock() {
+            let _ = conn.close(false, 0, b"");
+            flush_egress(&mut conn, sock.as_ref());
+        }
+    }
+    while live.load(Ordering::SeqCst) != 0 {
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -3892,6 +3956,7 @@ fn route(
         visit: AtomicU64::new(0),
         gone: AtomicBool::new(false),
         prefaced: Arc::new(AtomicBool::new(false)),
+        activity: Arc::new(Activity::new()),
     });
     conns.insert(scid.to_vec(), Arc::clone(&state));
     conns.insert(header.dcid.as_ref().to_vec(), state);
@@ -3952,6 +4017,7 @@ fn reap(
     sock: &Arc<Datagram>,
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
     scratch: &mut Scratch,
+    live: &Arc<AtomicUsize>,
 ) {
     scratch.fresh.clear();
     scratch.learned.clear();
@@ -3995,9 +4061,12 @@ fn reap(
                 if stream % 4 != 0 || !seen.insert(stream) {
                     continue;
                 }
-                scratch
-                    .fresh
-                    .push((Arc::clone(&state.conn), stream, Arc::clone(&state.prefaced)));
+                scratch.fresh.push((
+                    Arc::clone(&state.conn),
+                    stream,
+                    Arc::clone(&state.prefaced),
+                    Arc::clone(&state.activity),
+                ));
                 spawned = true;
             }
             // A peer FIN ends only its own direction, so a stream leaves the set once both are closed: else the next readable pass serves it again and resets the half-finished answer.
@@ -4013,7 +4082,7 @@ fn reap(
     for key in scratch.closed.drain(..) {
         conns.remove(&key);
     }
-    for (conn, stream, prefaced) in scratch.fresh.drain(..) {
+    for (conn, stream, prefaced, activity) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
@@ -4021,9 +4090,15 @@ fn reap(
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::clone(&prefaced),
+            activity: Arc::clone(&activity),
         };
         let serve = Arc::clone(serve);
-        std::thread::spawn(move || serve(session));
+        let live = Arc::clone(live);
+        live.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            serve(session);
+            live.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -4057,6 +4132,7 @@ pub(crate) fn direct_stream_on(
         sock: std::sync::Arc::new(sock),
         local,
         id: 4,
+        activity: Arc::new(Activity::new()),
         // Built outside the pool: nothing to hand back when the lane ends.
         entry: None,
     })

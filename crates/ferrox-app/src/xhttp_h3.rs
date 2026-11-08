@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use ferrox_core::foxy::frames;
 use ferrox_core::foxy::hpack;
 
-use crate::quic::{self, Datagram};
+use crate::quic::{self, Activity, Datagram};
 use crate::xhttp::{XhttpMode, XhttpSettings};
 
 const TICK: Duration = Duration::from_millis(20);
@@ -22,37 +22,6 @@ const READ_ROOM: usize = 16 * 1024;
 pub(crate) enum Wire {
     Server(quic::QuicStream),
     Client(ClientStream),
-}
-
-/// Any stream's byte resets the idle clock, so a busy upload keeps a quiet downlink alive.
-#[derive(Debug)]
-struct Activity {
-    base: Instant,
-    last_ms: AtomicU64,
-}
-
-impl Activity {
-    fn new() -> Self {
-        Self {
-            base: Instant::now(),
-            last_ms: AtomicU64::new(0),
-        }
-    }
-
-    fn touch(&self) {
-        let millis = Instant::now()
-            .saturating_duration_since(self.base)
-            .as_millis();
-        self.last_ms.store(millis as u64, Ordering::Relaxed);
-    }
-
-    fn age(&self) -> Duration {
-        let now = Instant::now()
-            .saturating_duration_since(self.base)
-            .as_millis() as u64;
-        let last = self.last_ms.load(Ordering::Relaxed);
-        Duration::from_millis(now.saturating_sub(last))
-    }
 }
 
 impl Read for Wire {
@@ -83,7 +52,7 @@ impl Write for Wire {
 impl Wire {
     fn activity(&self) -> Option<Arc<Activity>> {
         match self {
-            Self::Server(_) => None,
+            Self::Server(stream) => Some(stream.activity()),
             Self::Client(stream) => Some(Arc::clone(&stream.activity)),
         }
     }
@@ -120,6 +89,7 @@ pub(crate) struct H3Reader {
     expect_request: bool,
     idle_since: Option<Instant>,
     activity: Option<Arc<Activity>>,
+    deadline: Option<Instant>,
 }
 
 impl H3Reader {
@@ -139,6 +109,7 @@ impl H3Reader {
             expect_request,
             idle_since: None,
             activity,
+            deadline: None,
         }
     }
 
@@ -146,11 +117,34 @@ impl H3Reader {
         self.status
     }
 
+    /// Whether this POST's own response deadline has passed.
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Bounds this POST's response wait, independently of the connection's activity clock.
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    /// Drops this request's stream in both directions.
+    fn reset(&self) {
+        self.wire.close();
+    }
+
     fn idle_expired(&self, since: Instant) -> bool {
-        self.activity
-            .as_ref()
-            .map_or_else(|| since.elapsed(), |activity| activity.age())
-            >= crate::budgets::relay_stall()
+        if self.expired() {
+            return true;
+        }
+        let idle = if self.head_seen {
+            self.activity
+                .as_ref()
+                .map_or_else(|| since.elapsed(), |activity| activity.age())
+        } else {
+            since.elapsed()
+        };
+        idle >= crate::budgets::relay_stall()
     }
 
     /// The H1 head the request's HEADERS frame names, with the connection framing the reference's
@@ -347,6 +341,9 @@ impl H3Reader {
     }
 
     fn advance(&mut self) -> std::io::Result<bool> {
+        if self.expired() {
+            return Err(std::io::Error::other("h3 request stalled"));
+        }
         if self.at < self.payload.len() {
             return Ok(true);
         }
@@ -942,6 +939,8 @@ impl H3Client {
         let Some((mut reader, out)) = self.open(&block, false) else {
             return false;
         };
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        reader.set_deadline(deadline);
         if let Some(body) = body {
             if !out.data(body) {
                 out.reset();
@@ -953,13 +952,17 @@ impl H3Client {
         loop {
             match reader.read(&mut sink) {
                 Ok(0) => {
-                    return reader
-                        .status()
-                        .is_some_and(|code| (200..300).contains(&code))
+                    return Instant::now() < deadline
+                        && reader
+                            .status()
+                            .is_some_and(|code| (200..300).contains(&code));
                 }
                 Ok(_) => {}
                 Err(error) if crate::proxy::is_timeout(&error) => {}
-                Err(_) => return false,
+                Err(_) => {
+                    reader.reset();
+                    return false;
+                }
             }
         }
     }
