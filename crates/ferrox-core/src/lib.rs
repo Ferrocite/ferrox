@@ -21,6 +21,7 @@ pub(crate) mod keystream;
 pub mod mux;
 pub mod policy;
 pub mod poly1305;
+pub mod portmap;
 pub mod psiphon;
 pub mod realm;
 pub mod record;

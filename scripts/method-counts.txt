@@ -562,6 +562,7 @@ carrier-hysteria realm-punch-allocations 0 ferrox-core-realm::tests::an_encoded_
 carrier-hysteria realm-configs-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_realm_rendezvous
 carrier-hysteria realm-candidate-sorts 1 ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice
 carrier-hysteria realm-expansion-sorts 2 ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice
+carrier-hysteria upnp-mapped-externals 1 ferrox-app-hysteria-realm::tests::a_gateway_maps_the_port_and_names_its_external_address
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
