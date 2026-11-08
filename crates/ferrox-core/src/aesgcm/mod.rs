@@ -49,6 +49,17 @@ pub(crate) trait Lanes: Copy {
     }
     fn encrypt4(rk: &[Self; 11], s: &mut [Self; 4]);
     fn encrypt1v(rk: &[Self; 11], s: Self) -> Self;
+    /// The first four CTR blocks and the poly keystream block (counter 1), so a seal pays one five-block encryption for both.
+    #[inline(always)]
+    fn encrypt5(rk: &[Self; 11], s: &mut [Self; 5]) {
+        let mut quad = [s[0], s[1], s[2], s[3]];
+        Self::encrypt4(rk, &mut quad);
+        s[0] = quad[0];
+        s[1] = quad[1];
+        s[2] = quad[2];
+        s[3] = quad[3];
+        s[4] = Self::encrypt1v(rk, s[4]);
+    }
     #[inline(always)]
     fn encrypt1(rk: &[Self; 11], b: &[u8; 16]) -> [u8; 16] {
         let mut out = [0u8; 16];
@@ -57,6 +68,17 @@ pub(crate) trait Lanes: Copy {
     }
     fn encrypt4_256(rk: &[Self; 15], s: &mut [Self; 4]);
     fn encrypt1v_256(rk: &[Self; 15], s: Self) -> Self;
+    /// The 256-bit half of `encrypt5`.
+    #[inline(always)]
+    fn encrypt5_256(rk: &[Self; 15], s: &mut [Self; 5]) {
+        let mut quad = [s[0], s[1], s[2], s[3]];
+        Self::encrypt4_256(rk, &mut quad);
+        s[0] = quad[0];
+        s[1] = quad[1];
+        s[2] = quad[2];
+        s[3] = quad[3];
+        s[4] = Self::encrypt1v_256(rk, s[4]);
+    }
     #[inline(always)]
     fn encrypt1_256(rk: &[Self; 15], b: &[u8; 16]) -> [u8; 16] {
         let mut out = [0u8; 16];
@@ -163,6 +185,7 @@ pub(crate) fn flush<V: Lanes>(hp: &[(V, V); 4], state: V, tail: &mut Tail<V>) ->
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)] // ctr, mask and the GHASH accumulators are one seal's calling convention
 pub(crate) fn ctr_ghash<V: Lanes>(
     rk: &[V; 11],
     hp: &[(V, V); 4],
@@ -171,12 +194,38 @@ pub(crate) fn ctr_ghash<V: Lanes>(
     buf: &mut [u8],
     tailq: &mut Tail<V>,
     mut ctr: u32,
-) -> V {
+    mask: V,
+) -> (V, V) {
     let (blocks, tail) = buf.as_chunks_mut::<16>();
     let (groups, rest) = blocks.as_chunks_mut::<4>();
-    for quad in groups {
-        let mut ksv = ctr4v(template, ctr);
-        V::encrypt4(rk, &mut ksv);
+    // The first group carries the poly keystream block, so a seal pays one encryption for both.
+    let (first, mask) = if groups.is_empty() {
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
+        let mask = V::encrypt1v(rk, mask);
+        (None, mask)
+    } else {
+        let mut ksv = [
+            template.ctr_be(ctr),
+            template.ctr_be(ctr + 1),
+            template.ctr_be(ctr + 2),
+            template.ctr_be(ctr + 3),
+            mask,
+        ];
+        V::encrypt5(rk, &mut ksv);
+        (Some(ksv), ksv[4])
+    };
+    for (i, quad) in groups.iter_mut().enumerate() {
+        let mut ksv = if i == 0 {
+            match first {
+                Some(k) => [k[0], k[1], k[2], k[3]],
+                None => unreachable!("the first group supplied the keystream"),
+            }
+        } else {
+            ctr4v(template, ctr)
+        };
+        if i > 0 {
+            V::encrypt4(rk, &mut ksv);
+        }
         let ct4 = [
             ksv[0].xor(V::load(&quad[0])),
             ksv[1].xor(V::load(&quad[1])),
@@ -217,7 +266,7 @@ pub(crate) fn ctr_ghash<V: Lanes>(
         }
         tailq.push(V::load(&padded).bswap());
     }
-    state
+    (state, mask)
 }
 
 #[inline(always)]
@@ -294,11 +343,11 @@ pub(crate) fn seal_impl<V: Lanes>(
     buf: &mut [u8],
 ) -> [u8; 16] {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v(rk, template.ctr_be(1));
+    let mask = template.ctr_be(1);
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
-    let state = ctr_ghash(rk, h, template, state, buf, &mut tailq, 2);
+    let (state, mask) = ctr_ghash(rk, h, template, state, buf, &mut tailq, 2, mask);
     finish(
         h,
         state,
@@ -324,16 +373,42 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
     dst: &mut [u8],
     tailq: &mut Tail<V>,
     mut ctr: u32,
-) -> V {
+    mask: V,
+) -> (V, V) {
     debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
     let (sblocks, stail) = src.as_chunks::<16>();
     let (dblocks, dtail) = dst.as_chunks_mut::<16>();
     let (sgroups, srest) = sblocks.as_chunks::<4>();
     let (dgroups, drest) = dblocks.as_chunks_mut::<4>();
     debug_assert_eq!(sgroups.len(), dgroups.len(), "equal lengths group alike");
-    for (sq, dq) in sgroups.iter().zip(dgroups.iter_mut()) {
-        let mut ksv = ctr4v(template, ctr);
-        V::encrypt4(rk, &mut ksv);
+    // The first group carries the poly keystream block, so a seal pays one encryption for both.
+    let (first, mask) = if sgroups.is_empty() {
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
+        let mask = V::encrypt1v(rk, mask);
+        (None, mask)
+    } else {
+        let mut ksv = [
+            template.ctr_be(ctr),
+            template.ctr_be(ctr + 1),
+            template.ctr_be(ctr + 2),
+            template.ctr_be(ctr + 3),
+            mask,
+        ];
+        V::encrypt5(rk, &mut ksv);
+        (Some(ksv), ksv[4])
+    };
+    for (i, (sq, dq)) in sgroups.iter().zip(dgroups.iter_mut()).enumerate() {
+        let mut ksv = if i == 0 {
+            match first {
+                Some(k) => [k[0], k[1], k[2], k[3]],
+                None => unreachable!("the first group supplied the keystream"),
+            }
+        } else {
+            ctr4v(template, ctr)
+        };
+        if i > 0 {
+            V::encrypt4(rk, &mut ksv);
+        }
         let ct4 = [
             ksv[0].xor(V::load(&sq[0])),
             ksv[1].xor(V::load(&sq[1])),
@@ -379,7 +454,7 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
         }
         tailq.push(V::load(&padded).bswap());
     }
-    state
+    (state, mask)
 }
 
 /// CTR and GHASH reading `src` and writing `len` bytes to `dst`, which may be uninitialized. Every byte is written before this returns.
@@ -397,12 +472,38 @@ pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
     dst: *mut u8,
     tailq: &mut Tail<V>,
     mut ctr: u32,
-) -> V {
+    mask: V,
+) -> (V, V) {
     let (sblocks, stail) = src.as_chunks::<16>();
     let (sgroups, srest) = sblocks.as_chunks::<4>();
+    // The first group carries the poly keystream block, so a seal pays one encryption for both.
+    let (first, mask) = if sgroups.is_empty() {
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
+        let mask = V::encrypt1v(rk, mask);
+        (None, mask)
+    } else {
+        let mut ksv = [
+            template.ctr_be(ctr),
+            template.ctr_be(ctr + 1),
+            template.ctr_be(ctr + 2),
+            template.ctr_be(ctr + 3),
+            mask,
+        ];
+        V::encrypt5(rk, &mut ksv);
+        (Some(ksv), ksv[4])
+    };
     for (group, sq) in sgroups.iter().enumerate() {
-        let mut ksv = ctr4v(template, ctr);
-        V::encrypt4(rk, &mut ksv);
+        let mut ksv = if group == 0 {
+            match first {
+                Some(k) => [k[0], k[1], k[2], k[3]],
+                None => unreachable!("the first group supplied the keystream"),
+            }
+        } else {
+            ctr4v(template, ctr)
+        };
+        if group > 0 {
+            V::encrypt4(rk, &mut ksv);
+        }
         let ct4 = [
             ksv[0].xor(V::load(&sq[0])),
             ksv[1].xor(V::load(&sq[1])),
@@ -456,7 +557,7 @@ pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
         }
         tailq.push(V::load(&padded).bswap());
     }
-    state
+    (state, mask)
 }
 
 #[inline(always)]
@@ -471,11 +572,11 @@ pub(crate) fn seal_impl_from<V: Lanes>(
 ) -> [u8; 16] {
     debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v(rk, template.ctr_be(1));
+    let mask = template.ctr_be(1);
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
-    let state = ctr_ghash_from(rk, h, template, state, src, dst, &mut tailq, 2);
+    let (state, mask) = ctr_ghash_from(rk, h, template, state, src, dst, &mut tailq, 2, mask);
     finish(
         h,
         state,
@@ -498,12 +599,13 @@ pub(crate) unsafe fn seal_impl_from_uninit<V: Lanes>(
     dst: *mut u8,
 ) -> [u8; 16] {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v(rk, template.ctr_be(1));
+    let mask = template.ctr_be(1);
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
     // SAFETY: the caller guarantees `dst` has room for every plaintext byte.
-    let state = unsafe { ctr_ghash_from_uninit(rk, h, template, state, src, dst, &mut tailq, 2) };
+    let (state, mask) =
+        unsafe { ctr_ghash_from_uninit(rk, h, template, state, src, dst, &mut tailq, 2, mask) };
     finish(
         h,
         state,
@@ -871,6 +973,7 @@ pub(crate) fn powers_256<V: Lanes>(rk: &[V; 15]) -> [(V, V); 4] {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)] // ctr, mask and the GHASH accumulators are one seal's calling convention
 pub(crate) fn ctr_ghash_256<V: Lanes>(
     rk: &[V; 15],
     hp: &[(V, V); 4],
@@ -879,12 +982,38 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
     buf: &mut [u8],
     tailq: &mut Tail<V>,
     mut ctr: u32,
-) -> V {
+    mask: V,
+) -> (V, V) {
     let (blocks, tail) = buf.as_chunks_mut::<16>();
     let (groups, rest) = blocks.as_chunks_mut::<4>();
-    for quad in groups {
-        let mut ksv = ctr4v(template, ctr);
-        V::encrypt4_256(rk, &mut ksv);
+    // The first group carries the poly keystream block, so a seal pays one encryption for both.
+    let (first, mask) = if groups.is_empty() {
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
+        let mask = V::encrypt1v_256(rk, mask);
+        (None, mask)
+    } else {
+        let mut ksv = [
+            template.ctr_be(ctr),
+            template.ctr_be(ctr + 1),
+            template.ctr_be(ctr + 2),
+            template.ctr_be(ctr + 3),
+            mask,
+        ];
+        V::encrypt5_256(rk, &mut ksv);
+        (Some(ksv), ksv[4])
+    };
+    for (i, quad) in groups.iter_mut().enumerate() {
+        let mut ksv = if i == 0 {
+            match first {
+                Some(k) => [k[0], k[1], k[2], k[3]],
+                None => unreachable!("the first group supplied the keystream"),
+            }
+        } else {
+            ctr4v(template, ctr)
+        };
+        if i > 0 {
+            V::encrypt4_256(rk, &mut ksv);
+        }
         let ct4 = [
             ksv[0].xor(V::load(&quad[0])),
             ksv[1].xor(V::load(&quad[1])),
@@ -925,7 +1054,7 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
         }
         tailq.push(V::load(&padded).bswap());
     }
-    state
+    (state, mask)
 }
 
 /// CTR and GHASH reading `src` and writing `dst`, so a caller that holds plaintext in one buffer and the wire in another never copies between them. `src` and `dst` must not overlap; their lengths are equal.
@@ -943,16 +1072,42 @@ pub(crate) fn ctr_ghash_from_256<V: Lanes>(
     dst: &mut [u8],
     tailq: &mut Tail<V>,
     mut ctr: u32,
-) -> V {
+    mask: V,
+) -> (V, V) {
     debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
     let (sblocks, stail) = src.as_chunks::<16>();
     let (dblocks, dtail) = dst.as_chunks_mut::<16>();
     let (sgroups, srest) = sblocks.as_chunks::<4>();
     let (dgroups, drest) = dblocks.as_chunks_mut::<4>();
     debug_assert_eq!(sgroups.len(), dgroups.len(), "equal lengths group alike");
-    for (sq, dq) in sgroups.iter().zip(dgroups.iter_mut()) {
-        let mut ksv = ctr4v(template, ctr);
-        V::encrypt4_256(rk, &mut ksv);
+    // The first group carries the poly keystream block, so a seal pays one encryption for both.
+    let (first, mask) = if sgroups.is_empty() {
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
+        let mask = V::encrypt1v_256(rk, mask);
+        (None, mask)
+    } else {
+        let mut ksv = [
+            template.ctr_be(ctr),
+            template.ctr_be(ctr + 1),
+            template.ctr_be(ctr + 2),
+            template.ctr_be(ctr + 3),
+            mask,
+        ];
+        V::encrypt5_256(rk, &mut ksv);
+        (Some(ksv), ksv[4])
+    };
+    for (i, (sq, dq)) in sgroups.iter().zip(dgroups.iter_mut()).enumerate() {
+        let mut ksv = if i == 0 {
+            match first {
+                Some(k) => [k[0], k[1], k[2], k[3]],
+                None => unreachable!("the first group supplied the keystream"),
+            }
+        } else {
+            ctr4v(template, ctr)
+        };
+        if i > 0 {
+            V::encrypt4_256(rk, &mut ksv);
+        }
         let ct4 = [
             ksv[0].xor(V::load(&sq[0])),
             ksv[1].xor(V::load(&sq[1])),
@@ -998,7 +1153,7 @@ pub(crate) fn ctr_ghash_from_256<V: Lanes>(
         }
         tailq.push(V::load(&padded).bswap());
     }
-    state
+    (state, mask)
 }
 
 /// CTR and GHASH reading `src` and writing `len` bytes to `dst`, which may be uninitialized. Every byte is written before this returns.
@@ -1016,12 +1171,38 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
     dst: *mut u8,
     tailq: &mut Tail<V>,
     mut ctr: u32,
-) -> V {
+    mask: V,
+) -> (V, V) {
     let (sblocks, stail) = src.as_chunks::<16>();
     let (sgroups, srest) = sblocks.as_chunks::<4>();
+    // The first group carries the poly keystream block, so a seal pays one encryption for both.
+    let (first, mask) = if sgroups.is_empty() {
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
+        let mask = V::encrypt1v_256(rk, mask);
+        (None, mask)
+    } else {
+        let mut ksv = [
+            template.ctr_be(ctr),
+            template.ctr_be(ctr + 1),
+            template.ctr_be(ctr + 2),
+            template.ctr_be(ctr + 3),
+            mask,
+        ];
+        V::encrypt5_256(rk, &mut ksv);
+        (Some(ksv), ksv[4])
+    };
     for (group, sq) in sgroups.iter().enumerate() {
-        let mut ksv = ctr4v(template, ctr);
-        V::encrypt4_256(rk, &mut ksv);
+        let mut ksv = if group == 0 {
+            match first {
+                Some(k) => [k[0], k[1], k[2], k[3]],
+                None => unreachable!("the first group supplied the keystream"),
+            }
+        } else {
+            ctr4v(template, ctr)
+        };
+        if group > 0 {
+            V::encrypt4_256(rk, &mut ksv);
+        }
         let ct4 = [
             ksv[0].xor(V::load(&sq[0])),
             ksv[1].xor(V::load(&sq[1])),
@@ -1075,7 +1256,7 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
         }
         tailq.push(V::load(&padded).bswap());
     }
-    state
+    (state, mask)
 }
 
 #[inline(always)]
@@ -1116,11 +1297,11 @@ pub(crate) fn seal_impl_256<V: Lanes>(
     buf: &mut [u8],
 ) -> [u8; 16] {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
+    let mask = template.ctr_be(1);
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
-    let state = ctr_ghash_256(rk, h, template, state, buf, &mut tailq, 2);
+    let (state, mask) = ctr_ghash_256(rk, h, template, state, buf, &mut tailq, 2, mask);
     finish(
         h,
         state,
@@ -1144,11 +1325,11 @@ pub(crate) fn seal_impl_from_256<V: Lanes>(
 ) -> [u8; 16] {
     debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
+    let mask = template.ctr_be(1);
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
-    let state = ctr_ghash_from_256(rk, h, template, state, src, dst, &mut tailq, 2);
+    let (state, mask) = ctr_ghash_from_256(rk, h, template, state, src, dst, &mut tailq, 2, mask);
     finish(
         h,
         state,
@@ -1171,13 +1352,13 @@ pub(crate) unsafe fn seal_impl_from_256_uninit<V: Lanes>(
     dst: *mut u8,
 ) -> [u8; 16] {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
+    let mask = template.ctr_be(1);
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
     // SAFETY: the caller guarantees `dst` has room for every plaintext byte.
-    let state =
-        unsafe { ctr_ghash_from_256_uninit(rk, h, template, state, src, dst, &mut tailq, 2) };
+    let (state, mask) =
+        unsafe { ctr_ghash_from_256_uninit(rk, h, template, state, src, dst, &mut tailq, 2, mask) };
     finish(
         h,
         state,
