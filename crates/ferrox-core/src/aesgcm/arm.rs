@@ -331,7 +331,7 @@ fn ctr_ghash8(
     let (h, hp) = (ghash.h(), ghash.hp());
     if buf.len() <= SHORT_SEAL_BYTES {
         ctr_only8(rk, template, buf, ctr);
-        return ghash8(ghash, state, buf, tailq);
+        return (ghash8(ghash, state, buf, tailq), <uint8x16_t as Lanes>::encrypt1v(rk, mask));
     }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
@@ -491,7 +491,7 @@ fn ctr_ghash8_256(
     let (h, hp) = (ghash.h(), ghash.hp());
     if buf.len() <= SHORT_SEAL_BYTES {
         ctr_only8_256(rk, template, buf, ctr);
-        return ghash8(ghash, state, buf, tailq);
+        return (ghash8(ghash, state, buf, tailq), <uint8x16_t as Lanes>::encrypt1v_256(rk, mask));
     }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
@@ -815,7 +815,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
+        let (state, mask) = ctr_ghash8(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
@@ -845,7 +845,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_from(
+        let (state, mask) = ctr_ghash8_from(
             &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
         );
         super::finish(
@@ -877,7 +877,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = unsafe {
+        let (state, mask) = unsafe {
             ctr_ghash8_from_uninit(
                 &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
             )
@@ -1029,7 +1029,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_256(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
+        let (state, mask) = ctr_ghash8_256(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
@@ -1060,7 +1060,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = ctr_ghash8_from_256(
+        let (state, mask) = ctr_ghash8_from_256(
             &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
         );
         super::finish(
@@ -1092,7 +1092,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = unsafe {
+        let (state, mask) = unsafe {
             ctr_ghash8_from_256_uninit(
                 &self.rk, self, template, state, src, dst, &mut tailq, 2, mask,
             )

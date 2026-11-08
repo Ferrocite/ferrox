@@ -201,7 +201,7 @@ impl Engine {
         buf: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
         mask: __m128i,
-    ) -> __m128i {
+    ) -> (__m128i, __m128i) {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
             let (blocks, _) = buf.as_chunks_mut::<16>();
@@ -253,7 +253,7 @@ impl Engine {
         dst: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
         mask: __m128i,
-    ) -> __m128i {
+    ) -> (__m128i, __m128i) {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
             let (sblocks, _) = src.as_chunks::<16>();
@@ -327,7 +327,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8(template, state, buf, &mut tailq, mask);
+        let (state, mask) = self.ctr_ghash8(template, state, buf, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -357,7 +357,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8_from(template, state, src, dst, &mut tailq, mask);
+        let (state, mask) = self.ctr_ghash8_from(template, state, src, dst, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -378,7 +378,7 @@ impl Engine {
         dst: *mut u8,
         tailq: &mut super::Tail<__m128i>,
         mask: __m128i,
-    ) -> __m128i {
+    ) -> (__m128i, __m128i) {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
             let (sblocks, _) = src.as_chunks::<16>();
@@ -445,7 +445,7 @@ impl Engine {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state =
+        let (state, mask) =
             unsafe { self.ctr_ghash8_from_uninit(template, state, src, dst, &mut tailq, mask) };
         super::finish(
             &self.h,
@@ -561,7 +561,7 @@ impl Engine256 {
         buf: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
         mask: __m128i,
-    ) -> __m128i {
+    ) -> (__m128i, __m128i) {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
             let (blocks, _) = buf.as_chunks_mut::<16>();
@@ -614,7 +614,7 @@ impl Engine256 {
         dst: &mut [u8],
         tailq: &mut super::Tail<__m128i>,
         mask: __m128i,
-    ) -> __m128i {
+    ) -> (__m128i, __m128i) {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
             let (sblocks, _) = src.as_chunks::<16>();
@@ -671,7 +671,7 @@ impl Engine256 {
         dst: *mut u8,
         tailq: &mut super::Tail<__m128i>,
         mask: __m128i,
-    ) -> __m128i {
+    ) -> (__m128i, __m128i) {
         unsafe {
             let template2 = _mm256_broadcastsi128_si256(template);
             let (sblocks, _) = src.as_chunks::<16>();
@@ -731,7 +731,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8_256(template, state, buf, &mut tailq, mask);
+        let (state, mask) = self.ctr_ghash8_256(template, state, buf, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -762,7 +762,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state = self.ctr_ghash8_from_256(template, state, src, dst, &mut tailq, mask);
+        let (state, mask) = self.ctr_ghash8_from_256(template, state, src, dst, &mut tailq, mask);
         super::finish(
             &self.h,
             state,
@@ -792,7 +792,7 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let state =
+        let (state, mask) =
             unsafe { self.ctr_ghash8_from_256_uninit(template, state, src, dst, &mut tailq, mask) };
         super::finish(
             &self.h,
