@@ -31,10 +31,12 @@ graph TD
     D --> N{"roots missing?"}
     N -- yes --> X["return None, send nothing"]
     N -- no --> R0{"stored session for this edge?"}
-    R0 -- "stored" --> EA{"set_session accepted and<br/>is_in_early_data()?"}
+    R0 -- "stored" --> S0["offer it: set_session, best effort"]
+    R0 -- "none" --> H0["send initial handshake datagram"]
+    S0 --> H0
+    H0 --> EA{"is_in_early_data()?"}
     EA -- yes --> EA0["send h3 opening as 0-RTT"]
     EA -- no --> EA1["complete handshake,<br/>then send h3 opening"]
-    R0 -- "none" --> EA1
     EA0 --> C0["new connection: one handshake"]
     EA1 --> C0
     C0 --> V
