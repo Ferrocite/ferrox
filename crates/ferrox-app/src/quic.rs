@@ -3547,7 +3547,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             None => Datagram::plain(sock),
         };
         let bound = resolved.map(|_| Instant::now());
-        let Some((mut conn, _early)) = handshake_within(
+        let Some((conn, _early)) = handshake_within(
             &sock,
             peer,
             local,
@@ -5748,7 +5748,11 @@ mod tests {
         let mut server_config = serve_config(&identity).expect("serves");
         let server = std::thread::spawn(move || {
             let mut server_once = |server_sock: &Datagram, server_config: &mut quiche::Config| {
-                let mut conn = server_accept(server_sock, server_sock.local_addr().expect("addr"), server_config);
+                let mut conn = server_accept(
+                    server_sock,
+                    server_sock.local_addr().expect("addr"),
+                    server_config,
+                );
                 let resumed = conn.is_resumed();
                 let mut opened = Vec::new();
                 let mut chunk = [0u8; 1024];

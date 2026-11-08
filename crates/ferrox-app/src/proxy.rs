@@ -56804,7 +56804,7 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn = crate::quic::handshake_within(
+        let (mut conn, _early) = crate::quic::handshake_within(
             &sock,
             peer,
             local,
@@ -56812,9 +56812,9 @@ mod tests {
             roots,
             None,
             QUIC_TEST_TIMEOUT,
+            None,
         )
         .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 0, header, false, deadline
@@ -56842,7 +56842,7 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn = crate::quic::handshake_within(
+        let (mut conn, _early) = crate::quic::handshake_within(
             &sock,
             peer,
             local,
@@ -56850,9 +56850,9 @@ mod tests {
             roots,
             None,
             QUIC_TEST_TIMEOUT,
+            None,
         )
         .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 0, header, false, deadline
@@ -56952,7 +56952,7 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn = crate::quic::handshake_within(
+        let (mut conn, _early) = crate::quic::handshake_within(
             &sock,
             peer,
             local,
@@ -56960,9 +56960,9 @@ mod tests {
             &roots,
             None,
             QUIC_TEST_TIMEOUT,
+            None,
         )
         .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         assert!(crate::quic::stream_send_all(
             &mut conn,
@@ -57018,7 +57018,7 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn = crate::quic::handshake_within(
+        let (mut conn, _early) = crate::quic::handshake_within(
             &sock,
             peer,
             local,
@@ -57026,9 +57026,9 @@ mod tests {
             &roots,
             None,
             QUIC_TEST_TIMEOUT,
+            None,
         )
         .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         assert!(crate::quic::stream_send_all(
             &mut conn,
@@ -57304,7 +57304,7 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn = crate::quic::handshake_within(
+        let (mut conn, _early) = crate::quic::handshake_within(
             &sock,
             peer,
             local,
@@ -57312,9 +57312,9 @@ mod tests {
             &roots,
             None,
             QUIC_TEST_TIMEOUT,
+            None,
         )
         .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         for stream in [0u64, 4] {
             assert!(crate::quic::stream_send_all(
@@ -57362,7 +57362,7 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn = crate::quic::handshake_within(
+        let (mut conn, _early) = crate::quic::handshake_within(
             &sock,
             peer,
             local,
@@ -57370,9 +57370,9 @@ mod tests {
             &roots,
             None,
             QUIC_TEST_TIMEOUT,
+            None,
         )
         .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 0, &bad, false, deadline
