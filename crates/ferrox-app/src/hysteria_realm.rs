@@ -675,11 +675,9 @@ pub(crate) fn punch_via_state(
         return None;
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    state
-        .punch
-        .lock()
-        .ok()
-        .map(|mut map| map.insert(meta.nonce, (meta.clone(), tx)));
+    if let Ok(mut map) = state.punch.lock() {
+        map.insert(meta.nonce, (meta.clone(), tx));
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut next_send = Instant::now();
     let found = loop {
@@ -703,11 +701,9 @@ pub(crate) fn punch_via_state(
             Err(_) => break None,
         }
     };
-    state
-        .punch
-        .lock()
-        .ok()
-        .map(|mut map| map.remove(&meta.nonce));
+    if let Ok(mut map) = state.punch.lock() {
+        map.remove(&meta.nonce);
+    }
     found
 }
 
@@ -739,25 +735,29 @@ pub(crate) fn demux(
         // Even if no transaction is waiting, a STUN message the peer spoke is not a QUIC packet.
         return false;
     }
-    for (meta, sender) in state
-        .punch
-        .lock()
-        .ok()
-        .map(|map| map.values().cloned().collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
-        if let Some(decoded) = realm::decode_punch(packet, &meta) {
-            if decoded.packet_type == PacketType::Hello {
-                let mut ack = [0u8; realm::MAX_WIRE_LEN];
-                if let Some(written) = realm::encode_punch(PacketType::Ack, &meta, &mut ack) {
-                    let _ = sock.send_to(&ack[..written], from);
-                }
+    if packet.len() < realm::MIN_WIRE_LEN || packet.len() > realm::MAX_WIRE_LEN {
+        return false;
+    }
+    let mut found = None;
+    if let Ok(map) = state.punch.lock() {
+        for (meta, sender) in map.values() {
+            if let Some(decoded) = realm::decode_punch(packet, meta) {
+                found = Some((decoded.packet_type, meta.clone(), sender.clone()));
+                break;
             }
-            let _ = sender.send(from);
-            return true;
         }
     }
-    false
+    let Some((packet_type, meta, sender)) = found else {
+        return false;
+    };
+    if packet_type == PacketType::Hello {
+        let mut ack = [0u8; realm::MAX_WIRE_LEN];
+        if let Some(written) = realm::encode_punch(PacketType::Ack, &meta, &mut ack) {
+            let _ = sock.send_to(&ack[..written], from);
+        }
+    }
+    let _ = sender.send(from);
+    true
 }
 
 /// Register this serve at the rendezvous and answer its punches until `stop` names the end: the
@@ -1209,6 +1209,56 @@ mod tests {
             mapped.to_string(),
             "203.0.113.7:4100",
             "the gateway's port and address are the registered ones"
+        );
+    }
+
+    fn pending_punch() -> (
+        std::sync::Arc<RealmState>,
+        Metadata,
+        std::sync::mpsc::Receiver<SocketAddr>,
+    ) {
+        let state = RealmState::new();
+        let meta = Metadata {
+            nonce: [7; realm::NONCE_SIZE],
+            obfs: [9; realm::OBFS_SIZE],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        state
+            .punch
+            .lock()
+            .expect("punch lock")
+            .insert(meta.nonce, (meta.clone(), tx));
+        (state, meta, rx)
+    }
+
+    /// A packet that is not the pending punch costs no vector: the demux walks the map where it lies.
+    #[test]
+    fn a_pending_punch_costs_no_vector_on_a_foreign_packet() {
+        let (state, _, _rx) = pending_punch();
+        let sock = crate::quic::Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let packet = [0u8; realm::MIN_WIRE_LEN];
+        let from: SocketAddr = "127.0.0.1:9".parse().expect("address");
+        let (handled, counts) =
+            ferrox_core::alloc_count::measure(|| demux(&state, &sock, &packet, from));
+        assert!(!handled);
+        assert_eq!(
+            counts.allocs, 0,
+            "a foreign packet allocated a pending-punch copy"
+        );
+    }
+
+    /// The pending punch still reads its own hello and hands the source to the waiter.
+    #[test]
+    fn a_punch_packet_still_reaches_its_waiter() {
+        let (state, meta, rx) = pending_punch();
+        let sock = crate::quic::Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let mut packet = [0u8; realm::MAX_WIRE_LEN];
+        let written = realm::encode_punch(PacketType::Hello, &meta, &mut packet).expect("hello");
+        let from: SocketAddr = "127.0.0.1:9".parse().expect("address");
+        assert!(demux(&state, &sock, &packet[..written], from));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("the waiter"),
+            from
         );
     }
 }
