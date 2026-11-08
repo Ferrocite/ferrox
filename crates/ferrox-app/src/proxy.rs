@@ -20633,25 +20633,13 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    // The demux runs for the connection's life, so it detaches instead of holding the handshake worker.
-    if take_handshake_lane() {
-        let settings = settings.clone();
-        let keys: Vec<[u8; 56]> = key.to_vec();
-        let sniffing = crate::sniff::current();
-        let flow = crate::accesslog::snapshot();
-        thread::spawn(move || {
-            crate::sniff::install_current(sniffing);
-            let _flow = crate::accesslog::install_snapshot(flow);
-            serve_trojan_xhttp_carrier(read, write, &settings, &keys, freedom);
-        });
-        return;
-    }
     let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
         return;
     };
     if !h2 {
         return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
     }
+    // The demux parks on the socket between frames, so eight connections add lanes, not threads.
     let keys: Vec<[u8; 56]> = key.to_vec();
     let service = crate::xhttp_h2::XhttpSessionService::new(
         settings.clone(),
@@ -20659,7 +20647,19 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
             serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
         }),
     );
-    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+    let until = Instant::now() + crate::budgets::handshake();
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut step = crate::xhttp_h2::h2_lane(chained, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    lane_pool::submit_demux(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
 }
 
 fn serve_trojan_xhttp_accepted(
