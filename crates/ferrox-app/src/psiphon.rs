@@ -11,6 +11,7 @@ use ferrox_core::tls::Fingerprint;
 use flate2::read::ZlibDecoder;
 use ring::signature;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{
@@ -5831,12 +5832,22 @@ fn tactics_entry(entry: &Json, host: &str) -> Option<crate::psiphon_tactics::Key
 }
 
 /// A capability name with the legacy mask and CDN marker removed, as the reference matches it.
-fn capability_name(name: &str) -> String {
+fn capability_name(name: &str) -> Cow<'_, str> {
+    if !name.contains("-PASSTHROUGH")
+        && name != "QUICv1"
+        && !name.ends_with("-OSSH")
+        && !matches!(
+            name,
+            "FRONTED-MEEK-CDN" | "FRONTED-MEEK-CDN-HTTP" | "FRONTED-MEEK-CDN-QUIC"
+        )
+    {
+        return Cow::Borrowed(name);
+    }
     let stripped = name
         .replace("-PASSTHROUGH-v2", "")
         .replace("-PASSTHROUGH", "");
     if stripped == "QUICv1" {
-        return "QUIC".to_owned();
+        return Cow::Owned("QUIC".to_owned());
     }
     let base = match stripped.as_str() {
         "FRONTED-MEEK-CDN" => "FRONTED-MEEK",
@@ -5844,14 +5855,14 @@ fn capability_name(name: &str) -> String {
         "FRONTED-MEEK-CDN-QUIC" => "FRONTED-MEEK-QUIC",
         other => other,
     };
-    base.strip_suffix("-OSSH").unwrap_or(base).to_owned()
+    Cow::Owned(base.strip_suffix("-OSSH").unwrap_or(base).to_owned())
 }
 
 /// Whether one advertised capability satisfies a required one.
 fn capability_matches(advertised: &str, required: &str) -> bool {
     let required = capability_name(required);
     capability_name(advertised) == required
-        || (required == "TLS"
+        || (required.as_ref() == "TLS"
             && matches!(
                 advertised,
                 "UNFRONTED-MEEK-HTTPS-PASSTHROUGH-v2"
@@ -5862,10 +5873,10 @@ fn capability_matches(advertised: &str, required: &str) -> bool {
 /// The capability name an entry advertises for a tunnel protocol.
 fn capability_protocol(entry: &Json, candidates: &[(&str, &'static str)]) -> Option<&'static str> {
     let capabilities = entry.get("capabilities").and_then(Json::as_arr)?;
-    let names: Vec<&str> = capabilities.iter().filter_map(Json::as_str).collect();
     candidates.iter().find_map(|(name, protocol)| {
-        names
+        capabilities
             .iter()
+            .filter_map(Json::as_str)
             .any(|advertised| capability_matches(advertised, name))
             .then_some(*protocol)
     })
@@ -7299,6 +7310,26 @@ mod tests {
         let meek = server.meek.expect("meek");
         assert_eq!(meek.protocol, "FRONTED-MEEK-OSSH");
         assert!(meek.fronted);
+    }
+
+    #[test]
+    fn capability_names_borrow_when_no_mask_is_needed() {
+        let ((), new) = ferrox_core::alloc_count::measure(|| {
+            assert!(capability_matches("SSH", "SSH"));
+            assert!(capability_matches("FRONTED-MEEK", "FRONTED-MEEK"));
+            assert!(capability_matches(
+                "UNFRONTED-MEEK-HTTPS",
+                "UNFRONTED-MEEK-HTTPS"
+            ));
+        });
+        assert_eq!(new.allocs, 0, "the common names take no heap: {new:?}");
+        assert!(capability_matches("FRONTED-MEEK-OSSH", "FRONTED-MEEK"));
+        assert!(capability_matches("QUICv1", "QUIC"));
+        assert!(capability_matches(
+            "UNFRONTED-MEEK-HTTPS-PASSTHROUGH-v2",
+            "TLS"
+        ));
+        assert!(!capability_matches("FRONTED-MEEK-CDN-HTTP", "FRONTED-MEEK"));
     }
 
     #[test]
