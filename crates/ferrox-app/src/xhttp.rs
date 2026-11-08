@@ -1988,23 +1988,17 @@ thread_local! {
     static SWEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-thread_local! {
-    static LAST_SWEEP: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-}
+static LAST_SWEEP: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// A live lookup only sweeps once this thread has gone a stall budget without one.
+/// A live lookup only sweeps once the table has gone a stall budget without one.
 fn sweep_due(budget: std::time::Duration) -> bool {
-    LAST_SWEEP.with(|last| {
-        let now = std::time::Instant::now();
-        if last
-            .get()
-            .is_some_and(|last| now.duration_since(last) < budget)
-        {
-            return false;
-        }
-        last.set(Some(now));
-        true
-    })
+    let mut last = LAST_SWEEP.lock().expect("sweep lock");
+    let now = std::time::Instant::now();
+    if last.is_some_and(|last| now.duration_since(last) < budget) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 fn sweep_stalled_sessions(
