@@ -2321,17 +2321,6 @@ mod tests {
             }
         }
 
-        struct Sink;
-        impl Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let key = vec![7u8; 32];
         let uuid = [0x11u8; 16];
         let head = [0u8, 0x00, 0x01, 0x00, 0x02];
@@ -2388,29 +2377,51 @@ mod tests {
             direct_sliced.get_ref().calls,
             direct_control.get_ref().calls
         );
+    }
 
-        let mut steady = EncryptedStream::new(
+    #[test]
+    fn a_sliced_record_write_allocates_nothing_after_warmup() {
+        use std::io::Write as _;
+
+        struct Sink;
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = vec![7u8; 32];
+        let uuid = [0x11u8; 16];
+        let head = [0u8, 0x00, 0x01, 0x00, 0x02];
+        let payload = [0x33u8; 300];
+        let padding = vec![0u8; MAX_BATCH_PLAINTEXT - MAX_RECORD_PLAINTEXT + 300];
+        let parts: [&[u8]; 4] = [&uuid, &head, &payload, &padding];
+        let mut stream = EncryptedStream::new(
             Sink,
             key.clone(),
             Aead::new(b"sliced write", &key),
             None,
             ReadStage::Records,
         );
-        steady.write_all_slices(&parts).unwrap();
-        let capacity = steady.write.out.capacity();
-        let base = steady.write.out.as_ptr();
+        stream.write_all_slices(&parts).unwrap();
+        let capacity = stream.write.out.capacity();
+        let base = stream.write.out.as_ptr();
         let ((), counts) = crate::alloc_count::measure(|| {
             for _ in 0..64 {
-                steady.write_all_slices(&parts).unwrap();
+                stream.write_all_slices(&parts).unwrap();
             }
         });
         assert_eq!(
-            steady.write.out.capacity(),
+            stream.write.out.capacity(),
             capacity,
             "the sliced write buffer grew"
         );
         assert_eq!(
-            steady.write.out.as_ptr(),
+            stream.write.out.as_ptr(),
             base,
             "the sliced write buffer moved"
         );
