@@ -422,10 +422,10 @@ pub(crate) fn serve(
             ),
         )
     })?;
+    let device = Arc::new(tun_stack::build(spec, false, false)?.0);
     let listener = std::net::TcpListener::bind(SocketAddr::new(local, 0))?;
     listener.set_nonblocking(true)?;
     let listener_port = listener.local_addr()?.port();
-    let device = Arc::new(tun_stack::build(spec, false, false)?.0);
     if spec.queues() > 1 {
         let stack = if hybrid { "hybrid" } else { "system" };
         eprintln!("tun inbound: the {stack} stack uses one queue");
