@@ -315,6 +315,13 @@ impl<S: Stream> Server<S> {
 
         let certs = self.cfg.served_entries();
         let cert = self.pick_cert(&certs, hello.sni.as_deref())?;
+        // Decided before the flight so the acknowledgement and the status agree: an acked
+        // `status_request` must be followed by the message, and vice versa.
+        let staple = hello
+            .ocsp_requested
+            .then(|| certs[cert].ocsp.as_ref())
+            .flatten()
+            .and_then(|ocsp| ocsp.response.as_ref());
         let key = PKey::private_key_from_der(&certs[cert].key_der)
             .map_err(|error| TlsError::Other(format!("server key: {error}")))?;
         let rsa = key.rsa().is_ok();
@@ -350,28 +357,22 @@ impl<S: Stream> Server<S> {
             Some(shares.pop().ok_or(TlsError::NoSharedCipher)?)
         };
 
-        let mut flight = self.server_hello(&hello, suite_id, &random, share.is_some());
+        let mut flight = self.server_hello(&hello, suite_id, &random, share.is_some(), staple.is_some());
         let mut transcript = Vec::new();
         transcript.extend_from_slice(&hello_message);
         transcript.extend_from_slice(&flight);
         let certificate = certificate_message(&certs[cert].cert_chain);
         transcript.extend_from_slice(&certificate);
         flight.extend_from_slice(&certificate);
-        // The staple rides after the chain, only for a client that requested it.
-        if hello.ocsp_requested {
-            if let Some(response) = certs[cert]
-                .ocsp
-                .as_ref()
-                .and_then(|ocsp| ocsp.response.as_ref())
-            {
-                let mut status = Vec::with_capacity(4 + response.len());
-                status.push(1);
-                status.extend_from_slice(&(response.len() as u32).to_be_bytes()[1..]);
-                status.extend_from_slice(response);
-                let status = message(22, &status);
-                transcript.extend_from_slice(&status);
-                flight.extend_from_slice(&status);
-            }
+        // The staple rides after the chain, answering the extension the hello acknowledged.
+        if let Some(response) = staple {
+            let mut status = Vec::with_capacity(4 + response.len());
+            status.push(1);
+            status.extend_from_slice(&(response.len() as u32).to_be_bytes()[1..]);
+            status.extend_from_slice(response);
+            let status = message(22, &status);
+            transcript.extend_from_slice(&status);
+            flight.extend_from_slice(&status);
         }
         if let Some(share) = &share {
             let exchange = self.key_exchange(&hello, share, &random)?;
@@ -499,10 +500,17 @@ impl<S: Stream> Server<S> {
         Ok(0)
     }
 
-    fn server_hello(&self, hello: &Hello, suite: u16, random: &[u8; 32], ecdhe: bool) -> Vec<u8> {
+    fn server_hello(
+        &self,
+        hello: &Hello,
+        suite: u16,
+        random: &[u8; 32],
+        ecdhe: bool,
+        ocsp: bool,
+    ) -> Vec<u8> {
         let mut ext = Vec::new();
-        if hello.ocsp_requested {
-            // Acknowledged with the extension; the status rides later, gated on this request.
+        if ocsp {
+            // Acknowledged with the extension; the status rides later, gated on this same call.
             extension(&mut ext, 0x0005, &[]);
         }
         if hello.secure() {

@@ -96,49 +96,53 @@ const SESSION_SWEEP: u64 = 30;
 const SESSION_KEYS: usize = 64 * 1024;
 
 /// Whether the session this header opens was already admitted: the user, the request body key
-/// and the request body IV, the reference's session id, refused while it is still live.
+/// and the request body IV, the reference's session id, refused while it is still live. The
+/// history is partitioned by user, so one account cannot spend the admission another needs.
 fn session_seen(user: &[u8; 16], key: &[u8; 16], iv: &[u8; 16]) -> bool {
     static HISTORY: OnceLock<Mutex<SessionHistory>> = OnceLock::new();
-    let mut session = [0u8; 48];
-    session[..16].copy_from_slice(user);
-    session[16..32].copy_from_slice(key);
-    session[32..].copy_from_slice(iv);
+    let mut session = [0u8; 32];
+    session[..16].copy_from_slice(key);
+    session[16..].copy_from_slice(iv);
     let mut guard = HISTORY
         .get_or_init(|| Mutex::new(SessionHistory::new(now_secs())))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.seen(&session, now_secs())
+    guard.seen(user, &session, now_secs())
 }
 
 struct SessionHistory {
-    live: std::collections::HashMap<[u8; 48], u64>,
+    by_account: std::collections::HashMap<[u8; 16], std::collections::HashMap<[u8; 32], u64>>,
     swept: u64,
 }
 
 impl SessionHistory {
     fn new(now: u64) -> Self {
         Self {
-            live: std::collections::HashMap::new(),
+            by_account: std::collections::HashMap::new(),
             swept: now,
         }
     }
 
-    /// Whether this session was admitted before inside the lifetime; the clock is the caller's,
-    /// so the bounds are testable without waiting on it.
-    fn seen(&mut self, session: &[u8; 48], now: u64) -> bool {
+    /// Whether this account's session was admitted before inside the lifetime; the clock is the
+    /// caller's, so the bounds are testable without waiting on it.
+    fn seen(&mut self, user: &[u8; 16], session: &[u8; 32], now: u64) -> bool {
         if now.wrapping_sub(self.swept) >= SESSION_SWEEP {
-            self.live.retain(|_, expires| *expires > now);
+            self.by_account.retain(|_, live| {
+                live.retain(|_, expires| *expires > now);
+                live.shrink_to_fit();
+                !live.is_empty()
+            });
             self.swept = now;
-            self.live.shrink_to_fit();
         }
-        if self.live.get(session).is_some_and(|expires| *expires > now) {
+        let live = self.by_account.entry(*user).or_default();
+        if live.get(session).is_some_and(|expires| *expires > now) {
             return true;
         }
-        // A flood cannot grow the history past the cap, so a full one refuses a new session.
-        if !self.live.contains_key(session) && self.live.len() >= SESSION_KEYS {
+        // A flood cannot grow one account past the cap, so a full one refuses a new session.
+        if !live.contains_key(session) && live.len() >= SESSION_KEYS {
             return true;
         }
-        self.live.insert(*session, now + SESSION_LIFETIME);
+        live.insert(*session, now + SESSION_LIFETIME);
         false
     }
 }
@@ -4177,14 +4181,15 @@ mod tests {
     #[test]
     fn the_history_refuses_a_session_within_its_lifetime() {
         let mut history = SessionHistory::new(10_000);
-        let session = [0x42u8; 48];
-        assert!(!history.seen(&session, 10_000), "a first sighting");
+        let user = [0x11u8; 16];
+        let session = [0x42u8; 32];
+        assert!(!history.seen(&user, &session, 10_000), "a first sighting");
         assert!(
-            history.seen(&session, 10_000 + SESSION_LIFETIME - 1),
+            history.seen(&user, &session, 10_000 + SESSION_LIFETIME - 1),
             "inside the lifetime"
         );
         assert!(
-            !history.seen(&session, 10_000 + SESSION_LIFETIME),
+            !history.seen(&user, &session, 10_000 + SESSION_LIFETIME),
             "the lifetime forgets it"
         );
     }
@@ -4192,62 +4197,72 @@ mod tests {
     #[test]
     fn the_history_names_the_user_and_the_body_material() {
         let mut history = SessionHistory::new(10_000);
-        let session = [0x42u8; 48];
-        assert!(!history.seen(&session, 10_000));
-        for part in [0usize, 16, 32] {
+        let user = [0x11u8; 16];
+        let session = [0x42u8; 32];
+        assert!(!history.seen(&user, &session, 10_000));
+        for part in [0usize, 16] {
             let mut other = session;
             other[part] ^= 1;
             assert!(
-                !history.seen(&other, 10_000),
+                !history.seen(&user, &other, 10_000),
                 "partition {part} is a different session"
             );
-            assert!(history.seen(&other, 10_000));
+            assert!(history.seen(&user, &other, 10_000));
         }
+        let mut other_user = user;
+        other_user[0] ^= 1;
+        assert!(
+            !history.seen(&other_user, &session, 10_000),
+            "another account holds another history"
+        );
+        assert!(history.seen(&user, &session, 10_000));
     }
 
     #[test]
-    fn the_history_refuses_a_new_session_past_the_cap_without_evicting_a_live_one() {
+    fn one_account_cannot_spend_another_accounts_histories() {
         let mut history = SessionHistory::new(10_000);
+        let user = [0x11u8; 16];
         for index in 0..SESSION_KEYS {
-            let mut session = [0u8; 48];
+            let mut session = [0u8; 32];
             session[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            assert!(!history.seen(&session, 10_000));
+            assert!(!history.seen(&user, &session, 10_000));
         }
-        let mut fresh = [0u8; 48];
+        let mut fresh = [0u8; 32];
         fresh[0] = 0xff;
         assert!(
-            history.seen(&fresh, 10_000),
-            "a full history refuses the new session"
+            history.seen(&user, &fresh, 10_000),
+            "a full history refuses its own new session"
         );
-        assert_eq!(
-            history.live.len(),
-            SESSION_KEYS,
-            "nothing was evicted for it"
+        let other_user = [0x22u8; 16];
+        assert!(
+            !history.seen(&other_user, &fresh, 10_000),
+            "another account still has its own admission"
         );
         assert!(
-            history.seen(&[0u8; 48], 10_000),
-            "a live record still reads as seen"
+            history.seen(&other_user, &fresh, 10_000),
+            "and that account holds its record"
         );
     }
 
     #[test]
     fn the_history_sweeps_its_expired_entries() {
         let mut history = SessionHistory::new(10_000);
-        let session = [0x33u8; 48];
-        assert!(!history.seen(&session, 10_000));
+        let user = [0x11u8; 16];
+        let session = [0x33u8; 32];
+        assert!(!history.seen(&user, &session, 10_000));
         assert!(
-            history.seen(&session, 10_000 + SESSION_LIFETIME - 1),
+            history.seen(&user, &session, 10_000 + SESSION_LIFETIME - 1),
             "still live at the edge"
         );
-        assert_eq!(history.live.len(), 1);
-        assert!(!history.seen(&session, 10_000 + SESSION_LIFETIME));
+        assert_eq!(history.by_account[&user].len(), 1);
+        assert!(!history.seen(&user, &session, 10_000 + SESSION_LIFETIME));
         assert_eq!(
-            history.live.len(),
+            history.by_account[&user].len(),
             1,
             "the sweep frees before the fresh insert"
         );
         assert!(
-            history.live.capacity() < 64,
+            history.by_account[&user].capacity() < 64,
             "the sweep shrinks the map toward what it holds"
         );
     }

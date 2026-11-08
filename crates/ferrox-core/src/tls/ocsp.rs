@@ -274,6 +274,7 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
     if chunked {
         let mut out = Vec::new();
         let mut at = 0usize;
+        let mut terminated = false;
         while let Some(line_end) = body[at..].windows(2).position(|w| w == b"\r\n") {
             let size = usize::from_str_radix(
                 std::str::from_utf8(&body[at..at + line_end])
@@ -285,6 +286,7 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
             )
             .ok()?;
             if size == 0 {
+                terminated = true;
                 break;
             }
             at = at.checked_add(line_end)?.checked_add(2)?;
@@ -299,7 +301,8 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
             }
             at = end.checked_add(2)?;
         }
-        return Some(out);
+        // A final chunk closes the body; a stream that simply stops is truncated.
+        return terminated.then_some(out);
     }
     if let Some(length) = length {
         body = body.get(..length)?;
