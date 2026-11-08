@@ -1977,14 +1977,39 @@ fn sweep_expiring() -> (Vec<Arc<Session>>, Option<std::time::Instant>) {
     (due, next)
 }
 
-fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<Session>> {
-    let budget = crate::budgets::relay_stall();
+/// A session with no downlink that has been silent past the relay stall.
+fn is_stalled(session: &Session, budget: std::time::Duration) -> bool {
+    let state = session.state.lock().expect("session lock");
+    !state.downlink && state.last_seen.elapsed() >= budget
+}
+
+#[cfg(test)]
+thread_local! {
+    static SWEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+static LAST_SWEEP: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// A live lookup only sweeps once the table has gone a stall budget without one.
+fn sweep_due(budget: std::time::Duration) -> bool {
+    let mut last = LAST_SWEEP.lock().expect("sweep lock");
+    let now = std::time::Instant::now();
+    if last.is_some_and(|last| now.duration_since(last) < budget) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+fn sweep_stalled_sessions(
+    map: &mut HashMap<String, Arc<Session>>,
+    budget: std::time::Duration,
+) -> Vec<Arc<Session>> {
+    #[cfg(test)]
+    SWEEPS.with(|sweeps| sweeps.set(sweeps.get() + 1));
     let stale: Vec<String> = map
         .iter()
-        .filter(|(_, session)| {
-            let state = session.state.lock().expect("session lock");
-            !state.downlink && state.last_seen.elapsed() >= budget
-        })
+        .filter(|(_, session)| is_stalled(session, budget))
         .map(|(id, _)| id.clone())
         .collect();
     stale.into_iter().filter_map(|id| map.remove(&id)).collect()
@@ -1992,31 +2017,55 @@ fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<Se
 
 fn get_or_create_session(id: &str) -> Arc<Session> {
     let mut map = sessions().lock().expect("sessions lock");
-    let stalled = sweep_stalled_sessions(&mut map);
-    let session = if let Some(session) = map.get(id) {
-        Arc::clone(session)
-    } else {
-        map.entry(id.to_owned())
-            .or_insert_with(|| {
-                Arc::new(Session {
-                    state: Mutex::new(SessionState {
-                        upload: None,
-                        upload_attached: false,
-                        upload_done: false,
-                        upload_fd: None,
-                        packets: BTreeMap::new(),
-                        next_seq: 0,
-                        ended: false,
-                        downlink: false,
-                        last_seen: std::time::Instant::now(),
-                        response: None,
-                    }),
-                    cv: Condvar::new(),
-                    id: id.to_owned(),
-                })
+    let budget = crate::budgets::relay_stall();
+    let due = sweep_due(budget);
+    let mut stalled = Vec::new();
+    match map
+        .get(id)
+        .map(|session| (Arc::clone(session), is_stalled(session, budget)))
+    {
+        Some((session, false)) => {
+            if due {
+                stalled.extend(sweep_stalled_sessions(&mut map, budget));
+            }
+            drop(map);
+            // The owed answers run after the map lock, so a peer that stops reading cannot block a session lookup.
+            for session in stalled {
+                close_session(&session);
+            }
+            return session;
+        }
+        Some((_, true)) => {
+            if let Some(session) = map.remove(id) {
+                stalled.push(session);
+            }
+        }
+        None => {}
+    }
+    if due {
+        stalled.extend(sweep_stalled_sessions(&mut map, budget));
+    }
+    let session = map
+        .entry(id.to_owned())
+        .or_insert_with(|| {
+            Arc::new(Session {
+                state: Mutex::new(SessionState {
+                    upload: None,
+                    upload_attached: false,
+                    upload_done: false,
+                    upload_fd: None,
+                    packets: BTreeMap::new(),
+                    next_seq: 0,
+                    ended: false,
+                    downlink: false,
+                    last_seen: std::time::Instant::now(),
+                    response: None,
+                }),
+                cv: Condvar::new(),
+                id: id.to_owned(),
             })
-            .clone()
-    };
+        })
+        .clone();
     drop(map);
     // The owed answers run after the map lock, so a peer that stops reading cannot block a session lookup.
     for session in stalled {
@@ -5734,6 +5783,25 @@ mod tests {
         }
         end_session(id);
         crate::budgets::clear();
+    }
+
+    /// A live lookup is a map read until this thread's stall budget elapses.
+    #[test]
+    fn a_live_session_lookup_does_not_sweep_the_table() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_secs(3_600)),
+            ..Default::default()
+        });
+        let id = "packet-up-live-no-sweep";
+        let session = get_or_create_session(id);
+        SWEEPS.with(|sweeps| sweeps.set(0));
+        for _ in 0..64 {
+            assert!(Arc::ptr_eq(&session, &get_or_create_session(id)));
+        }
+        let swept = SWEEPS.with(std::cell::Cell::get);
+        end_session(id);
+        crate::budgets::clear();
+        assert_eq!(swept, 0, "a live lookup swept the session table");
     }
 
     /// A reader left over from an ended session must not remove the fresh session that reused its id:
