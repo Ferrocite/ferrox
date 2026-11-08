@@ -2572,5 +2572,5 @@ pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
 
 /// REALITY's one preset swap: android carries no TLS 1.3 share, so the dial uses the variant.
 pub(crate) fn reality_variant(profile: &'static Profile) -> Option<&'static Profile> {
-    std::ptr::eq(profile, &P_ANDROID).then_some(&P_ANDROID_REALITY)
+    std::ptr::eq(profile, &raw const P_ANDROID).then_some(&P_ANDROID_REALITY)
 }
