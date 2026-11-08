@@ -1292,6 +1292,7 @@ mod tests {
         assert_eq!(addresses, [SocketAddr::from(([192, 0, 2, 7], 443))]);
     }
 
+    /// Preferred servers keep their order and duplicates; configured repeats are dropped.
     #[test]
     fn alternate_servers_keep_preferred_order_and_drop_configured_repeats() {
         let preferred = [

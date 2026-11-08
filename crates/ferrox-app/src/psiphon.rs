@@ -10205,6 +10205,7 @@ mod tests {
         assert!(!wildcard_match("A*B*C", "AxBzCzB"));
     }
 
+    /// Matching a wildcard takes no heap, even with several `*` runs.
     #[test]
     fn wildcard_matching_does_not_allocate() {
         let (matched, counts) = ferrox_core::alloc_count::measure(|| {
