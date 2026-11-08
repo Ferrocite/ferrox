@@ -2476,6 +2476,118 @@ pub(crate) fn serve_muxed_trojan_conn(
     serve_muxed_trojan(read, write, settings, key, freedom);
 }
 
+/// The same connection, many gRPC streams, for `shadowsocks`: each request block opens one stream
+/// and runs the shadowsocks handler on its own reader and writer pair.
+pub(crate) struct SsGrpcService {
+    path: String,
+    multi_path: String,
+    users: crate::shadowsocks::SsUsers,
+    freedom: bool,
+    opened: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SsGrpcService {
+    pub(crate) fn new(
+        settings: &GrpcSettings,
+        users: &crate::shadowsocks::SsUsers,
+        freedom: bool,
+        opened: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            path: settings.path.clone(),
+            multi_path: settings.multi_path.clone(),
+            users: Arc::clone(users),
+            freedom,
+            opened,
+        }
+    }
+}
+
+impl crate::xhttp_h2::H2Service for SsGrpcService {
+    /// Validates a shadowsocks gRPC request head and hands the stream to the multiplexed handler.
+    fn open(
+        &self,
+        conn: &Arc<crate::xhttp_h2::H2Conn>,
+        sid: u32,
+        block: &[u8],
+        end_stream: bool,
+    ) -> bool {
+        let mut gate = Gate::default();
+        if !conn.decode_block(block, |name, value| {
+            gate.take(name, value, &self.path, &self.multi_path);
+        }) || gate.served != Some(true)
+            || gate.posted != Some(true)
+            || gate.typed != Some(true)
+        {
+            conn.reset(sid);
+            return false;
+        }
+        let method = if gate.multi == Some(true) {
+            Method::MultiHunk
+        } else {
+            Method::Hunk
+        };
+        let Some((body, _head, out)) = conn.open(sid, end_stream) else {
+            return false;
+        };
+        if !conn.respond(
+            sid,
+            &[
+                (":status", "200"),
+                ("content-type", "application/grpc"),
+                ("grpc-encoding", "identity"),
+            ],
+        ) {
+            conn.reset(sid);
+            return false;
+        }
+        let (reader, writer) = mux_stream(conn, body, out, sid, method);
+        let users = Arc::clone(&self.users);
+        let freedom = self.freedom;
+        let opened = Arc::clone(&self.opened);
+        crate::proxy::lane_pool::submit_stream_setup(move || {
+            crate::shadowsocks::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
+        });
+        // The head is not a request until the shadowsocks handshake decodes: `serve_grpc_muxed` puts the clock away then.
+        false
+    }
+}
+
+/// Serves a shadowsocks gRPC listener as one HTTP/2 connection: every request block opens a stream on the shared demux.
+pub(crate) fn serve_muxed_ss<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &GrpcSettings,
+    users: &crate::shadowsocks::SsUsers,
+    freedom: bool,
+) {
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = SsGrpcService::new(settings, users, freedom, Arc::clone(&opened));
+    let until = std::time::Instant::now() + crate::budgets::handshake();
+    let mut step = crate::xhttp_h2::h2_lane(read, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    crate::proxy::lane_pool::submit_demux(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
+}
+
+/// `serve_muxed_ss` over a plain connection, split into its read and write halves.
+pub(crate) fn serve_muxed_ss_conn(
+    read: Connection,
+    write: Tail,
+    settings: &GrpcSettings,
+    users: &crate::shadowsocks::SsUsers,
+    freedom: bool,
+) {
+    serve_muxed_ss(read, write, settings, users, freedom);
+}
+
 #[cfg(test)]
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
     accept_with(stream, &GrpcSettings::path(path))

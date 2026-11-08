@@ -328,14 +328,36 @@ pub(crate) fn serve_grpc_with(
     settings: &crate::config::GrpcSettings,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::grpc::accept_with(stream, settings) else {
+    let Ok(write) = stream.try_clone() else {
         return;
     };
+    let _ = stream.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+    crate::grpc::serve_muxed_ss_conn(
+        stream,
+        crate::grpc::Tail::new(Box::new(write)),
+        settings,
+        &std::sync::Arc::from(users),
+        freedom,
+    );
+}
+
+/// The shadowsocks handler for one stream of a multiplexed gRPC connection: the demux has already
+/// answered the HTTP/2 head, so only the cipher handshake and the relay remain.
+pub(crate) fn serve_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    mut writer: crate::grpc::GrpcWriter,
+    users: &[SsUser],
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
     let Some((accepted, meter)) = under_handshake(&mut reader, |read| {
         accept_on(read, &mut writer, users, freedom)
     }) else {
+        reader.abort();
         return;
     };
+    opened.store(true, std::sync::atomic::Ordering::Relaxed);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     serve_accepted(accepted, reader, writer, close, meter);
