@@ -200,8 +200,7 @@ pub(crate) fn ctr_ghash<V: Lanes>(
     let (groups, rest) = blocks.as_chunks_mut::<4>();
     // The first group carries the poly keystream block, so a seal pays one encryption for both.
     let (first, mask) = if groups.is_empty() {
-        // No group: the mask is still encrypted on its own, exactly as the
-        // pre-fusion seal did, and the keystream stays at `ctr`.
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
         let mask = V::encrypt1v(rk, mask);
         (None, mask)
     } else {
@@ -384,8 +383,7 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
     debug_assert_eq!(sgroups.len(), dgroups.len(), "equal lengths group alike");
     // The first group carries the poly keystream block, so a seal pays one encryption for both.
     let (first, mask) = if sgroups.is_empty() {
-        // No group: the mask is still encrypted on its own, exactly as the
-        // pre-fusion seal did, and the keystream stays at `ctr`.
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
         let mask = V::encrypt1v(rk, mask);
         (None, mask)
     } else {
@@ -480,8 +478,7 @@ pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
     let (sgroups, srest) = sblocks.as_chunks::<4>();
     // The first group carries the poly keystream block, so a seal pays one encryption for both.
     let (first, mask) = if sgroups.is_empty() {
-        // No group: the mask is still encrypted on its own, exactly as the
-        // pre-fusion seal did, and the keystream stays at `ctr`.
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
         let mask = V::encrypt1v(rk, mask);
         (None, mask)
     } else {
@@ -991,8 +988,7 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
     let (groups, rest) = blocks.as_chunks_mut::<4>();
     // The first group carries the poly keystream block, so a seal pays one encryption for both.
     let (first, mask) = if groups.is_empty() {
-        // No group: the mask is still encrypted on its own, exactly as the
-        // pre-fusion seal did, and the keystream stays at `ctr`.
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
         let mask = V::encrypt1v_256(rk, mask);
         (None, mask)
     } else {
@@ -1086,8 +1082,7 @@ pub(crate) fn ctr_ghash_from_256<V: Lanes>(
     debug_assert_eq!(sgroups.len(), dgroups.len(), "equal lengths group alike");
     // The first group carries the poly keystream block, so a seal pays one encryption for both.
     let (first, mask) = if sgroups.is_empty() {
-        // No group: the mask is still encrypted on its own, exactly as the
-        // pre-fusion seal did, and the keystream stays at `ctr`.
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
         let mask = V::encrypt1v_256(rk, mask);
         (None, mask)
     } else {
@@ -1182,8 +1177,7 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
     let (sgroups, srest) = sblocks.as_chunks::<4>();
     // The first group carries the poly keystream block, so a seal pays one encryption for both.
     let (first, mask) = if sgroups.is_empty() {
-        // No group: the mask is still encrypted on its own, exactly as the
-        // pre-fusion seal did, and the keystream stays at `ctr`.
+        // No group: the mask is still encrypted on its own, so the keystream stays at `ctr`.
         let mask = V::encrypt1v_256(rk, mask);
         (None, mask)
     } else {

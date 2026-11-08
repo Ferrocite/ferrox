@@ -327,11 +327,14 @@ fn ctr_ghash8(
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
     mask: uint8x16_t,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     if buf.len() <= SHORT_SEAL_BYTES {
         ctr_only8(rk, template, buf, ctr);
-        return (ghash8(ghash, state, buf, tailq), <uint8x16_t as Lanes>::encrypt1v(rk, mask));
+        return (
+            ghash8(ghash, state, buf, tailq),
+            <uint8x16_t as Lanes>::encrypt1v(rk, mask),
+        );
     }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
@@ -385,7 +388,7 @@ fn ctr_ghash8_from(
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
     mask: uint8x16_t,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _rest_bytes) = src.as_chunks::<16>();
     let (dblocks, _rest_bytes) = dst.as_chunks_mut::<16>();
@@ -433,7 +436,7 @@ fn ghash8(
     mut state: uint8x16_t,
     data: &[u8],
     tail: &mut super::Tail<uint8x16_t>,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (blocks, _rest_bytes) = data.as_chunks::<16>();
     let (groups, _rest) = blocks.as_chunks::<8>();
@@ -487,11 +490,14 @@ fn ctr_ghash8_256(
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
     mask: uint8x16_t,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     if buf.len() <= SHORT_SEAL_BYTES {
         ctr_only8_256(rk, template, buf, ctr);
-        return (ghash8(ghash, state, buf, tailq), <uint8x16_t as Lanes>::encrypt1v_256(rk, mask));
+        return (
+            ghash8(ghash, state, buf, tailq),
+            <uint8x16_t as Lanes>::encrypt1v_256(rk, mask),
+        );
     }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
@@ -546,7 +552,7 @@ fn ctr_ghash8_from_256(
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
     mask: uint8x16_t,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _) = src.as_chunks::<16>();
     let (dblocks, _) = dst.as_chunks_mut::<16>();
@@ -605,7 +611,7 @@ unsafe fn ctr_ghash8_from_256_uninit(
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
     mask: uint8x16_t,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _) = src.as_chunks::<16>();
     let (sgroups, _) = sblocks.as_chunks::<8>();
@@ -671,7 +677,7 @@ unsafe fn ctr_ghash8_from_uninit(
     tailq: &mut super::Tail<uint8x16_t>,
     mut ctr: u32,
     mask: uint8x16_t,
-) -> uint8x16_t {
+) -> (uint8x16_t, uint8x16_t) {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (sblocks, _) = src.as_chunks::<16>();
     let (sgroups, _) = sblocks.as_chunks::<8>();
@@ -1029,7 +1035,8 @@ impl Engine256 {
             &mut tailq,
         );
         let state = super::flush(&self.h, state, &mut tailq);
-        let (state, mask) = ctr_ghash8_256(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
+        let (state, mask) =
+            ctr_ghash8_256(&self.rk, self, template, state, buf, &mut tailq, 2, mask);
         super::finish(
             &self.h,
             state,
