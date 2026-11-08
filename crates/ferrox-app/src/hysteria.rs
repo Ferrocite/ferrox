@@ -2003,7 +2003,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
 
 /// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
-    let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
+    let mut head = Vec::with_capacity(22);
     loop {
         if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
             break;
@@ -2039,11 +2039,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
                 continue;
             };
-            reply.clear();
-            reply.extend_from_slice(&[0, 0, 0]);
-            crate::proxy::push_socks_addr(&mut reply, &destination);
-            reply.extend_from_slice(payload);
-            let _ = relay.send_to(&reply, src);
+            let (front, tail) = crate::proxy::socks_udp_parts(&mut head, &destination, payload);
+            let _ = crate::proxy::send_to_two(relay, front, tail, src);
         }
     }
 }
@@ -2743,6 +2740,35 @@ mod tests {
             "the path buffer and its one growth are all the answer adds to the platform's own read"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The client's UDP reply leaves the head and the arrived payload as two parts, so the payload
+    /// is handed to the socket where it landed rather than gathered into a reply buffer.
+    #[test]
+    fn a_client_reply_hands_the_payload_over_by_pointer() {
+        let destination: SocketAddr = "198.51.100.7:5353".parse().expect("addr");
+        let payload: Vec<u8> = (0..512).map(|i| (i as u8) ^ 0x0f).collect();
+        let mut head = Vec::with_capacity(22);
+        let (front, tail) = crate::proxy::socks_udp_parts(&mut head, &destination, &payload);
+        assert_eq!(
+            tail.as_ptr(),
+            payload.as_ptr(),
+            "the payload must be the sendmsg part itself, not a copy of it"
+        );
+        assert_eq!(tail.len(), payload.len());
+        assert_eq!(
+            front,
+            &[0u8, 0, 0, 1, 198, 51, 100, 7, 0x14, 0xe9][..],
+            "the head is the reserved pair, the ipv4 family, its body and a port"
+        );
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                let (front, tail) =
+                    crate::proxy::socks_udp_parts(&mut head, &destination, &payload);
+                std::hint::black_box((front.as_ptr(), tail.as_ptr()));
+            }
+        });
+        assert_eq!(counts.allocs, 0, "the head is reused, the payload is lent");
     }
 
     #[test]
