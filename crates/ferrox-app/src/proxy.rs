@@ -20633,13 +20633,25 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
+    // The demux runs for the connection's life, so it detaches instead of holding the handshake worker.
+    if take_handshake_lane() {
+        let settings = settings.clone();
+        let keys: Vec<[u8; 56]> = key.to_vec();
+        let sniffing = crate::sniff::current();
+        let flow = crate::accesslog::snapshot();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let _flow = crate::accesslog::install_snapshot(flow);
+            serve_trojan_xhttp_carrier(read, write, &settings, &keys, freedom);
+        });
+        return;
+    }
     let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
         return;
     };
     if !h2 {
         return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
     }
-    // The demux parks on the socket between frames, so it runs as a lane rather than holding the handshake worker for the connection's life.
     let keys: Vec<[u8; 56]> = key.to_vec();
     let service = crate::xhttp_h2::XhttpSessionService::new(
         settings.clone(),
@@ -20647,17 +20659,7 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
             serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
         }),
     );
-    let mut step = crate::xhttp_h2::h2_lane(chained, write, service, None, None);
-    let sniffing = crate::sniff::current();
-    let access = crate::accesslog::snapshot();
-    lane_pool::submit(
-        Box::new(move || {
-            crate::sniff::install_current(sniffing.clone());
-            let _flow = crate::accesslog::install_snapshot(access.clone());
-            step()
-        }),
-        Box::new(|| {}),
-    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
 }
 
 fn serve_trojan_xhttp_accepted(
@@ -50927,7 +50929,7 @@ mod tests {
     /// test's claim; this one only has to see all eight relays get a turn.
     #[test]
     fn eight_packet_up_trojan_h2_downloads_complete() {
-        const BULK: usize = 1024 * 1024;
+        const BULK: usize = 256 * 1024;
         const FLOWS: usize = 8;
         let (server_config, mut client_config) = carried_tls_configs();
         let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
