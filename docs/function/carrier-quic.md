@@ -28,7 +28,9 @@ graph TD
     P --> Q{"live connection with a flow to lend?"}
     Q -- yes --> U["ride it: 0 handshakes"]
     Q -- no --> D["quiche dial, ALPN h3,<br/>roots from caCertFile"]
-    D --> U
+    D --> R0{"stored session for this edge?<br/>offer it, then h3 opening rides 0-RTT"}
+    R0 -- no --> U
+    R0 -- yes --> U
     U --> V{"can the pump hand this<br/>lease its bytes?"}
     V -- "session: id in sessions" --> W["one pump restarted if parked"]
     V -- "VLESS UDP/mux lease" --> W2["one pump drives the lane<br/>until the lease drops"]
