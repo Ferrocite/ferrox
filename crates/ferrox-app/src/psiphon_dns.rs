@@ -840,13 +840,14 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
             } else {
                 None
             };
-            match query(
-                &name,
-                *server,
-                config,
-                use_transform,
-                use_transform.is_none() || (first_attempt && must_match),
-            ) {
+            let question_match = if first_attempt && must_match {
+                QuestionMatch::Exact
+            } else if use_transform.is_none() {
+                QuestionMatch::CaseInsensitive
+            } else {
+                QuestionMatch::None
+            };
+            match query(&name, *server, config, use_transform, question_match) {
                 Ok((addresses, ttl)) if !addresses.is_empty() => {
                     config.cache_put(&name, addresses.clone(), ttl);
                     return Ok(with_port(addresses, port));
@@ -986,7 +987,7 @@ fn query(
     server: SocketAddr,
     config: &Config,
     transform: Option<&Arc<Vec<Transform>>>,
-    must_match: bool,
+    question_match: QuestionMatch,
 ) -> io::Result<(Vec<IpAddr>, Duration)> {
     let (sender, receiver) = mpsc::channel();
     for record in [1u16, 28] {
@@ -1005,7 +1006,7 @@ fn query(
                         record,
                         &config,
                         transform.as_deref().map(Vec::as_slice),
-                        must_match,
+                        question_match,
                     ),
                 ));
             })
@@ -1063,7 +1064,7 @@ fn query_one(
     record: u16,
     config: &Config,
     transform: Option<&[Transform]>,
-    must_match: bool,
+    question_match: QuestionMatch,
 ) -> io::Result<(Vec<IpAddr>, Duration)> {
     let bind = if server.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -1089,7 +1090,7 @@ fn query_one(
         &reply[..count],
         record,
         sent_name.as_deref(),
-        must_match,
+        question_match,
     )
 }
 
@@ -1148,13 +1149,21 @@ fn question_name(packet: &[u8]) -> Option<&[u8]> {
     packet.get(12..at)
 }
 
+/// How the reply's question must echo the one that was sent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuestionMatch {
+    None,
+    CaseInsensitive,
+    Exact,
+}
+
 /// Parse a reply, checking the ID, question echo, and answer record type.
 fn parse_reply(
     id: [u8; 2],
     reply: &[u8],
     record: u16,
     sent_name: Option<&[u8]>,
-    must_match: bool,
+    question_match: QuestionMatch,
 ) -> io::Result<(Vec<IpAddr>, Duration)> {
     if reply.len() < 12 || reply[..2] != id[..] || reply[2] & 0x80 == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad DNS reply"));
@@ -1163,7 +1172,7 @@ fn parse_reply(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS error"));
     }
     let questions = usize::from(u16::from_be_bytes([reply[4], reply[5]]));
-    if must_match && questions == 0 {
+    if question_match != QuestionMatch::None && questions == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "missing DNS question",
@@ -1174,9 +1183,15 @@ fn parse_reply(
     for index in 0..questions {
         let start = at;
         skip_name(reply, &mut at)?;
-        if index == 0 && must_match {
+        if index == 0 && question_match != QuestionMatch::None {
             if let Some(sent) = sent_name {
-                if &reply[start..at] != sent {
+                let echo = &reply[start..at];
+                let matched = match question_match {
+                    QuestionMatch::Exact => echo == sent,
+                    QuestionMatch::CaseInsensitive => echo.eq_ignore_ascii_case(sent),
+                    QuestionMatch::None => true,
+                };
+                if !matched {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "DNS question changed",
@@ -1303,8 +1318,15 @@ mod tests {
         let server = socket.local_addr().expect("address");
         let responder = thread::spawn(move || responder(&socket));
         let config = Config::from_servers(&[server]);
-        let (addresses, _) =
-            super::query_one("psiphon.test", server, 1, &config, None, false).expect("alternate");
+        let (addresses, _) = super::query_one(
+            "psiphon.test",
+            server,
+            1,
+            &config,
+            None,
+            super::QuestionMatch::None,
+        )
+        .expect("alternate");
         responder.join().expect("responder");
         assert_eq!(addresses, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]);
     }
@@ -1414,16 +1436,22 @@ mod tests {
         let responder = thread::spawn(move || responder(&socket));
         let mut config = Config::from_servers(&[server]);
         config.request_timeout = std::time::Duration::from_millis(50);
-        let (addresses, ttl) =
-            super::query("psiphon.test", server, &config, None, false).expect("query");
+        let (addresses, ttl) = super::query(
+            "psiphon.test",
+            server,
+            &config,
+            None,
+            super::QuestionMatch::None,
+        )
+        .expect("query");
         responder.join().expect("responder");
         assert_eq!(addresses.len(), 1);
         assert_eq!(ttl, std::time::Duration::from_secs(60));
     }
 
     #[test]
-    /// A reply whose question echo changed case is refused.
-    fn a_changed_question_echo_is_refused_when_casing_was_sent() {
+    /// A reply whose question echo changed case is refused only for an exact-case policy.
+    fn a_changed_question_echo_is_refused_when_exact_case_was_sent() {
         let id = [0x12, 0x34];
         let sent = b"\x07PSIPHON\x04TEST\x00";
         let echo = b"\x07psiphon\x04test\x00";
@@ -1432,8 +1460,18 @@ mod tests {
         reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
         reply.extend_from_slice(echo);
         reply.extend_from_slice(&[0, 1, 0, 1]);
-        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), false).is_ok());
-        assert!(super::parse_reply(id, &reply, 1, Some(&sent[..]), true).is_err());
+        assert!(super::parse_reply(
+            id,
+            &reply,
+            1,
+            Some(&sent[..]),
+            super::QuestionMatch::CaseInsensitive
+        )
+        .is_ok());
+        assert!(
+            super::parse_reply(id, &reply, 1, Some(&sent[..]), super::QuestionMatch::Exact)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1443,8 +1481,11 @@ mod tests {
         let mut reply = Vec::new();
         reply.extend_from_slice(&id);
         reply.extend_from_slice(&[0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(super::parse_reply(id, &reply, 1, None, true).is_err());
-        assert!(super::parse_reply(id, &reply, 1, None, false).is_ok());
+        assert!(super::parse_reply(id, &reply, 1, None, super::QuestionMatch::Exact).is_err());
+        assert!(
+            super::parse_reply(id, &reply, 1, None, super::QuestionMatch::CaseInsensitive).is_err()
+        );
+        assert!(super::parse_reply(id, &reply, 1, None, super::QuestionMatch::None).is_ok());
     }
 
     #[test]
