@@ -227,6 +227,14 @@ pub fn encode_udp(message: &UdpMessage<'_>, out: &mut Vec<u8>) -> Result<(), Req
     if !message.validate() {
         return Err(RequestError::Invalid);
     }
+    encode_udp_unchecked(message, out);
+    Ok(())
+}
+
+/// The bytes `encode_udp` writes, without the validation [`encode_udp`] made first. A caller that
+/// already validated its whole message once — the relay's [`fragments_udp`], whose every fragment
+/// shares the whole's host and slices its payload — must not pay the same check per fragment.
+pub fn encode_udp_unchecked(message: &UdpMessage<'_>, out: &mut Vec<u8>) {
     out.extend_from_slice(&message.session.to_be_bytes());
     out.extend_from_slice(&(message.host.len() as u16).to_be_bytes());
     out.extend_from_slice(message.host.as_bytes());
@@ -236,7 +244,6 @@ pub fn encode_udp(message: &UdpMessage<'_>, out: &mut Vec<u8>) -> Result<(), Req
     out.push(message.frags);
     out.extend_from_slice(&(message.payload.len() as u16).to_be_bytes());
     out.extend_from_slice(message.payload);
-    Ok(())
 }
 
 pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
@@ -628,6 +635,33 @@ mod tests {
                 }
             }
             assert_eq!(seen, len);
+        }
+    }
+
+    /// The unchecked fragment writes what the checked one wrote for every fragment the v1 fragmenter
+    /// produced, at payload lengths that are and are not multiples of the fragment capacity.
+    #[test]
+    fn an_unchecked_v1_fragment_is_the_bytes_the_checked_encode_wrote() {
+        for len in 1..=200usize {
+            let payload = vec![len as u8; len];
+            let message = UdpMessage {
+                session: 7,
+                host: "example.org",
+                port: 443,
+                packet: 7,
+                frag: 0,
+                frags: 1,
+                payload: &payload,
+            };
+            let mut checked = Vec::new();
+            let mut bare = Vec::new();
+            for fragment in fragments_udp(&message, 40).expect("fragments") {
+                checked.clear();
+                bare.clear();
+                encode_udp(&fragment, &mut checked).expect("encodes");
+                encode_udp_unchecked(&fragment, &mut bare);
+                assert_eq!(bare, checked, "length {len}");
+            }
         }
     }
 
