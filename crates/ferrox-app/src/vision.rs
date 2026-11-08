@@ -421,8 +421,8 @@ impl Tls {
     }
 }
 
-/// A sealed session as the framer sees it: one frame is one sealed record, so the parts the
-/// walk hands over are joined before the record layer takes them.
+/// A sealed session as the framer sees it: one frame is one sealed record, and the parts the
+/// walk hands over are sealed where they land.
 pub(crate) struct Sealed<S>(ferrox_core::vless_encryption::EncryptedStream<S>);
 
 impl<S: Read + Write + RecordAlignment> Sealed<S> {
@@ -457,12 +457,7 @@ impl<S: Read + Write + RecordAlignment> RecordAlignment for Sealed<S> {
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-        let len = parts.iter().map(|part| part.len()).sum();
-        let mut joined = Vec::with_capacity(len);
-        for part in parts {
-            joined.extend_from_slice(part);
-        }
-        self.0.write_all(&joined)
+        self.0.write_all_slices(parts)
     }
 }
 
