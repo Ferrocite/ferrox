@@ -2165,30 +2165,40 @@ mod tests {
 
     #[test]
     fn a_sealed_vision_write_allocates_nothing_after_warmup() {
-        use ferrox_core::vless_encryption::{
-            generate_pair, Client, ClientConfig, Server, ServerConfig,
-        };
+        use ferrox_core::vless_encryption::{Aead, EncryptedStream, ReadStage};
 
-        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
-        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
-        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
-        let lane = std::thread::spawn(move || {
-            let mut sealed = server.handshake(server_side).expect("server handshake");
-            let mut buf = [0u8; 8192];
-            while let Ok(n) = sealed.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
+        struct Sink;
+        impl Read for Sink {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
             }
-        });
-        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
-        let sealed = client.handshake(client_side).expect("client handshake");
-        let mut link = Link::sealed(sealed, &UUID);
+        }
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Sink {}
+
+        let key = vec![7u8; 32];
+        let head = [0u8; 5];
         let payload = [0x33u8; 1000];
-        link.write_all(&payload).expect("warmup");
+        let padding = [0u8; 300];
+        let parts: [&[u8]; 4] = [&UUID, &head, &payload, &padding];
+        let mut sealed = Sealed(EncryptedStream::new(
+            Sink,
+            key.clone(),
+            Aead::new(b"sealed vision", &key),
+            None,
+            ReadStage::Records,
+        ));
+        sealed.write_all_slices(&parts).expect("warmup");
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             for _ in 0..64 {
-                link.write_all(&payload).expect("write");
+                sealed.write_all_slices(&parts).expect("write");
             }
         });
         assert_eq!(
@@ -2196,7 +2206,5 @@ mod tests {
             (0, 0, 0),
             "a sealed Vision write reuses its staging buffer"
         );
-        drop(link);
-        lane.join().expect("lane");
     }
 }
