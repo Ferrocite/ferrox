@@ -1188,7 +1188,7 @@ impl Inner {
     /// Append entries the lane does not already dial, keeping the snapshot stable.
     fn add_entries(&self, entries: Vec<Server>) -> usize {
         let mut current = lock(&self.entries);
-        let added = new_entries(&**current, entries);
+        let added = new_entries(&current, entries);
         let count = added.len();
         if count > 0 {
             let mut list = (**current).clone();
