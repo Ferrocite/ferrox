@@ -468,6 +468,12 @@ pub(crate) struct TlsShape {
     pub(crate) meek_payload_padding_min: usize,
     /// The largest padding size.
     pub(crate) meek_payload_padding_max: usize,
+    /// The chance a TLS dial splits its `ClientHello` at the SNI.
+    pub(crate) tls_fragment_client_hello: f64,
+    /// The protocols that admit `ClientHello` fragmentation; empty admits all.
+    pub(crate) tls_fragment_client_hello_protocols: Vec<String>,
+    /// The chance an HTTP dial draws a browser User-Agent.
+    pub(crate) user_agent_probability: f64,
 }
 
 /// The reference defaults for one lane's TLS shape.
@@ -502,6 +508,9 @@ impl Default for TlsShape {
             meek_payload_padding_omit: 0.0,
             meek_payload_padding_min: 0,
             meek_payload_padding_max: 65_533,
+            tls_fragment_client_hello: 0.0,
+            tls_fragment_client_hello_protocols: Vec::new(),
+            user_agent_probability: 0.5,
         }
     }
 }
@@ -609,6 +618,24 @@ impl TlsShape {
             }
         }
         server_name.to_owned()
+    }
+
+    /// Whether this TLS dial splits its `ClientHello` at the SNI, when the
+    /// protocol is admitted and the coin lands.
+    pub(crate) fn fragment_client_hello(&self, protocol: &str) -> bool {
+        if self.tls_fragment_client_hello <= 0.0 {
+            return false;
+        }
+        if !self.tls_fragment_client_hello_protocols.is_empty()
+            && !self
+                .tls_fragment_client_hello_protocols
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(protocol))
+        {
+            return false;
+        }
+        let draw = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        draw < self.tls_fragment_client_hello
     }
 }
 
@@ -2525,6 +2552,7 @@ fn tls_tunnel(
         .map_err(|error| format!("psiphon tls socket: {error}"))?;
     // An IP literal omits SNI, matching the reference's default; a host name is sent as the SNI it is.
     let name = shape.sni(protocol, server_name);
+    let fragment = name.parse::<IpAddr>().is_err() && shape.fragment_client_hello(protocol);
     let config = TlsConfig {
         server_name: name.clone(),
         roots: crate::quic::system_roots(),
@@ -2534,6 +2562,7 @@ fn tls_tunnel(
         padding: shape.padding(),
         ..TlsConfig::default()
     };
+    let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
     let mut tls = ferrox_core::tls::connect(&config, stream)
         .map_err(|error| format!("psiphon tls {name}: {error}"))?;
     tls.handshake()
@@ -2564,8 +2593,11 @@ fn tls_tunnel(
     Ok(Stream::Tcp(local))
 }
 
-fn relay_tls(mut tls: ClientSession<Stream>, mut peer: TcpStream) -> io::Result<()> {
-    tls.get_ref().set_read_timeout(Some(TLS_POLL))?;
+fn relay_tls(
+    mut tls: ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<Stream>>,
+    mut peer: TcpStream,
+) -> io::Result<()> {
+    tls.get_ref().inner().set_read_timeout(Some(TLS_POLL))?;
     peer.set_read_timeout(Some(TLS_POLL))?;
     peer.set_write_timeout(Some(IO_TIMEOUT))?;
     peer.set_nodelay(true)?;

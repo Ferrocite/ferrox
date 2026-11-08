@@ -10,7 +10,7 @@ use ferrox_core::tls::{ClientSession, RecordAlignment as _, TlsConfig, TlsProvid
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 pub(crate) const MAX_REQUEST_PAYLOAD: usize = 64 * 1024;
@@ -45,6 +45,8 @@ struct Profile {
     redial_tls: f64,
     /// The payload padding this connection selected.
     payload_padding: Option<PaddingConfig>,
+    /// The User-Agent this connection sends when the headers name none.
+    user_agent: String,
 }
 
 /// The padding sizes and omission chance one connection drew.
@@ -239,12 +241,18 @@ fn profile(shape: &TlsShape, protocol: &str) -> Profile {
     } else {
         request_limit
     };
+    let user_agent = if coin_probability(shape.user_agent_probability) {
+        crate::psiphon_user_agent::generate()
+    } else {
+        String::new()
+    };
     Profile {
         cookie_name,
         content_type,
         request_limit,
         redial_tls,
         payload_padding,
+        user_agent,
     }
 }
 
@@ -361,6 +369,8 @@ pub(crate) fn connect_inproxy(
         } else {
             meek.sni.clone()
         };
+        let fragment = server_name.parse::<IpAddr>().is_err()
+            && meek.shape.fragment_client_hello(meek.protocol);
         let config = TlsConfig {
             server_name,
             alpn: vec![b"http/1.1".to_vec()].into(),
@@ -371,6 +381,7 @@ pub(crate) fn connect_inproxy(
             padding: meek.shape.padding(),
             ..TlsConfig::default()
         };
+        let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
         let mut tls = ferrox_core::tls::connect(&config, stream)
             .map_err(|error| format!("psiphon meek tls {}: {error}", meek.sni))?;
         tls.handshake()
@@ -538,10 +549,14 @@ enum FragmentOrTcp {
 enum MeekStream {
     Plain(TcpStream),
     Fragment(crate::psiphon_fragment::FragmentStream),
-    Tls(ClientSession<TcpStream>),
-    TlsFragment(ClientSession<crate::psiphon_fragment::FragmentStream>),
+    Tls(ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<TcpStream>>),
+    TlsFragment(
+        ClientSession<
+            crate::psiphon_fragment::TlsHelloFragmentor<crate::psiphon_fragment::FragmentStream>,
+        >,
+    ),
     WebRtc(WebRtcStream),
-    TlsWebRtc(ClientSession<WebRtcStream>),
+    TlsWebRtc(ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<WebRtcStream>>),
     H3(Box<crate::psiphon_h3::H3>),
 }
 
@@ -609,9 +624,9 @@ impl MeekStream {
             Self::Plain(stream) => stream,
             Self::Fragment(stream) => stream.get_ref(),
             Self::Tls(stream) if stream.closed() => return true,
-            Self::Tls(stream) => stream.get_ref(),
+            Self::Tls(stream) => stream.get_ref().inner(),
             Self::TlsFragment(stream) if stream.closed() => return true,
-            Self::TlsFragment(stream) => stream.get_ref().get_ref(),
+            Self::TlsFragment(stream) => stream.get_ref().inner().get_ref(),
             Self::WebRtc(_) => return false,
             Self::TlsWebRtc(stream) => return stream.closed(),
             Self::H3(h3) => return h3.is_closed(),
@@ -731,6 +746,7 @@ impl MeekHttp {
             request_limit: MAX_REQUEST_PAYLOAD,
             redial_tls: 0.0,
             payload_padding: None,
+            user_agent: USER_AGENT.to_owned(),
         };
         let transform = http_transform(&meek);
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
@@ -948,6 +964,8 @@ impl MeekHttp {
                 }
                 vec![b"http/1.1".to_vec()]
             };
+        let fragment = server_name.parse::<IpAddr>().is_err()
+            && self.meek.shape.fragment_client_hello(self.meek.protocol);
         let config = TlsConfig {
             server_name,
             alpn: alpn.into(),
@@ -960,6 +978,7 @@ impl MeekHttp {
         };
         match stream {
             FragmentOrTcp::Tcp(stream) => {
+                let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
                 let mut tls = ferrox_core::tls::connect(&config, stream)
                     .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
                 tls.handshake().map_err(|error| {
@@ -968,6 +987,7 @@ impl MeekHttp {
                 self.stream = Some(MeekStream::Tls(tls));
             }
             FragmentOrTcp::Fragment(stream) => {
+                let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
                 let mut tls = ferrox_core::tls::connect(&config, stream)
                     .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
                 tls.handshake().map_err(|error| {
@@ -1029,7 +1049,7 @@ impl MeekHttp {
             .collect();
         for (name, value) in [
             ("Content-Type", self.profile.content_type),
-            ("User-Agent", USER_AGENT),
+            ("User-Agent", self.profile.user_agent.as_str()),
             ("Accept", "*/*"),
             ("Connection", "keep-alive"),
         ] {
@@ -1292,6 +1312,24 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
         }
+    }
+
+    #[test]
+    fn the_profile_draws_a_user_agent_by_probability() {
+        let always = TlsShape {
+            user_agent_probability: 1.0,
+            ..TlsShape::default()
+        };
+        let never = TlsShape {
+            user_agent_probability: 0.0,
+            ..TlsShape::default()
+        };
+        for _ in 0..16 {
+            let chosen = profile(&always, "FRONTED-MEEK-OSSH");
+            assert!(chosen.user_agent.starts_with("Mozilla/5.0 ("));
+        }
+        let empty = profile(&never, "FRONTED-MEEK-OSSH");
+        assert!(!empty.user_agent.starts_with("Mozilla/5.0 ("));
     }
 
     /// An alternate content type is one of the cover media types.
