@@ -36,3 +36,7 @@ Row 78 asks for a connection carrying several paths, the reference being draft-q
 What *is* in the tree: row 79's quiche lane already carries, both roles, the layer-aware single-path semantics the importers normally call the multipath floor: client and server migrate their path without re-handshaking (`a_stream_migrates_its_connection_to_a_new_local`, `a_peer_rebind_keeps_the_quic_lane`), key updates ride the established connection, 0-RTT resumes by one blob per edge, and batched datagrams run on Linux. The lane's page [`carrier-quic`](carrier-quic.md) names those checks.
 
 So the row stays planned rather than being called finished: cherry-picking a different QUIC crate stack would ship an unproved wire dialect, and fabricating an extension of the pinned quiche would not be "learning how the reference implements it, and writing the better thing" — there is no reference implementation in the pins to take the best idea from. The day `upstream/quiche` pins a revision carrying multipath, this row's first step is to mirror its API calls and diff against it, not to reinvent by rereading draft text. Nothing in the matrix today covers QUIC multipath, so no conformance seam exists to run it unmodified; serve any future slice's conformance via [`carrier-quic`](carrier-quic.md)'s `vless-quic-*` cells once `upstream/pins.toml` grows that seam.
+
+<!-- scope:begin -->
+- paths: -
+<!-- scope:end -->
