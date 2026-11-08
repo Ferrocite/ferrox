@@ -24,19 +24,19 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | both roles, both framing sets, and UDP over raw/ws/gRPC/xhttp/http header/httpUpgrade/KCP/Xdrive/QUIC/Hysteria with each carrier's TLS where it has one; the HTTP/2 transport carrier is not dialled |
 | Trojan share-link `trojan://` parser | implemented (`ferrox_core::trojan::TrojanLink`; `check`/`run` accept it beside `vless://`) |
 | Dokodemo transparent inbound | done (row 27): tcp/udp rewrite, `portMap`, `followRedirect` over `SO_ORIGINAL_DST`/`DIOCNATLOOK` and Linux `TPROXY`, UDP ancillary original-destination replies on Linux, `finalmask.tcp` fragment chain, JSON and protobuf config including the protobuf `tproxy` mode and receiver marker; Windows, macOS UDP, the non-follow missing-rewrite fallback, and partial `portMap` spellings are named open |
-| Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 155, 158) |
-| DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | `proxy/dns` outbound done (row 29); the resolver app planned (row 111) |
+| Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 163, 166) |
+| DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | `proxy/dns` outbound done (row 29); the resolver app planned (row 119) |
 | Blackhole outbound | partial (row 28): the three answers, the 403's bytes the reference's own (an oracle drives the pinned handler and the comparison is octet for octet), the flow ending when the peer is done; the datagram lane refuses the association with `0x07` ([blackhole](function/blackhole.md)) |
 | Loopback | done (row 30) |
-| WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | partial (row 67): client outbound and server inbound over `smoltcp`, IPv4/IPv6 TCP and UDP, JSON and protobuf config, no kernel TUN; `TestWireguard` is the CI gate ([wireguard](function/wireguard.md)) |
+| WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | partial (row 75): client outbound and server inbound over `smoltcp`, IPv4/IPv6 TCP and UDP, JSON and protobuf config, no kernel TUN; `TestWireguard` is the CI gate ([wireguard](function/wireguard.md)) |
 | Hysteria v1 proxy (`proxy/hysteria`) | planned (only v2 as carrier today) |
-| MASQUE proxy (`proxy/masque`) | done over h3, both roles (row 69): `protocol: masque` inbound with an address pool, and the `masque` transport dial (row 21); the h2 listener and the h2 dialer serve the same inbound and outbound (row 70), chosen by the configured ALPN; the reference's flat `address`/`port` outbound and `users`/`clients` with `pass` read the same edge and table |
+| MASQUE proxy (`proxy/masque`) | done over h3, both roles (row 77): `protocol: masque` inbound with an address pool, and the `masque` transport dial (row 21); the h2 listener and the h2 dialer serve the same inbound and outbound (row 78), chosen by the configured ALPN; the reference's flat `address`/`port` outbound and `users`/`clients` with `pass` read the same edge and table |
 | TUN inbound (`proxy/tun`) | done (row 32) |
 | uTLS fingerprints per connection | planned (row 41) |
 | ECH | client done, `echSockopt` applied to the DNS query socket; TLS server done; QUIC both roles, a dial offers the same list and a serving lane accepts it, while one that omits it still falls back; a rejected offer is redialled once with the BoringSSL retry list it returns where Go's `SendAsRetry=false` sends none, while an accepted offer is unchanged (row 42) |
 | VLESS stream encryption (`encryption` field, XOR/MLKEM) | partial (row 37): both roles raw/TLS/REALITY and carried ws/gRPC/httpUpgrade/xhttp (H1)/http header, Vision on raw, server UDP/mux/reverse and client UDP/mux served; Vision over carried and xhttp H2 open |
 | XTLS Vision UDP-over-443 flow | planned (row 38) |
-| REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | partial (row 156; both fields are validated with the reference's lengths and messages, and the handshake names the binding it does not carry; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` waits on the signature itself) |
+| REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | partial (row 164; both fields are validated with the reference's lengths and messages, and the handshake names the binding it does not carry; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` waits on the signature itself) |
 
 ### Transports
 
@@ -49,10 +49,10 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | all three modes both roles: the dial resolves an unstated `mode` and mints the session the hub validates, packets split at `uplinkChunkSize` into body or `X-Data-{i}`/cookie parts, posts paced by `scMinPostsIntervalMs`, and a relay half-close ends the request body ([carrier-xhttp](function/carrier-xhttp.md)) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask `fragment` done (row 34), other mask types planned |
 | Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 20); datagrams, salamander obfs, masquerade site |
-| MASQUE transport | CONNECT-IP client and terminating server over h3 (row 69) and, on the same port, h2 (row 70), chosen by the configured ALPN |
+| MASQUE transport | CONNECT-IP client and terminating server over h3 (row 77) and, on the same port, h2 (row 78), chosen by the configured ALPN |
 | XDrive (remote-storage carrier) | planned (row 35) |
 | Browser dialer | not scheduled |
-| Tagged connections / observatory webhooks | planned (rows 118, 117) |
+| Tagged connections / observatory webhooks | planned (rows 126, 125) |
 | UDP `transport/internet/udp` fullcone/NAT behavior | mux-cool carries XUDP; standalone UDP transport planned |
 | Unix sockets | done (row 33) |
 
@@ -60,17 +60,17 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 
 | xray-core | ferrox state |
 | --- | --- |
-| DNS client: DoH, DoQ, local, cached, fakeDNS | `proxy/dns` outbound done (row 29); the resolver app planned (row 111) |
-| Router with rules, balancers (leastload/leastping/random), webhook | rules, the selector set and the `webhook` action done (row 108); the four balancer strategies done, urltest and selector planned (row 110) |
+| DNS client: DoH, DoQ, local, cached, fakeDNS | `proxy/dns` outbound done (row 29); the resolver app planned (row 119) |
+| Router with rules, balancers (leastload/leastping/random), webhook | rules, the selector set and the `webhook` action done (row 116); the four balancer strategies done, urltest and selector planned (row 118) |
 | Observatory / burst probe | partially planned: QUIC ladder climb/descend, no burst |
-| Reverse portal / bridge | planned (row 112) |
+| Reverse portal / bridge | planned (row 120) |
 | Stats, metrics (Prometheus), policy manager | planned: policy.rs is parse-level gate only |
-| `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | planned (row 113) |
-| Geodata (.dat) loader/downloader | planned (row 108) |
+| `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | planned (row 121) |
+| Geodata (.dat) loader/downloader | planned (row 116) |
 | Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | implemented (engine-sniffing: HTTP/TLS/QUIC/FakeDNS, bittorrent, UDP, plain-HTTP protocol and loopback outbound sniffing carried; the named inbound's second routing pass is row 30) |
 | Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shapes the http, dokodemo, vmess, vless, shadowsocks and shadowsocks_2022 scenarios write (`xray_pb.rs`), every other field refused by number or name |
 | OCSP, antireplay, time-window caches | planned |
-| Freedom fragment, VLESS encryption fragment | planned (rows 155, 37) |
+| Freedom fragment, VLESS encryption fragment | planned (rows 163, 37) |
 | finalmask: fragment, header/custom, noise, realm, salamander, sudoku, udphop, xdns, xicmp, xmc | `fragment` done (row 34), salamander on hysteria, mkcp-legacy on KCP; the rest planned (`obfs-finalmask`) |
 
 ## What to build next

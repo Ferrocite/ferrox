@@ -55,7 +55,7 @@ impl Gap {
 /// One row of the README connection-method matrix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodRow {
-    /// The table letter, `A` through `O`.
+    /// The table letter, `A` through `R`.
     pub section: char,
     /// The `#` cell, the row's stable number across the whole matrix.
     pub index: u32,
@@ -487,13 +487,13 @@ mod tests {
     #[test]
     fn the_live_matrix_reads_and_has_open_rows() {
         let rows = methods_from_text(include_str!("../../../README.md"));
-        assert!(rows.len() > 80, "the matrix should have ~180 rows");
+        assert!(rows.len() > 80, "the matrix should have ~217 rows");
         // Some rows done, some not: a reader finding only one class has mis-parsed a column.
         assert!(rows.iter().any(|row| row.implemented));
         assert!(rows.iter().any(|row| !row.implemented));
         // G and H are prose lists with no `| # |` matrix, so they contribute no rows by design.
         for letter in [
-            'A', 'B', 'C', 'D', 'E', 'F', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+            'A', 'B', 'C', 'D', 'E', 'F', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
         ] {
             assert!(
                 rows.iter().any(|row| row.section == letter),

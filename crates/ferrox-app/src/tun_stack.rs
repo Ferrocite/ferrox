@@ -208,6 +208,7 @@ fn recv_loop(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::needless_pass_by_value)]
 fn recv_loop(
     device: Arc<SyncDevice>,
     packets: SyncSender<Packet>,

@@ -5,7 +5,7 @@
 - symbols: serve_hc_inbound, HcHandler, hc_content_length
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
-Row 149's front half: a `hc` inbound answers one HTTP path with one fixed body, so a remote urltest or `leastPing` probe can ask "is this server up?" without a real destination. The config is Leaf's shape:
+Row 125's front half: a `hc` inbound answers one HTTP path with one fixed body, so a remote urltest or `leastPing` probe can ask "is this server up?" without a real destination. The config is Leaf's shape:
 
 ```json
 {"protocol": "hc", "settings": {"path": "/health", "request": "optional body", "response": "ok"}}
