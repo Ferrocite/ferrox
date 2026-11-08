@@ -117,9 +117,9 @@ impl Nat {
         }
         let now = Instant::now();
         let key = FlowKey::of(&view);
-        let fallback = if view.destination == local {
+        let fallback = if view.source == local {
             Some(key)
-        } else if view.source == local {
+        } else if view.destination == local {
             Some(key.reversed())
         } else {
             None
@@ -188,7 +188,7 @@ impl Nat {
     }
 
     fn remember_fallback(&mut self, view: &TcpView, now: Instant) {
-        if !self.hybrid || view.destination != self.local {
+        if !self.hybrid || view.source != self.local {
             return;
         }
         let key = FlowKey::of(view);
@@ -925,17 +925,36 @@ mod tests {
         let peer = Ipv4Addr::new(198, 18, 0, 2);
         let remote = Ipv4Addr::new(203, 0, 113, 7);
         let mut nat = Nat::new(local.into(), peer.into(), 40_000, true);
-        let mut mid = ipv4_packet(remote, local, 1234, 443, FLAG_ACK);
-        assert!(nat.rewrite(&mut mid) == Outcome::UnhandledTcp);
-        let mut reverse = ipv4_packet(local, remote, 443, 1234, FLAG_ACK);
-        assert!(nat.rewrite(&mut reverse) == Outcome::UnhandledTcp);
-        let mut syn = ipv4_packet(remote, local, 1234, 443, FLAG_SYN);
+        let now = Instant::now();
+        for offset in 0..NAT_MAX {
+            let port = NAT_PORT_BASE + offset as u16;
+            nat.ports.insert(
+                port,
+                Mapping {
+                    key: FlowKey {
+                        source: local.into(),
+                        source_port: offset as u16,
+                        destination: remote.into(),
+                        destination_port: 443,
+                    },
+                    accepted: false,
+                    closed: false,
+                    generation: 0,
+                    last: now,
+                },
+            );
+        }
+        let mut syn = ipv4_packet(local, remote, 1234, 443, FLAG_SYN);
         assert!(nat.rewrite(&mut syn) == Outcome::UnhandledTcp);
-        assert!(nat.ports.is_empty());
-        let mut fin = ipv4_packet(remote, local, 1234, 443, FLAG_FIN | FLAG_ACK);
+        nat.ports.remove(&NAT_PORT_BASE);
+        let mut again = ipv4_packet(local, remote, 1234, 443, FLAG_SYN);
+        assert!(nat.rewrite(&mut again) == Outcome::UnhandledTcp);
+        let mut reverse = ipv4_packet(remote, local, 443, 1234, FLAG_ACK);
+        assert!(nat.rewrite(&mut reverse) == Outcome::UnhandledTcp);
+        let mut fin = ipv4_packet(local, remote, 1234, 443, FLAG_FIN | FLAG_ACK);
         assert!(nat.rewrite(&mut fin) == Outcome::UnhandledTcp);
-        let mut again = ipv4_packet(remote, local, 1234, 443, FLAG_SYN);
-        assert!(nat.rewrite(&mut again) == Outcome::Handled);
+        let mut replacement = ipv4_packet(local, remote, 1234, 443, FLAG_SYN);
+        assert!(nat.rewrite(&mut replacement) == Outcome::Handled);
     }
 
     #[test]
