@@ -126,25 +126,41 @@ impl Aead {
         out: &mut Vec<u8>,
     ) {
         let nonce = nonce.unwrap_or_else(|| self.next_nonce());
-        let start = out.len();
-        if let Cipher::Aes(cipher) = &self.cipher {
-            if plaintext.len() >= SOURCE_SEAL_MIN {
-                out.reserve(plaintext.len());
-                let tag = cipher.seal_from_uninit(
-                    &nonce,
-                    aad,
-                    plaintext,
-                    &mut out.spare_capacity_mut()[..plaintext.len()],
-                );
-                // SAFETY: seal_from_uninit wrote every byte of the spare range.
-                unsafe { out.set_len(start + plaintext.len()) };
+        match &self.cipher {
+            Cipher::Aes(cipher) => {
+                let start = out.len();
+                let tag = if plaintext.len() >= SOURCE_SEAL_MIN {
+                    out.reserve(plaintext.len());
+                    let tag = cipher.seal_from_uninit(
+                        &nonce,
+                        aad,
+                        plaintext,
+                        &mut out.spare_capacity_mut()[..plaintext.len()],
+                    );
+                    // SAFETY: seal_from_uninit wrote every byte of the spare range.
+                    unsafe { out.set_len(start + plaintext.len()) };
+                    tag
+                } else {
+                    out.extend_from_slice(plaintext);
+                    cipher.seal_in_place(&nonce, aad, &mut out[start..])
+                };
                 out.extend_from_slice(&tag);
-                return;
+            }
+            Cipher::ChaCha(cipher) => {
+                let start = out.len();
+                out.extend_from_slice(plaintext);
+                let tag = cipher
+                    .encrypt_inout_detached(
+                        &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
+                        aad,
+                        (&mut out[start..]).into(),
+                    )
+                    .expect("AEAD seal cannot fail for these sizes");
+                let mut bytes = [0u8; TAG_LEN];
+                bytes.copy_from_slice(&tag);
+                out.extend_from_slice(&bytes);
             }
         }
-        out.extend_from_slice(plaintext);
-        let tag = self.seal_in_place(Some(nonce), &mut out[start..], aad);
-        out.extend_from_slice(&tag);
     }
 
     /// Seal `plaintext` in place and return the tag.
