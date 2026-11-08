@@ -3754,6 +3754,15 @@ type FreshStream = (
     Arc<Activity>,
 );
 
+/// One worker's claim on the driver's socket, returned even when the session panics so the stop drain cannot wait on a thread that already ended.
+struct LiveGuard(Arc<AtomicUsize>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The driver's two datagram scratch buffers and the tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
@@ -4096,11 +4105,11 @@ fn reap(
             activity: Arc::clone(&activity),
         };
         let serve = Arc::clone(serve);
-        let live = Arc::clone(live);
         live.fetch_add(1, Ordering::SeqCst);
+        let guard = LiveGuard(Arc::clone(live));
         std::thread::spawn(move || {
+            let _guard = guard;
             serve(session);
-            live.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
