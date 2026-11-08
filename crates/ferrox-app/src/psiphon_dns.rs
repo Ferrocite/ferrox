@@ -7,7 +7,7 @@
 //! the previous behaviour byte for byte.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{mpsc, Arc, Mutex};
@@ -908,10 +908,11 @@ pub(crate) fn resolve_fronting(
 
 /// Preferred servers first when the coin lands, then the configured alternates.
 fn alternate_servers(config: &Config) -> Vec<SocketAddr> {
-    let mut servers = Vec::new();
+    let mut servers = Vec::with_capacity(config.preferred.len() + config.servers.len());
     servers.extend(config.preferred.iter().copied());
+    let mut seen: HashSet<SocketAddr> = config.preferred.iter().copied().collect();
     for server in &config.servers {
-        if !servers.contains(server) {
+        if seen.insert(*server) {
             servers.push(*server);
         }
     }
@@ -1289,6 +1290,33 @@ mod tests {
         let addresses =
             resolve_with(&Config::from_servers(&[]), "192.0.2.7", 443).expect("literal");
         assert_eq!(addresses, [SocketAddr::from(([192, 0, 2, 7], 443))]);
+    }
+
+    #[test]
+    fn alternate_servers_keep_preferred_order_and_drop_configured_repeats() {
+        let preferred = [
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+            SocketAddr::from(([192, 0, 2, 2], 53)),
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+        ];
+        let configured = [
+            SocketAddr::from(([192, 0, 2, 3], 53)),
+            SocketAddr::from(([192, 0, 2, 2], 53)),
+            SocketAddr::from(([192, 0, 2, 3], 53)),
+            SocketAddr::from(([192, 0, 2, 4], 53)),
+        ];
+        let mut config = Config::from_servers(&configured);
+        config.preferred = preferred.to_vec();
+        assert_eq!(
+            super::alternate_servers(&config),
+            vec![
+                preferred[0],
+                preferred[1],
+                preferred[2],
+                configured[0],
+                configured[3]
+            ]
+        );
     }
 
     /// Answer one query with a record of the type the client asked for.

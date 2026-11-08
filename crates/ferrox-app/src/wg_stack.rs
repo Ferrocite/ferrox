@@ -588,24 +588,6 @@ impl FragmentSet {
     }
 }
 
-/// Merge adjacent or overlapping ranges in place.
-fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
-    if ranges.len() < 2 {
-        return;
-    }
-    let mut write = 0;
-    for read in 1..ranges.len() {
-        let (start, finish) = ranges[read];
-        if start <= ranges[write].1 {
-            ranges[write].1 = ranges[write].1.max(finish);
-        } else {
-            write += 1;
-            ranges[write] = (start, finish);
-        }
-    }
-    ranges.truncate(write + 1);
-}
-
 /// The set and byte counts one peer holds in `Reassembly::parts`.
 #[derive(Default)]
 struct PeerUsage {
@@ -678,10 +660,9 @@ impl Reassembly {
             part.header.extend_from_slice(&packet[..header_len]);
             part.next_header = if packet[0] >> 4 == 6 { packet[40] } else { 0 };
         }
-        if part
-            .ranges
-            .iter()
-            .any(|&(start, finish)| offset < finish && start < end)
+        let pos = part.ranges.partition_point(|&(start, _)| start < offset);
+        if (pos > 0 && part.ranges[pos - 1].1 > offset)
+            || (pos < part.ranges.len() && part.ranges[pos].0 < end)
         {
             self.remove(&key);
             return Reassembled::Held;
@@ -689,15 +670,24 @@ impl Reassembly {
         if part
             .last
             .is_some_and(|last| end > last || total.is_some_and(|next| next != last))
-            || total.is_some_and(|last| part.ranges.iter().any(|&(_, finish)| finish > last))
+            || total
+                .is_some_and(|last| part.ranges.last().is_some_and(|&(_, finish)| finish > last))
         {
             self.remove(&key);
             return Reassembled::Held;
         }
         part.payload[offset..end].copy_from_slice(&packet[payload_at..payload_at + (end - offset)]);
-        part.ranges.push((offset, end));
-        part.ranges.sort_unstable();
-        merge_ranges(&mut part.ranges);
+        part.ranges.insert(pos, (offset, end));
+        let mut merged = pos;
+        if merged > 0 && part.ranges[merged - 1].1 == offset {
+            part.ranges[merged - 1].1 = end;
+            part.ranges.remove(merged);
+            merged -= 1;
+        }
+        if merged + 1 < part.ranges.len() && part.ranges[merged].1 == part.ranges[merged + 1].0 {
+            part.ranges[merged].1 = part.ranges[merged + 1].1;
+            part.ranges.remove(merged + 1);
+        }
         if part.ranges.len() > REASSEMBLY_RANGES {
             self.remove(&key);
             return Reassembled::Held;
@@ -708,13 +698,11 @@ impl Reassembly {
         let Some(total) = part.last else {
             return Reassembled::Held;
         };
-        let mut covered = 0;
-        for &(start, finish) in &part.ranges {
-            if start > covered {
-                break;
-            }
-            covered = covered.max(finish);
-        }
+        let covered = part
+            .ranges
+            .first()
+            .filter(|range| range.0 == 0)
+            .map_or(0, |range| range.1);
         if covered < total || part.header.is_empty() {
             return Reassembled::Held;
         }
@@ -4330,32 +4318,31 @@ mod tests {
         packet
     }
 
-    /// The range list is merged where it lies: the old merge drained into a
-    /// second list, so every fragment allocated one, while the in-place pass
-    /// allocates none and leaves the same ranges.
+    /// Out-of-order fragments keep the range list sorted and merged on insertion,
+    /// so a fragment checks only its two neighbours instead of sorting the list.
     #[test]
-    fn merging_fragment_ranges_reuses_the_list() {
-        let mut ranges = vec![(0, 8), (8, 16), (32, 40), (40, 48), (100, 108)];
-        let ((), new) = ferrox_core::alloc_count::measure(|| merge_ranges(&mut ranges));
-        assert_eq!(new.allocs, 0, "the in-place merge takes no heap: {new:?}");
-        assert_eq!(ranges, vec![(0, 16), (32, 48), (100, 108)]);
-
-        let mut old = vec![(0, 8), (8, 16), (32, 40), (40, 48), (100, 108)];
-        let ((), reference) = ferrox_core::alloc_count::measure(|| {
-            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(old.len());
-            for (start, finish) in old.drain(..) {
-                match merged.last_mut() {
-                    Some(last) if start <= last.1 => last.1 = last.1.max(finish),
-                    _ => merged.push((start, finish)),
-                }
+    fn out_of_order_fragments_keep_the_ranges_sorted() {
+        let original = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 5000]);
+        let fragments = fragment_packet(&original, 0, TUNNEL_FRAGMENT).expect("fragments");
+        let mut reassembly = Reassembly::default();
+        let mut complete = None;
+        for (index, fragment) in fragments.iter().rev().enumerate() {
+            if let Reassembled::Complete(packet) = reassembly.accept([0u8; 32], fragment, 0) {
+                complete = Some(packet);
+                assert_eq!(
+                    index,
+                    fragments.len() - 1,
+                    "the offset-zero fragment completes the set"
+                );
+            } else if let Some(part) = reassembly.parts.values().next() {
+                assert!(
+                    part.ranges.windows(2).all(|pair| pair[0].1 < pair[1].0),
+                    "ranges stay sorted and separated: {:?}",
+                    part.ranges
+                );
             }
-            old = merged;
-        });
-        assert_eq!(
-            reference.allocs, 1,
-            "the old merge allocated its second list: {reference:?}"
-        );
-        assert_eq!(old, ranges, "the in-place merge keeps the old ranges");
+        }
+        assert_eq!(complete.as_deref(), Some(original.as_slice()));
     }
 
     /// The peer table matches the sets after an eviction and an expiry, and the
