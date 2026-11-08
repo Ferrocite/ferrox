@@ -436,7 +436,7 @@ fn ghash8(
     mut state: uint8x16_t,
     data: &[u8],
     tail: &mut super::Tail<uint8x16_t>,
-) -> (uint8x16_t, uint8x16_t) {
+) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
     let (blocks, _rest_bytes) = data.as_chunks::<16>();
     let (groups, _rest) = blocks.as_chunks::<8>();
