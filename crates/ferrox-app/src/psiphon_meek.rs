@@ -1,7 +1,10 @@
 //! The meek relay the native `Psiphon` lane rides for unfronted and CDN-fronted
 //! entries: a loopback TCP stream whose bytes are carried in `POST /` requests.
 
-use crate::psiphon_ssh::{derive_key, random, Proxy, Rc4, TlsShape, MAGIC, SEED_LENGTH};
+use crate::psiphon_ssh::{
+    current_dial_seed, derive_key, dial_fill, dial_random, dial_seed_scope, random, Proxy, Rc4,
+    TlsShape, MAGIC, SEED_LENGTH,
+};
 use crate::psiphon_webrtc::WebRtcStream;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use crypto_box::aead::{Aead, OsRng};
@@ -169,7 +172,7 @@ fn coin_probability(probability: f64) -> bool {
     if probability >= 1.0 {
         return true;
     }
-    f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0 < probability
+    f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0 < probability
 }
 
 /// A random value in `0..bound`.
@@ -177,15 +180,15 @@ fn random_below(bound: u64) -> u64 {
     if bound <= 1 {
         return 0;
     }
-    u64::from_be_bytes(random::<8>()) % bound
+    u64::from_be_bytes(dial_random::<8>()) % bound
 }
 
 /// The reference's alternate cookie name: two to ten characters from `[a-z_]`.
 fn alternate_cookie_name() -> String {
-    let length = 2 + usize::from(random::<1>()[0]) % 9;
+    let length = 2 + usize::from(dial_random::<1>()[0]) % 9;
     (0..length)
         .map(|_| {
-            let draw = random::<1>()[0] % 27;
+            let draw = dial_random::<1>()[0] % 27;
             if draw == 26 {
                 '_'
             } else {
@@ -200,10 +203,10 @@ fn profile(shape: &TlsShape, protocol: &str) -> Profile {
     let cookie_name = if coin_probability(shape.meek_alternate_cookie_name) {
         alternate_cookie_name()
     } else {
-        char::from(b'A' + random::<1>()[0] % 26).to_string()
+        char::from(b'A' + dial_random::<1>()[0] % 26).to_string()
     };
     let content_type = if coin_probability(shape.meek_alternate_content_type) {
-        ALTERNATE_CONTENT_TYPES[usize::from(random::<1>()[0]) % ALTERNATE_CONTENT_TYPES.len()]
+        ALTERNATE_CONTENT_TYPES[usize::from(dial_random::<1>()[0]) % ALTERNATE_CONTENT_TYPES.len()]
     } else {
         ALTERNATE_CONTENT_TYPES[0]
     };
@@ -321,22 +324,26 @@ pub(crate) fn connect(
     let config = meek.clone();
     let proxy = proxy.cloned();
     let dns = dns.clone();
+    let seed = current_dial_seed();
     std::thread::Builder::new()
         .name("psiphon-meek".to_owned())
-        .spawn(move || match listener.accept() {
-            Ok((socket, _)) => {
-                if let Err(why) = relay(
-                    socket,
-                    &config,
-                    proxy.as_ref(),
-                    timeout,
-                    &dns,
-                    limit_buffer_sizes,
-                ) {
-                    eprintln!("psiphon: fronted-meek relay: {why}");
+        .spawn(move || {
+            let _scope = seed.map(dial_seed_scope);
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    if let Err(why) = relay(
+                        socket,
+                        &config,
+                        proxy.as_ref(),
+                        timeout,
+                        &dns,
+                        limit_buffer_sizes,
+                    ) {
+                        eprintln!("psiphon: fronted-meek relay: {why}");
+                    }
                 }
+                Err(why) => eprintln!("psiphon: fronted-meek accept: {why}"),
             }
-            Err(why) => eprintln!("psiphon: fronted-meek accept: {why}"),
         })
         .map_err(|error| format!("psiphon meek thread: {error}"))?;
     Ok(local)
@@ -427,17 +434,21 @@ fn start_relay(
         .and_then(|()| local.set_write_timeout(Some(timeout)))
         .map_err(|error| format!("psiphon meek loopback: {error}"))?;
     let config = meek.clone();
+    let seed = current_dial_seed();
     std::thread::Builder::new()
         .name("psiphon-meek".to_owned())
-        .spawn(move || match listener.accept() {
-            Ok((socket, _)) => {
-                if let Err(why) =
-                    relay_stream(socket, &config, timeout, transport, limit_buffer_sizes)
-                {
-                    eprintln!("psiphon: in-proxy-meek relay: {why}");
+        .spawn(move || {
+            let _scope = seed.map(dial_seed_scope);
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    if let Err(why) =
+                        relay_stream(socket, &config, timeout, transport, limit_buffer_sizes)
+                    {
+                        eprintln!("psiphon: in-proxy-meek relay: {why}");
+                    }
                 }
+                Err(why) => eprintln!("psiphon: in-proxy-meek accept: {why}"),
             }
-            Err(why) => eprintln!("psiphon: in-proxy-meek accept: {why}"),
         })
         .map_err(|error| format!("psiphon meek thread: {error}"))?;
     Ok(local)
@@ -1202,14 +1213,14 @@ fn make_cookie(
         b"client_to_server",
     ));
     let padding_len = MIN_COOKIE_PADDING
-        + usize::from(u16::from_be_bytes(random::<2>()))
+        + usize::from(u16::from_be_bytes(dial_random::<2>()))
             % (MAX_COOKIE_PADDING - MIN_COOKIE_PADDING + 1);
     let mut value = Vec::with_capacity(SEED_LENGTH + 8 + padding_len + 32 + sealed.len());
     value.extend_from_slice(&seed);
     value.extend_from_slice(&MAGIC.to_be_bytes());
     value.extend_from_slice(&u32::try_from(padding_len).unwrap_or(0).to_be_bytes());
     let mut padding = vec![0u8; padding_len];
-    getrandom::fill(&mut padding).map_err(|error| format!("psiphon meek entropy: {error}"))?;
+    dial_fill(&mut padding);
     value.extend_from_slice(&padding);
     client.apply(&mut value[SEED_LENGTH..]);
     let seed_len = value.len();

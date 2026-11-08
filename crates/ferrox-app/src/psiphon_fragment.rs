@@ -11,7 +11,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::psiphon_ssh::random;
+use crate::psiphon_ssh::dial_random;
 
 /// The reference's largest default fragment.
 const DEFAULT_MAX_WRITE: usize = 1500;
@@ -123,7 +123,7 @@ fn random_below(bound: u64) -> u64 {
     if bound <= 1 {
         return 0;
     }
-    u64::from_be_bytes(random::<8>()) % bound
+    u64::from_be_bytes(dial_random::<8>()) % bound
 }
 
 /// A random value in the inclusive range.
@@ -145,7 +145,7 @@ fn coin(probability: f64) -> bool {
     if probability >= 1.0 {
         return true;
     }
-    f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0 < probability
+    f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0 < probability
 }
 
 struct State {

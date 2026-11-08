@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -525,7 +525,7 @@ impl TlsShape {
     /// The browser hello one dial presents: a configured parrot drawn uniformly, the
     /// reference's randomized shape when its coin lands, or Chrome when nothing is named.
     pub(crate) fn fingerprint(&self) -> Fingerprint {
-        let draw = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
         if self.randomized_probability > 0.0 && draw < self.randomized_probability {
             if let Some(profile) = Fingerprint::resolve("randomized") {
                 return profile;
@@ -534,7 +534,7 @@ impl TlsShape {
         if self.profiles.is_empty() {
             return Fingerprint::default();
         }
-        let index = usize::from(random::<1>()[0]) % self.profiles.len();
+        let index = usize::from(dial_random::<1>()[0]) % self.profiles.len();
         self.profiles[index]
     }
 
@@ -584,7 +584,7 @@ impl TlsShape {
         if high == low {
             return low;
         }
-        low + usize::from(u16::from_be_bytes(random::<2>())) % (high - low + 1)
+        low + usize::from(u16::from_be_bytes(dial_random::<2>())) % (high - low + 1)
     }
 
     /// The padding body length for one dial, or `None` when no maximum is configured.
@@ -595,7 +595,7 @@ impl TlsShape {
         let low = self.min_padding.min(self.max_padding);
         let high = self.min_padding.max(self.max_padding);
         let span = u32::from(high - low) + 1;
-        let draw = u32::from(u16::from_be_bytes(random::<2>()));
+        let draw = u32::from(u16::from_be_bytes(dial_random::<2>()));
         Some(low + u16::try_from(draw % span).unwrap_or(0))
     }
 
@@ -611,13 +611,13 @@ impl TlsShape {
             return server_name.to_owned();
         }
         if !self.sni_names.is_empty() {
-            let index = usize::from(random::<1>()[0]) % self.sni_names.len();
+            let index = usize::from(dial_random::<1>()[0]) % self.sni_names.len();
             return self.sni_names[index].clone();
         }
         if self.transform_probability > 0.0 && !self.hostname_patterns.is_empty() {
-            let draw = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+            let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
             if draw < self.transform_probability {
-                let index = usize::from(random::<1>()[0]) % self.hostname_patterns.len();
+                let index = usize::from(dial_random::<1>()[0]) % self.hostname_patterns.len();
                 if let Some(name) = random_hostname(&self.hostname_patterns[index]) {
                     return name;
                 }
@@ -640,7 +640,7 @@ impl TlsShape {
         {
             return false;
         }
-        let draw = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
         draw < self.tls_fragment_client_hello
     }
 }
@@ -655,7 +655,7 @@ impl ShadowsocksPrefix {
         if self.probability <= 0.0 || self.specs.is_empty() {
             return None;
         }
-        let draw = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
         if draw >= self.probability {
             return None;
         }
@@ -667,7 +667,7 @@ impl ShadowsocksPrefix {
         if scope.1.is_empty() {
             return None;
         }
-        let name = &scope.1[usize::from(random::<1>()[0]) % scope.1.len()];
+        let name = &scope.1[usize::from(dial_random::<1>()[0]) % scope.1.len()];
         let (_, pattern) = self.specs.iter().find(|(spec, _)| spec == name)?;
         random_bytes(pattern, SHADOWSOCKS_SALT)
             .filter(|prefix| !prefix.is_empty() && prefix.len() <= SHADOWSOCKS_SALT)
@@ -684,7 +684,7 @@ impl OsshPrefix {
         if self.probability <= 0.0 || self.specs.is_empty() {
             return None;
         }
-        let draw = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
         if draw >= self.probability {
             return None;
         }
@@ -696,7 +696,7 @@ impl OsshPrefix {
         if scope.1.is_empty() {
             return None;
         }
-        let name = &scope.1[usize::from(random::<1>()[0]) % scope.1.len()];
+        let name = &scope.1[usize::from(dial_random::<1>()[0]) % scope.1.len()];
         if name.len() > OSSH_PREFIX_HEADER_MAX {
             return None;
         }
@@ -705,7 +705,7 @@ impl OsshPrefix {
         let prefix_len = prefix.len();
         if prefix.len() < OSSH_PREAMBLE_HEADER {
             let mut padding = vec![0u8; OSSH_PREAMBLE_HEADER - prefix.len()];
-            getrandom::fill(&mut padding).ok()?;
+            dial_fill(&mut padding);
             prefix.extend_from_slice(&padding);
         }
         let terminator = ossh_terminator(keyword, &prefix);
@@ -753,7 +753,7 @@ fn prefix_split(min: Duration, max: Duration) -> Option<Duration> {
     if high == 0 {
         return None;
     }
-    let draw = u64::from_be_bytes(random::<8>()) % (high - low + 1);
+    let draw = u64::from_be_bytes(dial_random::<8>()) % (high - low + 1);
     Some(Duration::from_nanos(low + draw))
 }
 
@@ -803,7 +803,7 @@ fn random_bytes(pattern: &str, limit: usize) -> Option<Vec<u8>> {
         let count = if span == 1 {
             low
         } else {
-            low + u16::from(random::<1>()[0]) % u16::try_from(span).unwrap_or(1)
+            low + u16::from(dial_random::<1>()[0]) % u16::try_from(span).unwrap_or(1)
         };
         for _ in 0..count {
             match &atom {
@@ -813,7 +813,7 @@ fn random_bytes(pattern: &str, limit: usize) -> Option<Vec<u8>> {
                         .iter()
                         .map(|(low, high)| u16::from(high - low) + 1)
                         .sum();
-                    let mut pick = u16::from_be_bytes(random::<2>()) % width;
+                    let mut pick = u16::from_be_bytes(dial_random::<2>()) % width;
                     let mut byte = 0u8;
                     for (low, high) in ranges {
                         let span = u16::from(high - low) + 1;
@@ -952,7 +952,7 @@ fn random_hostname(pattern: &str) -> Option<String> {
         let count = if span == 1 {
             low
         } else {
-            low + u16::from(random::<1>()[0]) % u16::try_from(span).unwrap_or(1)
+            low + u16::from(dial_random::<1>()[0]) % u16::try_from(span).unwrap_or(1)
         };
         for _ in 0..count {
             match &atom {
@@ -962,7 +962,7 @@ fn random_hostname(pattern: &str) -> Option<String> {
                         .iter()
                         .map(|(low, high)| u16::from(high - low) + 1)
                         .sum();
-                    let mut pick = u16::from_be_bytes(random::<2>()) % width;
+                    let mut pick = u16::from_be_bytes(dial_random::<2>()) % width;
                     let mut byte = b'?';
                     for (low, high) in ranges {
                         let span = u16::from(high - low) + 1;
@@ -1329,8 +1329,11 @@ fn hex_pair(high: u8, low: u8) -> Option<u8> {
 }
 
 /// One established SSH connection; clones of a channel share it.
+static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
+
 pub(crate) struct Session {
     inner: Arc<Inner>,
+    id: usize,
 }
 
 struct Inner {
@@ -1340,10 +1343,13 @@ struct Inner {
     channel_window: u32,
     next_channel: AtomicU32,
     closed: AtomicBool,
+    closed_at: AtomicU64,
     socket: Stream,
     relay: Mutex<Option<Relay>>,
     opened_at: Instant,
     last_read: AtomicU64,
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
     pending_request: Mutex<Option<mpsc::Sender<bool>>>,
     requests: Option<Arc<dyn ServerRequests>>,
     server: String,
@@ -1579,10 +1585,13 @@ impl Session {
             channel_window: server.channel_window,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: control,
             relay: Mutex::new(relay),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests,
             server: format!("{}:{}", server.host, server.port),
@@ -1607,7 +1616,10 @@ impl Session {
                 return Err(format!("psiphon ssh keepalive: {error}"));
             }
         }
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
     /// Open one `direct-tcpip` channel, treating a split-tunnel classification as a refusal.
@@ -1792,6 +1804,31 @@ impl Session {
         &self.inner.server
     }
 
+    /// The tunnel's identity, so an older session cannot settle a newer entry.
+    #[must_use]
+    pub(crate) fn id(&self) -> usize {
+        self.id
+    }
+
+    #[must_use]
+    pub(crate) fn bytes_up(&self) -> u64 {
+        self.inner.bytes_up.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub(crate) fn bytes_down(&self) -> u64 {
+        self.inner.bytes_down.load(Ordering::Relaxed)
+    }
+
+    /// The session's age, frozen at close.
+    #[must_use]
+    pub(crate) fn age(&self) -> Duration {
+        match self.inner.closed_at.load(Ordering::Relaxed) {
+            u64::MAX => self.inner.opened_at.elapsed(),
+            closed => Duration::from_millis(closed),
+        }
+    }
+
     #[must_use]
     pub(crate) fn protocol(&self) -> &'static str {
         self.inner.protocol
@@ -1943,10 +1980,13 @@ impl Inner {
         Duration::from_millis(now.saturating_sub(self.last_read.load(Ordering::Relaxed)))
     }
 
+    /// Close the transport once, recording the age the replay target sees.
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        let age = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.closed_at.store(age, Ordering::Relaxed);
         let _ = self.socket.shutdown();
         let _ = lock(&self.pending_request).take();
         let channels: Vec<Arc<ChannelState>> = lock(&self.channels)
@@ -2143,17 +2183,20 @@ impl Channel {
     ) -> io::Result<bool> {
         let adjust_at = window_adjust_at(self.session.channel_window);
         loop {
-            let (adjust, spent, eof) = {
+            let (adjust, spent, bytes, eof) = {
                 let mut recv = lock(&self.state.recv);
-                let (adjust, spent) = take_batch(&mut recv, batch, limit, adjust_at);
+                let (adjust, spent, bytes) = take_batch(&mut recv, batch, limit, adjust_at);
                 let eof = recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire);
-                (adjust, spent, eof)
+                (adjust, spent, bytes, eof)
             };
             if !spent.is_empty() {
                 self.recycle_buffers(spent);
             }
             if adjust != 0 {
                 self.adjust(adjust);
+            }
+            if bytes != 0 {
+                self.session.bytes_down.fetch_add(bytes, Ordering::Relaxed);
             }
             if !batch.is_empty() {
                 return Ok(true);
@@ -2202,8 +2245,9 @@ fn take_batch(
     batch: &mut Vec<ChannelChunk>,
     limit: usize,
     adjust_at: u64,
-) -> (u64, Vec<Vec<u8>>) {
+) -> (u64, Vec<Vec<u8>>, u64) {
     let mut adjust = 0u64;
+    let mut bytes = 0u64;
     let mut spent = Vec::new();
     while batch.len() < limit {
         let Some(chunk) = recv.chunks.pop_front() else {
@@ -2213,7 +2257,9 @@ fn take_batch(
             spent.push(chunk.buffer);
             continue;
         }
-        recv.pending_adjust += (chunk.end - chunk.start) as u64;
+        let take = (chunk.end - chunk.start) as u64;
+        recv.pending_adjust += take;
+        bytes += take;
         if recv.pending_adjust >= adjust_at {
             adjust += recv.pending_adjust;
             recv.local_window += recv.pending_adjust;
@@ -2225,7 +2271,7 @@ fn take_batch(
             end: chunk.end,
         });
     }
-    (adjust, spent)
+    (adjust, spent, bytes)
 }
 
 impl Read for Channel {
@@ -2301,6 +2347,9 @@ impl Read for Channel {
         if adjust != 0 {
             self.adjust(adjust);
         }
+        self.session
+            .bytes_down
+            .fetch_add(u64::try_from(take).unwrap_or(0), Ordering::Relaxed);
         Ok(take)
     }
 }
@@ -2358,6 +2407,9 @@ impl Channel {
         self.session
             .send_channel_data_in_place(&self.state, &mut buf[..take])
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+        self.session
+            .bytes_up
+            .fetch_add(u64::try_from(take).unwrap_or(0), Ordering::Relaxed);
         Ok(take)
     }
 }
@@ -2371,6 +2423,9 @@ impl Write for Channel {
         self.session
             .send_channel_data(&self.state, &buf[..take])
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+        self.session
+            .bytes_up
+            .fetch_add(u64::try_from(take).unwrap_or(0), Ordering::Relaxed);
         Ok(take)
     }
 
@@ -2696,7 +2751,7 @@ fn split(
         preamble.extend_from_slice(&MAGIC.to_be_bytes());
         preamble.extend_from_slice(&u32::try_from(padding_len).unwrap_or(0).to_be_bytes());
         let mut padding = vec![0u8; padding_len];
-        getrandom::fill(&mut padding).map_err(|error| format!("psiphon ssh entropy: {error}"))?;
+        dial_fill(&mut padding);
         preamble.extend_from_slice(&padding);
         if let Some(prefix) = &prefix {
             preamble.extend_from_slice(&1u16.to_be_bytes());
@@ -2734,10 +2789,99 @@ fn split(
     }
 }
 
+/// Fill a buffer from system entropy.
 pub(crate) fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("psiphon: system entropy");
     bytes
+}
+
+thread_local! {
+    static DIAL_RNG: std::cell::RefCell<Option<DialRng>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The per-dial `ChaCha20` stream that makes shape draws replayable.
+struct DialRng {
+    seed: [u8; 32],
+    cipher: chacha20::ChaCha20,
+    block: [u8; 64],
+    offset: usize,
+}
+
+impl DialRng {
+    /// Start a `ChaCha20` stream at block zero for this dial seed.
+    fn new(seed: [u8; 32]) -> Self {
+        use chacha20::cipher::KeyIvInit;
+        let cipher = chacha20::ChaCha20::new_from_slices(&seed, &[0u8; 12])
+            .expect("psiphon: ChaCha20 key and nonce lengths are fixed");
+        Self {
+            seed,
+            cipher,
+            block: [0u8; 64],
+            offset: 64,
+        }
+    }
+
+    /// Read the next bytes of the dial stream.
+    fn fill(&mut self, out: &mut [u8]) {
+        use chacha20::cipher::StreamCipher;
+        for byte in out {
+            if self.offset == self.block.len() {
+                self.block = [0u8; 64];
+                self.cipher.apply_keystream(&mut self.block);
+                self.offset = 0;
+            }
+            *byte = self.block[self.offset];
+            self.offset += 1;
+        }
+    }
+}
+
+/// Restore the previous dial seed when a nested scope ends.
+pub(crate) struct DialSeedScope {
+    previous: Option<DialRng>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for DialSeedScope {
+    fn drop(&mut self) {
+        DIAL_RNG.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Make every dial-shape draw in this thread deterministic from `seed`.
+pub(crate) fn dial_seed_scope(seed: [u8; 32]) -> DialSeedScope {
+    let previous = DIAL_RNG.with(|cell| cell.borrow_mut().replace(DialRng::new(seed)));
+    DialSeedScope {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// The seed in force on this thread, so a relay thread can replay the same shape.
+pub(crate) fn current_dial_seed() -> Option<[u8; 32]> {
+    DIAL_RNG.with(|cell| cell.borrow().as_ref().map(|rng| rng.seed))
+}
+
+/// A dial-shape random value, or system entropy when no replay scope is active.
+pub(crate) fn dial_random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    dial_fill(&mut bytes);
+    bytes
+}
+
+/// Fill a dial-shape buffer, or system entropy when no replay scope is active.
+pub(crate) fn dial_fill(bytes: &mut [u8]) {
+    DIAL_RNG.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(rng) = guard.as_mut() {
+            rng.fill(bytes);
+        } else {
+            getrandom::fill(bytes).expect("psiphon: system entropy");
+        }
+    });
 }
 
 /// A random payload size in the inclusive range.
@@ -4127,10 +4271,13 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         channel_window: DEFAULT_CHANNEL_WINDOW,
         next_channel: AtomicU32::new(1),
         closed: AtomicBool::new(false),
+        closed_at: AtomicU64::new(u64::MAX),
         socket: Stream::Tcp(peer),
         relay: Mutex::new(None),
         opened_at: Instant::now(),
         last_read: AtomicU64::new(0),
+        bytes_up: AtomicU64::new(0),
+        bytes_down: AtomicU64::new(0),
         pending_request: Mutex::new(None),
         requests: None,
         server: "test".to_owned(),
@@ -4407,10 +4554,13 @@ mod tests {
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4492,10 +4642,13 @@ mod tests {
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4563,10 +4716,13 @@ mod tests {
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4659,10 +4815,13 @@ mod tests {
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4750,10 +4909,13 @@ mod tests {
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4796,10 +4958,13 @@ mod tests {
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
             socket: Stream::Tcp(peer),
             relay: Mutex::new(None),
             opened_at: Instant::now(),
             last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),

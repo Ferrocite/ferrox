@@ -1,15 +1,17 @@
 //! The reference's `values.GetUserAgent`: a plausible browser User-Agent drawn
 //! from the same five families, so an HTTP dial does not repeat one string.
 
-use crate::psiphon_ssh::random;
+use crate::psiphon_ssh::dial_random;
 
 /// A random value in `0..bound`.
 fn below(bound: usize) -> usize {
     if bound <= 1 {
         return 0;
     }
-    usize::try_from(u64::from_be_bytes(random::<8>()) % u64::try_from(bound).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+    usize::try_from(
+        u64::from_be_bytes(dial_random::<8>()) % u64::try_from(bound).unwrap_or(u64::MAX),
+    )
+    .unwrap_or(0)
 }
 
 /// A random value in the inclusive range.

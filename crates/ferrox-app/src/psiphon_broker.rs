@@ -4,7 +4,7 @@
 
 use crate::json::Json;
 use crate::psiphon_meek::{self, Meek};
-use crate::psiphon_ssh::{random, Identity, Proxy};
+use crate::psiphon_ssh::{dial_random, random, Identity, Proxy};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
@@ -983,6 +983,7 @@ fn unwrap_session_packet(
     })
 }
 
+/// Seal one broker record, padding it with the replayable shape draw.
 fn obfuscate(record: &[u8], key: &Aes256Gcm, timestamped: bool) -> Result<Vec<u8>, String> {
     let nonce = random::<12>();
     let mut plain = Vec::with_capacity(record.len() + MAX_PADDING + 16);
@@ -994,7 +995,7 @@ fn obfuscate(record: &[u8], key: &Aes256Gcm, timestamped: bool) -> Result<Vec<u8
             .cast_signed();
         put_varint(&mut plain, timestamp);
     }
-    let padding = usize::from(u16::from_be_bytes(random::<2>())) % (MAX_PADDING + 1);
+    let padding = usize::from(u16::from_be_bytes(dial_random::<2>())) % (MAX_PADDING + 1);
     put_uvarint(&mut plain, padding as u64);
     plain.resize(plain.len() + padding, 0);
     plain.extend_from_slice(record);

@@ -1,8 +1,8 @@
 //! A str0m WebRTC data channel between the client and an in-proxy destination.
 
 use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics};
-use crate::psiphon_ssh::random;
 use crate::psiphon_ssh::Identity;
+use crate::psiphon_ssh::{dial_random, random};
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -257,9 +257,9 @@ impl WebRtc {
 /// Return a random lowercase hex data-channel label.
 fn label() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let length = usize::from(u16::from_be_bytes(random::<2>()) % 32) + 1;
+    let length = usize::from(u16::from_be_bytes(dial_random::<2>()) % 32) + 1;
     let mut label = String::with_capacity(length * 2);
-    for byte in &random::<32>()[..length] {
+    for byte in &dial_random::<32>()[..length] {
         label.push(char::from(HEX[usize::from(byte >> 4)]));
         label.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }

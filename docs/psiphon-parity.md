@@ -28,7 +28,6 @@ the gap count is complete, not so a client lane should implement them.
 | --- | --- | --- |
 | `client-api` | `missing` | `ClientAPILevel`, `DisableApi`, `TargetAPIEncoding`, `TargetAPIProtocol` |
 | `client-core` | `missing` | `LimitCPUThreads` |
-| `client-replay` | `missing` | `DisableReplay`, `FrontedHTTPClientReplayDialParametersProbability`, `FrontedHTTPClientReplayDialParametersTTLSeconds`, `FrontedHTTPClientReplayRetainFailedProbability`, `FrontedHTTPClientReplayUpdateFrequencySeconds`, `InproxyReplayBrokerDialParametersProbability`, `InproxyReplayBrokerDialParametersTTLSeconds`, `InproxyReplayBrokerRetainFailedProbability`, `InproxyReplayBrokerUpdateFrequencySeconds`, `InproxyReplayRetainFailedProbability`, `ReplayCandidateCount`, `ReplayDialParametersTTLSeconds`, `ReplayIgnoreChangedConfigStateProbability`, `ReplayLaterRoundMoveToFrontProbability`, `ReplayRetainFailedProbability`, `ReplayTargetDownstreamBytes`, `ReplayTargetTunnelDurationSeconds`, `ReplayTargetUpstreamBytes` |
 | `client-packet-tunnel` | `missing` | `PacketTunnelTransparentDNSIPv4Address`, `PacketTunnelTransparentDNSIPv6Address`, `PacketTunnelTunFileDescriptor`, `SSHPacketTunnelChannelWindowSize` |
 | `client-tls` | `missing` | `CustomTLSProfiles`, `DisableFrontingProviderTLSProfiles`, `NoDefaultTLSSessionIDProbability`, `UseOnlyCustomTLSProfiles` |
 | `client-obfuscation` | `missing` | `ObfuscatedSSHAlgorithms`, `QUICObfuscatedPSKProbability`, `TLSTunnelObfuscatedPSKProbability` |
