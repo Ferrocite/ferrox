@@ -315,8 +315,7 @@ impl<S: Stream> Server<S> {
 
         let certs = self.cfg.served_entries();
         let cert = self.pick_cert(&certs, hello.sni.as_deref())?;
-        // Decided before the flight so the acknowledgement and the status agree: an acked
-        // `status_request` must be followed by the message, and vice versa.
+        // Decided before the flight so the acknowledgement and the status agree.
         let staple = hello
             .ocsp_requested
             .then(|| certs[cert].ocsp.as_ref())

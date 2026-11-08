@@ -562,8 +562,7 @@ impl TlsServerConfig {
                         .and_then(|was| was.ocsp.as_ref())
                         .and_then(|was| was.response.clone())
                 });
-                // The comparison is the response that will be served, fallback included, so a
-                // failed refresh against a steady cache changes nothing.
+                // The comparison is the served response, fallback included, so a steady cache never rebuilds.
                 changed |= served.get(index).is_none_or(|was| {
                     ocsp.response.as_ref()
                         != was.ocsp.as_ref().and_then(|was| was.response.as_ref())
