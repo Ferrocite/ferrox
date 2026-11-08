@@ -1887,9 +1887,8 @@ fn udp_reader(
         };
         for frag in fragments {
             wire.clear();
-            if hysteria::encode_udp(&frag, &mut wire).is_ok() {
-                let _ = conn.dgram_send(&wire);
-            }
+            hysteria::encode_udp_unchecked(&frag, &mut wire);
+            let _ = conn.dgram_send(&wire);
         }
         crate::quic::flush_egress(&mut conn, sock);
     }
@@ -1993,9 +1992,8 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
         };
         for frag in fragments {
             wire.clear();
-            if hysteria::encode_udp(&frag, &mut wire).is_ok() {
-                let _ = conn.dgram_send(&wire);
-            }
+            hysteria::encode_udp_unchecked(&frag, &mut wire);
+            let _ = conn.dgram_send(&wire);
         }
         crate::quic::flush_egress(&mut conn, &session.sock);
     }

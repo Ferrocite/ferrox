@@ -377,6 +377,18 @@ impl UdpMessage<'_> {
 /// Append a whole UDP message to `out`; the session id is written here rather than left for the transport, so a datagram is self-describing.
 pub fn encode_udp(message: &UdpMessage, out: &mut Vec<u8>) -> Result<(), RequestError> {
     message.validate()?;
+    encode_udp_unchecked(message, out);
+    Ok(())
+}
+
+/// The bytes `encode_udp` writes, without the validation [`encode_udp`] made first: only an address
+/// an empty or over-long address, a payload an empty or over-large payload, and a fragment id
+/// outside its count would be refused there. A caller that already validated its whole message once —
+/// the relay's [`fragments_udp`], whose every fragment shares the whole's address and slices its
+/// payload, or a datagram [`decode_udp`] read whole — must not pay the same two or ten fragments
+/// again to say the same thing louder. An unchecked caller that hands an invalid message writes the
+/// same bytes the checked form would have refused, and the peer's parser refuses those bytes.
+pub fn encode_udp_unchecked(message: &UdpMessage, out: &mut Vec<u8>) {
     out.extend_from_slice(&message.session.to_be_bytes());
     out.extend_from_slice(&message.packet.to_be_bytes());
     out.push(message.frag);
@@ -384,7 +396,6 @@ pub fn encode_udp(message: &UdpMessage, out: &mut Vec<u8>) -> Result<(), Request
     frames::quic_varint(out, message.address.len() as u64);
     out.extend_from_slice(message.address.as_bytes());
     out.extend_from_slice(message.payload);
-    Ok(())
 }
 
 /// Read one whole UDP message from a datagram; the payload is whatever follows the address, borrowed from the caller's buffer, so a relay never copies it to look at it.
@@ -1342,7 +1353,7 @@ mod tests {
         let mut wire = Vec::with_capacity(1200);
         for frag in fragments_udp(&message, 1200).expect("fragments") {
             wire.clear();
-            encode_udp(&frag, &mut wire).expect("encodes");
+            encode_udp_unchecked(&frag, &mut wire);
         }
         wire.clear();
         let ((), counts) = crate::alloc_count::measure(|| {
@@ -1350,7 +1361,7 @@ mod tests {
                 for frag in fragments_udp(std::hint::black_box(&message), 1200).expect("fragments")
                 {
                     wire.clear();
-                    encode_udp(&frag, &mut wire).expect("encodes");
+                    encode_udp_unchecked(&frag, &mut wire);
                     std::hint::black_box(&wire);
                 }
             }
@@ -1360,6 +1371,84 @@ mod tests {
             (0, 0, 0),
             "4096 fragment runs take no heap at all"
         );
+    }
+
+    /// The unchecked fragment writes what the checked one wrote for every fragment the fragmenter
+    /// produced, at payload lengths that are and are not multiples of the fragment capacity.
+    #[test]
+    fn an_unchecked_fragment_is_the_bytes_the_checked_encode_wrote() {
+        let address = "edge.example:443";
+        for len in 1..=200usize {
+            let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let message = UdpMessage {
+                session: 9,
+                packet: 1,
+                frag: 0,
+                frags: 1,
+                address,
+                payload: &payload,
+            };
+            let max = message.header_len() + 7;
+            let mut checked = Vec::new();
+            let mut bare = Vec::new();
+            for frag in fragments_udp(&message, max).expect("fragments") {
+                checked.clear();
+                bare.clear();
+                encode_udp(&frag, &mut checked).expect("encodes");
+                encode_udp_unchecked(&frag, &mut bare);
+                assert_eq!(bare, checked, "length {len}");
+            }
+        }
+    }
+
+    /// The fragments' wire bytes, 512 runs of a 3000-byte payload split at 1200, folded through the
+    /// checked encoder — so one ops job reports what the validation costs.
+    #[test]
+    fn the_checked_fragment_costs_the_validate_and_nothing_else() {
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let message = UdpMessage {
+            session: 7,
+            packet: 42,
+            frag: 0,
+            frags: 1,
+            address: "edge.example:443",
+            payload: &payload,
+        };
+        let mut wire = Vec::with_capacity(1200);
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            for frag in fragments_udp(std::hint::black_box(&message), 1200).expect("fragments") {
+                wire.clear();
+                encode_udp(std::hint::black_box(&frag), &mut wire).expect("encodes");
+                fold = fold.wrapping_add(wire.len() as u32);
+            }
+        }
+        assert!(fold > 0, "the fragments were written");
+    }
+
+    /// The same 512 fragment runs through the unchecked encoder — so one ops job reports both
+    /// frames and only their difference is a claim about the validation.
+    #[test]
+    fn the_unchecked_fragment_costs_the_bytes_and_nothing_else() {
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let message = UdpMessage {
+            session: 7,
+            packet: 42,
+            frag: 0,
+            frags: 1,
+            address: "edge.example:443",
+            payload: &payload,
+        };
+        let mut wire = Vec::with_capacity(1200);
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            for frag in fragments_udp(std::hint::black_box(&message), 1200).expect("fragments") {
+                wire.clear();
+                encode_udp_unchecked(std::hint::black_box(&frag), &mut wire);
+                fold = fold.wrapping_add(wire.len() as u32);
+            }
+        }
+        assert!(fold > 0, "the fragments were written");
     }
 
     #[test]
