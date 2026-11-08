@@ -11528,9 +11528,7 @@ fn relay_kcp_under_reality(
     let Some(session) = kcp_reality_connect(conn, cfg) else {
         return;
     };
-    relay_kcp_under(client, conn, session, header, |session| {
-        read_vless_response(session).is_some()
-    });
+    relay_kcp_under(client, conn, session, header, |_| true);
 }
 
 fn dial_vless_kcp(
@@ -11547,7 +11545,12 @@ fn dial_vless_kcp(
         return;
     }
     if let Some(cfg) = vless.reality.as_deref() {
-        relay_kcp_under_reality(client, conn, cfg, &header);
+        let Some(session) = kcp_reality_connect(conn, cfg) else {
+            return;
+        };
+        relay_kcp_under(client, conn, session, &header, |session| {
+            read_vless_response(session).is_some()
+        });
         return;
     }
     if conn.write(&header).is_err() {
