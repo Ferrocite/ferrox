@@ -226,12 +226,14 @@ def parse_diff(text: str) -> tuple[dict[str, list], dict[str, list[str]]]:
 
 
 def repo_root() -> str:
+    """Return the working tree's top-level directory."""
     out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                          capture_output=True, text=True, check=True)
     return out.stdout.strip()
 
 
 def split_values(text: str) -> list[str]:
+    """Split a comma-separated scope value into trimmed non-empty parts."""
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
@@ -253,6 +255,7 @@ def read_scope(path: str) -> dict[str, list[str]]:
 
 
 def pages(root: str) -> dict[str, dict[str, list[str]]]:
+    """Read every method page's scope block, keyed by page name."""
     return {os.path.splitext(os.path.basename(path))[0]: read_scope(path)
             for path in sorted(glob.glob(os.path.join(root, PAGES, "*.md")))}
 
@@ -409,6 +412,7 @@ def is_shared_source(path: str) -> bool:
 
 
 def ops_rows(root: str, selected: list[str] | None) -> list[dict[str, str]]:
+    """The ops manifest rows, optionally limited to the selected methods."""
     rows: list[dict[str, str]] = []
     with open(os.path.join(root, OPS_ROWS), encoding="utf-8") as handle:
         for line in handle:
@@ -482,6 +486,7 @@ def shared_paths(changed: list[str], scopes: dict) -> list[str]:
 
 def build_plan(root: str, changed: list[str], hunks: dict | None = None,
                bodies: dict | None = None, base: str = "") -> dict:
+    """Classify a change list and fill in the matrix, rows and suites it owes."""
     scopes = pages(root)
     attributed = None
     if base and hunks is not None:
@@ -494,6 +499,7 @@ def build_plan(root: str, changed: list[str], hunks: dict | None = None,
 
 
 def changed_from(root: str, base: str) -> tuple[list[str], dict, dict]:
+    """The changed paths, hunks and changed lines between one base and HEAD."""
     out = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"],
                          capture_output=True, text=True, cwd=root)
     if out.returncode != 0:
@@ -552,6 +558,7 @@ def write_summary(plan: dict, path: str) -> None:
 
 
 def emit_outputs(plan: dict, github_output: str) -> None:
+    """Print the plan and append its job flags to GITHUB_OUTPUT."""
     keys = output_flags(plan)
     lines = [f"{key}={value}" for key, value in keys.items()]
     if github_output:
@@ -566,6 +573,7 @@ def emit_outputs(plan: dict, github_output: str) -> None:
 
 
 def cmd_scope(args: argparse.Namespace) -> int:
+    """Plan a diff, write the plan file and publish its flags."""
     root = repo_root()
     hunks: dict = {}
     bodies: dict = {}
@@ -592,6 +600,7 @@ def cmd_scope(args: argparse.Namespace) -> int:
 
 
 def query_plan(root: str) -> dict:
+    """The plan file, or a wide plan when no file exists."""
     path = os.path.join(root, PLAN)
     if not os.path.exists(path):
         return build_plan(root, [])
@@ -600,6 +609,7 @@ def query_plan(root: str) -> dict:
 
 
 def cmd_rows(args: argparse.Namespace) -> int:
+    """Print the ops rows in the plan grouped by method and filter."""
     plan = query_plan(repo_root())
     grouped: dict[str, list[str]] = {}
     order: list[str] = []
@@ -615,6 +625,7 @@ def cmd_rows(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    """Print one list-valued plan key, one entry per line."""
     plan = query_plan(repo_root())
     for item in plan[args.key]:
         print(item)
@@ -622,6 +633,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_suite(args: argparse.Namespace) -> int:
+    """Print one pin's scoped suite command."""
     print(query_plan(repo_root())["suites"].get(args.pin, ""))
     return 0
 
@@ -660,6 +672,7 @@ def shared_names(root: str, scopes: dict) -> dict[str, list[str]]:
 
 
 def validate(root: str) -> tuple[list[str], list[str]]:
+    """Check every page's scope against the tree and return failures and notes."""
     scopes = pages(root)
     pinned = {pin["name"]: pin for pin in pins(root)}
     fails: list[str] = []
@@ -738,6 +751,7 @@ def validate(root: str) -> tuple[list[str], list[str]]:
 
 
 def check_oracle(root: str, scopes: dict, fails: list, notes: list) -> None:
+    """Check oracle patterns against the enabled pins' test-name lists."""
     listed: dict[str, list[str]] = {}
     for pin in pins(root):
         if pin.get("test_enabled") == "true" and pin.get("suite"):
@@ -766,6 +780,7 @@ def check_oracle(root: str, scopes: dict, fails: list, notes: list) -> None:
 
 
 def check_scenarios(scopes: dict, ids: list[str], fails: list) -> None:
+    """Check scenario patterns against the ids lib-matrix.sh knows."""
     for name, scope in sorted(scopes.items()):
         for pattern in scope.get("scenarios", []):
             if not any(pattern in i for i in ids):
@@ -774,6 +789,7 @@ def check_scenarios(scopes: dict, ids: list[str], fails: list) -> None:
 
 
 def check_go(root: str, scopes: dict, fails: list, notes: list) -> None:
+    """Check go package patterns against the pinned xray-core checkout."""
     tree = os.path.join(root, "upstream", "xray-core")
     if not os.path.isdir(tree):
         notes.append("upstream/xray-core is not checked out here; go packages not verified")
@@ -787,6 +803,7 @@ def check_go(root: str, scopes: dict, fails: list, notes: list) -> None:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    """Validate the scope declarations and report every drift."""
     root = repo_root()
     fails, notes = validate(root)
     for note in notes:
@@ -874,6 +891,7 @@ mod tests {
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
+    """Run the planner's fixtures and report the first disagreement."""
     root = repo_root()
     scopes = pages(root)
     failed = 0
@@ -1036,6 +1054,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str]) -> int:
+    """Dispatch one ci-scope subcommand and return its exit status."""
     parser = argparse.ArgumentParser(prog="ci-scope",
                                      description="What CI has to measure for a change")
     sub = parser.add_subparsers(dest="command", required=True)
