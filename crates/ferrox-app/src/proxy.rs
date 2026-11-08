@@ -17144,6 +17144,7 @@ pub(crate) enum XhttpPairRead {
 }
 
 impl XhttpPairRead {
+    /// Only the H1 reader has a separate poll knob; the H2 reader owns its own clock.
     fn set_poll(&mut self, every: Option<std::time::Duration>) {
         if let Self::H1(reader) = self {
             reader.set_poll(every);
