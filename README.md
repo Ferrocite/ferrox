@@ -202,7 +202,7 @@ Rows 1–26 are the proxy-protocol world; rows 27–52 are the xray-core config 
 | 75 | AmneziaWG | planned | — | amneziawg-go, amnezia-client, mlmvpn |
 | 76 | MASQUE CONNECT-IP over QUIC | implemented — both roles over h3, h2, h1 and cleartext h2c; transport `masque` | Implemented both roles over h3/h2/h1/h2c; address pool, `user`/`pass` auth, `{target}`/`{ipproto}` path templates, `xmux.hKeepAlivePeriod`, WARP, remoteDNS, ICMP limits and a gated `cf-connect-ip` server for Aether. xray scenarios 6/6. | [carrier-masque](docs/function/carrier-masque.md) |
 | 77 | MASQUE over HTTP/3 vs HTTP/2 | implemented — h3, h2, h1 and cleartext h2c, both roles | Implemented both roles over h3/h2/h1/h2c; shared TLS port, ALPN select. xray scenarios 6/6. | quiche; Aether; mqvpn |
-| 78 | Multipath QUIC | planned | — | mqvpn, slipstream, quiche |
+| 78 | Multipath QUIC | planned | — | [multipath-quic](docs/function/multipath-quic.md) documents why the wire surface is unavailable in the pinned quiche and why no match is fabricated |
 | 79 | quiche: QUIC + HTTP/3, 0-RTT, migration, key updates, batched datagrams | implemented — key updates and peer path validation, 0-RTT both roles, client-initiated migration, batched datagrams on Linux | Implemented: 0-RTT resumes one blob per edge (the h3 opening rides early), listener accepts early data, peer path validation covers client movement servers see, and a client opens a new path without re-handshaking. | [carrier-quic](docs/function/carrier-quic.md) |
 | 80 | Multipath schedulers `minrtt`/`wlb`/`backup-fec` | planned | — | mqvpn |
 | 81 | Hybrid TCP lane (local termination over an H3 stream) | planned | — | mqvpn |
