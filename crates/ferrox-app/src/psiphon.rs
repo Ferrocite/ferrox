@@ -111,6 +111,7 @@ struct Inner {
     conduit: Mutex<Option<Arc<crate::psiphon_webrtc::Conduit>>>,
     split_untunneled: Mutex<HashMap<String, Instant>>,
     replay: Arc<crate::psiphon_replay::Cache>,
+    light: Option<Arc<crate::psiphon_light::Client>>,
 }
 
 /// The reference's protocol hold-off: a jittered delay before a new tunnel is activated.
@@ -334,6 +335,8 @@ struct Settings {
     authorizations: Vec<String>,
     proxy_user: Option<String>,
     proxy_pass: Option<String>,
+    burst: Option<crate::psiphon_burst::Config>,
+    light: Option<crate::psiphon_light::Config>,
     raw: Option<Json>,
 }
 
@@ -380,6 +383,7 @@ impl std::fmt::Debug for PsiphonOut {
 
 impl PsiphonOut {
     /// Start the native tunnel and its loopback SOCKS edge.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn new(settings: Option<&Json>) -> Result<Self, String> {
         let settings = Settings::from_json(settings)?;
         warn_ignored(settings.raw.as_ref());
@@ -430,6 +434,16 @@ impl PsiphonOut {
             .unwrap_or_else(|| hex(&random::<16>()));
         let config_state = settings.config_state();
         let replay = Arc::new(crate::psiphon_replay::Cache::new(settings.replay.clone()));
+        let light = settings.light.clone().and_then(|mut config| {
+            config.session_id.clone_from(&session_id);
+            match crate::psiphon_light::Client::new(config) {
+                Ok(client) => Some(Arc::new(client)),
+                Err(error) => {
+                    eprintln!("psiphon: {error}");
+                    None
+                }
+            }
+        });
         let inner = Arc::new(Inner {
             session_id,
             settings,
@@ -451,6 +465,7 @@ impl PsiphonOut {
             conduit: Mutex::new(None),
             split_untunneled: Mutex::new(HashMap::new()),
             replay,
+            light,
         });
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
         let weak = Arc::downgrade(&inner);
@@ -497,6 +512,11 @@ impl PsiphonOut {
             eprintln!(
                 "psiphon: a custom compartment is set, but this transport dials SSH/OSSH only"
             );
+        }
+        if let Some(config) = settings.light.clone() {
+            if let Err(error) = crate::psiphon_light::Client::new(config) {
+                eprintln!("psiphon: {error}");
+            }
         }
         let endpoint = settings.listen;
         Ok(Self {
@@ -758,6 +778,7 @@ impl Inner {
             let keepalive = self.settings.keepalive;
             let limit_meek_buffers = self.settings.limit_meek_buffers;
             let tls_shape = self.settings.tls_shape.clone();
+            let burst = self.settings.burst;
             let config_state = self.config_state;
             let replay = Arc::clone(&self.replay);
             let conduit =
@@ -808,6 +829,7 @@ impl Inner {
                     &tls_shape,
                     limit_meek_buffers,
                     Some(Arc::clone(&requests)),
+                    burst,
                 ) {
                     Ok(session) => Ok((session, lease)),
                     Err(why) => {
@@ -1007,6 +1029,19 @@ impl Inner {
     }
 
     fn dial(&self, host: &str, port: u16) -> Result<Flow, String> {
+        if let Some(light) = self.light.as_ref() {
+            if light.routes(host, port) && !self.recent_tunnel(light.inactive()) {
+                match light.dial(host, port, self.settings.proxy.as_ref()) {
+                    Ok(stream) => {
+                        if std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some() {
+                            eprintln!("psiphon: light proxy carried {host}:{port}");
+                        }
+                        return Ok(Flow::Direct(stream));
+                    }
+                    Err(error) => eprintln!("psiphon: {error}"),
+                }
+            }
+        }
         if !self.split_tunnel_enabled() {
             return self.dial_tunnel(host, port, false).map(Flow::Tunnel);
         }
@@ -1071,6 +1106,13 @@ impl Inner {
 
     fn split_tunnel_enabled(&self) -> bool {
         self.settings.split_tunnel_own_region || !self.settings.split_tunnel_regions.is_empty()
+    }
+
+    /// Whether any tunnel read within `threshold`, which keeps the light fallback off.
+    fn recent_tunnel(&self, threshold: Duration) -> bool {
+        let mut sessions = lock(&self.sessions);
+        sessions.retain(|session| !session.is_closed());
+        sessions.iter().any(|session| session.idle() < threshold)
     }
 
     fn split_is_untunneled(&self, key: &str) -> bool {
@@ -2526,6 +2568,30 @@ impl Settings {
         } else {
             Some(keepalive(settings))
         };
+        let sponsor = text(settings, "sponsorId")
+            .or_else(|| text(settings, "SponsorId"))
+            .or_else(|| text(settings, "SponsorID"))
+            .or_else(|| env("AETHER_PSIPHON_SPONSOR_ID"))
+            .unwrap_or_else(|| SPONSOR_ID.to_owned());
+        let session_id = client_session_id(settings);
+        let burst = crate::psiphon_burst::Config::new(
+            number(settings, "ClientBurstUpstreamTargetBytes").unwrap_or(0),
+            Duration::from_millis(
+                number(settings, "ClientBurstUpstreamDeadlineMilliseconds").unwrap_or(0),
+            ),
+            number(settings, "ClientBurstDownstreamTargetBytes").unwrap_or(0),
+            Duration::from_millis(
+                number(settings, "ClientBurstDownstreamDeadlineMilliseconds").unwrap_or(0),
+            ),
+        );
+        let light = light_settings(
+            settings,
+            &tls_shape,
+            &sponsor,
+            &platform,
+            device_region.as_deref(),
+            session_id.as_deref(),
+        );
         Ok(Self {
             state: text(settings, "state")
                 .or_else(|| text(settings, "dataRootDirectory"))
@@ -2659,15 +2725,13 @@ impl Settings {
             ),
             headers: custom_headers(settings),
             proxy,
-            sponsor: text(settings, "sponsorId")
-                .or_else(|| text(settings, "SponsorId"))
-                .or_else(|| text(settings, "SponsorID"))
-                .or_else(|| env("AETHER_PSIPHON_SPONSOR_ID"))
-                .unwrap_or_else(|| SPONSOR_ID.to_owned()),
-            session_id: client_session_id(settings),
+            sponsor,
+            session_id,
             authorizations: string_list(settings, "Authorizations"),
             proxy_user,
             proxy_pass,
+            burst,
+            light,
             raw,
         })
     }
@@ -2798,6 +2862,7 @@ impl Settings {
         self.restrict_fronting_ids.hash(&mut hasher);
         format!("{:?}", self.tls_shape).hash(&mut hasher);
         format!("{:?}", self.proxy).hash(&mut hasher);
+        format!("{:?}", self.light).hash(&mut hasher);
         format!("{:?}", self.dial_ports).hash(&mut hasher);
         self.dial_ports_probability.to_bits().hash(&mut hasher);
         self.limit_protocols_probability.to_bits().hash(&mut hasher);
@@ -3833,6 +3898,24 @@ const KNOWN_SETTINGS: &[&str] = &[
     "ReplayTargetUpstreamBytes",
     "MeekAdditionalHeaders",
     "SSHChannelWindowSize",
+    "ClientBuildRev",
+    "NetworkType",
+    "ClientBurstUpstreamTargetBytes",
+    "ClientBurstUpstreamDeadlineMilliseconds",
+    "ClientBurstDownstreamTargetBytes",
+    "ClientBurstDownstreamDeadlineMilliseconds",
+    "EnableLightProxy",
+    "LightProxyEntry",
+    "LightProxyEntryTracker",
+    "LightProxyDisable",
+    "LightProxyTestFetchAddress",
+    "LightProxyUseRecommendedSNIProbability",
+    "LightProxyCustomHostNameProbability",
+    "LightProxyCustomHostNameRegexes",
+    "LightProxyTunnelInactiveThresholdMilliseconds",
+    "LightProxyTunnelInactiveThreshold",
+    "LightProxyDialTimeoutMilliseconds",
+    "LightProxyDialTimeout",
     "LimitQUICVersions",
     "LimitTLSProfiles",
     "TLSProfile",
@@ -3978,6 +4061,119 @@ fn client_session_id(settings: Option<&Json>) -> Option<String> {
         eprintln!("psiphon: SessionID must be 32 lowercase hex digits; generating one");
     }
     valid.then_some(session)
+}
+
+/// The `LightProxy` client settings, or `None` when the lane is not enabled.
+fn light_settings(
+    settings: Option<&Json>,
+    tls_shape: &TlsShape,
+    sponsor: &str,
+    platform: &str,
+    device_region: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<crate::psiphon_light::Config> {
+    if !flag(settings, "EnableLightProxy", "AETHER_PSIPHON_LIGHT_PROXY") {
+        return None;
+    }
+    if flag(
+        settings,
+        "LightProxyDisable",
+        "AETHER_PSIPHON_LIGHT_PROXY_DISABLE",
+    ) {
+        return None;
+    }
+    let Some(entry) =
+        text(settings, "LightProxyEntry").or_else(|| env("AETHER_PSIPHON_LIGHT_PROXY_ENTRY"))
+    else {
+        eprintln!("psiphon: EnableLightProxy is set but LightProxyEntry is missing");
+        return None;
+    };
+    let build_rev = text(settings, "ClientBuildRev")
+        .or_else(|| env("AETHER_PSIPHON_BUILD_REV"))
+        .unwrap_or_default();
+    let network_type = text(settings, "NetworkType")
+        .or_else(|| env("AETHER_PSIPHON_NETWORK_TYPE"))
+        .unwrap_or_default();
+    let test_fetch_address =
+        text(settings, "LightProxyTestFetchAddress").filter(|address| address.contains(':'));
+    Some(crate::psiphon_light::Config {
+        entry,
+        tracker: integer(settings, "LightProxyEntryTracker").unwrap_or(0),
+        sponsor: sponsor.to_owned(),
+        platform: platform.to_owned(),
+        build_rev,
+        device_region: device_region.map(str::to_owned),
+        session_id: session_id.unwrap_or_default().to_owned(),
+        network_type,
+        recommended_probability: decimal(settings, "LightProxyUseRecommendedSNIProbability")
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
+        custom_probability: decimal(settings, "LightProxyCustomHostNameProbability")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        custom_hostnames: string_list(settings, "LightProxyCustomHostNameRegexes"),
+        inactive: light_duration(
+            settings,
+            "LightProxyTunnelInactiveThresholdMilliseconds",
+            "LightProxyTunnelInactiveThreshold",
+            Duration::from_secs(30),
+        ),
+        dial_timeout: light_duration(
+            settings,
+            "LightProxyDialTimeoutMilliseconds",
+            "LightProxyDialTimeout",
+            Duration::from_secs(20),
+        )
+        .max(Duration::from_secs(1)),
+        test_fetch_address,
+        tls_shape: tls_shape.clone(),
+    })
+}
+
+/// Read a millisecond setting, or the older duration spelling.
+fn light_duration(
+    settings: Option<&Json>,
+    millis_key: &str,
+    duration_key: &str,
+    default: Duration,
+) -> Duration {
+    if let Some(millis) = number(settings, millis_key) {
+        return Duration::from_millis(millis.min(600_000));
+    }
+    let Some(value) = settings.and_then(|settings| settings.get(duration_key)) else {
+        return default;
+    };
+    if let Some(text) = value.as_str() {
+        if let Some(duration) = go_duration(text) {
+            return duration.min(Duration::from_secs(600));
+        }
+    }
+    number(settings, duration_key).map_or(default, |nanos| {
+        Duration::from_nanos(nanos).min(Duration::from_secs(600))
+    })
+}
+
+/// The reference's `time.Duration` spellings that tactics use for these two knobs.
+fn go_duration(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    for (suffix, scale) in [
+        ("ms", 1u64),
+        ("ns", 0),
+        ("s", 1_000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+    ] {
+        if let Some(value) = text.strip_suffix(suffix) {
+            let value = value.trim().parse::<u64>().ok()?;
+            let millis = value.checked_mul(scale)?;
+            return Some(if suffix == "ns" {
+                Duration::from_nanos(value)
+            } else {
+                Duration::from_millis(millis)
+            });
+        }
+    }
+    None
 }
 
 fn text(settings: Option<&Json>, key: &str) -> Option<String> {
@@ -6610,7 +6806,8 @@ fn race<T: Send + 'static>(
     Err(last)
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Lowercase hex for a byte slice.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{byte:02x}"));
@@ -6636,7 +6833,8 @@ const fn hex_table() -> [u8; 256] {
 
 static HEX: [u8; 256] = hex_table();
 
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+/// Decode an even-length hex string.
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
     }
@@ -9748,6 +9946,7 @@ mod tests {
             replay: Arc::new(crate::psiphon_replay::Cache::new(
                 crate::psiphon_replay::Settings::default(),
             )),
+            light: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -9808,6 +10007,7 @@ mod tests {
             replay: Arc::new(crate::psiphon_replay::Cache::new(
                 crate::psiphon_replay::Settings::default(),
             )),
+            light: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -10323,6 +10523,7 @@ mod tests {
             replay: Arc::new(crate::psiphon_replay::Cache::new(
                 crate::psiphon_replay::Settings::default(),
             )),
+            light: None,
         };
         let (at, _) = inner.start();
         assert_eq!(at, 42, "start uses the shared lookup");

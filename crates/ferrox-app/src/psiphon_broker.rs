@@ -35,7 +35,7 @@ const MAX_TACTICS_BYTES: usize = 1024 * 1024;
 /// A CBOR value. Maps preserve their entries so callers can encode
 /// deterministic integer-key maps.
 #[derive(Debug, Clone, PartialEq)]
-enum Value {
+pub(crate) enum Value {
     UInt(u64),
     Int(i64),
     Bytes(Vec<u8>),
@@ -48,7 +48,7 @@ enum Value {
 }
 
 impl Value {
-    fn get(&self, key: u64) -> Option<&Value> {
+    pub(crate) fn get(&self, key: u64) -> Option<&Value> {
         let Self::Map(entries) = self else {
             return None;
         };
@@ -60,21 +60,21 @@ impl Value {
             })
     }
 
-    fn bytes(&self) -> Option<&[u8]> {
+    pub(crate) fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(bytes) => Some(bytes),
             _ => None,
         }
     }
 
-    fn text(&self) -> Option<&str> {
+    pub(crate) fn text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
             _ => None,
         }
     }
 
-    fn uint(&self) -> Option<u64> {
+    pub(crate) fn uint(&self) -> Option<u64> {
         match self {
             Self::UInt(number) => Some(*number),
             Self::Int(number) => u64::try_from(*number).ok(),
@@ -82,7 +82,7 @@ impl Value {
         }
     }
 
-    fn bool(&self) -> Option<bool> {
+    pub(crate) fn bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
             _ => None,
@@ -1140,7 +1140,7 @@ fn get_varint(bytes: &[u8]) -> Option<(i64, &[u8])> {
     Some((value, rest))
 }
 
-fn encode(value: &Value) -> Vec<u8> {
+pub(crate) fn encode(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     encode_into(value, &mut out);
     out
@@ -1216,7 +1216,7 @@ fn encode_head(major: u8, value: u64, out: &mut Vec<u8>) {
     }
 }
 
-fn decode(bytes: &[u8]) -> Option<(Value, usize)> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<(Value, usize)> {
     decode_depth(bytes, 0)
 }
 

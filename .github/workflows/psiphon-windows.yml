@@ -29,6 +29,10 @@ on:
         description: native SSH channel window in bytes; blank keeps the lane's 2 MiB
         required: false
         default: ""
+      light_proxy_entry:
+        description: base64 signed LightProxyEntry; blank skips the light-proxy leg
+        required: false
+        default: ""
 
 concurrency:
   group: psiphon-windows-${{ github.ref }}
@@ -97,6 +101,7 @@ jobs:
           PSIPHON_REGION: ${{ inputs.region }}
           PSIPHON_POOL: ${{ inputs.pool }}
           PSIPHON_WINDOW: ${{ inputs.window }}
+          PSIPHON_LIGHT_ENTRY: ${{ inputs.light_proxy_entry }}
         run: |
           BIN=target/release/ferrox-app.exe
           test -s "$BIN"
@@ -198,7 +203,7 @@ jobs:
             echo "::error::window must be an integer from 65536 to 67108864, got '$PSIPHON_WINDOW'"
             exit 1
           fi
-          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_WINDOW="$PSIPHON_WINDOW" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_WINDOW="$PSIPHON_WINDOW" PSIPHON_LIGHT_ENTRY="$PSIPHON_LIGHT_ENTRY" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
           import json, os
           settings = {
               "listen": "127.0.0.1:1821",
@@ -212,6 +217,11 @@ jobs:
               settings["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
           if os.environ.get("PSIPHON_WINDOW"):
               settings["SSHChannelWindowSize"] = int(os.environ["PSIPHON_WINDOW"])
+          if os.environ.get("PSIPHON_LIGHT_ENTRY"):
+              settings["EnableLightProxy"] = True
+              settings["LightProxyEntry"] = os.environ["PSIPHON_LIGHT_ENTRY"]
+              settings["LightProxyTestFetchAddress"] = "speed.cloudflare.com:443"
+              settings["LightProxyTunnelInactiveThresholdMilliseconds"] = 0
           document = {
               "inbounds": [
                   {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
@@ -313,6 +323,10 @@ jobs:
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
           fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
           fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
+          if [ -n "${PSIPHON_LIGHT_ENTRY:-}" ] && ! grep -q 'light proxy carried speed.cloudflare.com:443' psiphon-windows.log; then
+            echo "native light FAILED: the ten-megabyte legs did not use the light proxy" >&2
+            FAILED="$FAILED native(light)"
+          fi
           # The CPU window matches the reference's three ten-megabyte legs; the mixed leg
           # still gates, but it is extra work and stays outside the ratio.
           sample_native "native done" "$NATIVE_LANE"

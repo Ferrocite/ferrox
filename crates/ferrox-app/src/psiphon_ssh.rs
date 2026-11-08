@@ -908,7 +908,8 @@ fn char_byte_any(character: char) -> Option<u8> {
 
 /// A best-effort generator for the regex subset `CustomHostNameRegexes` uses in practice:
 /// literals, escapes, `.`, character classes and `?`, `*`, `+` or `{n,m}` quantifiers.
-fn random_hostname(pattern: &str) -> Option<String> {
+/// Generate one hostname from a regex-like pattern, or `None` when it cannot.
+pub(crate) fn random_hostname(pattern: &str) -> Option<String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len());
     let mut at = 0;
@@ -1350,6 +1351,8 @@ struct Inner {
     last_read: AtomicU64,
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
+    burst: Mutex<crate::psiphon_burst::Burst>,
+    burst_enabled: bool,
     pending_request: Mutex<Option<mpsc::Sender<bool>>>,
     requests: Option<Arc<dyn ServerRequests>>,
     server: String,
@@ -1465,6 +1468,7 @@ impl Session {
         shape: &TlsShape,
         limit_meek_buffers: bool,
         requests: Option<Arc<dyn ServerRequests>>,
+        burst: Option<crate::psiphon_burst::Config>,
     ) -> Result<Self, String> {
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
@@ -1578,6 +1582,7 @@ impl Session {
             .set_timeout(None)
             .map_err(|error| format!("psiphon ssh socket: {error}"))?;
 
+        let opened_at = Instant::now();
         let inner = Arc::new(Inner {
             writer: Mutex::new(output),
             channels: Mutex::new(HashMap::new()),
@@ -1588,10 +1593,12 @@ impl Session {
             closed_at: AtomicU64::new(u64::MAX),
             socket: control,
             relay: Mutex::new(relay),
-            opened_at: Instant::now(),
+            opened_at,
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst_enabled: burst.is_some(),
+            burst: Mutex::new(crate::psiphon_burst::Burst::new(burst, opened_at)),
             pending_request: Mutex::new(None),
             requests,
             server: format!("{}:{}", server.host, server.port),
@@ -1820,6 +1827,12 @@ impl Session {
         self.inner.bytes_down.load(Ordering::Relaxed)
     }
 
+    /// Time since the last packet read, measured from session open.
+    #[must_use]
+    pub(crate) fn idle(&self) -> Duration {
+        self.inner.idle()
+    }
+
     /// The session's age, frozen at close.
     #[must_use]
     pub(crate) fn age(&self) -> Duration {
@@ -1975,9 +1988,34 @@ impl Inner {
     }
 
     /// Time since the last packet read, measured from session open.
-    fn idle(&self) -> Duration {
+    pub(crate) fn idle(&self) -> Duration {
         let now = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         Duration::from_millis(now.saturating_sub(self.last_read.load(Ordering::Relaxed)))
+    }
+
+    /// The clock a burst update needs, or `None` when the monitor is disabled.
+    fn burst_started(&self) -> Option<Instant> {
+        self.burst_enabled.then(Instant::now)
+    }
+
+    /// Add an upstream write to the counters and the burst monitor.
+    fn record_up(&self, started: Option<Instant>, bytes: u64) {
+        self.bytes_up.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(started) = started {
+            if let Ok(mut burst) = self.burst.lock() {
+                burst.upstream(started, Instant::now(), bytes);
+            }
+        }
+    }
+
+    /// Add a downstream read to the counters and the burst monitor.
+    fn record_down(&self, started: Option<Instant>, bytes: u64) {
+        self.bytes_down.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(started) = started {
+            if let Ok(mut burst) = self.burst.lock() {
+                burst.downstream(started, Instant::now(), bytes);
+            }
+        }
     }
 
     /// Close the transport once, recording the age the replay target sees.
@@ -1987,6 +2025,11 @@ impl Inner {
         }
         let age = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.closed_at.store(age, Ordering::Relaxed);
+        if let Ok(burst) = self.burst.lock() {
+            if let Some(metrics) = burst.metrics() {
+                eprintln!("psiphon: {} bursts:{metrics}", self.server);
+            }
+        }
         let _ = self.socket.shutdown();
         let _ = lock(&self.pending_request).take();
         let channels: Vec<Arc<ChannelState>> = lock(&self.channels)
@@ -2181,6 +2224,7 @@ impl Channel {
         batch: &mut Vec<ChannelChunk>,
         limit: usize,
     ) -> io::Result<bool> {
+        let started = self.session.burst_started();
         let adjust_at = window_adjust_at(self.session.channel_window);
         loop {
             let (adjust, spent, bytes, eof) = {
@@ -2196,7 +2240,7 @@ impl Channel {
                 self.adjust(adjust);
             }
             if bytes != 0 {
-                self.session.bytes_down.fetch_add(bytes, Ordering::Relaxed);
+                self.session.record_down(started, bytes);
             }
             if !batch.is_empty() {
                 return Ok(true);
@@ -2279,6 +2323,7 @@ impl Read for Channel {
         if out.is_empty() {
             return Ok(0);
         }
+        let started = self.session.burst_started();
         let mut adjust = 0u64;
         let adjust_at = window_adjust_at(self.session.channel_window);
         let mut drained = None;
@@ -2348,8 +2393,7 @@ impl Read for Channel {
             self.adjust(adjust);
         }
         self.session
-            .bytes_down
-            .fetch_add(u64::try_from(take).unwrap_or(0), Ordering::Relaxed);
+            .record_down(started, u64::try_from(take).unwrap_or(0));
         Ok(take)
     }
 }
@@ -2403,13 +2447,13 @@ impl Channel {
         if buf.is_empty() {
             return Ok(0);
         }
+        let started = self.session.burst_started();
         let take = self.take_window(buf.len())?;
         self.session
             .send_channel_data_in_place(&self.state, &mut buf[..take])
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
         self.session
-            .bytes_up
-            .fetch_add(u64::try_from(take).unwrap_or(0), Ordering::Relaxed);
+            .record_up(started, u64::try_from(take).unwrap_or(0));
         Ok(take)
     }
 }
@@ -2419,13 +2463,13 @@ impl Write for Channel {
         if buf.is_empty() {
             return Ok(0);
         }
+        let started = self.session.burst_started();
         let take = self.take_window(buf.len())?;
         self.session
             .send_channel_data(&self.state, &buf[..take])
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
         self.session
-            .bytes_up
-            .fetch_add(u64::try_from(take).unwrap_or(0), Ordering::Relaxed);
+            .record_up(started, u64::try_from(take).unwrap_or(0));
         Ok(take)
     }
 
@@ -4278,6 +4322,8 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         last_read: AtomicU64::new(0),
         bytes_up: AtomicU64::new(0),
         bytes_down: AtomicU64::new(0),
+        burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+        burst_enabled: false,
         pending_request: Mutex::new(None),
         requests: None,
         server: "test".to_owned(),
@@ -4561,6 +4607,8 @@ mod tests {
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4649,6 +4697,8 @@ mod tests {
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4723,6 +4773,8 @@ mod tests {
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4822,6 +4874,8 @@ mod tests {
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4916,6 +4970,8 @@ mod tests {
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
@@ -4965,6 +5021,8 @@ mod tests {
             last_read: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
             pending_request: Mutex::new(None),
             requests: None,
             server: "test".to_owned(),
