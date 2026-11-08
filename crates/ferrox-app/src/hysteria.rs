@@ -2003,7 +2003,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
 
 /// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
-    let mut head = Vec::with_capacity(22);
+    let mut reply_head = Vec::with_capacity(22);
     loop {
         if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
             break;
@@ -2039,7 +2039,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
                 continue;
             };
-            let (front, tail) = crate::proxy::socks_udp_parts(&mut head, &destination, payload);
+            let (front, tail) =
+                crate::proxy::socks_udp_parts(&mut reply_head, &destination, payload);
             let _ = crate::proxy::send_to_two(relay, front, tail, src);
         }
     }
