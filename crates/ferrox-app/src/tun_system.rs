@@ -15,7 +15,9 @@ use ferrox_core::foxy::connectip::{
     ipv4_checksum, ipv4_head, ipv6_head, tcp_checksum, IPV4_HEADER, IPV6_HEADER,
 };
 
+const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
+const FLAG_RST: u8 = 0x04;
 const FLAG_ACK: u8 = 0x10;
 const NAT_PORT_BASE: u16 = 20_000;
 const NAT_PORT_LIMIT: u16 = 65_000;
@@ -29,6 +31,26 @@ struct FlowKey {
     source_port: u16,
     destination: IpAddr,
     destination_port: u16,
+}
+
+impl FlowKey {
+    fn of(view: &TcpView) -> Self {
+        Self {
+            source: view.source,
+            source_port: view.source_port,
+            destination: view.destination,
+            destination_port: view.destination_port,
+        }
+    }
+
+    fn reversed(self) -> Self {
+        Self {
+            source: self.destination,
+            source_port: self.destination_port,
+            destination: self.source,
+            destination_port: self.source_port,
+        }
+    }
 }
 
 struct Mapping {
@@ -47,6 +69,8 @@ struct Nat {
     ports: HashMap<u16, Mapping>,
     next: u16,
     created: u64,
+    hybrid: bool,
+    fallback: HashMap<FlowKey, Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,7 +91,7 @@ struct TcpView {
 }
 
 impl Nat {
-    fn new(local: IpAddr, peer: IpAddr, listener_port: u16) -> Self {
+    fn new(local: IpAddr, peer: IpAddr, listener_port: u16, hybrid: bool) -> Self {
         Self {
             local,
             peer,
@@ -76,6 +100,8 @@ impl Nat {
             ports: HashMap::new(),
             next: NAT_PORT_BASE,
             created: 0,
+            hybrid,
+            fallback: HashMap::new(),
         }
     }
 
@@ -90,6 +116,23 @@ impl Nat {
             return Outcome::Other;
         }
         let now = Instant::now();
+        let key = FlowKey::of(&view);
+        let fallback = if view.destination == local {
+            Some(key)
+        } else if view.source == local {
+            Some(key.reversed())
+        } else {
+            None
+        };
+        if let Some(fallback) = fallback {
+            if let Some(last) = self.fallback.get_mut(&fallback) {
+                *last = now;
+                if view.flags & (FLAG_FIN | FLAG_RST) != 0 {
+                    self.fallback.remove(&fallback);
+                }
+                return Outcome::UnhandledTcp;
+            }
+        }
         if view.source == local && view.destination == peer && view.source_port == listener_port {
             let Some(mapping) = self.ports.get_mut(&view.destination_port) else {
                 return Outcome::UnhandledTcp;
@@ -108,12 +151,6 @@ impl Nat {
             );
         }
 
-        let key = FlowKey {
-            source: view.source,
-            source_port: view.source_port,
-            destination: view.destination,
-            destination_port: view.destination_port,
-        };
         if let Some(port) = self.forward.get(&key).copied() {
             if let Some(mapping) = self.ports.get_mut(&port) {
                 if !mapping.closed {
@@ -128,9 +165,11 @@ impl Nat {
         }
 
         if view.flags & FLAG_SYN == 0 || view.flags & FLAG_ACK != 0 {
+            self.remember_fallback(&view, now);
             return Outcome::UnhandledTcp;
         }
         let Some(port) = self.allocate(now) else {
+            self.remember_fallback(&view, now);
             return Outcome::UnhandledTcp;
         };
         let generation = self.created;
@@ -146,6 +185,24 @@ impl Nat {
             },
         );
         mapped(packet, &view, peer, local, port, listener_port)
+    }
+
+    fn remember_fallback(&mut self, view: &TcpView, now: Instant) {
+        if !self.hybrid || view.destination != self.local {
+            return;
+        }
+        let key = FlowKey::of(view);
+        if !self.fallback.contains_key(&key) && self.fallback.len() >= NAT_MAX {
+            if let Some(oldest) = self
+                .fallback
+                .iter()
+                .min_by_key(|(_, last)| **last)
+                .map(|(key, _)| *key)
+            {
+                self.fallback.remove(&oldest);
+            }
+        }
+        self.fallback.insert(key, now);
     }
 
     fn allocate(&mut self, now: Instant) -> Option<u16> {
@@ -454,7 +511,7 @@ pub(crate) fn serve(
     let (to_stack, stack_rx) = mpsc::sync_channel(RX_QUEUE);
     let (recycle, reused) = mpsc::sync_channel(RX_QUEUE);
     let failed = Arc::new(AtomicBool::new(false));
-    let nat = Arc::new(Mutex::new(Nat::new(local, peer, listener_port)));
+    let nat = Arc::new(Mutex::new(Nat::new(local, peer, listener_port, hybrid)));
 
     let (wake_read, wake_write) = UnixStream::pair()?;
     wake_write.set_nonblocking(true)?;
@@ -669,7 +726,7 @@ mod tests {
     fn a_forwarded_syn_becomes_a_packet_to_the_local_listener() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
         let peer = Ipv4Addr::new(198, 18, 0, 2);
-        let mut nat = Nat::new(local.into(), peer.into(), 40_000);
+        let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
         let mut packet = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_SYN);
 
         assert!(nat.rewrite(&mut packet) == Outcome::Handled);
@@ -702,7 +759,7 @@ mod tests {
     fn an_accepted_flow_names_its_original_destination() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
         let peer = Ipv4Addr::new(198, 18, 0, 2);
-        let mut nat = Nat::new(local.into(), peer.into(), 40_000);
+        let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
         let mut packet = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_SYN);
         assert!(nat.rewrite(&mut packet) == Outcome::Handled);
         let port = fields(&packet).2;
@@ -727,7 +784,7 @@ mod tests {
         let local = "fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap();
         let peer = "fdfe:dcba:9876::2".parse::<Ipv6Addr>().unwrap();
         let remote = "2001:db8::7".parse::<Ipv6Addr>().unwrap();
-        let mut nat = Nat::new(local.into(), peer.into(), 40_000);
+        let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
         let mut packet = ipv6_packet(local, remote, 1234, 443, FLAG_SYN);
 
         assert!(nat.rewrite(&mut packet) == Outcome::Handled);
@@ -761,7 +818,12 @@ mod tests {
     #[test]
     fn a_fragment_stays_for_the_userspace_stack() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
-        let mut nat = Nat::new(local.into(), Ipv4Addr::new(198, 18, 0, 2).into(), 40_000);
+        let mut nat = Nat::new(
+            local.into(),
+            Ipv4Addr::new(198, 18, 0, 2).into(),
+            40_000,
+            false,
+        );
         let mut packet = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_SYN);
         packet[6] |= 0x20;
         let original = packet.clone();
@@ -773,7 +835,7 @@ mod tests {
     fn a_second_flow_gets_its_own_port_and_a_closed_one_is_replaced() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
         let nat_ip = Ipv4Addr::new(198, 18, 0, 2);
-        let mut nat = Nat::new(local.into(), nat_ip.into(), 40_000);
+        let mut nat = Nat::new(local.into(), nat_ip.into(), 40_000, false);
         let mut first = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_SYN);
         assert!(nat.rewrite(&mut first) == Outcome::Handled);
         let first_port = fields(&first).2;
@@ -797,7 +859,12 @@ mod tests {
     #[test]
     fn a_foreign_family_segment_stays_for_the_userspace_stack() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
-        let mut nat = Nat::new(local.into(), Ipv4Addr::new(198, 18, 0, 2).into(), 40_000);
+        let mut nat = Nat::new(
+            local.into(),
+            Ipv4Addr::new(198, 18, 0, 2).into(),
+            40_000,
+            false,
+        );
         let mut packet = ipv6_packet(
             "2001:db8::1".parse().unwrap(),
             "2001:db8::2".parse().unwrap(),
@@ -814,7 +881,7 @@ mod tests {
     fn a_stale_close_keeps_a_reused_port_open() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
         let peer = Ipv4Addr::new(198, 18, 0, 2);
-        let mut nat = Nat::new(local.into(), peer.into(), 40_000);
+        let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
         let mut packet = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_SYN);
         assert!(nat.rewrite(&mut packet) == Outcome::Handled);
         let port = fields(&packet).2;
@@ -831,7 +898,7 @@ mod tests {
     fn an_open_accepted_mapping_survives_the_idle_timeout() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
         let peer = Ipv4Addr::new(198, 18, 0, 2);
-        let mut nat = Nat::new(local.into(), peer.into(), 40_000);
+        let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
         let mut packet = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_SYN);
         assert!(nat.rewrite(&mut packet) == Outcome::Handled);
         let port = fields(&packet).2;
@@ -853,9 +920,33 @@ mod tests {
     }
 
     #[test]
+    fn a_hybrid_fallback_flow_keeps_the_userspace_stack() {
+        let local = Ipv4Addr::new(198, 18, 0, 1);
+        let peer = Ipv4Addr::new(198, 18, 0, 2);
+        let remote = Ipv4Addr::new(203, 0, 113, 7);
+        let mut nat = Nat::new(local.into(), peer.into(), 40_000, true);
+        let mut mid = ipv4_packet(remote, local, 1234, 443, FLAG_ACK);
+        assert!(nat.rewrite(&mut mid) == Outcome::UnhandledTcp);
+        let mut reverse = ipv4_packet(local, remote, 443, 1234, FLAG_ACK);
+        assert!(nat.rewrite(&mut reverse) == Outcome::UnhandledTcp);
+        let mut syn = ipv4_packet(remote, local, 1234, 443, FLAG_SYN);
+        assert!(nat.rewrite(&mut syn) == Outcome::UnhandledTcp);
+        assert!(nat.ports.is_empty());
+        let mut fin = ipv4_packet(remote, local, 1234, 443, FLAG_FIN | FLAG_ACK);
+        assert!(nat.rewrite(&mut fin) == Outcome::UnhandledTcp);
+        let mut again = ipv4_packet(remote, local, 1234, 443, FLAG_SYN);
+        assert!(nat.rewrite(&mut again) == Outcome::Handled);
+    }
+
+    #[test]
     fn an_unmatched_segment_stays_for_the_userspace_fallback() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
-        let mut nat = Nat::new(local.into(), Ipv4Addr::new(198, 18, 0, 2).into(), 40_000);
+        let mut nat = Nat::new(
+            local.into(),
+            Ipv4Addr::new(198, 18, 0, 2).into(),
+            40_000,
+            false,
+        );
         let mut packet = ipv4_packet(local, Ipv4Addr::new(203, 0, 113, 7), 1234, 443, FLAG_ACK);
         assert!(nat.rewrite(&mut packet) == Outcome::UnhandledTcp);
     }
