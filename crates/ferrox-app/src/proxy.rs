@@ -1380,6 +1380,10 @@ fn note_dial_failure(target: &SocketAddr, failure: Failure) {
     if let Ok(mut last) = LAST_DIAL.lock() {
         *last = Some((*target, failure));
     }
+    #[cfg(test)]
+    if let Ok(mut by_target) = LAST_DIAL_BY_TARGET.lock() {
+        by_target.push((*target, failure));
+    }
     echo_trace(&format!("dial {target} failed: {failure}"));
     eprintln!("dial {target} failed: {failure}");
 }
@@ -1397,6 +1401,16 @@ fn answer_refused(server: Option<SocketAddr>) -> Arc<dyn Fn() + Send + Sync> {
 #[cfg(test)]
 pub(crate) fn last_dial_failure() -> Option<(SocketAddr, Failure)> {
     LAST_DIAL.lock().ok().and_then(|last| *last)
+}
+
+#[cfg(test)]
+pub(crate) fn last_dial_failure_at(target: SocketAddr) -> Option<Failure> {
+    LAST_DIAL_BY_TARGET.lock().ok().and_then(|all| {
+        all.iter()
+            .rev()
+            .find(|(at, _)| *at == target)
+            .map(|(_, failure)| *failure)
+    })
 }
 
 // The ladder rung a configured carrier answers, if it is on the ladder.
@@ -1432,6 +1446,10 @@ static FATAL_DIALS: AtomicU64 = AtomicU64::new(0);
 static RETRYABLE_DIALS: AtomicU64 = AtomicU64::new(0);
 // The last dial failure, so a test that outlives its dial names the stage instead of timing out in silence.
 static LAST_DIAL: std::sync::Mutex<Option<(SocketAddr, Failure)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static LAST_DIAL_BY_TARGET: std::sync::Mutex<Vec<(SocketAddr, Failure)>> =
+    std::sync::Mutex::new(Vec::new());
 
 // Echo stage tracing behind one env flag, on stdout because the harness captures stdout per test.
 static ECHO_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -47247,12 +47265,10 @@ mod tests {
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some((at, failure)) = last_dial_failure() {
-                if at == server_addr {
-                    assert_eq!(failure.stage, ferrox_core::failure::Stage::RequestSent);
-                    assert_eq!(failure.kind, ferrox_core::failure::Kind::Dropped);
-                    break;
-                }
+            if let Some(failure) = last_dial_failure_at(server_addr) {
+                assert_eq!(failure.stage, ferrox_core::failure::Stage::RequestSent);
+                assert_eq!(failure.kind, ferrox_core::failure::Kind::Dropped);
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
