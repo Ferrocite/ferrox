@@ -986,6 +986,7 @@ mod tests {
             config,
             connection: AtomicI64::new(0),
             replay: Mutex::new(None),
+            failed_until: Mutex::new(None),
         };
         let header = client
             .header(
