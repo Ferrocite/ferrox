@@ -555,16 +555,18 @@ impl TlsServerConfig {
             }
             if let Some(ocsp) = &mut entry.ocsp {
                 let fetched = ocsp::staple_for(&entry.cert_chain);
-                // The swap is against what the listener serves, not what the config started with.
-                changed |= served.get(index).is_none_or(|was| {
-                    fetched.as_ref() != was.ocsp.as_ref().and_then(|was| was.response.as_ref())
-                });
                 // A failed fetch keeps the served response, not the startup one it would roll back to.
                 ocsp.response = fetched.or_else(|| {
                     served
                         .get(index)
                         .and_then(|was| was.ocsp.as_ref())
                         .and_then(|was| was.response.clone())
+                });
+                // The comparison is the response that will be served, fallback included, so a
+                // failed refresh against a steady cache changes nothing.
+                changed |= served.get(index).is_none_or(|was| {
+                    ocsp.response.as_ref()
+                        != was.ocsp.as_ref().and_then(|was| was.response.as_ref())
                 });
             }
             entries.push(entry);

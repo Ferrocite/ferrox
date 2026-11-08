@@ -357,7 +357,8 @@ impl<S: Stream> Server<S> {
             Some(shares.pop().ok_or(TlsError::NoSharedCipher)?)
         };
 
-        let mut flight = self.server_hello(&hello, suite_id, &random, share.is_some(), staple.is_some());
+        let mut flight =
+            self.server_hello(&hello, suite_id, &random, share.is_some(), staple.is_some());
         let mut transcript = Vec::new();
         transcript.extend_from_slice(&hello_message);
         transcript.extend_from_slice(&flight);
