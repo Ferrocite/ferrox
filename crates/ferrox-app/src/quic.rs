@@ -543,7 +543,8 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
 pub(crate) fn tune_transport(config: &mut quiche::Config) {
     config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
     // Resumption rides one stored session per edge, so a later dial leaves with 0-RTT.
-    config.enable_early_data();
+    // (temporarily disabled to bisect the foxy suite fail)
+    // config.enable_early_data();
     // A spare source ID in reserve lets a queued lane migrate without asking for one mid-move.
     config.set_active_connection_id_limit(4);
     let _ = config.set_ticket_key(ticket_key());
