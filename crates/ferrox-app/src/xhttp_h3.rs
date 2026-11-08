@@ -24,6 +24,37 @@ pub(crate) enum Wire {
     Client(ClientStream),
 }
 
+/// Any stream's byte resets the idle clock, so a busy upload keeps a quiet downlink alive.
+#[derive(Debug)]
+struct Activity {
+    base: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let millis = Instant::now()
+            .saturating_duration_since(self.base)
+            .as_millis();
+        self.last_ms.store(millis as u64, Ordering::Relaxed);
+    }
+
+    fn age(&self) -> Duration {
+        let now = Instant::now()
+            .saturating_duration_since(self.base)
+            .as_millis() as u64;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now.saturating_sub(last))
+    }
+}
+
 impl Read for Wire {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -50,6 +81,13 @@ impl Write for Wire {
 }
 
 impl Wire {
+    fn activity(&self) -> Option<Arc<Activity>> {
+        match self {
+            Self::Server(_) => None,
+            Self::Client(stream) => Some(Arc::clone(&stream.activity)),
+        }
+    }
+
     fn fin(&self) {
         match self {
             Self::Server(stream) => {
@@ -78,11 +116,16 @@ pub(crate) struct H3Reader {
     status: Option<u16>,
     frame_left: usize,
     ended: bool,
+    head_seen: bool,
+    expect_request: bool,
     idle_since: Option<Instant>,
+    activity: Option<Arc<Activity>>,
 }
 
 impl H3Reader {
     fn new(wire: Wire) -> Self {
+        let activity = wire.activity();
+        let expect_request = matches!(&wire, Wire::Server(_));
         Self {
             wire,
             buf: Vec::new(),
@@ -92,7 +135,10 @@ impl H3Reader {
             status: None,
             frame_left: 0,
             ended: false,
+            head_seen: false,
+            expect_request,
             idle_since: None,
+            activity,
         }
     }
 
@@ -100,11 +146,24 @@ impl H3Reader {
         self.status
     }
 
+    fn idle_expired(&self, since: Instant) -> bool {
+        self.activity
+            .as_ref()
+            .map_or_else(|| since.elapsed(), |activity| activity.age())
+            >= crate::budgets::relay_stall()
+    }
+
     /// The H1 head the request's HEADERS frame names, with the connection framing the reference's
     /// hub never writes: an H3 stream ends by itself, so the head says chunked and nothing parses it.
     pub(crate) fn read_head(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         while self.head.is_none() && !self.ended {
             self.step()?;
+            if self.head_seen && self.head.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "h3 request head is missing",
+                ));
+            }
         }
         Ok(self.head.take())
     }
@@ -150,7 +209,7 @@ impl H3Reader {
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
                     let since = *self.idle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= crate::budgets::relay_stall() {
+                    if self.idle_expired(since) {
                         return Err(std::io::Error::other("h3 request stalled"));
                     }
                     if crate::proxy::relay_step_owns_poll()
@@ -188,6 +247,12 @@ impl H3Reader {
                 ));
             }
             if frame.kind == frames::H3_DATA {
+                if !self.head_seen {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "h3 data before headers",
+                    ));
+                }
                 self.buf.drain(..at);
                 self.frame_left = length;
                 if length == 0 {
@@ -209,10 +274,17 @@ impl H3Reader {
             at = end;
             match frame.kind {
                 frames::H3_HEADERS => {
+                    self.head_seen = true;
                     if self.head.is_none() && self.status.is_none() {
                         self.head =
                             hpack::qpack_fields(payload).and_then(|fields| synth_head(&fields));
                         self.status = hpack::qpack_status(payload);
+                        if self.expect_request && self.head.is_none() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "h3 request head is missing",
+                            ));
+                        }
                     }
                 }
                 frames::H3_RESET => self.ended = true,
@@ -242,9 +314,10 @@ impl H3Reader {
             let mut room = [0u8; READ_ROOM];
             match self.wire.read(&mut room) {
                 Ok(0) => {
-                    self.ended = true;
-                    self.frame_left = 0;
-                    return Ok(());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "h3 data frame ended early",
+                    ));
                 }
                 Ok(n) => {
                     let take = n.min(self.frame_left);
@@ -258,7 +331,7 @@ impl H3Reader {
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
                     let since = *self.idle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= crate::budgets::relay_stall() {
+                    if self.idle_expired(since) {
                         return Err(std::io::Error::other("h3 request stalled"));
                     }
                     if crate::proxy::relay_step_owns_poll()
@@ -566,6 +639,7 @@ pub(crate) fn serve_inbound(
     identity: &ferrox_core::tls::TlsServerConfig,
     settings: &XhttpSettings,
     service: Arc<dyn H3Service>,
+    stop: Option<Arc<crate::proxy::Stop>>,
 ) -> Result<u16, String> {
     let config = quic::serve_config(identity).ok_or("unreadable xhttp h3 identity")?;
     let sock = quic::bind_datagram_plain(address)
@@ -579,6 +653,9 @@ pub(crate) fn serve_inbound(
         stream.preface_h3();
         serve_one(&stream, &settings, &service);
     });
+    let stop_flag = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     std::thread::Builder::new()
         .name("xhttp-h3".to_owned())
         .spawn(move || {
@@ -586,8 +663,11 @@ pub(crate) fn serve_inbound(
                 Datagram::plain(sock),
                 &Arc::new(Mutex::new(config)),
                 &serve,
-                &Arc::new(AtomicBool::new(false)),
+                &stop_flag,
             );
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
         })
         .map_err(|error| format!("xhttp h3 listener: {error}"))?;
     Ok(port)
@@ -630,6 +710,7 @@ pub(crate) struct ClientStream {
     sock: Arc<Datagram>,
     id: u64,
     peer_fin: Arc<AtomicBool>,
+    activity: Arc<Activity>,
 }
 
 impl Read for ClientStream {
@@ -653,6 +734,7 @@ impl Read for ClientStream {
                 Ok((n, fin)) => {
                     if n > 0 {
                         self.peer_fin.store(fin, Ordering::Relaxed);
+                        self.activity.touch();
                         quic::flush_egress(&mut conn, &self.sock);
                         return Ok(n);
                     }
@@ -694,6 +776,7 @@ impl Write for ClientStream {
                     std::thread::sleep(POLL);
                 }
                 Ok(n) => {
+                    self.activity.touch();
                     quic::flush_egress(&mut conn, &self.sock);
                     rest = &rest[n..];
                 }
@@ -740,6 +823,7 @@ pub(crate) struct H3Client {
     sock: Arc<Datagram>,
     next: AtomicU64,
     dead: Arc<AtomicBool>,
+    activity: Arc<Activity>,
 }
 
 impl Drop for H3Client {
@@ -814,6 +898,7 @@ impl H3Client {
             sock,
             next: AtomicU64::new(0),
             dead,
+            activity: Arc::new(Activity::new()),
         }))
     }
 
@@ -828,6 +913,7 @@ impl H3Client {
             sock: Arc::clone(&self.sock),
             id,
             peer_fin: Arc::new(AtomicBool::new(false)),
+            activity: Arc::clone(&self.activity),
         });
         let mut frame = Vec::with_capacity(block.len() + 9);
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
@@ -1025,6 +1111,28 @@ mod tests {
     use super::*;
     use crate::proxy::WindowRead;
 
+    struct Recorder(Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>);
+
+    impl H3Service for Recorder {
+        fn serve(
+            &self,
+            mut reader: Box<dyn WindowRead + Send>,
+            _writer: crate::xhttp::XhttpWriter,
+        ) {
+            let mut buf = [0u8; 16];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        *self.0.lock().expect("recorder lock") = Some(error.kind());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     struct Echo;
 
     impl H3Service for Echo {
@@ -1102,11 +1210,55 @@ mod tests {
             .expect("the h3 streams open")
     }
 
+    fn client(port: u16, roots: Vec<Vec<u8>>) -> Arc<H3Client> {
+        let tls = ferrox_core::tls::TlsConfig {
+            server_name: "localhost".to_owned(),
+            roots: roots.into(),
+            ..Default::default()
+        };
+        H3Client::connect("127.0.0.1", port, "localhost", &tls).expect("the h3 client connects")
+    }
+
+    fn raw_stream(client: &Arc<H3Client>) -> Wire {
+        let id = client.next.fetch_add(4, Ordering::SeqCst);
+        Wire::Client(ClientStream {
+            _owner: Arc::clone(client),
+            conn: Arc::clone(&client.conn),
+            sock: Arc::clone(&client.sock),
+            id,
+            peer_fin: Arc::new(AtomicBool::new(false)),
+            activity: Arc::clone(&client.activity),
+        })
+    }
+
+    fn send_frame(wire: &Wire, kind: u64, payload: &[u8]) {
+        let mut frame = Vec::with_capacity(payload.len() + 9);
+        frames::quic_varint(&mut frame, kind);
+        frames::quic_varint(&mut frame, payload.len() as u64);
+        frame.extend_from_slice(payload);
+        wire.clone().write_all(&frame).expect("the frame sends");
+    }
+
+    fn refused(reader: &mut H3Reader, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut buf = [0u8; 1];
+            match reader.read(&mut buf) {
+                Ok(0) => panic!("{what} ended as a clean EOF"),
+                Ok(_) => panic!("{what} was answered"),
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    assert!(Instant::now() < deadline, "{what} never refused");
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     #[test]
     fn a_stream_up_upload_reaches_the_downlink_over_h3() {
         let (identity, roots) = minted_identity("localhost");
         let settings = dual_settings(XhttpMode::StreamUp);
-        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo))
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let (mut reader, writer) = dial(port, &settings, roots);
         assert!(writer.send(b"hello"));
@@ -1120,7 +1272,7 @@ mod tests {
     fn a_bulk_upload_crosses_h3_in_one_data_frame() {
         let (identity, roots) = minted_identity("localhost");
         let settings = dual_settings(XhttpMode::StreamUp);
-        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo))
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let (mut reader, writer) = dial(port, &settings, roots);
         let payload: Vec<u8> = (0..96 * 1024).map(|byte| (byte % 251) as u8).collect();
@@ -1135,7 +1287,7 @@ mod tests {
     fn an_h3_packet_up_post_gets_a_2xx_and_carries_the_body() {
         let (identity, roots) = minted_identity("localhost");
         let settings = dual_settings(XhttpMode::PacketUp);
-        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo))
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let (mut reader, writer) = dial(port, &settings, roots);
         assert!(writer.send(b"hello"));
@@ -1161,6 +1313,79 @@ mod tests {
     }
 
     #[test]
+    fn a_data_frame_before_headers_is_refused() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let client = client(port, roots);
+        let wire = raw_stream(&client);
+        send_data(&wire, b"too early");
+        let mut reader = H3Reader::new(wire);
+        refused(&mut reader, "early DATA");
+    }
+
+    #[test]
+    fn a_request_head_without_a_method_is_refused() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let client = client(port, roots);
+        let wire = raw_stream(&client);
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(&[(":path", "/x")], &mut block);
+        send_frame(&wire, frames::H3_HEADERS, &block);
+        let mut reader = H3Reader::new(wire);
+        refused(&mut reader, "a head without :method");
+    }
+
+    #[test]
+    fn a_truncated_data_frame_is_an_error() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let port = serve_inbound(
+            "127.0.0.1:0",
+            &identity,
+            &settings,
+            Arc::new(Recorder(Arc::clone(&seen))),
+            None,
+        )
+        .expect("the h3 listener binds");
+        let client = client(port, roots);
+        let wire = raw_stream(&client);
+        let mut block = Vec::new();
+        let padding = "x".repeat(100);
+        let target = format!("/x?x_padding={padding}");
+        hpack::qpack_literal_many(
+            &[
+                (":method", "POST"),
+                (":path", target.as_str()),
+                (":scheme", "https"),
+                (":authority", "localhost"),
+            ],
+            &mut block,
+        );
+        send_frame(&wire, frames::H3_HEADERS, &block);
+        let mut frame = Vec::new();
+        frames::quic_varint(&mut frame, frames::H3_DATA);
+        frames::quic_varint(&mut frame, 16);
+        frame.extend_from_slice(b"cut");
+        wire.clone().write_all(&frame).expect("the frame sends");
+        wire.fin();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.lock().expect("recorder lock").is_none() {
+            assert!(Instant::now() < deadline, "the truncation was never seen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            *seen.lock().expect("recorder lock"),
+            Some(std::io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
     fn a_non_2xx_status_is_an_error() {
         assert!(status_ok(Some(403)).is_err());
         assert!(status_ok(Some(204)).is_ok());
@@ -1171,7 +1396,7 @@ mod tests {
     fn a_stream_one_session_crosses_h3_both_ways() {
         let (identity, roots) = minted_identity("localhost");
         let settings = settings();
-        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo))
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let tls = ferrox_core::tls::TlsConfig {
             server_name: "localhost".to_owned(),

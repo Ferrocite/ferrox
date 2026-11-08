@@ -821,7 +821,7 @@ fn inbound_served(protocol: &str) -> bool {
 /// the flag, and drops the socket instead of waiting for a flow that will never come.
 #[derive(Debug, Default)]
 pub(crate) struct Stop {
-    stopped: std::sync::atomic::AtomicBool,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     listeners: std::sync::atomic::AtomicUsize,
     closed: std::sync::Mutex<bool>,
     wake: std::sync::Condvar,
@@ -846,11 +846,16 @@ impl Stop {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The same flag as an owned handle the QUIC driver can poll.
+    pub(crate) fn shared(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stopped)
+    }
+
     fn stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn mark_closed(&self) {
+    pub(crate) fn mark_closed(&self) {
         if self
             .listeners
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
@@ -7926,7 +7931,7 @@ fn serve_vless_tls_inbound(
         if crate::xhttp_h3::is_h3(&server.alpn) {
             let service =
                 crate::xhttp_h2::h3_vless_service(settings, users, freedom, decryption.clone());
-            return match crate::xhttp_h3::serve_inbound(address, &server, settings, service) {
+            return match crate::xhttp_h3::serve_inbound(address, &server, settings, service, None) {
                 Ok(_) => true,
                 Err(error) => {
                     eprintln!("xhttp h3 in {path}: {error}");
@@ -12556,8 +12561,9 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                                 serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
                             }),
                         ));
-                    return match crate::xhttp_h3::serve_inbound(address, &server, settings, service)
-                    {
+                    return match crate::xhttp_h3::serve_inbound(
+                        address, &server, settings, service, None,
+                    ) {
                         Ok(_) => true,
                         Err(error) => {
                             eprintln!("xhttp h3 trojan on {address}: {error}");
@@ -12902,8 +12908,9 @@ fn serve_vmess_inbound_users(
                                 );
                             }),
                         ));
-                    return match crate::xhttp_h3::serve_inbound(address, &server, settings, service)
-                    {
+                    return match crate::xhttp_h3::serve_inbound(
+                        address, &server, settings, service, stop,
+                    ) {
                         Ok(_) => true,
                         Err(error) => {
                             eprintln!("xhttp h3 vmess on {address}: {error}");
