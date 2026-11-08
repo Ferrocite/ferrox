@@ -2970,19 +2970,6 @@ pub(crate) fn udp_to_server(
 /// the same identity the pool deduplicates on.
 static RESUMPTION: OnceLock<Mutex<HashMap<QuicServer, Vec<u8>>>> = OnceLock::new();
 
-/// One ticket key for the process, so a server issues tickets its later dial can offer. The
-/// resumption blobs it gates are in-process only, so the key's lifetime matches theirs.
-static TICKET_KEY: OnceLock<[u8; 48]> = OnceLock::new();
-
-/// A process-wide key, minted once: rotating it is the caller's worry when persistence matters.
-fn ticket_key() -> &'static [u8; 48] {
-    TICKET_KEY.get_or_init(|| {
-        let mut key = [0u8; 48];
-        getrandom::fill(&mut key).expect("random");
-        key
-    })
-}
-
 /// A captured session for this edge, if an earlier dial's peer issued a ticket.
 fn resumption_entry(key: &QuicServer) -> Option<Vec<u8>> {
     let entries = RESUMPTION.get_or_init(Default::default).lock().ok()?;
