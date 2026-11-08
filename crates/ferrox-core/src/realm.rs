@@ -256,6 +256,27 @@ fn unmasked(wire: u8, mask: &[u8; 32], at: usize) -> u8 {
     wire ^ mask[at % 32]
 }
 
+/// XOR a range tiled against `key`: four `u64` xors per 32-byte word, then one byte xor per tail
+/// byte, so the masked bytes run at a `u64` word per step instead of paying `at % 32` per byte.
+#[inline]
+fn xor_tiled(room: &mut [u8], key: &[u8; 32]) {
+    let (words, tail) = room.as_chunks_mut::<32>();
+    let lanes = key.as_chunks::<8>().0;
+    for word in words {
+        let read = u64::from_le_bytes(word[0..8].try_into().expect("whole lane"));
+        word[0..8].copy_from_slice(&(read ^ u64::from_le_bytes(lanes[0])).to_le_bytes());
+        let read = u64::from_le_bytes(word[8..16].try_into().expect("whole lane"));
+        word[8..16].copy_from_slice(&(read ^ u64::from_le_bytes(lanes[1])).to_le_bytes());
+        let read = u64::from_le_bytes(word[16..24].try_into().expect("whole lane"));
+        word[16..24].copy_from_slice(&(read ^ u64::from_le_bytes(lanes[2])).to_le_bytes());
+        let read = u64::from_le_bytes(word[24..32].try_into().expect("whole lane"));
+        word[24..32].copy_from_slice(&(read ^ u64::from_le_bytes(lanes[3])).to_le_bytes());
+    }
+    for (i, byte) in tail.iter_mut().enumerate() {
+        *byte ^= key[i];
+    }
+}
+
 /// Encode one punch packet of `packet_type` under a fixed `salt` and the caller's `padding` into
 /// `out`, returning the wire length. `out` must hold the salt, the header and `padding` whole;
 /// anything smaller is refused with `None` so a forged or undersized buffer is never written past.
@@ -281,9 +302,7 @@ pub fn encode_punch_with_salt_and_padding(
     room[SALT_LEN + MAGIC.len() + 1..MIN_WIRE_LEN].copy_from_slice(&meta.nonce);
     room[MIN_WIRE_LEN..total].copy_from_slice(padding);
     let key = mask(&meta.obfs, *salt);
-    for (at, byte) in room[SALT_LEN..total].iter_mut().enumerate() {
-        *byte = unmasked(*byte, &key, at);
-    }
+    xor_tiled(&mut room[SALT_LEN..total], &key);
     Some(total)
 }
 
@@ -307,12 +326,39 @@ pub fn encode_punch(packet_type: PacketType, meta: &Metadata, out: &mut [u8]) ->
     )
 }
 
+/// The `SHA-256(obfs || salt)` key one packet's header unmasks against, so both the magic screen
+/// and the router share one key per salt instead of two digests per packet.
+#[must_use]
+pub fn punch_salt_key(packet: &[u8], obfs: &[u8; OBFS_SIZE]) -> Option<[u8; 32]> {
+    if packet.len() < SALT_LEN {
+        return None;
+    }
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&packet[..SALT_LEN]);
+    Some(mask(obfs, salt))
+}
+
+/// Whether a packet's masked magic matches `key`: the router's magic-first screen.
+#[must_use]
+pub fn magic_matches(packet: &[u8], key: &[u8; 32]) -> bool {
+    if packet.len() < SALT_LEN + MAGIC.len() {
+        return false;
+    }
+    for (at, &want) in MAGIC.iter().enumerate() {
+        if unmasked(packet[SALT_LEN + at], key, at) != want {
+            return false;
+        }
+    }
+    true
+}
+
 /// Decode one punch packet punched under `meta` into its type and padding length. A packet shorter
 /// than the salt plus header, longer than the reference's ceiling, carrying a bad magic, an unknown
 /// type or a nonce the meta did not agree is `None`. The mask is computed once from the packet's own
 /// salt and the header is read off the wire by `XORing` each byte at its tiled position — no plaintext
 /// copy of the packet is ever staged, so a hook that read the copy back would spend it and never
-/// notice.
+/// notice. The router screens on [`magic_matches`] first, so a non-punch packet never pays a digest
+/// per pending meta.
 #[must_use]
 pub fn decode_punch(packet: &[u8], meta: &Metadata) -> Option<PunchPacket> {
     if packet.len() < MIN_WIRE_LEN || packet.len() > MAX_WIRE_LEN {

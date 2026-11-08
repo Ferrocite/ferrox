@@ -740,6 +740,13 @@ pub(crate) fn demux(
     }
     let mut found = None;
     if let Ok(map) = state.punch.lock() {
+        let screen_ok = map.values().any(|(meta, _)| {
+            realm::punch_salt_key(packet, &meta.obfs)
+                .is_some_and(|key| realm::magic_matches(packet, &key))
+        });
+        if !screen_ok {
+            return false;
+        }
         for (meta, sender) in map.values() {
             if let Some(decoded) = realm::decode_punch(packet, meta) {
                 found = Some((decoded.packet_type, meta.clone(), sender.clone()));
