@@ -421,8 +421,8 @@ impl Tls {
     }
 }
 
-/// A sealed session as the framer sees it: one frame is one sealed record, so the parts the
-/// walk hands over are joined before the record layer takes them.
+/// A sealed session as the framer sees it: one frame is one sealed record, and the parts the
+/// walk hands over are sealed where they land.
 pub(crate) struct Sealed<S>(ferrox_core::vless_encryption::EncryptedStream<S>);
 
 impl<S: Read + Write + RecordAlignment> Sealed<S> {
@@ -457,12 +457,7 @@ impl<S: Read + Write + RecordAlignment> RecordAlignment for Sealed<S> {
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-        let len = parts.iter().map(|part| part.len()).sum();
-        let mut joined = Vec::with_capacity(len);
-        for part in parts {
-            joined.extend_from_slice(part);
-        }
-        self.0.write_all(&joined)
+        self.0.write_all_slices(parts)
     }
 }
 
@@ -2166,5 +2161,42 @@ mod tests {
             !link.tls.snapshot().twelve_or_above,
             "a ClientHello says nothing about a version"
         );
+    }
+
+    #[test]
+    fn a_sealed_vision_write_allocates_nothing_after_warmup() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        let lane = std::thread::spawn(move || {
+            let mut sealed = server.handshake(server_side).expect("server handshake");
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = sealed.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let sealed = client.handshake(client_side).expect("client handshake");
+        let mut link = Link::sealed(sealed, &UUID);
+        let payload = [0x33u8; 1000];
+        link.write_all(&payload).expect("warmup");
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..64 {
+                link.write_all(&payload).expect("write");
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "a sealed Vision write reuses its staging buffer"
+        );
+        drop(link);
+        lane.join().expect("lane");
     }
 }

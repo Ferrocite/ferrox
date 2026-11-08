@@ -126,39 +126,48 @@ impl Aead {
         out: &mut Vec<u8>,
     ) {
         let nonce = nonce.unwrap_or_else(|| self.next_nonce());
-        match &self.cipher {
-            Cipher::Aes(cipher) => {
-                let start = out.len();
-                let tag = if plaintext.len() >= SOURCE_SEAL_MIN {
-                    out.reserve(plaintext.len());
-                    let tag = cipher.seal_from_uninit(
-                        &nonce,
-                        aad,
-                        plaintext,
-                        &mut out.spare_capacity_mut()[..plaintext.len()],
-                    );
-                    // SAFETY: seal_from_uninit wrote every byte of the spare range.
-                    unsafe { out.set_len(start + plaintext.len()) };
-                    tag
-                } else {
-                    out.extend_from_slice(plaintext);
-                    cipher.seal_in_place(&nonce, aad, &mut out[start..])
-                };
+        let start = out.len();
+        if let Cipher::Aes(cipher) = &self.cipher {
+            if plaintext.len() >= SOURCE_SEAL_MIN {
+                out.reserve(plaintext.len());
+                let tag = cipher.seal_from_uninit(
+                    &nonce,
+                    aad,
+                    plaintext,
+                    &mut out.spare_capacity_mut()[..plaintext.len()],
+                );
+                // SAFETY: seal_from_uninit wrote every byte of the spare range.
+                unsafe { out.set_len(start + plaintext.len()) };
                 out.extend_from_slice(&tag);
+                return;
             }
+        }
+        out.extend_from_slice(plaintext);
+        let tag = self.seal_in_place(Some(nonce), &mut out[start..], aad);
+        out.extend_from_slice(&tag);
+    }
+
+    /// Seal `plaintext` in place and return the tag.
+    fn seal_in_place(
+        &mut self,
+        nonce: Option<[u8; 12]>,
+        plaintext: &mut [u8],
+        aad: &[u8],
+    ) -> [u8; TAG_LEN] {
+        let nonce = nonce.unwrap_or_else(|| self.next_nonce());
+        match &self.cipher {
+            Cipher::Aes(cipher) => cipher.seal_in_place(&nonce, aad, plaintext),
             Cipher::ChaCha(cipher) => {
-                let start = out.len();
-                out.extend_from_slice(plaintext);
                 let tag = cipher
                     .encrypt_inout_detached(
                         &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
                         aad,
-                        (&mut out[start..]).into(),
+                        plaintext.into(),
                     )
                     .expect("AEAD seal cannot fail for these sizes");
                 let mut bytes = [0u8; TAG_LEN];
                 bytes.copy_from_slice(&tag);
-                out.extend_from_slice(&bytes);
+                bytes
             }
         }
     }
@@ -1381,6 +1390,22 @@ struct WriteSide {
     direct: bool,
 }
 
+fn copy_from_parts(parts: &[&[u8]], mut at: usize, mut len: usize, out: &mut Vec<u8>) {
+    for part in parts {
+        if at >= part.len() {
+            at -= part.len();
+            continue;
+        }
+        let n = (part.len() - at).min(len);
+        out.extend_from_slice(&part[at..at + n]);
+        len -= n;
+        at = 0;
+        if len == 0 {
+            break;
+        }
+    }
+}
+
 impl WriteSide {
     fn write<W: Write>(&mut self, inner: &mut W, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
@@ -1415,6 +1440,50 @@ impl WriteSide {
         self.out_mask.apply(&mut self.out, true);
         inner.write_all(&self.out)?;
         Ok(take)
+    }
+
+    fn write_all_slices<W: Write>(&mut self, inner: &mut W, parts: &[&[u8]]) -> io::Result<()> {
+        let total = parts.iter().map(|part| part.len()).sum::<usize>();
+        let mut at = 0;
+        while at < total {
+            let take = (total - at).min(MAX_BATCH_PLAINTEXT);
+            self.out.clear();
+            if self.direct {
+                copy_from_parts(parts, at, take, &mut self.out);
+                debug_assert_eq!(self.out.len(), take);
+                self.out_mask.apply(&mut self.out, true);
+                inner.write_all(&self.out)?;
+                at += take;
+                continue;
+            }
+            self.out.append(&mut self.pre_write);
+            let mut done = 0;
+            while done < take {
+                let n = (take - done).min(MAX_RECORD_PLAINTEXT);
+                let header_at = self.out.len();
+                let len = n + TAG_LEN;
+                let header = [23, 3, 3, (len >> 8) as u8, len as u8];
+                self.out.extend_from_slice(&header);
+                let start = self.out.len();
+                copy_from_parts(parts, at + done, n, &mut self.out);
+                debug_assert_eq!(self.out.len() - start, n);
+                let rekey = self.aead.nonce == MAX_NONCE;
+                let tag = self
+                    .aead
+                    .seal_in_place(None, &mut self.out[start..], &header);
+                self.out.extend_from_slice(&tag);
+                if rekey {
+                    self.aead = self
+                        .aead
+                        .derive(&self.out[header_at..], self.united_key.as_slice());
+                }
+                done += n;
+            }
+            self.out_mask.apply(&mut self.out, true);
+            inner.write_all(&self.out)?;
+            at += take;
+        }
+        Ok(())
     }
 }
 
@@ -1500,6 +1569,12 @@ impl<S> EncryptedStream<S> {
 
     fn united_key(&self) -> &[u8] {
         self.write.united_key.as_slice()
+    }
+}
+
+impl<S: Write> EncryptedStream<S> {
+    pub fn write_all_slices(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        self.write.write_all_slices(&mut self.inner, parts)
     }
 }
 
@@ -2222,6 +2297,128 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         reader.read_exact(&mut got).unwrap();
         assert_eq!(got, payload, "the masked batch reads back its plaintext");
+    }
+
+    #[test]
+    fn a_sliced_record_write_is_the_same_bytes_without_a_heap_buffer() {
+        use std::io::Write as _;
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: usize,
+            wire: Vec<u8>,
+        }
+
+        impl Write for Recorder {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.wire.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct Sink;
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = vec![7u8; 32];
+        let uuid = [0x11u8; 16];
+        let head = [0u8, 0x00, 0x01, 0x00, 0x02];
+        let payload: Vec<u8> = (0..MAX_RECORD_PLAINTEXT - HEADER_LEN - TAG_LEN)
+            .map(|at| (at as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let padding = vec![0u8; MAX_BATCH_PLAINTEXT - MAX_RECORD_PLAINTEXT + 300];
+        let parts: [&[u8]; 4] = [&uuid, &head, &payload, &padding];
+        let joined: Vec<u8> = parts.concat();
+
+        let mut control = EncryptedStream::new(
+            Recorder::default(),
+            key.clone(),
+            Aead::new(b"sliced write", &key),
+            None,
+            ReadStage::Records,
+        );
+        control.write_all(&joined).unwrap();
+
+        let mut sliced = EncryptedStream::new(
+            Recorder::default(),
+            key.clone(),
+            Aead::new(b"sliced write", &key),
+            None,
+            ReadStage::Records,
+        );
+        sliced.write_all_slices(&parts).unwrap();
+
+        assert_eq!(sliced.get_ref().wire, control.get_ref().wire);
+        assert_eq!(sliced.get_ref().calls, control.get_ref().calls);
+
+        let mut direct_control = EncryptedStream::new(
+            Recorder::default(),
+            key.clone(),
+            Aead::new(b"sliced write", &key),
+            None,
+            ReadStage::Records,
+        );
+        direct_control.enter_direct_mode();
+        direct_control.write_all(&joined).unwrap();
+
+        let mut direct_sliced = EncryptedStream::new(
+            Recorder::default(),
+            key.clone(),
+            Aead::new(b"sliced write", &key),
+            None,
+            ReadStage::Records,
+        );
+        direct_sliced.enter_direct_mode();
+        direct_sliced.write_all_slices(&parts).unwrap();
+
+        assert_eq!(direct_sliced.get_ref().wire, direct_control.get_ref().wire);
+        assert_eq!(
+            direct_sliced.get_ref().calls,
+            direct_control.get_ref().calls
+        );
+
+        let mut steady = EncryptedStream::new(
+            Sink,
+            key.clone(),
+            Aead::new(b"sliced write", &key),
+            None,
+            ReadStage::Records,
+        );
+        steady.write_all_slices(&parts).unwrap();
+        let capacity = steady.write.out.capacity();
+        let base = steady.write.out.as_ptr();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..64 {
+                steady.write_all_slices(&parts).unwrap();
+            }
+        });
+        assert_eq!(
+            steady.write.out.capacity(),
+            capacity,
+            "the sliced write buffer grew"
+        );
+        assert_eq!(
+            steady.write.out.as_ptr(),
+            base,
+            "the sliced write buffer moved"
+        );
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "a sliced record write reuses its staging buffer"
+        );
     }
 
     #[test]
