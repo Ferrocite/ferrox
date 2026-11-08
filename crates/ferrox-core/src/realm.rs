@@ -341,6 +341,9 @@ pub fn punch_salt_key(packet: &[u8], obfs: &[u8; OBFS_SIZE]) -> Option<[u8; 32]>
 /// Whether a packet's masked magic matches `key`: the router's magic-first screen.
 #[must_use]
 pub fn magic_matches(packet: &[u8], key: &[u8; 32]) -> bool {
+    if packet.len() < SALT_LEN + MAGIC.len() {
+        return false;
+    }
     for (at, &want) in MAGIC.iter().enumerate() {
         if unmasked(packet[SALT_LEN + at], key, at) != want {
             return false;
