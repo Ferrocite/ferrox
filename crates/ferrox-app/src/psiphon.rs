@@ -2200,6 +2200,16 @@ impl Settings {
                     .min(65_533),
             )
             .unwrap_or(65_533),
+            tls_fragment_client_hello: decimal(settings, "TLSFragmentClientHelloProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            tls_fragment_client_hello_protocols: protocol_list_named(
+                settings,
+                "TLSFragmentClientHelloLimitProtocols",
+            ),
+            user_agent_probability: decimal(settings, "PickUserAgentProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
             fragmentor: crate::psiphon_fragment::Fragmentor::new(
                 decimal(settings, "FragmentorProbability").unwrap_or(0.5),
                 protocol_list_named(settings, "FragmentorLimitProtocols"),
@@ -3698,6 +3708,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "MeekPayloadPaddingMaxSize",
     "MeekPayloadPaddingOmitProbability",
     "TLSTunnelTrafficShapingProbability",
+    "TLSFragmentClientHelloProbability",
+    "TLSFragmentClientHelloLimitProtocols",
+    "PickUserAgentProbability",
     "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",
     "TLSOSSHSNIServerNames",
@@ -9836,6 +9849,33 @@ mod tests {
         assert_eq!(&frame[5..21], &octets);
         assert_eq!(u16::from_be_bytes([frame[21], frame[22]]), 53);
         assert_eq!(&frame[23..], b"hi");
+    }
+
+    #[test]
+    fn the_tls_fragment_and_user_agent_settings_reach_the_shape() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"TLSFragmentClientHelloProbability":0.25,"TLSFragmentClientHelloLimitProtocols":["tls-ossh"],"PickUserAgentProbability":0.0}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.tls_fragment_client_hello, 0.25);
+        assert_eq!(
+            settings.tls_shape.tls_fragment_client_hello_protocols,
+            vec!["TLS-OSSH"]
+        );
+        assert_eq!(settings.tls_shape.user_agent_probability, 0.0);
+        assert!(!settings.tls_shape.fragment_client_hello("SSH"));
+        let always = Settings::from_json(Some(
+            &json::parse(
+                r#"{"TLSFragmentClientHelloProbability":1.0,"TLSFragmentClientHelloLimitProtocols":["tls-ossh"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(!always.tls_shape.fragment_client_hello("SSH"));
+        assert!(always.tls_shape.fragment_client_hello("TLS-OSSH"));
     }
 
     #[test]

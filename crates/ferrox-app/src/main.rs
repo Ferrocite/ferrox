@@ -61,6 +61,7 @@ mod psiphon_rate;
 mod psiphon_shadowsocks;
 mod psiphon_ssh;
 mod psiphon_tactics;
+mod psiphon_user_agent;
 mod psiphon_webrtc;
 mod quic;
 mod reverse;
