@@ -1368,8 +1368,10 @@ mod tests {
             ],
             &mut block,
         );
-        send_frame(&wire, frames::H3_HEADERS, &block);
         let mut frame = Vec::new();
+        frames::quic_varint(&mut frame, frames::H3_HEADERS);
+        frames::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
         frames::quic_varint(&mut frame, frames::H3_DATA);
         frames::quic_varint(&mut frame, 16);
         frame.extend_from_slice(b"cut");
