@@ -28,9 +28,9 @@ The system path replaces the smoltcp TCP hop for a handled flow:
 ```mermaid
 graph TD
     A["inbound config: protocol tun, stack system"] --> B["tun_stack::build<br/>one queue, offload off"]
-    B --> R["recv_loop: one device read per packet"]
+    B --> R["recv_loop: batched recv_multiple<br/>packet_bytes into a reused Vec"]
     R --> N["Nat::rewrite<br/>source peer, destination local:listener<br/>IP + TCP checksums"]
-    N -->|handled TCP| W["send_plain_recycle<br/>write back to the device"]
+    N -->|handled TCP| W["send_plain with a bounded recycle pool<br/>write back to the device"]
     N -->|UDP, ICMP, hybrid fallback| S["serve_tun_device<br/>smoltcp"]
     W --> K["kernel TCP stack"]
     K --> L["accept_loop<br/>serve_device_flow"]

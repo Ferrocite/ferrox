@@ -672,6 +672,11 @@ fn serve_inbounds_counted(
                                 eprintln!("tun inbound: the loopback handler supports IPv4 only");
                                 continue;
                             }
+                            #[cfg(not(target_os = "linux"))]
+                            if tun_stack(inbound) == "system" {
+                                eprintln!("tun inbound: the system tun stack is Linux-only");
+                                continue;
+                            }
                             inbounds += 1;
                         } else if serve_tun_inbound(&spec, inbound, &out, address) {
                             inbounds += 1;

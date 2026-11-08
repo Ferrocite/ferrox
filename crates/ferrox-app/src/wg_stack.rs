@@ -150,6 +150,7 @@ struct QueueDevice {
     mtu: usize,
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
+    tun_recycle: Option<SyncSender<Vec<u8>>>,
 }
 
 impl QueueDevice {
@@ -161,6 +162,7 @@ impl QueueDevice {
             mtu,
             headroom,
             recycle: None,
+            tun_recycle: None,
         }
     }
 
@@ -179,7 +181,9 @@ impl QueueDevice {
         if at != self.headroom {
             return;
         }
-        if let Some(recycle) = &self.recycle {
+        if let Some(recycle) = &self.tun_recycle {
+            let _ = recycle.try_send(buffer);
+        } else if let Some(recycle) = &self.recycle {
             let _ = recycle.send(buffer);
         }
     }
@@ -202,6 +206,7 @@ struct QueueRx {
     buffer: Vec<u8>,
     at: usize,
     recycle: Option<Sender<Vec<u8>>>,
+    tun_recycle: Option<SyncSender<Vec<u8>>>,
 }
 
 impl RxToken for QueueRx {
@@ -218,8 +223,11 @@ impl RxToken for QueueRx {
 impl Drop for QueueRx {
     /// Return the slot to the batch once smoltcp has consumed it.
     fn drop(&mut self) {
-        if let Some(recycle) = self.recycle.take() {
-            let _ = recycle.send(std::mem::take(&mut self.buffer));
+        let buffer = std::mem::take(&mut self.buffer);
+        if let Some(recycle) = self.tun_recycle.take() {
+            let _ = recycle.try_send(buffer);
+        } else if let Some(recycle) = self.recycle.take() {
+            let _ = recycle.send(buffer);
         }
     }
 }
@@ -264,6 +272,11 @@ impl Device for QueueDevice {
                 at,
                 recycle: if at == self.headroom {
                     self.recycle.clone()
+                } else {
+                    None
+                },
+                tun_recycle: if at == self.headroom {
+                    self.tun_recycle.clone()
                 } else {
                     None
                 },
@@ -1320,12 +1333,12 @@ pub(crate) fn serve_tun_device(
     packets: Receiver<Packet>,
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
-    recycle: Option<Sender<Vec<u8>>>,
+    recycle: Option<SyncSender<Vec<u8>>>,
     wake: std::os::unix::net::UnixStream,
     failed: Arc<AtomicBool>,
 ) {
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
-    stack.device.recycle = recycle;
+    stack.device.tun_recycle = recycle;
     let _ = wake.set_nonblocking(true);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -1364,11 +1377,11 @@ pub(crate) fn serve_tun_device(
     packets: Receiver<Packet>,
     to_tunnel: SyncSender<Vec<u8>>,
     out: Outbound,
-    recycle: Option<Sender<Vec<u8>>>,
+    recycle: Option<SyncSender<Vec<u8>>>,
     failed: Arc<AtomicBool>,
 ) {
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
-    stack.device.recycle = recycle;
+    stack.device.tun_recycle = recycle;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if failed.load(Ordering::Relaxed) {

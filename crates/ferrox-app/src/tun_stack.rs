@@ -11,7 +11,6 @@ use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -152,7 +151,7 @@ pub(crate) fn build(
 fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outbound) {
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
-    let (recycle, reused) = mpsc::channel();
+    let (recycle, reused) = mpsc::sync_channel(RX_QUEUE);
     #[cfg(unix)]
     let (wake_read, wake_write) = std::os::unix::net::UnixStream::pair().expect("tun wake pair");
     #[cfg(unix)]
@@ -360,7 +359,7 @@ pub(crate) fn send_plain(
     device: Arc<SyncDevice>,
     packets: Receiver<Vec<u8>>,
     failed: &AtomicBool,
-    recycle: Option<Sender<Vec<u8>>>,
+    recycle: Option<SyncSender<Vec<u8>>>,
 ) {
     while let Ok(packet) = packets.recv() {
         if let Err(error) = device.send(&packet) {
@@ -369,7 +368,7 @@ pub(crate) fn send_plain(
             return;
         }
         if let Some(recycle) = &recycle {
-            let _ = recycle.send(packet);
+            let _ = recycle.try_send(packet);
         }
     }
 }
