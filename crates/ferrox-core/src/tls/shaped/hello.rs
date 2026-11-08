@@ -1641,8 +1641,8 @@ mod tests {
         assert_eq!(&versions[4..], &[0x02, 0x03, 0x03], "1.2 only");
     }
 
-    /// REALITY refuses a fingerprint with no TLS 1.3 key share, so the REALITY dial swaps android
-    /// for a variant carrying the X25519 share and 1.3 offer its uTLS preset omits.
+    /// REALITY refuses a fingerprint with no TLS 1.3 share, so the REALITY dial swaps android for
+    /// a variant carrying the suites and the hybrid share its uTLS preset omits.
     #[test]
     fn android_offers_the_tls13_share_reality_needs() {
         let fingerprint = Fingerprint::resolve("android").expect("a preset name resolves");
@@ -1667,7 +1667,18 @@ mod tests {
             .iter()
             .find(|ext| kind(ext) == 0x0033)
             .expect("the hello shares a key");
-        assert_eq!(&share[6..8], &[0x00, 0x1d], "an X25519 group");
+        let body = &share[4..];
+        let mut at = 2;
+        let mut groups = Vec::new();
+        while at + 4 <= body.len() {
+            groups.push(u16::from_be_bytes([body[at], body[at + 1]]));
+            at += 4 + usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
+        }
+        assert_eq!(
+            groups,
+            [0x11ec, 0x001d],
+            "the hybrid first, then the plain share the reference prefers"
+        );
         assert!(
             hello.auth_secret().is_some(),
             "REALITY seals through the share"

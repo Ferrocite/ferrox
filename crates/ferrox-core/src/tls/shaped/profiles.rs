@@ -99,7 +99,7 @@ static P_ANDROID: Profile = Profile {
     ],
 };
 
-// uTLS's android offers no TLS 1.3 suites or share, so REALITY refuses it; this variant adds both.
+// uTLS's android offers no TLS 1.3 suites or shares, so REALITY refuses it; this variant adds both.
 static P_ANDROID_REALITY: Profile = Profile {
     name: "android",
     ciphers: &[
@@ -122,7 +122,7 @@ static P_ANDROID_REALITY: Profile = Profile {
         },
         Ext {
             kind: 0x000a,
-            body: Body::Groups(&[0x001d, 0x0017, 0x0018]),
+            body: Body::Groups(&[0x11ec, 0x001d, 0x0017, 0x0018]),
         },
         Ext {
             kind: 0x000b,
@@ -141,7 +141,7 @@ static P_ANDROID_REALITY: Profile = Profile {
         Ext {
             kind: 0x0033,
             body: Body::KeyShare {
-                groups: &[0x001d],
+                groups: &[0x11ec, 0x001d],
                 reuse: false,
             },
         },

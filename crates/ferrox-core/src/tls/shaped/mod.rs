@@ -156,7 +156,7 @@ impl Fingerprint {
         self.0
     }
 
-    /// REALITY needs a TLS 1.3 share; android is the one preset uTLS ships without one.
+    /// REALITY needs TLS 1.3 suites and an X25519MLKEM768 share; android is the one preset without them.
     pub(crate) fn reality_profile(self) -> Option<&'static Profile> {
         self.0
             .map(|profile| profiles::reality_variant(profile).unwrap_or(profile))
