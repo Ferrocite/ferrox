@@ -128,7 +128,6 @@ jobs:
           code=0
           curl -sS --noproxy '*' --max-time 30 \
             https://www.cloudflare.com/cdn-cgi/trace -o route-trace.txt || code=$?
-          echo "control, route trace ${code:-0} 0 0" >> psiphon-legs.tsv
           {
             grep -E '^(loc|ip)=' route-trace.txt || true
             echo "server: none yet"
@@ -247,7 +246,7 @@ jobs:
           lane_route() {
             grep 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null | tail -n 1 | \
               sed -n 's/.*tunnel up via \([^ ]*\) \([^ ]*\).*/server: \1\nprotocol: \2/p'
-            loc=$(grep '^loc=' route-trace.txt 2>/dev/null | cut -d= -f2)
+            loc=$(awk '$1" "$2=="native socks" {print $4}' psiphon-egress.tsv 2>/dev/null | head -n 1)
             printf 'region: %s\n' "${loc:-unknown}"
           }
           # The two signature values are read out of the lane's own source, so the
@@ -601,6 +600,9 @@ jobs:
           print()
           if route:
               print("route: " + ", ".join(f"{key}={value}" for key, value in route.items()))
+              print()
+          if egress:
+              print("egress: " + ", ".join(f"{k}={v}" for k, v in egress.items()))
               print()
           print("| leg | bytes | seconds | MiB/s | ÷control |")
           print("| --- | --- | --- | --- | --- |")
