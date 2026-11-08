@@ -27,6 +27,7 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 /// A held datagram retries inside one poll grain, so a full queue never waits out a tick.
 const RETRY: Duration = Duration::from_millis(1);
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
@@ -37,7 +38,7 @@ const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 /// The authority and path xray's WARP transport dials when the config names none.
 const WARP_HOST: &str = "cloudflareaccess.com";
-const WARP_PROTOCOL: &[u8] = b"cf-connect-ip";
+pub(crate) const WARP_PROTOCOL: &[u8] = b"cf-connect-ip";
 /// The draft-datagram setting Cloudflare's endpoint reads.
 const SETTINGS_DATAGRAM_DRAFT: u64 = 0x276;
 /// The resolvers xray's MASQUE client asks when `remoteDNS` names none.
@@ -1056,8 +1057,9 @@ fn attempt(
         return Err(format!("masque: the edge answered {status}"));
     }
     if let Some(warp) = &spec.warp {
+        let deadline = Instant::now() + WARP_ASSIGN_WAIT;
         let mut addresses = assigned(&mut stream);
-        if addresses.is_none() {
+        while addresses.is_none() && Instant::now() < deadline {
             stream.poll(&mut conn, sock, local, TICK)?;
             addresses = assigned(&mut stream);
         }
@@ -1099,21 +1101,34 @@ fn attempt(
     })
 }
 
-/// The first non-empty assignment the edge sent, so a WARP client uses the
-/// address the server routes rather than the one it was configured with.
+/// Every assignment the edge sent, in order: a WARP client uses the addresses
+/// the server routes rather than the ones it was configured with.
 fn assigned(stream: &mut Stream) -> Option<Vec<IpAddr>> {
-    stream.take_capsules().into_iter().find_map(|capsule| {
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    for capsule in stream.take_capsules() {
         let Owned::AddressAssign(body) = capsule else {
-            return None;
+            continue;
         };
         let mut grants = Vec::new();
-        connectip::address_assign(&body, &mut grants)?;
-        let addresses: Vec<IpAddr> = grants
-            .iter()
-            .filter_map(|grant| (!grant.refused()).then(|| address_of(grant)).flatten())
-            .collect();
-        (!addresses.is_empty()).then_some(addresses)
-    })
+        if connectip::address_assign(&body, &mut grants).is_none() {
+            continue;
+        }
+        for version in [4, 6] {
+            if !grants.iter().any(|grant| grant.version == version) {
+                continue;
+            }
+            addresses.retain(|address| {
+                let family = if address.is_ipv4() { 4 } else { 6 };
+                family != version
+            });
+            addresses.extend(grants.iter().filter_map(|grant| {
+                (grant.version == version && !grant.refused())
+                    .then(|| address_of(grant))
+                    .flatten()
+            }));
+        }
+    }
+    (!addresses.is_empty()).then_some(addresses)
 }
 
 /// Check the WARP public key or the configured certificate pins.
@@ -1863,7 +1878,7 @@ pub(crate) struct ServerSpec {
     pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
-    warp: bool,
+    pub(crate) warp: bool,
 }
 
 impl ServerSpec {
@@ -1932,18 +1947,18 @@ impl ServerSpec {
         })
     }
 
-    fn accepts_protocol(&self, protocol: &[u8]) -> bool {
+    pub(crate) fn accepts_protocol(&self, protocol: &[u8]) -> bool {
         protocol == b"connect-ip" || (self.warp && protocol == WARP_PROTOCOL)
     }
 
-    fn path_matches(&self, path: &[u8], protocol: &[u8]) -> bool {
+    pub(crate) fn path_matches(&self, path: &[u8], protocol: &[u8]) -> bool {
         if self.warp && protocol == WARP_PROTOCOL {
             return path_matches(path, "/");
         }
         path_matches(path, &self.path)
     }
 
-    fn request_authenticated(&self, protocol: &[u8], header: Option<&[u8]>) -> bool {
+    pub(crate) fn request_authenticated(&self, protocol: &[u8], header: Option<&[u8]>) -> bool {
         (self.warp && protocol == WARP_PROTOCOL) || self.authenticates(header)
     }
 
@@ -4356,22 +4371,50 @@ mod tests {
         assert!(warp_addresses(&twice).is_err());
     }
 
-    #[test]
-    fn a_warp_client_takes_the_address_the_edge_assigns() {
-        let want = vec!["172.16.0.9".parse::<IpAddr>().expect("v4")];
+    fn assignment(addrs: &[IpAddr]) -> Owned {
         let mut wire = Vec::new();
-        connectip::address_assign_encode(&grants(&want, 0), &mut wire);
+        connectip::address_assign_encode(&grants(addrs, 0), &mut wire);
+        let (_, connectip::Capsule::AddressAssign(body)) =
+            connectip::capsule_split(&wire).expect("a capsule")
+        else {
+            panic!("an assignment capsule");
+        };
+        Owned::AddressAssign(body.to_vec())
+    }
+
+    #[test]
+    fn a_warp_client_takes_every_address_the_edge_assigns() {
+        let v4 = "172.16.0.9".parse::<IpAddr>().expect("v4");
+        let v6 = "fd00::9".parse::<IpAddr>().expect("v6");
+        let mut stream = Stream {
+            pending: vec![assignment(&[v4]), assignment(&[v6])],
+            ..Stream::default()
+        };
+        assert_eq!(assigned(&mut stream), Some(vec![v4, v6]));
+        assert_eq!(assigned(&mut stream), None);
+
+        let refused = connectip::Assigned {
+            request_id: 0,
+            version: 4,
+            address: [0u8; 16],
+            prefix: 32,
+        };
+        let mut wire = Vec::new();
+        connectip::address_assign_encode(&[refused], &mut wire);
         let (_, connectip::Capsule::AddressAssign(body)) =
             connectip::capsule_split(&wire).expect("a capsule")
         else {
             panic!("an assignment capsule");
         };
         let mut stream = Stream {
-            pending: vec![Owned::AddressAssign(body.to_vec())],
+            pending: vec![
+                assignment(&[v4]),
+                assignment(&[v6]),
+                Owned::AddressAssign(body.to_vec()),
+            ],
             ..Stream::default()
         };
-        assert_eq!(assigned(&mut stream), Some(want));
-        assert_eq!(assigned(&mut stream), None);
+        assert_eq!(assigned(&mut stream), Some(vec![v6]));
     }
 
     #[test]

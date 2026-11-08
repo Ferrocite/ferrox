@@ -20,6 +20,7 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_ROOM: usize = 16 * 1024;
 const PREFACE: usize = 24;
@@ -589,9 +590,13 @@ fn handshake(
         return Err(format!("the edge answered {status}"));
     }
     if let Some(warp) = warp {
-        if client.addresses.is_empty() {
+        let deadline = Instant::now() + WARP_ASSIGN_WAIT;
+        while client.addresses.is_empty() && Instant::now() < deadline {
             client.wire.fill();
             client.pump();
+            if client.wire.closed || client.end {
+                break;
+            }
         }
         if client.addresses.is_empty() {
             client.addresses = warp.local_addresses();
@@ -1060,6 +1065,7 @@ struct Session {
     peer_window: i64,
     granted: Option<Granted>,
     addrs: Vec<IpAddr>,
+    warp: bool,
     end: bool,
 }
 
@@ -1080,6 +1086,7 @@ impl Session {
             peer_window: DEFAULT_WINDOW,
             granted: None,
             addrs: Vec::new(),
+            warp: false,
             end: false,
         }
     }
@@ -1240,13 +1247,19 @@ impl Session {
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.as_slice())
         };
-        let path_ok =
-            field(b":path").is_some_and(|path| masque::path_matches(path, &self.spec.path));
+        let warp = self.spec.warp && field(b"cf-connect-proto") == Some(masque::WARP_PROTOCOL);
+        let protocol = if warp {
+            masque::WARP_PROTOCOL
+        } else {
+            field(b":protocol").unwrap_or_default()
+        };
+        let path_ok = field(b":path").is_some_and(|path| self.spec.path_matches(path, protocol));
         let method_ok = field(b":method") == Some(b"CONNECT");
-        let protocol_ok = field(b":protocol") == Some(b"connect-ip");
-        let capsules_ok = field(b"capsule-protocol")
-            .and_then(|value| value.strip_prefix(b"?"))
-            .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
+        let protocol_ok = self.spec.accepts_protocol(protocol);
+        let capsules_ok = warp
+            || field(b"capsule-protocol")
+                .and_then(|value| value.strip_prefix(b"?"))
+                .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
         if !decoded {
             self.reply(wire, id, 400);
             return;
@@ -1259,10 +1272,14 @@ impl Session {
             self.reply(wire, id, 400);
             return;
         }
-        if !self.spec.authenticates(field(b"authorization")) {
+        if !self
+            .spec
+            .request_authenticated(protocol, field(b"authorization"))
+        {
             self.reply(wire, id, 401);
             return;
         }
+        self.warp = warp;
         let Some(addrs) = masque::assign(&self.shared) else {
             self.reply(wire, id, 503);
             return;
@@ -1317,9 +1334,12 @@ impl Session {
     fn capsules(&mut self, wire: &mut Wire, bytes: &[u8]) {
         self.capsules.extend_from_slice(bytes);
         let mut answers = Vec::new();
-        while let Some((used, capsule)) =
-            connectip::capsule_split(&self.capsules[self.capsule_at..])
-        {
+        let split: fn(&[u8]) -> Option<(usize, connectip::Capsule<'_>)> = if self.warp {
+            connectip::capsule_split_bare
+        } else {
+            connectip::capsule_split
+        };
+        while let Some((used, capsule)) = split(&self.capsules[self.capsule_at..]) {
             self.capsule_at += used;
             match capsule {
                 connectip::Capsule::Datagram(packet) => {
@@ -1409,7 +1429,11 @@ impl Session {
                 break;
             };
             let mut capsule = Vec::with_capacity(packet.len() + 8);
-            datagram(&packet, &mut capsule);
+            if self.warp {
+                bare_datagram(&packet, &mut capsule);
+            } else {
+                datagram(&packet, &mut capsule);
+            }
             self.capsule(wire, &capsule);
         }
         if self.request.is_some() && !wire.closed && self.queued.is_empty() {
@@ -1442,6 +1466,13 @@ fn datagram(packet: &[u8], out: &mut Vec<u8>) {
     frames::quic_varint(out, 0);
     frames::quic_varint(out, (packet.len() + 1) as u64);
     out.push(0);
+    out.extend_from_slice(packet);
+}
+
+/// The WARP HTTP/2 body carries a bare packet with no context byte.
+fn bare_datagram(packet: &[u8], out: &mut Vec<u8>) {
+    frames::quic_varint(out, 0);
+    frames::quic_varint(out, packet.len() as u64);
     out.extend_from_slice(packet);
 }
 
@@ -2408,9 +2439,19 @@ mod tests {
     }
 
     fn established(echo: SocketAddr) -> (ferrox_core::tls::ClientSession<TcpStream>, IpAddr) {
-        let config = inbound(
-            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
-        );
+        established_with(echo, false)
+    }
+
+    fn established_with(
+        echo: SocketAddr,
+        warp: bool,
+    ) -> (ferrox_core::tls::ClientSession<TcpStream>, IpAddr) {
+        let settings = if warp {
+            r#"{"warp":true,"address":["10.14.0.1/24","fd14::1/64"]}"#
+        } else {
+            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#
+        };
+        let config = inbound(settings);
         let port =
             crate::masque::serve_inbound(&config, &freedom(&echo.to_string()), "127.0.0.1:0")
                 .expect("serve");
@@ -2432,16 +2473,28 @@ mod tests {
         write_frame(&mut tls, h2::T_SETTINGS, 0, 0, &[]);
         let mut block = Vec::new();
         field(&mut block, ":method", b"CONNECT");
-        field(&mut block, ":protocol", b"connect-ip");
         field(&mut block, ":scheme", b"https");
-        field(&mut block, ":path", b"/.well-known/masque/ip/*/*/");
+        field(
+            &mut block,
+            ":path",
+            if warp {
+                b"/"
+            } else {
+                b"/.well-known/masque/ip/*/*/"
+            },
+        );
         field(
             &mut block,
             ":authority",
             format!("localhost:{port}").as_bytes(),
         );
-        field(&mut block, "capsule-protocol", b"?1");
-        field(&mut block, "authorization", b"Basic dUBleGFtcGxlLmNvbTpw");
+        if warp {
+            field(&mut block, "cf-connect-proto", b"cf-connect-ip");
+        } else {
+            field(&mut block, ":protocol", b"connect-ip");
+            field(&mut block, "capsule-protocol", b"?1");
+            field(&mut block, "authorization", b"Basic dUBleGFtcGxlLmNvbTpw");
+        }
         write_frame(&mut tls, h2::T_HEADERS, h2::F_END_HEADERS, 1, &block);
 
         let mut status = None;
@@ -2464,8 +2517,13 @@ mod tests {
                     .find(|(name, _)| name == b":status")
                     .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
             } else if kind == h2::T_DATA && id == 1 {
+                let split: fn(&[u8]) -> Option<(usize, connectip::Capsule<'_>)> = if warp {
+                    connectip::capsule_split_bare
+                } else {
+                    connectip::capsule_split
+                };
                 let mut at = 0;
-                while let Some((used, capsule)) = connectip::capsule_split(&body[at..]) {
+                while let Some((used, capsule)) = split(&body[at..]) {
                     at += used;
                     if let connectip::Capsule::AddressAssign(body) = capsule {
                         connectip::address_assign(body, &mut assigned).expect("an assignment");
@@ -2537,6 +2595,62 @@ mod tests {
         assert_eq!(
             answered.as_deref(),
             Some(b"hello".as_slice()),
+            "{client} → 192.0.2.1:{}",
+            echo_address.port()
+        );
+    }
+
+    #[test]
+    fn a_warp_h2_tunnel_assigns_and_carries_a_bare_datagram() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+
+        let (mut tls, client) = established_with(echo_address, true);
+        let mut packet = Vec::new();
+        assert!(connectip::udp_datagram(
+            &UdpDatagram {
+                source: &client
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .expect("v4")
+                    .octets(),
+                destination: &[192, 0, 2, 1],
+                source_port: 1234,
+                destination_port: echo_address.port(),
+                payload: b"warp",
+            },
+            &mut packet
+        ));
+        let mut capsule = Vec::new();
+        bare_datagram(&packet, &mut capsule);
+        write_frame(&mut tls, h2::T_DATA, 0, 1, &capsule);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut answered = None;
+        while Instant::now() < deadline && answered.is_none() {
+            let (kind, _, id, body) = read_frame(&mut tls);
+            if kind != h2::T_DATA || id != 1 {
+                continue;
+            }
+            let mut at = 0;
+            while let Some((used, capsule)) = connectip::capsule_split_bare(&body[at..]) {
+                at += used;
+                if let connectip::Capsule::Datagram(packet) = capsule {
+                    if let Some(datagram) = connectip::udp_from_packet(packet) {
+                        answered = Some(datagram.payload.to_vec());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            answered.as_deref(),
+            Some(b"warp".as_slice()),
             "{client} → 192.0.2.1:{}",
             echo_address.port()
         );
