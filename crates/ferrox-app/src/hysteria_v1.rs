@@ -422,9 +422,8 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
         };
         for frag in fragments {
             wire.clear();
-            if wire::encode_udp(&frag, &mut wire).is_ok() {
-                let _ = conn.dgram_send(&wire);
-            }
+            wire::encode_udp_unchecked(&frag, &mut wire);
+            let _ = conn.dgram_send(&wire);
         }
         flush(&session.sock, &mut conn, out.as_mut());
     }
@@ -701,9 +700,8 @@ fn udp_reader(
         };
         for frag in fragments {
             wire.clear();
-            if wire::encode_udp(&frag, &mut wire).is_ok() {
-                let _ = conn.dgram_send(&wire);
-            }
+            wire::encode_udp_unchecked(&frag, &mut wire);
+            let _ = conn.dgram_send(&wire);
         }
         flush(sock, &mut conn, out.as_mut());
     }
