@@ -925,21 +925,151 @@ fn heartbeat_loop(
     }
 }
 
-/// Ask the local gateway for a UDP mapping of `local` and read its external address back. Until this
-/// build discovers a gateway without hard-coding one and exchanges the correct RFC 6886 requests and
-/// replies, it asks for no mapping and answers `None` — a wrong external address registered with the
-/// rendezvous would mislead the punch, and the caller continues with its STUN address instead. The
-/// reference's mapper is `UPnP` and NAT-PMP through `go-nat`; SSDP discovery of `UPnP` gateways is the
-/// named gap, so no mapping is claimed from either family of gateway yet.
+/// Ask the local gateway for a UDP mapping of `local` and read its external address back: SSDP
+/// discovery finds the gateway, its description names the `WAN` service the mapping travels to, and
+/// `AddPortMapping` followed by `GetExternalIPAddress` carries it — every write lands in the caller's
+/// buffer before it leaves. `None` answers when no gateway names itself in time; the caller
+/// continues without a gateway address, as the reference does when its mapper fails to initialise.
 #[must_use]
 pub(crate) fn port_mapping_external(
     local: Option<SocketAddr>,
     timeout_secs: u64,
     lifetime_secs: u64,
 ) -> Option<SocketAddr> {
-    let _ = (local, timeout_secs, lifetime_secs);
-    eprintln!("hysteria realm port mapping: gateway discovery not yet implemented; serving without a gateway address");
+    let local = local?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    let location = ssdp_discover(deadline)?;
+    map_via_gateway(&location, local.port(), lifetime_secs)
+}
+
+/// Map `internal_port` through the gateway a device description at `location` names: fetch its
+/// description, `AddPortMapping` on the `WAN` service it lists, then `GetExternalIPAddress` for the
+/// address the mapping is reachable at. `None` answers when any hop refuses; the caller continues
+/// with its STUN address instead.
+fn map_via_gateway(location: &str, internal_port: u16, lifetime_secs: u64) -> Option<SocketAddr> {
+    let (gateway_host, gateway_port, root_path) = ferrox_core::portmap::split_url(location)?;
+    let root = http_get(&gateway_host, gateway_port, &root_path)?;
+    let (url_base, service) = ferrox_core::portmap::parse_root_desc(&root)?;
+    let control = ferrox_core::portmap::join_control(url_base.as_deref(), &service.control_url);
+    let (control_host, control_port, control_path) = ferrox_core::portmap::split_url(&control)?;
+    let mut body = [0u8; 4096];
+    let lease = u32::try_from(lifetime_secs).unwrap_or(u32::MAX);
+    let written = ferrox_core::portmap::add_mapping_body(
+        &service.service_type,
+        internal_port,
+        "hysteria-realm",
+        lease,
+        &mut body,
+    )?;
+    let reply = soap_call(
+        &control_host,
+        control_port,
+        &control_path,
+        &service.service_type,
+        "AddPortMapping",
+        &body[..written],
+    )?;
+    let external_port = ferrox_core::portmap::parse_external_port(&reply)?;
+    let mut body = [0u8; 1024];
+    let written = ferrox_core::portmap::external_ip_body(&service.service_type, &mut body)?;
+    let reply = soap_call(
+        &control_host,
+        control_port,
+        &control_path,
+        &service.service_type,
+        "GetExternalIPAddress",
+        &body[..written],
+    )?;
+    let ip = ferrox_core::portmap::parse_external_ip(&reply)?;
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
+    }
+    Some(SocketAddr::new(ip, external_port))
+}
+
+/// SSDP `M-SEARCH` discovery: one multicast search per advertised type, plus a unicast search to the
+/// default gateway of the local route when the local address names its subnet. The first `LOCATION`
+/// any router answers names the gateway the mapping travels to.
+fn ssdp_discover(deadline: Instant) -> Option<String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .or_else(|| UdpSocket::bind("[::]:0").ok())?;
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = sock.set_multicast_loop_v4(true);
+    let mut buf = [0u8; 1024];
+    let mut x = 0u64;
+    while Instant::now() < deadline {
+        for st in ferrox_core::portmap::SEARCH_TYPES {
+            let written = ferrox_core::portmap::ssdp_search(st, &mut buf)?;
+            let _ = sock.send_to(&buf[..written], ferrox_core::portmap::SSDP_MULTICAST);
+        }
+        let mut reply = [0u8; 2048];
+        if let Ok((len, _)) = sock.recv_from(&mut reply) {
+            if let Some(location) = ferrox_core::portmap::ssdp_location(&reply[..len]) {
+                return Some(location);
+            }
+        }
+        x = x.wrapping_add(1);
+        let _ = x;
+    }
     None
+}
+
+/// One closed HTTP exchange to the gateway's description or control URL. `None` answers only a
+/// transport failure, a non-2xx reply, or a body that will not fit the ceiling.
+fn http_get(host: &str, port: u16, path: &str) -> Option<String> {
+    http_exchange(host, port, "GET", path, None, None)
+}
+
+/// One SOAP call to the control URL the description names. The envelope rides its own `SOAPAction`
+/// header and `text/xml` body, as the gateway requires.
+fn soap_call(
+    host: &str,
+    port: u16,
+    path: &str,
+    service: &str,
+    action: &str,
+    body: &[u8],
+) -> Option<String> {
+    let action = format!("\"{service}#{action}\"");
+    http_exchange(host, port, "POST", path, Some(&action), Some(body))
+}
+
+fn http_exchange(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    soap_action: Option<&str>,
+    body: Option<&[u8]>,
+) -> Option<String> {
+    let address: SocketAddr = format!("{host}:{port}").to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let host_header = format!("{host}:{port}");
+    let mut request = Vec::with_capacity(256 + body.map_or(0, <[u8]>::len));
+    let _ = write!(request, "{method} {path} HTTP/1.1\r\n");
+    let _ = write!(request, "Host: {host_header}\r\n");
+    if let Some(action) = soap_action {
+        let _ = write!(request, "SOAPAction: {action}\r\n");
+    }
+    if body.is_some() {
+        let _ = write!(request, "Content-Type: text/xml\r\n");
+        let _ = write!(
+            request,
+            "Content-Length: {}\r\n",
+            body.map_or(0, <[u8]>::len)
+        );
+    }
+    let _ = write!(request, "Connection: close\r\n\r\n");
+    if let Some(body) = body {
+        request.extend_from_slice(body);
+    }
+    stream.write_all(&request).ok()?;
+    stream.flush().ok()?;
+    read_http_body(&mut stream, false)
 }
 
 /// Punch the hole the QUIC dial walks: at every interval a hello goes to every candidate, and the
@@ -986,5 +1116,95 @@ pub(crate) fn punch(
             }
             return Some(from);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A loopback gateway that names a `WANIPConnection` control URL, maps the internal port to
+    /// 4100 and answers its external address as the TEST-NET the fixture uses. The mapping the
+    /// realm registers is the one this gateway handed out.
+    #[test]
+    fn a_gateway_maps_the_port_and_names_its_external_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(stream) = client else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
+                let mut request = String::new();
+                {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    request.push_str(&line);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).is_err()
+                            || header == "\r\n"
+                            || header == "\n"
+                        {
+                            break;
+                        }
+                        if let Some((name, value)) = header.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        request.push_str(&header);
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 && reader.read_exact(&mut body).is_err() {
+                        continue;
+                    }
+                    request.push_str(std::str::from_utf8(&body).unwrap_or(""));
+                }
+                let mut stream = stream;
+                let head = request;
+                let first = head.lines().next().unwrap_or_default();
+                if first.starts_with("GET ") {
+                    let body = format!(
+                        r"<root><URLBase>http://127.0.0.1:{port}</URLBase><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/WANIPConnection1</controlURL></service></serviceList></root>"
+                    );
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                } else if first.starts_with("POST ") {
+                    let action = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("SOAPAction:"))
+                        .unwrap_or_default()
+                        .trim()
+                        .trim_matches('"');
+                    let body = if action.ends_with("AddPortMapping") {
+                        r"<s:Envelope><s:Body><u:AddPortMappingResponse><NewExternalPort>4100</NewExternalPort></u:AddPortMappingResponse></s:Body></s:Envelope>".to_owned()
+                    } else {
+                        r"<s:Envelope><s:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>203.0.113.7</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>".to_owned()
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+        let location = format!("http://127.0.0.1:{port}/rootDesc.xml");
+        let mapped =
+            map_via_gateway(&location, 4000, 600).expect("a mapping and its external address");
+        assert_eq!(
+            mapped.to_string(),
+            "203.0.113.7:4100",
+            "the gateway's port and address are the registered ones"
+        );
     }
 }
