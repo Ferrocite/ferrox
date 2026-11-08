@@ -7,6 +7,9 @@ masque-down-8|server|0.15|861
 wireguard-raw-down-8|server|0.18|861|ceiling
 masque-down-8|server-threads|1.40|861
 shadowsocks-raw-duplex-8|client|0.84|696
+# Serving the xray client's shared gRPC connection reveals the cost the single-stream row never produced: one control thread per connection and the xray client's small stream window, both #696.
+shadowsocks-grpc-down-8|server-cpu|1.50|696
+shadowsocks-grpc-down-8|server-threads|1.08|696
 shadowsocks2022-raw-up-1|server|0.72|696
 vless-hysteria-down-8|server-threads|1.09|696
 vless-grpc-down-8|server-threads|1.14|696
@@ -41,6 +44,11 @@ vless-xhttp-streamup-down-8|server-threads|1.29|696
 # Stream-one relays now that the poll is armed, but an idle xray client still leaves the server leg at 0.59x of its ceiling.
 vless-xhttp-streamone-down-8|server|0.59|486|ceiling
 vless-tls-xhttp-h2-down-8|server-threads|1.85|696
+# The muxed gRPC server starts one h2 control thread per connection and pays the xray client's small stream window, the same #696 cost its vless and vmess siblings file.
+trojan-grpc-down-8|server-cpu|1.30|696
+trojan-grpc-down-8|server-threads|1.08|696
+trojan-tls-grpc-down-8|server-cpu|1.09|696
+trojan-tls-grpc-down-8|server-threads|1.15|696
 trojan-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-ws-down-8|server-threads|1.54|696
