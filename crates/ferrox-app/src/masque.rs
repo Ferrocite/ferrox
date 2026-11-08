@@ -7,7 +7,7 @@
 //! pool, and forwards a packet to the tunnel that owns its destination — or to
 //! the stack when no tunnel does.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -2021,8 +2021,8 @@ pub(crate) struct Shared {
 }
 
 /// One address a pool may hand out, per family: the server's own address, the
-/// network, the usable range and the next candidate, so an assignment walks the
-/// range rather than searching it.
+/// network, the usable range, the next candidate and the free runs, so an
+/// assignment takes the first free address without walking the used ones.
 #[derive(Debug, Clone)]
 struct Family {
     server: u128,
@@ -2031,7 +2031,9 @@ struct Family {
     first: u128,
     last: u128,
     next: u128,
-    used: HashSet<u128>,
+    free: BTreeMap<u128, u128>,
+    #[cfg(test)]
+    probes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2079,6 +2081,7 @@ impl AddressPool {
         Ok(pool)
     }
 
+    /// Grant one address per configured family, rolling both back when either is full.
     fn assign(&mut self) -> Vec<IpAddr> {
         let v4 = self.v4.as_mut().and_then(Family::allocate);
         let v6 = self.v6.as_mut().and_then(Family::allocate);
@@ -2098,16 +2101,17 @@ impl AddressPool {
         addrs
     }
 
+    /// Return a refused or finished assignment to its family's free runs.
     fn release(&mut self, ip: IpAddr) {
         match ip {
             IpAddr::V4(ip) => {
                 if let Some(family) = self.v4.as_mut() {
-                    family.used.remove(&u128::from(u32::from(ip)));
+                    family.release(u128::from(u32::from(ip)));
                 }
             }
             IpAddr::V6(ip) => {
                 if let Some(family) = self.v6.as_mut() {
-                    family.used.remove(&u128::from(ip));
+                    family.release(u128::from(ip));
                 }
             }
         }
@@ -2156,6 +2160,7 @@ pub(crate) fn test_spec() -> ServerSpec {
 }
 
 impl Family {
+    /// A family whose free runs are the usable range minus the server's own address.
     fn new(server: u128, prefix: u8, bits: u8) -> Result<Self, String> {
         let mask = if prefix == 0 {
             u128::MAX
@@ -2176,6 +2181,17 @@ impl Family {
         if first > last {
             return Err("masque pool has no assignable address".to_owned());
         }
+        let mut free = BTreeMap::new();
+        if server >= first && server <= last {
+            if first < server {
+                free.insert(first, server - 1);
+            }
+            if server < last {
+                free.insert(server + 1, last);
+            }
+        } else {
+            free.insert(first, last);
+        }
         Ok(Self {
             server,
             network,
@@ -2183,36 +2199,107 @@ impl Family {
             first,
             last,
             next: first,
-            used: HashSet::new(),
+            free,
+            #[cfg(test)]
+            probes: 0,
         })
     }
 
+    #[cfg(test)]
+    fn probe(&mut self) {
+        self.probes += 1;
+    }
+
+    /// Take the first free address at or after the cursor, wrapping once.
     fn allocate(&mut self) -> Option<u128> {
         let start = if self.next < self.first || self.next > self.last {
             self.first
         } else {
             self.next
         };
-        let mut candidate = start;
-        loop {
-            if candidate != self.server && !self.used.contains(&candidate) {
-                self.used.insert(candidate);
-                self.next = if candidate >= self.last {
-                    self.first
+        let before = self
+            .free
+            .range(..=start)
+            .next_back()
+            .map(|(&run_start, &run_end)| (run_start, run_end));
+        #[cfg(test)]
+        self.probe();
+        let candidate = match before {
+            Some((_, run_end)) if run_end >= start => start,
+            Some(_) => {
+                let next = self
+                    .free
+                    .range(start..)
+                    .next()
+                    .map(|(&run_start, _)| run_start);
+                #[cfg(test)]
+                self.probe();
+                if let Some(run_start) = next {
+                    run_start
                 } else {
-                    candidate + 1
-                };
-                return Some(candidate);
+                    let first = self.free.first_key_value().map(|(&run_start, _)| run_start);
+                    #[cfg(test)]
+                    self.probe();
+                    first?
+                }
             }
-            candidate = if candidate >= self.last {
-                self.first
-            } else {
-                candidate + 1
-            };
-            if candidate == start {
-                return None;
+            None => {
+                let first = self.free.first_key_value().map(|(&run_start, _)| run_start);
+                #[cfg(test)]
+                self.probe();
+                first?
+            }
+        };
+        let (&run_start, &run_end) = self.free.range(..=candidate).next_back()?;
+        debug_assert!(run_start <= candidate && candidate <= run_end);
+        self.free.remove(&run_start);
+        if run_start < candidate {
+            self.free.insert(run_start, candidate - 1);
+        }
+        if candidate < run_end {
+            self.free.insert(candidate + 1, run_end);
+        }
+        self.next = if candidate >= self.last {
+            self.first
+        } else {
+            candidate + 1
+        };
+        Some(candidate)
+    }
+
+    /// Return an address to the free runs, merging the neighbours it touches.
+    fn release(&mut self, address: u128) {
+        if address < self.first || address > self.last || address == self.server {
+            return;
+        }
+        let mut start = address;
+        let mut end = address;
+        let before = self
+            .free
+            .range(..=address)
+            .next_back()
+            .map(|(&run_start, &run_end)| (run_start, run_end));
+        if let Some((run_start, run_end)) = before {
+            if run_end >= address {
+                return;
+            }
+            if run_end.checked_add(1) == Some(address) {
+                self.free.remove(&run_start);
+                start = run_start;
             }
         }
+        let after = self
+            .free
+            .range(address..)
+            .next()
+            .map(|(&run_start, &run_end)| (run_start, run_end));
+        if let Some((run_start, run_end)) = after {
+            if address.checked_add(1) == Some(run_start) {
+                self.free.remove(&run_start);
+                end = run_end;
+            }
+        }
+        self.free.insert(start, end);
     }
 
     fn holds(&self, address: u128) -> bool {
@@ -3009,6 +3096,7 @@ fn peer_key(addrs: &[IpAddr]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn the_tunnel_queue_is_bounded() {
@@ -3096,6 +3184,114 @@ mod tests {
         assert!(
             verify_edge(&spec, &conn).is_err(),
             "a pinned edge with no certificate chain was accepted"
+        );
+    }
+
+    /// The pre-free-run allocator: a cursor and a used set, kept as the differential oracle.
+    struct ScanFamily {
+        server: u128,
+        first: u128,
+        last: u128,
+        next: u128,
+        used: HashSet<u128>,
+        probes: usize,
+    }
+
+    impl ScanFamily {
+        /// Mirror the pre-free-run allocator's cursor and used set.
+        fn from(family: &Family) -> Self {
+            Self {
+                server: family.server,
+                first: family.first,
+                last: family.last,
+                next: family.next,
+                used: HashSet::new(),
+                probes: 0,
+            }
+        }
+
+        /// The old first-fit walk, counting every candidate it visits.
+        fn allocate(&mut self) -> Option<u128> {
+            let start = if self.next < self.first || self.next > self.last {
+                self.first
+            } else {
+                self.next
+            };
+            let mut candidate = start;
+            loop {
+                self.probes += 1;
+                if candidate != self.server && !self.used.contains(&candidate) {
+                    self.used.insert(candidate);
+                    self.next = if candidate >= self.last {
+                        self.first
+                    } else {
+                        candidate + 1
+                    };
+                    return Some(candidate);
+                }
+                candidate = if candidate >= self.last {
+                    self.first
+                } else {
+                    candidate + 1
+                };
+                if candidate == start {
+                    return None;
+                }
+            }
+        }
+
+        /// The old release: drop the address from the used set.
+        fn release(&mut self, address: u128) {
+            self.used.remove(&address);
+        }
+    }
+
+    #[test]
+    /// The free runs take the same addresses as the old scan, and a full pool takes a
+    /// constant number of free-run lookups rather than one per host.
+    fn a_pool_takes_the_scan_order_without_scanning() {
+        let mut family = Family::new(u128::from(0x0a14_0001u32), 24, 32).expect("family");
+        let mut scan = ScanFamily::from(&family);
+        let mut allocated = Vec::new();
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let rounds = usize::try_from(family.last - family.first + 1).expect("pool size") * 3;
+        for _ in 0..rounds {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            if allocated.is_empty() || state & 3 != 0 {
+                let new = family.allocate();
+                let old = scan.allocate();
+                assert_eq!(new, old, "the free runs changed the allocation order");
+                if let Some(address) = new {
+                    allocated.push(address);
+                }
+            } else {
+                let index = (state as usize) % allocated.len();
+                let address = allocated.swap_remove(index);
+                family.release(address);
+                scan.release(address);
+            }
+        }
+        loop {
+            let new = family.allocate();
+            let old = scan.allocate();
+            assert_eq!(new, old, "the free runs changed the drain order");
+            if new.is_none() {
+                break;
+            }
+        }
+        let new_before = family.probes;
+        let old_before = scan.probes;
+        for _ in 0..100 {
+            assert_eq!(family.allocate(), None);
+            assert_eq!(scan.allocate(), None);
+        }
+        let new_work = family.probes - new_before;
+        let old_work = scan.probes - old_before;
+        assert!(
+            new_work * 10 < old_work,
+            "a full pool took {new_work} free-run probes against {old_work} scan probes"
         );
     }
 
