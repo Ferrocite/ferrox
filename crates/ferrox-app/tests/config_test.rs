@@ -89,23 +89,30 @@ fn test_refuses_json_it_cannot_parse() {
     let _ = std::fs::remove_file(&path);
 }
 
-fn geodata_config(url: &str) -> String {
-    format!(
-        r#"{{"geodata": {{"cron": "0 3 * * *", "outbound": "direct",
-        "assets": [{{"url": "{url}", "file": "Cargo.toml"}}]}},
+fn geodata_config(url: &str) -> (String, std::path::PathBuf) {
+    let file = format!("ferrox-test-geodata-{}.dat", std::process::id());
+    let asset = std::path::Path::new(env!("CARGO_BIN_EXE_ferrox-app"))
+        .parent()
+        .expect("binary directory")
+        .join(&file);
+    std::fs::write(&asset, b"").expect("write the geodata asset");
+    (
+        format!(
+            r#"{{"geodata": {{"cron": "0 3 * * *", "outbound": "direct",
+        "assets": [{{"url": "{url}", "file": "{file}"}}]}},
         "inbounds": [{{"tag": "in", "listen": "127.0.0.1", "port": 18095, "protocol": "socks",
         "settings": {{"auth": "noauth"}}}}],
         "outbounds": [{{"protocol": "freedom", "tag": "direct"}}]}}"#
+        ),
+        asset,
     )
 }
 
 /// The reference refuses an asset URL that is not HTTPS while building the config, so `-test` does too.
 #[test]
 fn test_refuses_a_geodata_asset_over_plain_http() {
-    let path = config_path(
-        "geodata-http",
-        &geodata_config("http://example.test/geosite.dat"),
-    );
+    let (text, asset) = geodata_config("http://example.test/geosite.dat");
+    let path = config_path("geodata-http", &text);
     let named = path.to_string_lossy().into_owned();
     let output = run(&["-test", "-c", &named]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -120,15 +127,14 @@ fn test_refuses_a_geodata_asset_over_plain_http() {
         "the refusal carries the reference's spelling: {stdout}"
     );
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&asset);
 }
 
-/// A schedule this tree does not run is still a config the reference runs, so it starts with one line saying so.
+/// A schedule the reference builds and starts is a config this tree accepts too.
 #[test]
-fn test_accepts_a_geodata_schedule_it_does_not_carry() {
-    let path = config_path(
-        "geodata-cron",
-        &geodata_config("https://example.test/geosite.dat"),
-    );
+fn test_accepts_a_geodata_schedule() {
+    let (text, asset) = geodata_config("https://example.test/geosite.dat");
+    let path = config_path("geodata-cron", &text);
     let named = path.to_string_lossy().into_owned();
     let output = run(&["-test", "-c", &named]);
     assert_eq!(
@@ -138,11 +144,8 @@ fn test_accepts_a_geodata_schedule_it_does_not_carry() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("asset downloads are not carried"),
-        "the unscheduled refresh is named instead of silent"
-    );
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&asset);
 }
 
 fn reality_config(seed: &str) -> String {

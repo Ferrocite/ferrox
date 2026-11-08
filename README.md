@@ -273,7 +273,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 
 | # | method | state | notes | supported today by |
 | --- | --- | --- | --- | --- |
-| 115 | Routing rules + geosite/geoip | partial — high priority; routing/selectors, balancers, webhook and geodata guard; observatory row 124; second routing pass row 30; rule sets and scripts row 116; SNI/Host routing behind a tun row 204 | — | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; [page](docs/function/engine-router.md) |
+| 115 | Routing rules + geosite/geoip | partial — high priority; routing/selectors, balancers, webhook and geodata refresh; observatory row 124; second routing pass row 30; rule sets and scripts row 116; SNI/Host routing behind a tun row 204 | — | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; [page](docs/function/engine-router.md) |
 | 116 | Routing rule sets + scripts | partial — inline and local rule sets plus Lua scripts; binary `.srs`, remote sets and script+rule mixing missing | — | Xray `app/router` + `common/lua`; sing-box `route/rule_set`; [page](docs/function/engine-router.md) |
 | 117 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | partial — high priority; four balancer strategies reading observatory row 124; urltest and selector planned | — | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory` |
 | 118 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | implemented — UDP/TCP/DoT/DoH/DoQ, cache, hosts, FakeDNS, filters and parallel groups; Lua script row 116 | xray scenarios 1/1. | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; [page](docs/function/engine-dns.md) |

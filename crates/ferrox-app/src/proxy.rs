@@ -286,7 +286,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     }
     crate::stats::install(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    install_file_apps(root, test)
+    let geodata = install_file_apps(root, test)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     install_default_outbound_tag(root);
     let freedom = has_protocol(root, "outbounds", "freedom");
@@ -348,6 +348,9 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         );
     }
     if !test {
+        if let Some(geodata) = geodata {
+            crate::geodata::start(geodata, route.clone(), outbound.clone(), root.clone());
+        }
         install_dns_route(route.clone(), outbound.as_ref());
         start_bridges(root, outbound.as_ref(), route.as_ref());
     }
@@ -399,8 +402,8 @@ fn start_observatory(
 }
 
 /// The file-backed apps and the `geodata` block: `-test` parses them without opening or creating anything the reference also leaves alone.
-fn install_file_apps(root: &Json, test: bool) -> Result<(), String> {
-    crate::geodata::parse(root, &crate::router::asset_dirs())?;
+fn install_file_apps(root: &Json, test: bool) -> Result<Option<crate::geodata::Config>, String> {
+    let geodata = crate::geodata::parse(root, &crate::router::asset_dirs())?;
     if test {
         crate::metrics::parse(root)?;
         crate::accesslog::parse(root)?;
@@ -408,7 +411,7 @@ fn install_file_apps(root: &Json, test: bool) -> Result<(), String> {
         crate::metrics::install(root)?;
         crate::accesslog::install(root)?;
     }
-    Ok(())
+    Ok(geodata)
 }
 
 /// Attach the runtime a management call drives, then listen for it; `-test` skips the listener.
@@ -2091,7 +2094,7 @@ struct Dynamic {
 /// Routing once its assets are read: the rules, every outbound a rule names, and the first
 /// configured outbound as the fallback the reference calls its default handler.
 #[derive(Debug)]
-struct RouteShared {
+pub(crate) struct RouteShared {
     routing: Arc<RwLock<crate::router::Routing>>,
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
@@ -2123,6 +2126,39 @@ struct RouteShared {
 }
 
 impl RouteShared {
+    /// Rebuild the rule table from the config after a geodata download, keeping the balancer state
+    /// a reparse cannot recreate. A script owns its own matchers and reads the files per call.
+    pub(crate) fn reload_routing(&self, root: &Json) -> Result<(), String> {
+        if self
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .carries_script()
+        {
+            return Ok(());
+        }
+        let Some(mut next) = crate::router::Routing::parse_in(root, crate::router::asset_dirs())?
+        else {
+            return Ok(());
+        };
+        let mut current = self
+            .routing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        next.adopt_balancer_state(&mut current);
+        *current = next;
+        Ok(())
+    }
+
+    /// The outbound a `geodata.outbound` tag names, or the default when the tag is empty, which is
+    /// what the reference's forced-tag dispatch falls back to.
+    pub(crate) fn outbound_for(&self, tag: &str) -> Option<Outbound> {
+        if tag.is_empty() {
+            return Some(self.default.clone());
+        }
+        self.tagged.get(tag).cloned()
+    }
+
     /// Remember a direct-dial server inbound the management API added, so a later rule that can
     /// reach it is proved against the lane it really serves.
     fn record_server_inbound(&self, tag: Option<String>) {
