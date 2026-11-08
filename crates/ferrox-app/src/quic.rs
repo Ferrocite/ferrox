@@ -56,7 +56,7 @@ pub(crate) struct QuicDial {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct QuicServer {
+pub(crate) struct QuicServer {
     address: std::sync::Arc<str>,
     port: u16,
     host: std::sync::Arc<str>,
@@ -3563,7 +3563,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             None => Datagram::plain(sock),
         };
         let bound = resolved.map(|_| Instant::now());
-        let Some((mut conn, _early)) = handshake_within(
+        let Some((conn, _early)) = handshake_within(
             &sock,
             peer,
             local,
