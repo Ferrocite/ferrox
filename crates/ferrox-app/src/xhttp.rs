@@ -5804,7 +5804,7 @@ mod tests {
         for _ in 0..64 {
             assert!(Arc::ptr_eq(&session, &get_or_create_session(id)));
         }
-        let swept = SWEEPS.with(|sweeps| sweeps.get());
+        let swept = SWEEPS.with(std::cell::Cell::get);
         end_session(id);
         crate::budgets::clear();
         assert_eq!(swept, 0, "a live lookup swept the session table");
