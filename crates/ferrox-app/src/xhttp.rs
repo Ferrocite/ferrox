@@ -1191,12 +1191,15 @@ impl Xmux {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct XhttpSettings {
     pub path: String,
     pub query: String,
     pub headers: Vec<(String, String)>,
     pub mode: XhttpMode,
     pub mode_source: ModeSource,
+    /// Dial the cleartext carrier with the HTTP/2 preface instead of an H1 head; the hub answers both.
+    pub h2c: bool,
     pub session_placement: Placement,
     pub session_key: String,
     pub seq_placement: Placement,
@@ -1255,6 +1258,7 @@ impl XhttpSettings {
             headers: Vec::new(),
             mode: XhttpMode::StreamOne,
             mode_source: ModeSource::Auto,
+            h2c: false,
             session_placement: Placement::Path,
             session_key: String::new(),
             seq_placement: Placement::Path,
@@ -1322,6 +1326,10 @@ impl XhttpSettings {
         } else {
             XhttpMode::auto_mode(settings, xhttp)
         };
+        out.h2c = xhttp
+            .get("h2c")
+            .and_then(crate::json::Json::as_bool)
+            .unwrap_or(false);
         // Xray's `SplitHTTPConfig.Build` replaces every knob below but host, path and mode with the `extra` block a link carries, which arrives either as an object or as the JSON string the link query holds.
         let extra = xhttp.get("extra");
         let owned: Option<crate::json::Json> = match extra {
@@ -4468,6 +4476,19 @@ mod tests {
                 .mode,
             XhttpMode::StreamUp
         );
+    }
+
+    #[test]
+    fn h2c_is_an_opt_in_framing_on_the_cleartext_carrier() {
+        let default = crate::json::parse(r#"{"network": "xhttp"}"#).expect("parses");
+        assert!(
+            !XhttpSettings::from_json(Some(&default))
+                .expect("default")
+                .h2c
+        );
+        let h2c = crate::json::parse(r#"{"network": "xhttp", "xhttpSettings": {"h2c": true}}"#)
+            .expect("parses");
+        assert!(XhttpSettings::from_json(Some(&h2c)).expect("h2c").h2c);
     }
 
     /// The path placements read the segments in order without collecting them: the default

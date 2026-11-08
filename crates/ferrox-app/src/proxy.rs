@@ -15436,6 +15436,34 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     }
     let server = resolve_outbound(&vless.address, vless.port)?;
     let mask = vless.carrier.tcp_mask();
+    if let Some(cfg) = vless.tls.as_deref() {
+        if let Carrier::Xhttp { settings } = &vless.carrier {
+            if crate::xhttp_h3::is_h3(&cfg.alpn) {
+                let address = server.ip().to_string();
+                let port = server.port();
+                let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                    crate::xhttp_h3::connect_split(&address, port, &vless.host, settings, cfg).map(
+                        |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                    )
+                } else {
+                    crate::xhttp_h3::connect_dual_split(&address, port, &vless.host, settings, cfg)
+                        .map(|(reader, writer)| {
+                            (Box::new(reader) as Box<dyn WindowRead + Send>, writer)
+                        })
+                };
+                let (read, writer) = pair?;
+                let closer = writer.clone();
+                let header = vless_mux_header(&vless.id);
+                return vless_mux_carried(
+                    vless,
+                    read,
+                    writer,
+                    Arc::new(move || closer.finish()),
+                    &header,
+                );
+            }
+        }
+    }
     if let Some(cfg) = vless.reality.as_deref() {
         let session = dial_reality_session(&server, cfg, mask)?;
         return vless_mux_session(&server, vless, session, || {
@@ -17109,22 +17137,96 @@ fn dial_tls_carried_stream(
     }
 }
 
+/// The cleartext xHTTP reader: H1 writes its own head, h2c reads frames the preface opened.
+pub(crate) enum XhttpPairRead {
+    H1(crate::xhttp::Reader<Connection>),
+    H2(crate::xhttp_h2::H2StreamReader),
+}
+
+impl XhttpPairRead {
+    fn set_poll(&mut self, every: Option<std::time::Duration>) {
+        if let Self::H1(reader) = self {
+            reader.set_poll(every);
+        }
+    }
+}
+
+impl Read for XhttpPairRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::H1(reader) => reader.read(buf),
+            Self::H2(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl RelayPoll for XhttpPairRead {
+    fn arm_relay_poll(&mut self) {
+        if let Self::H1(reader) = self {
+            reader.arm_relay_poll();
+        }
+    }
+}
+
+impl WindowRead for XhttpPairRead {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        match self {
+            Self::H1(reader) => reader.read_window(),
+            Self::H2(reader) => reader.read_window(),
+        }
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        match self {
+            Self::H1(reader) => reader.parks_on_timeout(),
+            Self::H2(reader) => reader.parks_on_timeout(),
+        }
+    }
+
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        match self {
+            Self::H1(reader) => reader.set_head_progress(progress),
+            Self::H2(reader) => reader.set_head_progress(progress),
+        }
+    }
+
+    fn awaits_head(&self) -> bool {
+        match self {
+            Self::H1(reader) => reader.awaits_head(),
+            Self::H2(reader) => reader.awaits_head(),
+        }
+    }
+}
+
 /// xHTTP outside TLS: stream-one replaces the whole session; the session shapes dial a second plain transport for the GET downlink (`dialer.go:411`).
 fn xhttp_pair(
     uplink: Connection,
     host: &str,
     settings: &crate::xhttp::XhttpSettings,
-) -> Option<(crate::xhttp::Reader<Connection>, crate::xhttp::XhttpWriter)> {
+) -> Option<(XhttpPairRead, crate::xhttp::XhttpWriter)> {
+    if settings.h2c {
+        // Prior-knowledge h2c: one cleartext listener answers both spellings, and this dial picks the framing.
+        let read = uplink.try_clone().ok()?;
+        let raw = Arc::new(uplink.try_clone().ok()?);
+        let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+            crate::xhttp_h2::connect_split(read, uplink, raw, host, settings, "http")
+        } else {
+            crate::xhttp_h2::connect_dual_split(read, uplink, raw, host, settings, "http")
+        };
+        return pair.map(|(reader, writer)| (XhttpPairRead::H2(reader), writer));
+    }
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         return crate::xhttp::connect(
             uplink,
             host,
             &crate::xhttp::dial_path(settings),
             &settings.headers,
-        );
+        )
+        .map(|(reader, writer)| (XhttpPairRead::H1(reader), writer));
     }
     let down = dial(&uplink.peer_addr().ok()?).ok()?;
     crate::xhttp::connect_dual(down, uplink, host, settings)
+        .map(|(reader, writer)| (XhttpPairRead::H1(reader), writer))
 }
 
 /// The xhttp rung of a ladder: a configured xhttp carrier dials its own settings, and a climb from another transport takes the default stream-one shape at the rung's path — the dial that rung made before the settings carried a mode.
@@ -17133,7 +17235,7 @@ fn xhttp_rung(
     host: &str,
     carrier: &Carrier,
     path: &str,
-) -> Option<(crate::xhttp::Reader<Connection>, crate::xhttp::XhttpWriter)> {
+) -> Option<(XhttpPairRead, crate::xhttp::XhttpWriter)> {
     if let Some(settings) = carrier.xhttp_settings() {
         return xhttp_pair(uplink, host, settings);
     }
@@ -43138,6 +43240,73 @@ mod tests {
         serving.join().expect("joins");
     }
 
+    #[test]
+    fn a_plaintext_h2c_dial_reaches_the_hub() {
+        assert_plaintext_h2c_dial(crate::xhttp::XhttpMode::StreamOne);
+    }
+
+    #[test]
+    fn a_plaintext_h2c_stream_up_reaches_the_hub() {
+        assert_plaintext_h2c_dial(crate::xhttp::XhttpMode::StreamUp);
+    }
+
+    #[test]
+    fn a_plaintext_h2c_packet_up_reaches_the_hub() {
+        assert_plaintext_h2c_dial(crate::xhttp::XhttpMode::PacketUp);
+    }
+
+    fn assert_plaintext_h2c_dial(mode: crate::xhttp::XhttpMode) {
+        let witness = format!("/plain-h2c-{mode:?}");
+        let id = [0x56u8; 16];
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            h2c: true,
+            ..*xhttp_settings_mode(&witness, mode)
+        });
+        let server_settings = settings.clone();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&id),
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                true,
+                None,
+                None,
+            );
+        });
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Xhttp { settings },
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        });
+        carrier_echo(out, port);
+        server.join().expect("joins");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == &witness),
+            "an h2c dial must open with the H2 preface"
+        );
+    }
+
     fn xhttp_vless_header(echo_port: u16) -> Vec<u8> {
         let link = ferrox_core::vless::VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
@@ -59917,6 +60086,185 @@ mod tests {
             master_key_log: None,
         });
         (identity, roots)
+    }
+
+    /// One h3 carrier identity: the ALPN is the only field that differs from the carrier TLS pair.
+    fn h3_loopback_identity() -> (
+        Arc<ferrox_core::tls::TlsServerConfig>,
+        ferrox_core::tls::TlsConfig,
+    ) {
+        let (server, mut client) = carried_tls_configs();
+        let server = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h3".to_vec()],
+            ..(*server).clone()
+        });
+        client.alpn = vec![b"h3".to_vec()].into();
+        (server, client)
+    }
+
+    /// A SOCKS flow through the carrier outbound and an echo reached over the carrier's own dial.
+    fn carrier_echo(out: Outbound, port: u16) {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
+        let echo_addr: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds front");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            dial_socks_outbound(&client, &out, &server, &Destination::from(echo_addr));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+    }
+
+    #[test]
+    fn h3_carries_vless_echo_over_loopback() {
+        let (identity, client) = h3_loopback_identity();
+        let id = [0x52u8; 16];
+        let settings = xhttp_settings_mode("/h3-vless", crate::xhttp::XhttpMode::StreamOne);
+        let users = one_vless_user(&id);
+        let service = crate::xhttp_h2::h3_vless_service(&settings, &users, true, None);
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client);
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_trojan_echo_over_loopback() {
+        let (identity, client) = h3_loopback_identity();
+        let key = crate::config::trojan_key("h3-secret");
+        let settings = xhttp_settings_mode("/h3-trojan", crate::xhttp::XhttpMode::StreamOne);
+        let keys = vec![key];
+        let service: Arc<dyn crate::xhttp_h3::H3Service> =
+            Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+                (*settings).clone(),
+                Arc::new(move |reader, writer, _| {
+                    serve_trojan_xhttp_accepted(reader, writer, &keys, true);
+                }),
+            ));
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = tls_trojan_out(port, key, Carrier::Xhttp { settings }, client);
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_vmess_echo_over_loopback() {
+        let (identity, client) = h3_loopback_identity();
+        let id = [0x53u8; 16];
+        let settings = xhttp_settings_mode("/h3-vmess", crate::xhttp::XhttpMode::StreamOne);
+        let users = crate::vmess::Users::single(id);
+        let service: Arc<dyn crate::xhttp_h3::H3Service> =
+            Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+                (*settings).clone(),
+                Arc::new(move |reader, writer, _| {
+                    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                    crate::vmess::serve_xhttp_accepted(
+                        reader,
+                        writer,
+                        users.as_ref(),
+                        true,
+                        &close,
+                    );
+                }),
+            ));
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = tls_vmess_out(port, id, Carrier::Xhttp { settings }, client);
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_a_sealed_vless_session_over_loopback() {
+        let (identity, client_config) = h3_loopback_identity();
+        let id = [0x54u8; 16];
+        let settings = xhttp_settings_mode("/h3-sealed", crate::xhttp::XhttpMode::StreamOne);
+        let users = one_vless_user(&id);
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let service = crate::xhttp_h2::h3_vless_service(&settings, &users, true, Some(decryption));
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let mut out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client_config);
+        if let Outbound::Vless(vless) = &mut out {
+            vless.encryption = Some(client);
+        }
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_a_vless_mux_stream_over_loopback() {
+        let (identity, client_config) = h3_loopback_identity();
+        let id = [0x55u8; 16];
+        let settings = xhttp_settings_mode("/h3-mux", crate::xhttp::XhttpMode::StreamOne);
+        let users = one_vless_user(&id);
+        let service = crate::xhttp_h2::h3_vless_service(&settings, &users, true, None);
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let mut out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client_config);
+        if let Outbound::Vless(vless) = &mut out {
+            vless.mux = true;
+        }
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_a_sealed_vless_mux_stream_over_loopback() {
+        let (identity, client_config) = h3_loopback_identity();
+        let id = [0x57u8; 16];
+        let settings = xhttp_settings_mode("/h3-sealed-mux", crate::xhttp::XhttpMode::StreamOne);
+        let users = one_vless_user(&id);
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let service = crate::xhttp_h2::h3_vless_service(&settings, &users, true, Some(decryption));
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let mut out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client_config);
+        if let Outbound::Vless(vless) = &mut out {
+            vless.encryption = Some(client);
+            vless.mux = true;
+        }
+        carrier_echo(out, port);
     }
 
     /// The accept call returns before the peer's first byte: the handshake rides a lane, and the
