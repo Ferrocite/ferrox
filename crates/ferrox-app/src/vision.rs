@@ -1888,6 +1888,16 @@ mod tests {
         );
     }
 
+    /// The pointer identity is the core sliced test; a join buffer here would grow the newtype.
+    #[test]
+    fn the_sealed_wrapper_adds_no_join_buffer() {
+        assert_eq!(
+            std::mem::size_of::<Sealed<Peeker>>(),
+            std::mem::size_of::<ferrox_core::vless_encryption::EncryptedStream<Peeker>>(),
+            "Sealed must forward the framer's parts, not join them into a staging buffer"
+        );
+    }
+
     /// The relay hands one buffer of up to 64 KiB; past one `buf.Size` block the u16 length wraps and the reference's reader refuses the frame, so the buffer frames as whole blocks and every byte still arrives.
     #[test]
     fn a_bulk_write_frames_every_block_inside_the_bound() {
