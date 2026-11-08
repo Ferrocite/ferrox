@@ -1308,51 +1308,58 @@ impl Engine {
         let mut stream_frame = None;
         let mut window_frame = false;
         let mut ack_eliciting = false;
-        if self.ack_pending[space] {
+        let probe = if space == ONE_RTT {
+            self.probe_target
+        } else {
+            None
+        };
+        if probe.is_none() && self.ack_pending[space] {
             put_ack(&mut payload, &self.ack_seen[space]);
             self.ack_pending[space] = false;
             self.ack_seen[space].clear();
         }
         if space == ONE_RTT {
-            if let Some(token) = self.path_response.take() {
-                payload.push(0x1b);
-                payload.extend_from_slice(&token);
-                ack_eliciting = true;
-            }
-            if self.window_update {
-                put_varint(&mut payload, 0x10);
-                put_varint(&mut payload, self.max_data);
-                put_varint(&mut payload, 0x11);
-                put_varint(&mut payload, self.stream_id);
-                put_varint(&mut payload, self.max_stream);
-                self.window_update = false;
-                window_frame = true;
-                ack_eliciting = true;
-            }
-            if let Some((offset, len)) = self.retx.pop_front() {
-                if let Some(frame) = self.write_stream_frame(&mut payload, offset, len) {
-                    stream_frame = Some(frame);
+            if probe.is_none() {
+                if let Some(token) = self.path_response.take() {
+                    payload.push(0x1b);
+                    payload.extend_from_slice(&token);
                     ack_eliciting = true;
                 }
-            }
-            if stream_frame.is_none()
-                && self.opened
-                && self.stream_sent < self.stream_base + self.stream_data.len() as u64
-                && self.bytes_in_flight < self.cwnd
-            {
-                let available = (self.stream_base + self.stream_data.len() as u64)
-                    .saturating_sub(self.stream_sent);
-                let limit = self.stream.min(self.data).saturating_sub(self.stream_sent);
-                let room = available
-                    .min(limit)
-                    .min(self.max_payload_room(space, payload.len() - head) as u64);
-                if room > 0 {
-                    if let Some(frame) =
-                        self.write_stream_frame(&mut payload, self.stream_sent, room)
-                    {
-                        self.stream_sent += frame.1;
+                if self.window_update {
+                    put_varint(&mut payload, 0x10);
+                    put_varint(&mut payload, self.max_data);
+                    put_varint(&mut payload, 0x11);
+                    put_varint(&mut payload, self.stream_id);
+                    put_varint(&mut payload, self.max_stream);
+                    self.window_update = false;
+                    window_frame = true;
+                    ack_eliciting = true;
+                }
+                if let Some((offset, len)) = self.retx.pop_front() {
+                    if let Some(frame) = self.write_stream_frame(&mut payload, offset, len) {
                         stream_frame = Some(frame);
                         ack_eliciting = true;
+                    }
+                }
+                if stream_frame.is_none()
+                    && self.opened
+                    && self.stream_sent < self.stream_base + self.stream_data.len() as u64
+                    && self.bytes_in_flight < self.cwnd
+                {
+                    let available = (self.stream_base + self.stream_data.len() as u64)
+                        .saturating_sub(self.stream_sent);
+                    let limit = self.stream.min(self.data).saturating_sub(self.stream_sent);
+                    let room = available
+                        .min(limit)
+                        .min(self.max_payload_room(space, payload.len() - head) as u64);
+                    if room > 0 {
+                        if let Some(frame) =
+                            self.write_stream_frame(&mut payload, self.stream_sent, room)
+                        {
+                            self.stream_sent += frame.1;
+                            stream_frame = Some(frame);
+                            ack_eliciting = true;
+                        }
                     }
                 }
             }
@@ -1371,11 +1378,6 @@ impl Engine {
                 ack_eliciting = true;
             }
         }
-        let probe = if space == ONE_RTT {
-            self.probe_target
-        } else {
-            None
-        };
         if payload.len() == head {
             if probe.is_some()
                 || (space == ONE_RTT && now.saturating_duration_since(self.last_send) >= KEEPALIVE)
@@ -1423,8 +1425,20 @@ impl Engine {
                 self.probe_target = None;
             }
             self.last_send = now;
-            udp.send(&payload)
-                .map_err(|error| format!("psiphon quic send failed: {error}"))?;
+            if let Err(error) = udp.send(&payload) {
+                if probe.is_some() {
+                    self.probe_inflight = false;
+                    self.probe_failed = true;
+                    self.probe_target = None;
+                    if ack_eliciting {
+                        self.sent.pop();
+                        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(size);
+                    }
+                    self.tx_scratch = payload;
+                    return Ok(false);
+                }
+                return Err(format!("psiphon quic send failed: {error}"));
+            }
             self.tx_scratch = payload;
             return Ok(true);
         }
@@ -2596,7 +2610,8 @@ mod tests {
     use super::{
         get_varint, get_varint_byte, lock, quic_server_name, randomize_cipher_suites,
         randomize_kx_groups, sessions, transport_params, Engine, ObfuscatedUdp, PacketIo,
-        QuicNoise, SentPacket, INITIAL_CWND, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
+        QuicNoise, SentPacket, Udp, INITIAL_CWND, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
+        PMTU_STEP,
     };
     use std::net::{SocketAddr, UdpSocket};
     use std::time::{Duration, Instant};
@@ -2611,6 +2626,20 @@ mod tests {
             "test.psiphon".to_owned(),
         )
         .expect("engine")
+    }
+
+    fn ready_engine() -> Engine {
+        let mut engine = test_engine();
+        let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(rustls::Tls13CipherSuite::quic_suite)
+            .expect("quic suite");
+        let dcid = engine.dcid.clone();
+        engine.one_rtt = Some(suite.keys(&dcid, rustls::Side::Client, rustls::quic::Version::V1));
+        engine.opened = true;
+        engine.max_datagram = 1200;
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine
     }
 
     #[test]
@@ -2956,6 +2985,60 @@ mod tests {
         engine.expire(sent_at + Duration::from_secs(10));
         assert!(engine.probe_failed);
         assert!(!engine.probe_inflight);
+    }
+
+    #[test]
+    fn a_path_mtu_probe_carries_no_stream_bytes() {
+        let mut engine = ready_engine();
+        engine.stream_data = vec![0u8; 4000];
+        engine.data = 4000;
+        engine.stream = 4000;
+        engine.bidi = 1;
+        engine.probe_target = Some((engine.max_datagram + PMTU_STEP).min(engine.packet_limit));
+        let target = engine.probe_target.expect("probe target");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        socket
+            .connect(receiver.local_addr().expect("receiver address"))
+            .expect("connect");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(engine
+            .send_space(ONE_RTT, &mut udp, Instant::now())
+            .expect("probe"));
+        let mut datagram = [0u8; MAX_PACKET_SIZE + 64];
+        assert_eq!(
+            receiver.recv(&mut datagram).expect("probe datagram"),
+            target
+        );
+        assert_eq!(engine.stream_sent, 0, "the probe carried stream bytes");
+        assert_eq!(engine.sent.last().expect("probe packet").stream, None);
+        assert!(engine.probe_inflight);
+        assert!(engine
+            .send_space(ONE_RTT, &mut udp, Instant::now())
+            .expect("data"));
+        assert!(
+            engine.stream_sent > 0,
+            "the stream did not follow the probe"
+        );
+    }
+
+    #[test]
+    fn a_failed_path_mtu_probe_send_stops_discovery() {
+        let mut engine = ready_engine();
+        engine.probe_target = Some((engine.max_datagram + PMTU_STEP).min(engine.packet_limit));
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(!engine
+            .send_space(ONE_RTT, &mut udp, Instant::now())
+            .expect("the probe send is contained"));
+        assert!(engine.probe_failed);
+        assert!(!engine.probe_inflight);
+        assert!(engine.probe_target.is_none());
+        assert!(engine.sent.is_empty());
+        assert_eq!(engine.bytes_in_flight, 0);
     }
 
     #[test]
