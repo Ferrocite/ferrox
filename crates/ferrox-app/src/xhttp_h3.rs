@@ -50,10 +50,10 @@ impl Write for Wire {
 }
 
 impl Wire {
-    fn activity(&self) -> Option<Arc<Activity>> {
+    fn activity(&self) -> Arc<Activity> {
         match self {
-            Self::Server(stream) => Some(stream.activity()),
-            Self::Client(stream) => Some(Arc::clone(&stream.activity)),
+            Self::Server(stream) => stream.activity(),
+            Self::Client(stream) => Arc::clone(&stream.activity),
         }
     }
 
@@ -88,7 +88,7 @@ pub(crate) struct H3Reader {
     head_seen: bool,
     expect_request: bool,
     idle_since: Option<Instant>,
-    activity: Option<Arc<Activity>>,
+    activity: Arc<Activity>,
     deadline: Option<Instant>,
 }
 
@@ -138,9 +138,7 @@ impl H3Reader {
             return true;
         }
         let idle = if self.head_seen {
-            self.activity
-                .as_ref()
-                .map_or_else(|| since.elapsed(), |activity| activity.age())
+            self.activity.age()
         } else {
             since.elapsed()
         };

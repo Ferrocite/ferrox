@@ -3746,16 +3746,19 @@ struct ServerConn {
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
+/// One stream a reap hands to a new worker: the connection, the stream id, the preface flag and the clock they share.
+type FreshStream = (
+    Arc<Mutex<quiche::Connection>>,
+    u64,
+    Arc<AtomicBool>,
+    Arc<Activity>,
+);
+
 /// The driver's two datagram scratch buffers and the tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
-    fresh: Vec<(
-        Arc<Mutex<quiche::Connection>>,
-        u64,
-        Arc<AtomicBool>,
-        Arc<Activity>,
-    )>,
+    fresh: Vec<FreshStream>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
     /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
