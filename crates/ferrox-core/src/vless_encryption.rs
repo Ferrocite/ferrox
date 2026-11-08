@@ -2381,8 +2381,6 @@ mod tests {
 
     #[test]
     fn a_sliced_record_write_allocates_nothing_after_warmup() {
-        use std::io::Write as _;
-
         struct Sink;
         impl Write for Sink {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
