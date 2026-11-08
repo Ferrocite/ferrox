@@ -13908,10 +13908,16 @@ fn serve_tun_inbound(
 ) -> bool {
     let stack = tun_stack(inbound);
     if stack != "loopback" {
-        if !matches!(stack, "smoltcp" | "userspace") {
-            eprintln!("tun inbound: unknown stack `{stack}`, using the userspace stack");
-        }
-        return match crate::tun_stack::serve(spec, out) {
+        let mode = match stack {
+            "smoltcp" | "userspace" => crate::tun_stack::Mode::Userspace,
+            "system" => crate::tun_stack::Mode::System,
+            "hybrid" => crate::tun_stack::Mode::Hybrid,
+            _ => {
+                eprintln!("tun inbound: unknown stack `{stack}`, using the userspace stack");
+                crate::tun_stack::Mode::Userspace
+            }
+        };
+        return match crate::tun_stack::serve(spec, out, mode) {
             Ok(()) => true,
             Err(error) => {
                 eprintln!("tun inbound: {error}");

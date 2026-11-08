@@ -1,14 +1,17 @@
-//! The userspace TUN inbound: `tun-rs` carries the kernel device, batching a
-//! queue's packets with GSO/GRO, and the `WireGuard` server stack owns the TCP
-//! state machine and the per-flow proxy dial. Every queue is one stack, one
-//! reader and one writer, so a multi-queue device spreads flows across cores
-//! without a lock between them.
+//! The TUN inbound: `tun-rs` carries the kernel device, batching a queue's
+//! packets with GSO/GRO, and the `WireGuard` server stack owns the TCP state
+//! machine and the per-flow proxy dial. Every queue is one stack, one reader
+//! and one writer, so a multi-queue device spreads flows across cores without a
+//! lock between them. The `system` and `hybrid` names hand TCP to the kernel
+//! stack through a NAT loop on Linux instead; hybrid falls back to this stack
+//! for a flow the kernel cannot take.
 
 use std::io;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -23,20 +26,55 @@ use crate::tun::Spec;
 use crate::wg_stack::Packet;
 use crate::wireguard::DeviceConfig;
 
-const RX_QUEUE: usize = 1024;
-const TX_QUEUE: usize = 1024;
+pub(crate) const RX_QUEUE: usize = 1024;
+pub(crate) const TX_QUEUE: usize = 1024;
 /// A writer keeps this many aggregate-sized buffers so GRO never allocates on
 /// the packet path; 32 packets fill one 64 KiB aggregate.
 #[cfg(target_os = "linux")]
 const WRITE_BATCH: usize = 64;
 
 #[cfg(unix)]
-type WakeWriter = std::os::unix::net::UnixStream;
+pub(crate) type WakeWriter = std::os::unix::net::UnixStream;
 #[cfg(not(unix))]
-type WakeWriter = ();
+pub(crate) type WakeWriter = ();
 
-/// Open the device and start one stack per queue.
-pub(crate) fn serve(spec: &Spec, out: &Outbound) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Userspace,
+    System,
+    Hybrid,
+}
+
+/// Open the device and start the configured TCP stack.
+pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<()> {
+    match mode {
+        Mode::Userspace => serve_userspace(spec, out),
+        #[cfg(target_os = "linux")]
+        Mode::System => crate::tun_system::serve(spec, out, false),
+        #[cfg(target_os = "linux")]
+        Mode::Hybrid => match crate::tun_system::serve(spec, out, true) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "tun inbound: the hybrid stack is unavailable ({error}), using the userspace stack"
+                );
+                serve_userspace(spec, out)
+            }
+        },
+        #[cfg(not(target_os = "linux"))]
+        Mode::System => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the system tun stack is Linux-only",
+        )),
+        #[cfg(not(target_os = "linux"))]
+        Mode::Hybrid => {
+            eprintln!("tun inbound: the hybrid stack is Linux-only, using the userspace stack");
+            serve_userspace(spec, out)
+        }
+    }
+}
+
+fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<()> {
     let (first, offload, queues) = open(spec)?;
     let first = Arc::new(first);
     spawn_queue(Arc::clone(&first), spec, offload, out.clone());
@@ -81,7 +119,11 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
     }
 }
 
-fn build(spec: &Spec, multi: bool, offload: bool) -> io::Result<(SyncDevice, bool, bool)> {
+pub(crate) fn build(
+    spec: &Spec,
+    multi: bool,
+    offload: bool,
+) -> io::Result<(SyncDevice, bool, bool)> {
     spec.validate()?;
     let mtu = u16::try_from(spec.mtu()).map_err(|_| {
         io::Error::new(
@@ -148,7 +190,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     thread::spawn(move || recv_loop(device, packets, reused, mtu, wake_write));
 }
 
-fn device_config(spec: &Spec) -> DeviceConfig {
+pub(crate) fn device_config(spec: &Spec) -> DeviceConfig {
     DeviceConfig {
         secret: [0; 32],
         addresses: vec![spec.address()],
@@ -164,7 +206,7 @@ fn device_config(spec: &Spec) -> DeviceConfig {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::needless_pass_by_value)]
-fn recv_loop(
+pub(crate) fn recv_loop(
     device: Arc<SyncDevice>,
     packets: SyncSender<Packet>,
     reuse: Receiver<Vec<u8>>,
@@ -209,7 +251,7 @@ fn recv_loop(
 
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::needless_pass_by_value)]
-fn recv_loop(
+pub(crate) fn recv_loop(
     device: Arc<SyncDevice>,
     packets: SyncSender<Packet>,
     reuse: Receiver<Vec<u8>>,
@@ -248,7 +290,7 @@ fn send_loop(
     failed: &AtomicBool,
 ) {
     if !offload {
-        send_plain(device, packets, failed);
+        send_plain(device, packets, failed, None);
         return;
     }
     let mut gro = GROTable::default();
@@ -295,16 +337,16 @@ fn send_loop(
     _offload: bool,
     failed: &AtomicBool,
 ) {
-    send_plain(device, packets, failed);
+    send_plain(device, packets, failed, None);
 }
 
 #[cfg(unix)]
-fn wake_signal(wake: &WakeWriter) {
+pub(crate) fn wake_signal(wake: &WakeWriter) {
     let _ = unsafe { libc::write(wake.as_raw_fd(), c"".as_ptr().cast(), 1) };
 }
 
 #[cfg(not(unix))]
-fn wake_signal(_: &WakeWriter) {}
+pub(crate) fn wake_signal(_: &WakeWriter) {}
 
 fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
     let mut bytes = reuse.try_recv().unwrap_or_default();
@@ -314,12 +356,20 @@ fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn send_plain(device: Arc<SyncDevice>, packets: Receiver<Vec<u8>>, failed: &AtomicBool) {
+pub(crate) fn send_plain(
+    device: Arc<SyncDevice>,
+    packets: Receiver<Vec<u8>>,
+    failed: &AtomicBool,
+    recycle: Option<Sender<Vec<u8>>>,
+) {
     while let Ok(packet) = packets.recv() {
         if let Err(error) = device.send(&packet) {
             eprintln!("tun write: {error}");
             failed.store(true, Ordering::Relaxed);
             return;
+        }
+        if let Some(recycle) = &recycle {
+            let _ = recycle.send(packet);
         }
     }
 }
