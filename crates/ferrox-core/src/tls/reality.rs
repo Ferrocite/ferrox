@@ -1127,7 +1127,7 @@ impl<S: Stream> RealityClientSession<S> {
     /// along because the core stays deterministic: the caller owns time.
     pub fn connect(cfg: &RealityClientConfig, now: u32, io: S) -> Result<Self, TlsError> {
         let profile = crate::tls::shaped::Fingerprint::resolve(&cfg.fingerprint)
-            .and_then(crate::tls::shaped::Fingerprint::profile)
+            .and_then(crate::tls::shaped::Fingerprint::reality_profile)
             .ok_or_else(|| {
                 TlsError::Other(format!(
                     "reality: fingerprint {:?} shapes no TLS 1.3 hello",

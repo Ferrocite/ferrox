@@ -1641,6 +1641,50 @@ mod tests {
         assert_eq!(&versions[4..], &[0x02, 0x03, 0x03], "1.2 only");
     }
 
+    /// REALITY refuses a fingerprint with no TLS 1.3 share, so the REALITY dial swaps android for
+    /// a variant carrying the suites and the hybrid share its uTLS preset omits.
+    #[test]
+    fn android_offers_the_tls13_share_reality_needs() {
+        let fingerprint = Fingerprint::resolve("android").expect("a preset name resolves");
+        let plain = Hello::canonical(
+            fingerprint.profile().expect("a shaped profile"),
+            "example.com",
+        );
+        assert!(
+            plain.auth_secret().is_none(),
+            "the uTLS preset stays byte-exact"
+        );
+        let profile = fingerprint.reality_profile().expect("a shaped profile");
+        let hello =
+            Hello::build(profile, "example.com", &[], false, &[], None).expect("a shaped hello");
+        let exts = extensions(&hello.msg[4..]);
+        let versions = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x002b)
+            .expect("the hello names its versions");
+        assert_eq!(&versions[5..7], &[0x03, 0x04], "a 1.3 offer");
+        let share = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x0033)
+            .expect("the hello shares a key");
+        let body = &share[4..];
+        let mut at = 2;
+        let mut groups = Vec::new();
+        while at + 4 <= body.len() {
+            groups.push(u16::from_be_bytes([body[at], body[at + 1]]));
+            at += 4 + usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
+        }
+        assert_eq!(
+            groups,
+            [0x11ec, 0x001d],
+            "the hybrid first, then the plain share the reference prefers"
+        );
+        assert!(
+            hello.auth_secret().is_some(),
+            "REALITY seals through the share"
+        );
+    }
+
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
     /// cookie — is the walk no golden byte names, and it still closes exactly on the vector it
     /// measured: every width below is the one the same walk wrote its bytes into.

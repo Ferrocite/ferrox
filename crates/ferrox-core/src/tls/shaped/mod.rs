@@ -156,6 +156,12 @@ impl Fingerprint {
         self.0
     }
 
+    /// REALITY needs TLS 1.3 suites and an X25519MLKEM768 share; android is the one preset without them.
+    pub(crate) fn reality_profile(self) -> Option<&'static Profile> {
+        self.0
+            .map(|profile| profiles::reality_variant(profile).unwrap_or(profile))
+    }
+
     /// Whether this fingerprint shapes its hello; the stock one dials rustls's own.
     pub fn is_shaped(self) -> bool {
         self.0.is_some()
