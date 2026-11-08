@@ -1191,12 +1191,15 @@ impl Xmux {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct XhttpSettings {
     pub path: String,
     pub query: String,
     pub headers: Vec<(String, String)>,
     pub mode: XhttpMode,
     pub mode_source: ModeSource,
+    /// Dial the cleartext carrier with the HTTP/2 preface instead of an H1 head; the hub answers both.
+    pub h2c: bool,
     pub session_placement: Placement,
     pub session_key: String,
     pub seq_placement: Placement,
@@ -1255,6 +1258,7 @@ impl XhttpSettings {
             headers: Vec::new(),
             mode: XhttpMode::StreamOne,
             mode_source: ModeSource::Auto,
+            h2c: false,
             session_placement: Placement::Path,
             session_key: String::new(),
             seq_placement: Placement::Path,
@@ -1337,6 +1341,10 @@ impl XhttpSettings {
             },
             Some(_) => return None,
         };
+        out.h2c = xhttp
+            .get("h2c")
+            .and_then(crate::json::Json::as_bool)
+            .unwrap_or(false);
         out.headers = crate::config::masquerade_headers(xhttp.get("headers"));
         out.session_placement = placement_or(
             xhttp.get("sessionIDPlacement"),
@@ -4468,6 +4476,39 @@ mod tests {
                 .mode,
             XhttpMode::StreamUp
         );
+    }
+
+    #[test]
+    fn h2c_is_an_opt_in_framing_on_the_cleartext_carrier() {
+        let default = crate::json::parse(r#"{"network": "xhttp"}"#).expect("parses");
+        assert!(
+            !XhttpSettings::from_json(Some(&default))
+                .expect("default")
+                .h2c
+        );
+        let h2c = crate::json::parse(r#"{"network": "xhttp", "xhttpSettings": {"h2c": true}}"#)
+            .expect("parses");
+        assert!(XhttpSettings::from_json(Some(&h2c)).expect("h2c").h2c);
+        let object = crate::json::parse(
+            r#"{"network": "xhttp", "xhttpSettings": {"extra": {"h2c": true}}}"#,
+        )
+        .expect("parses");
+        assert!(XhttpSettings::from_json(Some(&object)).expect("h2c").h2c);
+        let string = crate::json::parse(
+            r#"{"network": "xhttp", "xhttpSettings": {"extra": "{\"h2c\": true}"}}"#,
+        )
+        .expect("parses");
+        assert!(XhttpSettings::from_json(Some(&string)).expect("h2c").h2c);
+        let cleared = crate::json::parse(
+            r#"{"network": "xhttp", "xhttpSettings": {"h2c": true, "extra": {"h2c": false}}}"#,
+        )
+        .expect("parses");
+        assert!(!XhttpSettings::from_json(Some(&cleared)).expect("h2c").h2c);
+        let replaced = crate::json::parse(
+            r#"{"network": "xhttp", "xhttpSettings": {"h2c": true, "extra": {}}}"#,
+        )
+        .expect("parses");
+        assert!(!XhttpSettings::from_json(Some(&replaced)).expect("h2c").h2c);
     }
 
     /// The path placements read the segments in order without collecting them: the default
