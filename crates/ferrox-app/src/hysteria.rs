@@ -1225,6 +1225,7 @@ struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     client_cid: Vec<u8>,
     initial_dcid: Vec<u8>,
+    source_ids: Vec<Vec<u8>>,
     authed: bool,
     settings_sent: bool,
     settings_done: bool,
@@ -2205,6 +2206,7 @@ impl Router<'_> {
             conn: Arc::new(Mutex::new(conn)),
             client_cid: client_cid.to_vec(),
             initial_dcid: initial_dcid.to_vec(),
+            source_ids: Vec::new(),
             authed: false,
             settings_sent: false,
             settings_done: false,
@@ -2224,12 +2226,13 @@ impl Router<'_> {
             self.by_initial_dcid
                 .insert(initial_dcid.to_vec(), key.clone());
         }
-        if let Some(inbound) = self.routes.get(&key) {
+        if let Some(inbound) = self.routes.get_mut(&key) {
             if let Ok(guard) = inbound.conn.lock() {
                 let ids: Vec<_> = guard.source_ids().collect();
                 for id in ids {
-                    self.by_initial_dcid
-                        .insert(id.as_ref().to_vec(), key.clone());
+                    let raw = id.as_ref().to_vec();
+                    self.by_initial_dcid.insert(raw.clone(), key.clone());
+                    inbound.source_ids.push(raw);
                 }
             }
         }
@@ -2243,6 +2246,7 @@ impl Router<'_> {
             key,
             &inbound.client_cid,
             &inbound.initial_dcid,
+            &inbound.source_ids,
         );
     }
 
@@ -2398,6 +2402,7 @@ impl Router<'_> {
                     key,
                     &inbound.client_cid,
                     &inbound.initial_dcid,
+                    &inbound.source_ids,
                 );
                 for flow in inbound.udp.values() {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -2427,6 +2432,7 @@ fn forget_route(
     key: &[u8],
     client_cid: &[u8],
     initial_dcid: &[u8],
+    source_ids: &[Vec<u8>],
 ) {
     if !client_cid.is_empty()
         && by_client_cid
@@ -2441,6 +2447,14 @@ fn forget_route(
             .is_some_and(|held| held.as_slice() == key)
     {
         by_initial_dcid.remove(initial_dcid);
+    }
+    for alias in source_ids {
+        if by_initial_dcid
+            .get(alias)
+            .is_some_and(|held| held.as_slice() == key)
+        {
+            by_initial_dcid.remove(alias);
+        }
     }
 }
 
@@ -3105,6 +3119,7 @@ mod tests {
                     conn: Arc::clone(&session.shared),
                     client_cid: vec![2u8; 8],
                     initial_dcid: vec![3u8; 8],
+                    source_ids: Vec::new(),
                     authed: true,
                     settings_sent: true,
                     settings_done: true,
@@ -3287,6 +3302,7 @@ mod tests {
                     conn: Arc::clone(&session.shared),
                     client_cid: client.clone(),
                     initial_dcid: initial.clone(),
+                    source_ids: Vec::new(),
                     authed: false,
                     settings_sent: false,
                     settings_done: false,

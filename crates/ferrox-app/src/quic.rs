@@ -139,20 +139,7 @@ impl PooledStream {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
-        for _ in 0..2 {
-            if conn.active_scids() >= 2 {
-                break;
-            }
-            let mut scid = [0u8; 16];
-            getrandom::fill(&mut scid)
-                .map_err(|error| std::io::Error::other(format!("quic scid: {error}")))?;
-            conn.new_scid(
-                &quiche::ConnectionId::from_ref(&scid),
-                u128::from_le_bytes(scid),
-                true,
-            )
-            .map_err(|error| std::io::Error::other(format!("quic scid: {error:?}")))?;
-        }
+        issue_two_scids(&mut conn, quiche::MAX_CONN_ID_LEN)?;
         let at = conn
             .migrate_source(new_local)
             .map_err(|error| std::io::Error::other(format!("quic migrate: {error:?}")))?;
@@ -3001,7 +2988,9 @@ pub(crate) fn udp_to_server(
 /// The in-process resumption blobs: one captured session per edge, so a later dial can offer
 /// it for 0-RTT. The pool's key is what a session belongs to: edge, trust and ECH together,
 /// the same identity the pool deduplicates on.
-static RESUMPTION: OnceLock<Mutex<HashMap<QuicServer, Vec<u8>>>> = OnceLock::new();
+const RESUMPTION_CAP: usize = 128;
+type ResumptionCache = Vec<(QuicServer, Vec<u8>)>;
+static RESUMPTION: OnceLock<Mutex<ResumptionCache>> = OnceLock::new();
 
 /// One ticket key for the process, so a server issues a ticket a later dial can offer.
 static TICKET_KEY: OnceLock<[u8; 48]> = OnceLock::new();
@@ -3017,7 +3006,10 @@ fn ticket_key() -> &'static [u8; 48] {
 /// A captured session for this edge, if an earlier dial's peer issued a ticket.
 fn resumption_entry(key: &QuicServer) -> Option<Vec<u8>> {
     let entries = RESUMPTION.get_or_init(Default::default).lock().ok()?;
-    entries.get(key).cloned()
+    entries
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
 }
 
 /// Keep the ticket a completed handshake read, already stamped with the keys of that handshake.
@@ -3027,7 +3019,14 @@ fn resumption_remember(key: &QuicServer, conn: &quiche::Connection) {
         return;
     };
     if let Ok(mut entries) = RESUMPTION.get_or_init(Default::default).lock() {
-        entries.insert(key.clone(), blob);
+        if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = blob;
+            return;
+        }
+        entries.push((key.clone(), blob));
+        while entries.len() > RESUMPTION_CAP {
+            entries.remove(0);
+        }
     }
 }
 
@@ -3772,20 +3771,7 @@ impl QuicStream {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
-        for _ in 0..2 {
-            if conn.active_scids() >= 2 {
-                break;
-            }
-            let mut scid = [0u8; 16];
-            getrandom::fill(&mut scid)
-                .map_err(|error| std::io::Error::other(format!("quic scid: {error}")))?;
-            conn.new_scid(
-                &quiche::ConnectionId::from_ref(&scid),
-                u128::from_le_bytes(scid),
-                true,
-            )
-            .map_err(|error| std::io::Error::other(format!("quic scid: {error:?}")))?;
-        }
+        issue_two_scids(&mut conn, quiche::MAX_CONN_ID_LEN)?;
         let at = conn
             .migrate_source(new_local)
             .map_err(|error| std::io::Error::other(format!("quic migrate: {error:?}")))?;
@@ -4103,7 +4089,7 @@ fn route(
     if conn.recv(buf, info).is_err() {
         return;
     }
-    issue_spare_scids(&mut conn, sock, out);
+    issue_spare_scids_len(&mut conn, sock, out, quiche::MAX_CONN_ID_LEN);
     flush_egress(&mut conn, sock);
     let state = Arc::new(ServerConn {
         conn: Arc::new(Mutex::new(conn)),
@@ -4211,6 +4197,9 @@ fn reap(
                     .learned
                     .push((id.as_ref().to_vec(), Arc::clone(state)));
             }
+        }
+        if !conn.is_established() {
+            continue;
         }
         if let Ok(mut seen) = state.seen.lock() {
             let mut spawned = false;
@@ -4374,32 +4363,44 @@ pub(crate) fn server_accept(
     conn
 }
 
-/// Issue spare source IDs a client can walk onto a migrated path with: without them a fresh path
-/// has no destination ID to name it. Two per established connection is the number the migration
-/// tests and the references walk; the transport limit `4` keeps a third spare if one retires.
-pub(crate) fn issue_spare_scids(conn: &mut quiche::Connection, sock: &Datagram, out: &mut [u8]) {
+/// Mint two spare source IDs for a client to walk onto a migrated path with. Each ID gets an
+/// independent reset token; the router SCID length is named by the caller.
+fn issue_two_scids(conn: &mut quiche::Connection, len: usize) -> std::io::Result<()> {
     for _ in 0..2 {
         if conn.active_scids() >= 2 {
             break;
         }
-        let mut scid = [0u8; 16];
-        if getrandom::fill(&mut scid).is_err() {
-            break;
-        }
-        if conn
-            .new_scid(
-                &quiche::ConnectionId::from_ref(&scid),
-                u128::from_le_bytes(scid),
-                true,
-            )
-            .is_err()
-        {
-            break;
-        }
+        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        getrandom::fill(&mut scid[..len])
+            .map_err(|error| std::io::Error::other(format!("quic scid: {error}")))?;
+        let mut token = [0u8; 16];
+        getrandom::fill(&mut token)
+            .map_err(|error| std::io::Error::other(format!("quic token: {error}")))?;
+        conn.new_scid(
+            &quiche::ConnectionId::from_ref(&scid[..len]),
+            u128::from_le_bytes(token),
+            true,
+        )
+        .map_err(|error| std::io::Error::other(format!("quic scid: {error:?}")))?;
     }
-    while let Ok((written, info)) = conn.send(out) {
-        let _ = sock.send_to(&out[..written], info.to);
-    }
+    Ok(())
+}
+
+/// Issue spare source IDs a client can walk onto a migrated path with: without them a fresh path
+/// has no destination ID to name it. Two per established connection is the number the migration
+/// tests and the references walk; the transport limit `4` keeps a third spare if one retires.
+pub(crate) fn issue_spare_scids(conn: &mut quiche::Connection, sock: &Datagram, out: &mut [u8]) {
+    issue_spare_scids_len(conn, sock, out, SCID_LEN);
+}
+
+pub(crate) fn issue_spare_scids_len(
+    conn: &mut quiche::Connection,
+    sock: &Datagram,
+    _out: &mut [u8],
+    len: usize,
+) {
+    let _ = issue_two_scids(conn, len);
+    flush_egress(conn, sock);
 }
 
 #[cfg(test)]
