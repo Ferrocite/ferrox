@@ -1,0 +1,26 @@
+name: all-features
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  test:
+    name: cargo test --workspace --all-features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+          cache-on-failure: true
+      - run: cargo test --workspace --all-features --locked
