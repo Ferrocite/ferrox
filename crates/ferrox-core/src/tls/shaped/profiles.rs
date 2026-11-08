@@ -99,6 +99,59 @@ static P_ANDROID: Profile = Profile {
     ],
 };
 
+// uTLS's android offers no TLS 1.3 suites or share, so REALITY refuses it; this variant adds both.
+static P_ANDROID_REALITY: Profile = Profile {
+    name: "android",
+    ciphers: &[
+        0x1301, 0x1302, 0x1303, 0xc02b, 0xc02c, 0xcca9, 0xc02f, 0xc030, 0xcca8, 0xc013, 0xc014,
+        0x009c, 0x009d, 0x002f, 0x0035,
+    ],
+    shuffle: false,
+    exts: &[
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x001d, 0x0017, 0x0018]),
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
+            ]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x001d],
+                reuse: false,
+            },
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0304, 0x0303]),
+        },
+    ],
+};
+
 pub(crate) static P_CHROME: Profile = Profile {
     name: "chrome",
     ciphers: &[
@@ -2515,4 +2568,9 @@ pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
         _ => return None,
     };
     Some(p)
+}
+
+/// REALITY's one preset swap: android carries no TLS 1.3 share, so the dial uses the variant.
+pub(crate) fn reality_variant(profile: &'static Profile) -> Option<&'static Profile> {
+    std::ptr::eq(profile, &P_ANDROID).then_some(&P_ANDROID_REALITY)
 }

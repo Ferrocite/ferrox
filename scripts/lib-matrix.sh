@@ -96,6 +96,14 @@ matrix_engine_skip_reason() {
     printf '%s\n' "sing-box at this pin has no stream layer on a Shadowsocks outbound"
     return 0
   fi
+  if [[ "$id" == vless-vision-reality-android-* && "$role" == client ]]; then
+    case "$engine" in
+      xray-core | xray-core-rust | sing-box | zeronet)
+        printf '%s\n' "android's uTLS preset has no TLS 1.3 suites or key share, so REALITY cannot establish"
+        return 0
+        ;;
+    esac
+  fi
   case "$engine:$id" in
     sing-box:*-quic-*)
       printf '%s\n' "sing-box at this pin has no QUIC transport" ;;

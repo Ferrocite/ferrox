@@ -1641,6 +1641,39 @@ mod tests {
         assert_eq!(&versions[4..], &[0x02, 0x03, 0x03], "1.2 only");
     }
 
+    /// REALITY refuses a fingerprint with no TLS 1.3 key share, so the REALITY dial swaps android
+    /// for a variant carrying the X25519 share and 1.3 offer its uTLS preset omits.
+    #[test]
+    fn android_offers_the_tls13_share_reality_needs() {
+        let fingerprint = Fingerprint::resolve("android").expect("a preset name resolves");
+        let plain = Hello::canonical(
+            fingerprint.profile().expect("a shaped profile"),
+            "example.com",
+        );
+        assert!(
+            plain.auth_secret().is_none(),
+            "the uTLS preset stays byte-exact"
+        );
+        let profile = fingerprint.reality_profile().expect("a shaped profile");
+        let hello =
+            Hello::build(profile, "example.com", &[], false, &[], None).expect("a shaped hello");
+        let exts = extensions(&hello.msg[4..]);
+        let versions = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x002b)
+            .expect("the hello names its versions");
+        assert_eq!(&versions[5..7], &[0x03, 0x04], "a 1.3 offer");
+        let share = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x0033)
+            .expect("the hello shares a key");
+        assert_eq!(&share[6..8], &[0x00, 0x1d], "an X25519 group");
+        assert!(
+            hello.auth_secret().is_some(),
+            "REALITY seals through the share"
+        );
+    }
+
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
     /// cookie — is the walk no golden byte names, and it still closes exactly on the vector it
     /// measured: every width below is the one the same walk wrote its bytes into.
