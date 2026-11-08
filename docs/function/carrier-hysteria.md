@@ -138,7 +138,7 @@ graph TD
   'hysteria::read_request' 'hysteria::auth_exchange' 'hysteria::open_pooled'
 ```
 
-`UNBLESSED`, as above. `scripts/expected-ops.txt` blesses three exact-count rows in the whole tree — `append_pem 562`, the DNS decide probe and the Vision pump — and none is a hysteria carrier. That is why the whole ops row in this table is open. All six symbols are rows in `scripts/method-ops.txt`, so `ops.yml` publishes their inclusive cost on every run — the functions whose first store to a receive or send buffer used to be a memset, and the pool path a shared flow rides. The artefact was read on PR #536 (x86_64 Linux, rustc 1.99.1, this filter, base `8a5aad0` against this branch): `serve_loop` 2 393 385 → 2 393 188, `drive_once` 171 954 → 173 760, `auth_exchange` 16 870 → 16 870. `serve_stream`, `read_request` and `open_pooled` read `Ir=inlined-not-a-frame`; their work is inside the frames above, not a line of its own. The row stays `UNBLESSED` because no `expected-ops.txt` gate can resolve those inlined symbols, and the loopback test's `drive_once` call count follows the scheduler, so this pair is a published measurement, not a gate. The datagram relay is under these rows' inclusive cost (`serve_loop` calls `drive`, which calls `relay_datagrams`); it has no `ops.yml` row of its own yet.
+`UNBLESSED`, as above. `scripts/expected-ops.txt` blesses three exact-count rows in the whole tree — `append_pem 562`, the DNS decide probe and the Vision pump — and none is a hysteria carrier. That is why the whole ops row in this table is open. All six symbols are rows in `scripts/method-ops.txt`, so `ops.yml` visits them on every run — the functions whose first store to a receive or send buffer used to be a memset, and the pool path a shared flow rides; a symbol that inlines reads `Ir=inlined-not-a-frame` and publishes no cost of its own. The artefact was read on PR #536 (x86_64 Linux, rustc 1.99.1, this filter, base `8a5aad0` against this branch): `serve_loop` 2 393 385 → 2 393 188, `drive_once` 171 954 → 173 760, `auth_exchange` 16 870 → 16 870. `serve_stream`, `read_request` and `open_pooled` read `Ir=inlined-not-a-frame`; their work is inside the frames above, not a line of its own. The row stays `UNBLESSED` because no `expected-ops.txt` gate can resolve those inlined symbols, and the loopback test's `drive_once` call count follows the scheduler, so this pair is a published measurement, not a gate. The datagram relay is under these rows' inclusive cost (`serve_loop` calls `drive`, which calls `relay_datagrams`); it has no `ops.yml` row of its own yet.
 
 Two probe pairs price the cover path's rewrites on the same run (`ops.yml` run `40877903421`, x86_64 Linux, rustc 1.99.1, artefact `method-ops`, this branch against main's `6428cd7c`): `the_word_extension_key_costs_the_word_and_nothing_else` retires **985 575** instructions against `the_lowercase_extension_key_costs_the_same_answer`'s **1 346 151** — the same 64 walks of the 39-path table, 0.73× the instructions for the same answers — and `the_direct_answer_costs_the_same_bytes_once` retires **489 598** against `the_block_answer_costs_the_bytes_it_copies`'s **1 169 083** — the same 512 answers, 0.42×, which is the temporary block, its write and the copy that lifted it into the frame. Neither figure is a gate: the gate is the allocation row each pair sits beside (`masquerade-file-type-allocations` 0, `masquerade-answer-allocations-per-response` 0) and the byte oracle each pair shares with the answer it prices, both blessed above.
 
@@ -152,17 +152,17 @@ One more pair prices the outbound UDP fragment's check once per fragment, `the_c
 
 ## Time
 
-The matrix's `vless-hysteria` cells on `ubuntu-latest`, base `62c54e90` against the server-receive-turn branch (runs `40258853413` and `40258675970`), five repeats. The change touches the `srv-ferrox` cell only; the ratio is ferrox's median against xray-core's in that cell:
+The matrix's `vless-hysteria` cells on `ubuntu-latest`, commit `eb85a991`, full tier, three repeats (run `42494654825`). The client leg is ferrox's median against xray-core's as clients of the xray-core server; the server leg is the same xray-core client on the ferrox server against the xray-core server:
 
-| cell | throughput | cpu per GiB |
+| cell | client leg | server leg |
 | --- | --- | --- |
-| `vless-hysteria-down-8--srv-ferrox` | 2.02× → 2.16× | 1.77× → 1.76× |
-| `vless-hysteria-duplex-8--srv-ferrox` | 1.06× → 1.30× | 1.36× → 1.38× |
-| `vless-hysteria-up-1--srv-ferrox` | 0.09× → 0.11× | 1.37× → 1.38× |
+| `vless-hysteria-down-8` | 2.85× | 1.00× |
+| `vless-hysteria-duplex-8` | 1.36× | 1.25× |
+| `vless-hysteria-up-1` | 1.10× | 0.89× |
 
-The cross-cell server leg — the same xray-core client on the ferrox server against the xray-core server — is still under the 0.85 bound: down `0.36× → 0.36×`, duplex `0.43× → 0.40×`, up `0.26× → 0.35×`. Those are the known holes filed in `scripts/leg-gaps.txt`; the matrix gate is red on the base too, so this page does not call the server leg closed.
+The down-8 server leg has moved from `0.36×` on the earlier read to parity, and duplex-8 from `0.40×` to `1.25×`; up-1 is `0.89×`, still below parity and the remaining server hole. Ferrox leads throughput in all six priced rows, and the client leg is ahead in all three. The repeat spread flags the duplex-8 cells wide (CV 10–11%), and the cost table's CPU column reads 3 040 vs 8 160 for down-8, 5 520 vs 6 880 for duplex-8 and 3 440 vs 9 600 for up-1 on the ferrox server. The row stays partial because up-1 is still below parity and because rate-capped pacing and `bbrProfile` remain unfilled; `scripts/leg-gaps.txt` still carries the older down-8 `0.04` entry, which this run does not reproduce.
 
-`hysteria::serve_loop` retires 2 749 401 → 2 684 380 instructions on the loopback echo (`ops.yml` base `3e00131c` against branch run `40258675941`); `drive_once` reads 169 974 → 172 708. The loop is a published measurement, not a blessed gate.
+`hysteria::serve_loop` retires 2 749 401 → 2 684 380 instructions on the earlier run (`ops.yml` base `3e00131c` against branch run `40258675941`); `drive_once` read 169 974 → 172 708 there. On the current branch the artifact (`ops.yml` run `42494503241`, x86_64 Linux, rustc 1.99.1) reads `serve_loop`, `serve_stream` and `read_request` as `inlined-not-a-frame`, `drive_once` at 491 127 (scheduler-dependent, not comparable to the earlier pair), `auth_exchange` at 29 119 and `open_pooled` at 3 649 824. The loop is a published measurement, not a blessed gate; the route probes this change removes have no frame of their own in that artifact.
 
 ## What we removed
 
