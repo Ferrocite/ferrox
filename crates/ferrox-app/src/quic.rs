@@ -140,6 +140,7 @@ impl PooledStream {
             peer_fin: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::new(AtomicBool::new(true)),
             activity: Arc::clone(&self.activity),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -3551,6 +3552,8 @@ pub(crate) struct QuicStream {
     prefaced: Arc<AtomicBool>,
     /// The connection clock this stream's reads and writes refresh.
     activity: Arc<Activity>,
+    /// Set by the serving driver when it stops: a worker parked in a read or write leaves instead of holding the socket past the loop.
+    stop: Arc<AtomicBool>,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -3565,6 +3568,9 @@ impl Read for QuicStream {
             return Ok(0);
         }
         if self.peer_fin.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        if self.stop.load(Ordering::Relaxed) {
             return Ok(0);
         }
         let deadline = Instant::now() + STREAM_QUANTUM;
@@ -3611,6 +3617,9 @@ impl Write for QuicStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
@@ -3741,6 +3750,8 @@ struct ServerConn {
     prefaced: Arc<AtomicBool>,
     /// The clock every stream this connection serves shares.
     activity: Arc<Activity>,
+    /// The serving loop's stop, so every stream on this connection leaves with the driver.
+    stop: Arc<AtomicBool>,
 }
 
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
@@ -3752,6 +3763,7 @@ type FreshStream = (
     u64,
     Arc<AtomicBool>,
     Arc<Activity>,
+    Arc<AtomicBool>,
 );
 
 /// One worker's claim on the driver's socket, returned even when the session panics so the stop drain cannot wait on a thread that already ended.
@@ -3856,6 +3868,7 @@ pub(crate) fn serve_loop(
         reap(serve, &sock, &mut conns, &mut scratch, &live);
     }
     for state in conns.values() {
+        state.stop.store(true, Ordering::SeqCst);
         if let Ok(mut conn) = state.conn.lock() {
             let _ = conn.close(false, 0, b"");
             flush_egress(&mut conn, sock.as_ref());
@@ -3969,6 +3982,7 @@ fn route(
         gone: AtomicBool::new(false),
         prefaced: Arc::new(AtomicBool::new(false)),
         activity: Arc::new(Activity::new()),
+        stop: Arc::new(AtomicBool::new(false)),
     });
     conns.insert(scid.to_vec(), Arc::clone(&state));
     conns.insert(header.dcid.as_ref().to_vec(), state);
@@ -4078,6 +4092,7 @@ fn reap(
                     stream,
                     Arc::clone(&state.prefaced),
                     Arc::clone(&state.activity),
+                    Arc::clone(&state.stop),
                 ));
                 spawned = true;
             }
@@ -4094,7 +4109,7 @@ fn reap(
     for key in scratch.closed.drain(..) {
         conns.remove(&key);
     }
-    for (conn, stream, prefaced, activity) in scratch.fresh.drain(..) {
+    for (conn, stream, prefaced, activity, stop) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
@@ -4103,6 +4118,7 @@ fn reap(
             peer_fin: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::clone(&prefaced),
             activity: Arc::clone(&activity),
+            stop,
         };
         let serve = Arc::clone(serve);
         live.fetch_add(1, Ordering::SeqCst);
