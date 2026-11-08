@@ -586,6 +586,16 @@ tls-cipher-suites legacy-static-rsa-suite-negotiated-by-the-listener 1 ferrox-co
 tls-cipher-suites legacy-tls12-session-resumed 1 ferrox-core-tls::rustls_backend::tests::a_legacy_dial_resumes_a_tls12_session
 tls-cipher-suites config-key-heap-buffers-per-dial 0 ferrox-core-tls::rustls_backend::tests::a_repeat_dial_keys_the_config_without_copying_the_suite_order
 
+# --- OCSP stapling + anti-replay/time-window caches (matrix row 49) -----------
+ocsp-stapling-anti-replay-time-window-caches ops-retired-instructions UNBLESSED scripts/count-ops.sh
+ocsp-stapling-anti-replay-time-window-caches syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+ocsp-stapling-anti-replay-time-window-caches relay-staging-copies-per-byte UNBLESSED not measured
+ocsp-stapling-anti-replay-time-window-caches seconds-per-relayed-megabyte UNBLESSED .github/workflows/bench.yml
+ocsp-stapling-anti-replay-time-window-caches ocsp-fetch-unit-tests 11 ferrox-core-tls::ocsp::tests
+ocsp-stapling-anti-replay-time-window-caches ocsp-handshake-witness-tests 5 ferrox-core-tls::rustls_backend::tests::a_stapled_identity_reaches_the_client_and_is_checked
+ocsp-stapling-anti-replay-time-window-caches vmess-history-tests 4 ferrox-app-vmess::tests::the_history_refuses_a_session_within_its_lifetime
+ocsp-stapling-anti-replay-time-window-caches ocsp-config-tests 1 ferrox-app-config::tests::an_ocsp_stapling_entry_records_the_ticker_and_renews_with_it
+
 # --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
 security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 security-utls oracle-cases-replayed-byte-identical 50 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls

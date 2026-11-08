@@ -88,6 +88,65 @@ fn replay_seen(id: &[u8; AUTH_LEN]) -> bool {
     guard.seen(&key, now_secs())
 }
 
+/// How long xray's session history remembers a session id, and how often it sweeps the expired.
+const SESSION_LIFETIME: u64 = 180;
+const SESSION_SWEEP: u64 = 30;
+
+/// Sessions one sweep can be holding at once: the flood bound the sweep interval alone leaves open.
+const SESSION_KEYS: usize = 64 * 1024;
+
+/// Whether the session this header opens was already admitted: the user, the request body key
+/// and the request body IV, the reference's session id, refused while it is still live. The
+/// history is partitioned by user, so one account cannot spend the admission another needs.
+fn session_seen(user: &[u8; 16], key: &[u8; 16], iv: &[u8; 16]) -> bool {
+    static HISTORY: OnceLock<Mutex<SessionHistory>> = OnceLock::new();
+    let mut session = [0u8; 32];
+    session[..16].copy_from_slice(key);
+    session[16..].copy_from_slice(iv);
+    let mut guard = HISTORY
+        .get_or_init(|| Mutex::new(SessionHistory::new(now_secs())))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.seen(user, &session, now_secs())
+}
+
+struct SessionHistory {
+    by_account: std::collections::HashMap<[u8; 16], std::collections::HashMap<[u8; 32], u64>>,
+    swept: u64,
+}
+
+impl SessionHistory {
+    fn new(now: u64) -> Self {
+        Self {
+            by_account: std::collections::HashMap::new(),
+            swept: now,
+        }
+    }
+
+    /// Whether this account's session was admitted before inside the lifetime; the clock is the
+    /// caller's, so the bounds are testable without waiting on it.
+    fn seen(&mut self, user: &[u8; 16], session: &[u8; 32], now: u64) -> bool {
+        if now.wrapping_sub(self.swept) >= SESSION_SWEEP {
+            self.by_account.retain(|_, live| {
+                live.retain(|_, expires| *expires > now);
+                live.shrink_to_fit();
+                !live.is_empty()
+            });
+            self.swept = now;
+        }
+        let live = self.by_account.entry(*user).or_default();
+        if live.get(session).is_some_and(|expires| *expires > now) {
+            return true;
+        }
+        // A flood cannot grow one account past the cap, so a full one refuses a new session.
+        if !live.contains_key(session) && live.len() >= SESSION_KEYS {
+            return true;
+        }
+        live.insert(*session, now + SESSION_LIFETIME);
+        false
+    }
+}
+
 fn hmac_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
     use sha2::Digest as _;
     let mut flat = [0u8; 64];
@@ -1650,6 +1709,11 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
     let (instruction, user) = users.authenticate(&auth_id)?;
     let header = read_open_header(stream, &instruction, &auth_id)?;
     let (target, mut send, recv, prefix, cmd) = decode_header(&header)?;
+    let data_iv: [u8; 16] = header[1..17].try_into().unwrap();
+    let data_key: [u8; 16] = header[17..33].try_into().unwrap();
+    if session_seen(&user.id, &data_key, &data_iv) {
+        return None;
+    }
     send.end_marker = !user.no_termination;
     let meter = crate::stats::user(&user.email, user.level);
     Some(Accepted {
@@ -4111,6 +4175,95 @@ mod tests {
         assert!(
             !window.seen(&key, 10_000 + 2 * REPLAY_SPAN),
             "two spans of quiet empty the window"
+        );
+    }
+
+    #[test]
+    fn the_history_refuses_a_session_within_its_lifetime() {
+        let mut history = SessionHistory::new(10_000);
+        let user = [0x11u8; 16];
+        let session = [0x42u8; 32];
+        assert!(!history.seen(&user, &session, 10_000), "a first sighting");
+        assert!(
+            history.seen(&user, &session, 10_000 + SESSION_LIFETIME - 1),
+            "inside the lifetime"
+        );
+        assert!(
+            !history.seen(&user, &session, 10_000 + SESSION_LIFETIME),
+            "the lifetime forgets it"
+        );
+    }
+
+    #[test]
+    fn the_history_names_the_user_and_the_body_material() {
+        let mut history = SessionHistory::new(10_000);
+        let user = [0x11u8; 16];
+        let session = [0x42u8; 32];
+        assert!(!history.seen(&user, &session, 10_000));
+        for part in [0usize, 16] {
+            let mut other = session;
+            other[part] ^= 1;
+            assert!(
+                !history.seen(&user, &other, 10_000),
+                "partition {part} is a different session"
+            );
+            assert!(history.seen(&user, &other, 10_000));
+        }
+        let mut other_user = user;
+        other_user[0] ^= 1;
+        assert!(
+            !history.seen(&other_user, &session, 10_000),
+            "another account holds another history"
+        );
+        assert!(history.seen(&user, &session, 10_000));
+    }
+
+    #[test]
+    fn one_account_cannot_spend_another_accounts_histories() {
+        let mut history = SessionHistory::new(10_000);
+        let user = [0x11u8; 16];
+        for index in 0..SESSION_KEYS {
+            let mut session = [0u8; 32];
+            session[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert!(!history.seen(&user, &session, 10_000));
+        }
+        let mut fresh = [0u8; 32];
+        fresh[0] = 0xff;
+        assert!(
+            history.seen(&user, &fresh, 10_000),
+            "a full history refuses its own new session"
+        );
+        let other_user = [0x22u8; 16];
+        assert!(
+            !history.seen(&other_user, &fresh, 10_000),
+            "another account still has its own admission"
+        );
+        assert!(
+            history.seen(&other_user, &fresh, 10_000),
+            "and that account holds its record"
+        );
+    }
+
+    #[test]
+    fn the_history_sweeps_its_expired_entries() {
+        let mut history = SessionHistory::new(10_000);
+        let user = [0x11u8; 16];
+        let session = [0x33u8; 32];
+        assert!(!history.seen(&user, &session, 10_000));
+        assert!(
+            history.seen(&user, &session, 10_000 + SESSION_LIFETIME - 1),
+            "still live at the edge"
+        );
+        assert_eq!(history.by_account[&user].len(), 1);
+        assert!(!history.seen(&user, &session, 10_000 + SESSION_LIFETIME));
+        assert_eq!(
+            history.by_account[&user].len(),
+            1,
+            "the sweep frees before the fresh insert"
+        );
+        assert!(
+            history.by_account[&user].capacity() < 64,
+            "the sweep shrinks the map toward what it holds"
         );
     }
 

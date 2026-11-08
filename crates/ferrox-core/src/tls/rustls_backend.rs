@@ -1093,7 +1093,16 @@ impl<S: Stream> RustlsServerProvider<S> {
     ) -> Result<Self, TlsError> {
         if cfg.ech_server_keys.is_some() {
             let ctx = cached_ech_server_context(&cfg)?;
-            let ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
+            let mut ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
+            if let Some(response) = cfg
+                .served_entries()
+                .first()
+                .and_then(|entry| entry.ocsp.as_ref())
+                .and_then(|ocsp| ocsp.response.as_ref())
+                .cloned()
+            {
+                ssl.set_ocsp_status(&response).ok();
+            }
             return Ok(Self {
                 inner: ServerInner::Boring {
                     handshake: Some(ssl.setup_accept(io)),
@@ -1114,7 +1123,16 @@ impl<S: Stream> RustlsServerProvider<S> {
         }
         if crate::tls::legacy::needed(&cfg.cipher_suites) {
             let ctx = crate::tls::legacy::server_context(&cfg)?;
-            let ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
+            let mut ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
+            if let Some(response) = cfg
+                .served_entries()
+                .first()
+                .and_then(|entry| entry.ocsp.as_ref())
+                .and_then(|ocsp| ocsp.response.as_ref())
+                .cloned()
+            {
+                ssl.set_ocsp_status(&response).ok();
+            }
             return Ok(Self {
                 inner: ServerInner::Boring {
                     handshake: Some(ssl.setup_accept(io)),
@@ -1489,10 +1507,16 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     let mut config = if cfg.certs.len() == 1 && !cfg.reject_unknown_sni {
         let entry = cfg.certs.into_iter().next().expect("one identity");
         let key = key_of(&entry);
-        builder
-            .with_no_client_auth()
-            .with_single_cert(chain_of(entry.cert_chain), key)
-            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?
+        match entry.ocsp.and_then(|ocsp| ocsp.response) {
+            Some(response) => builder
+                .with_no_client_auth()
+                .with_single_cert_with_ocsp(chain_of(entry.cert_chain), key, response)
+                .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?,
+            None => builder
+                .with_no_client_auth()
+                .with_single_cert(chain_of(entry.cert_chain), key)
+                .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?,
+        }
     } else {
         let mut identities = Vec::with_capacity(cfg.certs.len());
         for entry in cfg.certs {
@@ -1502,12 +1526,13 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
                 .map(|leaf| certificate_names(leaf))
                 .unwrap_or_default();
             let key = key_of(&entry);
-            let key = rustls::sign::CertifiedKey::from_der(
+            let mut key = rustls::sign::CertifiedKey::from_der(
                 chain_of(entry.cert_chain),
                 key,
                 crypto_provider.as_ref(),
             )
             .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+            key.ocsp = entry.ocsp.and_then(|ocsp| ocsp.response);
             identities.push((Arc::new(key), names));
         }
         builder
@@ -1629,7 +1654,9 @@ pub(crate) fn reality_server_config(
         .key_provider
         .load_private_key(key_der)
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
-    let key = rustls::sign::CertifiedKey::new(certs, Arc::new(RealitySigningKey { inner }));
+    let ocsp = entry.ocsp.as_ref().and_then(|ocsp| ocsp.response.clone());
+    let mut key = rustls::sign::CertifiedKey::new(certs, Arc::new(RealitySigningKey { inner }));
+    key.ocsp = ocsp;
     key.keys_match()
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
@@ -2012,10 +2039,12 @@ pub(crate) fn server_identity_builder(
     server_settings(&mut builder, cfg)?;
     if cfg.certs.len() > 1 || cfg.reject_unknown_sni {
         let mut names = Vec::with_capacity(cfg.certs.len());
+        let mut statuses: Vec<Option<Vec<u8>>> = Vec::with_capacity(cfg.certs.len());
         for entry in &cfg.certs {
             names.push(certificate_names(entry.cert_chain.first().ok_or_else(
                 || TlsError::Other("server identity has no certificate".to_owned()),
             )?));
+            statuses.push(entry.ocsp.as_ref().and_then(|ocsp| ocsp.response.clone()));
         }
         let mut contexts = Vec::with_capacity(cfg.certs.len().saturating_sub(1));
         for entry in cfg.certs.iter().skip(1) {
@@ -2027,7 +2056,11 @@ pub(crate) fn server_identity_builder(
         builder.set_servername_callback(move |ssl, alert| {
             use boring::ssl::{NameType, SniError};
             let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("");
+            // Which identity answered decides which staple rides, by the same index.
             if !reject && (names.len() == 1 || sni.is_empty()) {
+                if let Some(Some(response)) = statuses.first() {
+                    ssl.set_ocsp_status(response).ok();
+                }
                 return Ok(());
             }
             if let Some((at, _)) = names
@@ -2036,11 +2069,17 @@ pub(crate) fn server_identity_builder(
                 .find(|(_, names)| sni_matches(names, sni))
             {
                 if at == 0 {
+                    if let Some(Some(response)) = statuses.first() {
+                        ssl.set_ocsp_status(response).ok();
+                    }
                     return Ok(());
                 }
                 if ssl.set_ssl_context(&contexts[at - 1]).is_err() {
                     *alert = boring::ssl::SslAlert::INTERNAL_ERROR;
                     return Err(SniError::ALERT_FATAL);
+                }
+                if let Some(Some(response)) = statuses.get(at) {
+                    ssl.set_ocsp_status(response).ok();
                 }
                 return Ok(());
             }
@@ -2063,6 +2102,14 @@ fn identity_builder(entry: &super::CertEntry) -> Result<boring::ssl::SslContextB
     let mut builder =
         SslContextBuilder::new(SslMethod::tls()).map_err(|error| boring_error(&error))?;
     builder.set_verify(SslVerifyMode::NONE);
+    // The context switch: status rides per connection, set by the accept path or the callback.
+    if entry
+        .ocsp
+        .as_ref()
+        .is_some_and(|ocsp| ocsp.response.is_some())
+    {
+        builder.enable_ocsp_stapling();
+    }
     let leaf = boring::x509::X509::from_der(leaf).map_err(|error| boring_error(&error))?;
     builder
         .set_certificate(&leaf)
@@ -3467,6 +3514,7 @@ mod tests {
                 key_der: ANCHOR_KEY.to_vec(),
                 key_kind: crate::tls::ServerKeyKind::Pkcs8,
                 reload: None,
+                ocsp: None,
             }],
             alpn: Vec::new(),
             min_version: None,
@@ -3524,6 +3572,35 @@ mod tests {
             .handshake()
             .expect("resumes after the write timeout");
         assert!(fired.get(), "the write budget must have fired");
+        assert_eq!(session.peer_leaf(), Some(ANCHOR));
+    }
+
+    /// A stapling shaped listener answers a shaped client: the `CertificateStatus` between the
+    /// chain and the exchange is consumed, not read as unexpected.
+    #[cfg_attr(miri, ignore = "assembles real handshake bytes through ring")]
+    #[test]
+    fn a_shaped_client_consumes_a_stapled_chains_status() {
+        let to_server = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let to_client = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let wire = Wire {
+            to_server: std::rc::Rc::clone(&to_server),
+            to_client: std::rc::Rc::clone(&to_client),
+            write_budget: std::rc::Rc::new(std::cell::Cell::new(None)),
+            read_budget: std::rc::Rc::new(std::cell::Cell::new(None)),
+            fired: std::rc::Rc::new(std::cell::Cell::new(false)),
+        };
+        let mut listener = shaped_listener();
+        listener.certs[0].ocsp = Some(garbage_staple());
+        let server = crate::tls::shaped::server::Server::new(listener, wire);
+        let client = ClientWire {
+            to_server,
+            to_client,
+            server,
+        };
+        let mut session = shaped_session(client);
+        session
+            .handshake()
+            .expect("consumes the certificate status");
         assert_eq!(session.peer_leaf(), Some(ANCHOR));
     }
 
@@ -4045,6 +4122,228 @@ mod tests {
         });
     }
 
+    fn garbage_staple() -> crate::tls::OcspStaple {
+        crate::tls::OcspStaple {
+            interval: std::time::Duration::from_secs(7),
+            response: Some(b"not an OCSP response".to_vec()),
+        }
+    }
+
+    /// The control the three staple tests share: no `ocspStapling` answers a stock client.
+    #[cfg_attr(miri, ignore = "needs a loopback socket")]
+    #[test]
+    fn an_unstapled_identity_answers_a_stock_client() {
+        let identity = plain_identity();
+        let server_config = identity.server_config().expect("server config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut server = rustls::ServerConnection::new(server_config).expect("session");
+                server.complete_io(&mut stream).expect("handshakes");
+            });
+            let mut client = stock_session(stock_client(&[&rustls::version::TLS13]));
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            client.complete_io(&mut stream).expect("handshakes");
+        });
+    }
+
+    /// A verifier that reports the OCSP response the server sent: the staple's own witness,
+    /// since the stock webpki verifier traces it without checking its bytes.
+    #[derive(Debug)]
+    struct StapleWitness {
+        inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        seen: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for StapleWitness {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            server_name: &rustls::pki_types::ServerName<'_>,
+            ocsp_response: &[u8],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            *self.seen.lock().expect("witness") = Some(ocsp_response.to_vec());
+            self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            self.inner.verify_tls12_signature(message, cert, dss)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.inner.supported_verify_schemes()
+        }
+    }
+
+    /// A stapled identity answers with `CertificateStatus`: the witness reports the bytes.
+    #[cfg_attr(miri, ignore = "needs a loopback socket")]
+    #[test]
+    fn a_stapled_identity_reaches_the_client_and_is_checked() {
+        let mut identity = plain_identity();
+        identity.certs[0].ocsp = Some(garbage_staple());
+        let server_config = identity.server_config().expect("server config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_later = Arc::clone(&seen);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut server = rustls::ServerConnection::new(server_config).expect("session");
+                server.complete_io(&mut stream).expect("handshakes");
+            });
+            let mut roots = RootStore::empty();
+            roots
+                .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
+                .expect("anchor");
+            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                    .build()
+                    .expect("verifier")
+                    as Arc<dyn rustls::client::danger::ServerCertVerifier>;
+            let mut anchor_roots = RootStore::empty();
+            anchor_roots
+                .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
+                .expect("anchor");
+            let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("client versions")
+            .with_root_certificates(anchor_roots)
+            .with_no_client_auth();
+            client_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(StapleWitness {
+                    inner: verifier,
+                    seen: seen_later,
+                }));
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                rustls::pki_types::ServerName::try_from("tls.test").expect("name"),
+            )
+            .expect("client session");
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            client.complete_io(&mut stream).expect("handshakes");
+        });
+        assert_eq!(
+            seen.lock().expect("witness").as_deref(),
+            Some(&b"not an OCSP response"[..]),
+            "the client saw the staple the server sent"
+        );
+    }
+
+    /// One stock client that reports whatever OCSP response the server sends.
+    fn witness_session(seen: Arc<std::sync::Mutex<Option<Vec<u8>>>>) -> rustls::ClientConnection {
+        let mut roots = RootStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
+            .expect("anchor");
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots.clone()))
+                .build()
+                .expect("verifier")
+                as Arc<dyn rustls::client::danger::ServerCertVerifier>;
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("client versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(StapleWitness {
+                inner: verifier,
+                seen,
+            }));
+        rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("tls.test").expect("name"),
+        )
+        .expect("client session")
+    }
+
+    /// The shaped TLS 1.2 listener answers with the same status after its chain, and the
+    /// witness reports the bytes it sent.
+    #[cfg_attr(miri, ignore = "needs a loopback socket")]
+    #[test]
+    fn a_shaped_listener_staples_and_a_stock_tls12_client_checks_it() {
+        let mut identity = plain_identity();
+        identity.certs[0].ocsp = Some(garbage_staple());
+        identity.max_version = Some(0x0303);
+        identity.cipher_suites = vec![0xc02b, 0x1301];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_later = Arc::clone(&seen);
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = RustlsServerProvider::accept(identity, stream).expect("settles");
+                let _ = server.handshake();
+            });
+            let mut client = witness_session(seen_later);
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            client.complete_io(&mut stream).expect("handshakes");
+        });
+        assert_eq!(
+            seen.lock().expect("witness").as_deref(),
+            Some(&b"not an OCSP response"[..]),
+            "the shaped staple reached the client verbatim"
+        );
+    }
+
+    /// The legacy listener answers through its own context, and its staple reaches a stock
+    /// client the same way.
+    #[cfg_attr(miri, ignore = "needs a loopback socket")]
+    #[test]
+    fn a_legacy_listener_staples_and_a_boring_client_reads_it() {
+        let mut identity = plain_identity();
+        identity.certs[0].ocsp = Some(garbage_staple());
+        identity.cipher_suites = vec![0xc009];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = RustlsServerProvider::accept(identity, stream).expect("settles");
+                let _ = server.handshake();
+            });
+            let mut config = client("tls.test", &[]);
+            config.cipher_suites = vec![0xc009].into();
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut session = crate::tls::connect(&config, stream).expect("dials");
+            session.handshake().expect("handshakes");
+            assert_eq!(
+                session.peer_ocsp(),
+                Some(&b"not an OCSP response"[..]),
+                "the legacy staple reached the client verbatim"
+            );
+        });
+    }
+
     /// The other role of the field: a dial naming a TLS 1.2 AEAD suite negotiates it against a listener admitting only that suite.
     #[cfg_attr(
         miri,
@@ -4107,6 +4406,7 @@ mod tests {
             key_der: key.private_key_to_der_pkcs8().expect("pkcs8"),
             key_kind: crate::tls::ServerKeyKind::Pkcs8,
             reload: None,
+            ocsp: None,
         }
     }
 
@@ -4135,6 +4435,7 @@ mod tests {
             key_der: key.private_key_to_der_pkcs8().expect("pkcs8"),
             key_kind: crate::tls::ServerKeyKind::Pkcs8,
             reload: None,
+            ocsp: None,
         }
     }
 

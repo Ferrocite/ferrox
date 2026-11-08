@@ -1448,6 +1448,7 @@ fn warp_tls(tls_config: &TlsConfig, warp: Option<&masque::Warp>) -> Option<TlsCo
         key_der: warp.key().to_vec(),
         key_kind: ServerKeyKind::Pkcs8,
         reload: None,
+        ocsp: None,
     }));
     Some(config)
 }
