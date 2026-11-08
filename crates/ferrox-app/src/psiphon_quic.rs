@@ -10,10 +10,10 @@
 )]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, ErrorKind, IoSlice, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,11 +21,13 @@ use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use hkdf::Hkdf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{ResolvesClientCert, Resumption};
 use rustls::crypto::SecureRandom;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::quic::{ClientConnection, KeyChange, Keys, Secrets, Version};
+use rustls::quic::{ClientConnection, DirectionalKeys, KeyChange, Keys, Secrets, Version};
+use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, Side, SignatureScheme};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::psiphon_ssh::{tls_passthrough, tls_passthrough_key, Proxy, Server};
 use crate::psiphon_webrtc::WebRtcStream;
@@ -38,6 +40,9 @@ const PADDING_LIMIT: usize = 1280;
 const MAX_SEND_QUEUE: usize = 512 * 1024;
 const MAX_RECV_QUEUE: usize = 512 * 1024;
 const MAX_PAYLOAD: usize = 1200;
+const MIN_DATAGRAM: usize = 1280;
+const PMTU_STEP: usize = 100;
+const INPROXY_PACKET_ADJUSTMENT: usize = 109;
 const MAX_UDP_PAYLOAD: u64 = 1439;
 const INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
 const STREAM_WINDOW: u64 = 8 * 1024 * 1024;
@@ -134,6 +139,64 @@ fn send_guarded(socket: &UdpSocket, packet: &mut [u8]) -> io::Result<()> {
     socket.send(packet).map(|_| ())
 }
 
+#[derive(Clone)]
+struct Remembered {
+    data: u64,
+    stream: u64,
+    bidi: u64,
+}
+
+static QUIC_SESSIONS: OnceLock<Mutex<HashMap<String, Remembered>>> = OnceLock::new();
+static QUIC_RESUMPTION: OnceLock<Resumption> = OnceLock::new();
+static QUIC_VERIFIER: OnceLock<Arc<dyn ServerCertVerifier>> = OnceLock::new();
+static QUIC_CLIENT_AUTH: OnceLock<Arc<dyn ResolvesClientCert>> = OnceLock::new();
+
+/// Shared flow-control grants remembered from completed handshakes.
+fn sessions() -> &'static Mutex<HashMap<String, Remembered>> {
+    QUIC_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The process-wide rustls ticket store shared by every QUIC dial.
+fn resumption() -> Resumption {
+    QUIC_RESUMPTION
+        .get_or_init(|| Resumption::in_memory_sessions(256))
+        .clone()
+}
+
+/// The permissive verifier shared by every QUIC client config.
+fn verifier() -> Arc<dyn ServerCertVerifier> {
+    Arc::clone(QUIC_VERIFIER.get_or_init(|| {
+        Arc::new(NoVerify {
+            schemes: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }) as Arc<dyn ServerCertVerifier>
+    }))
+}
+
+/// The shared client-auth resolver that keeps rustls resumption enabled.
+fn client_auth() -> Arc<dyn ResolvesClientCert> {
+    Arc::clone(
+        QUIC_CLIENT_AUTH.get_or_init(|| Arc::new(NoClientAuth) as Arc<dyn ResolvesClientCert>),
+    )
+}
+
+#[derive(Debug)]
+struct NoClientAuth;
+
+impl ResolvesClientCert for NoClientAuth {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        None
+    }
+
+    fn has_certs(&self) -> bool {
+        false
+    }
+}
 thread_local! {
     static PENDING_RANDOM: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
 }
@@ -280,7 +343,9 @@ impl QuicStream {
             packet_key,
             shape,
         )?;
-        Self::connect_over(udp, remote, timeout, proof_key, randomized)
+        Self::connect_over(
+            udp, remote, timeout, proof_key, randomized, obfuscated, false, shape,
+        )
     }
 
     /// Dial QUIC-OSSH through an in-proxy WebRTC data channel.
@@ -300,18 +365,46 @@ impl QuicStream {
             packet_key,
             shape,
         )?;
-        Self::connect_over(udp, remote, timeout, proof_key, randomized)
+        Self::connect_over(
+            udp, remote, timeout, proof_key, randomized, obfuscated, true, shape,
+        )
     }
 
     /// Complete the QUIC handshake over a packet source and start its driver.
+    #[allow(clippy::too_many_arguments)]
     fn connect_over(
         mut udp: Udp,
         remote: SocketAddr,
         timeout: Duration,
         proof_key: &str,
         randomized: bool,
+        obfuscated: bool,
+        inproxy: bool,
+        shape: &crate::psiphon_ssh::TlsShape,
     ) -> Result<Self, String> {
-        let mut engine = Engine::new(proof_key, randomized)?;
+        let dial_early = coin(shape.quic_dial_early);
+        let disable_path_mtu = obfuscated || inproxy || coin(shape.quic_disable_path_mtu);
+        let adjustment = (obfuscated as usize) * OBFUSCATION_OVERHEAD
+            + (inproxy as usize) * INPROXY_PACKET_ADJUSTMENT;
+        let packet_limit = if obfuscated || inproxy {
+            MIN_DATAGRAM - adjustment
+        } else {
+            MAX_PACKET_SIZE
+        };
+        let name = quic_server_name(remote, proof_key);
+        let mut engine = Engine::new(
+            proof_key,
+            randomized,
+            dial_early,
+            disable_path_mtu,
+            packet_limit,
+            name,
+        )?;
+        if engine.early() {
+            engine.open_stream_early();
+            engine.flush(&mut udp, Instant::now())?;
+            return Self::start(udp, engine, timeout);
+        }
         let deadline = Instant::now() + timeout;
         let mut datagram = vec![0u8; 65535];
         loop {
@@ -344,7 +437,11 @@ impl QuicStream {
         }
         engine.open_stream();
         engine.flush(&mut udp, Instant::now())?;
+        Self::start(udp, engine, timeout)
+    }
 
+    /// Start a session from a connected socket and its prepared engine.
+    fn start(udp: Udp, engine: Engine, timeout: Duration) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 send: VecDeque::new(),
@@ -733,6 +830,8 @@ struct SentPacket {
     crypto: Option<(u64, u64)>,
     stream: Option<(u64, u64)>,
     window: bool,
+    early: bool,
+    probe: Option<usize>,
 }
 
 struct Engine {
@@ -740,7 +839,17 @@ struct Engine {
     initial: Keys,
     handshake: Option<Keys>,
     one_rtt: Option<Keys>,
+    zero_rtt: Option<DirectionalKeys>,
     next_secrets: Option<Secrets>,
+    session_name: String,
+    early_attempted: bool,
+    early_decided: bool,
+    disable_path_mtu: bool,
+    packet_limit: usize,
+    max_datagram: usize,
+    probe_target: Option<usize>,
+    probe_inflight: bool,
+    probe_failed: bool,
     key_phase: bool,
     level: usize,
     dcid: Vec<u8>,
@@ -765,9 +874,11 @@ struct Engine {
     recv_eof: bool,
     max_data: u64,
     max_stream: u64,
-    peer_max_data: u64,
-    peer_max_stream: u64,
-    peer_streams_bidi: u64,
+    data: u64,
+    stream: u64,
+    bidi: u64,
+    initial_limits: (u64, u64, u64),
+    session_saved: bool,
     peer_params: bool,
     received: Vec<u8>,
     sent: Vec<SentPacket>,
@@ -785,14 +896,20 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(key: &str, randomized: bool) -> Result<Self, String> {
-        let config = client_config(randomized)?;
-        let mut dcid = vec![0u8; CID_LEN];
-        getrandom::fill(&mut dcid).map_err(|error| format!("psiphon quic dcid: {error}"))?;
+    /// Build an engine and its initial packet keys for one server.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn new(
+        key: &str,
+        randomized: bool,
+        dial_early: bool,
+        disable_path_mtu: bool,
+        packet_limit: usize,
+        name: String,
+    ) -> Result<Self, String> {
+        let config = client_config(randomized, dial_early)?;
         let mut scid = vec![0u8; CID_LEN];
         getrandom::fill(&mut scid).map_err(|error| format!("psiphon quic scid: {error}"))?;
         let params = transport_params(&scid, randomized)?;
-        let name = quic_server_name();
         let server_name = ServerName::try_from(name.as_str())
             .map_err(|error| format!("psiphon quic server name: {error}"))?
             .to_owned();
@@ -806,6 +923,27 @@ impl Engine {
                 created
             })
             .map_err(|error| format!("psiphon quic tls: {error}"))?;
+        let remembered = if dial_early {
+            let guard = lock(sessions());
+            guard.get(&name).cloned()
+        } else {
+            None
+        };
+        let zero_rtt = if dial_early {
+            tls.zero_rtt_keys()
+        } else {
+            None
+        };
+        let early = zero_rtt.is_some() && remembered.is_some();
+        let mut dcid = vec![0u8; CID_LEN];
+        getrandom::fill(&mut dcid).map_err(|error| format!("psiphon quic dcid: {error}"))?;
+        let (data, stream, bidi) = if early {
+            remembered.as_ref().map_or((0, 0, 0), |remembered| {
+                (remembered.data, remembered.stream, remembered.bidi)
+            })
+        } else {
+            (0, 0, 0)
+        };
         let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
             .tls13()
             .and_then(rustls::Tls13CipherSuite::quic_suite)
@@ -816,7 +954,17 @@ impl Engine {
             initial,
             handshake: None,
             one_rtt: None,
+            zero_rtt: if early { zero_rtt } else { None },
             next_secrets: None,
+            session_name: name,
+            early_attempted: early,
+            early_decided: false,
+            disable_path_mtu,
+            packet_limit,
+            max_datagram: MIN_DATAGRAM.min(packet_limit),
+            probe_target: None,
+            probe_inflight: false,
+            probe_failed: false,
             key_phase: false,
             level: INITIAL,
             dcid,
@@ -841,9 +989,11 @@ impl Engine {
             recv_eof: false,
             max_data: INITIAL_WINDOW,
             max_stream: STREAM_WINDOW,
-            peer_max_data: 0,
-            peer_max_stream: 0,
-            peer_streams_bidi: 0,
+            data,
+            stream,
+            bidi,
+            initial_limits: (0, 0, 0),
+            session_saved: false,
             peer_params: false,
             received: Vec::new(),
             sent: Vec::new(),
@@ -881,6 +1031,16 @@ impl Engine {
         self.opened = true;
     }
 
+    /// Whether the first stream bytes can ride a 0-RTT packet.
+    fn early(&self) -> bool {
+        self.zero_rtt.is_some()
+    }
+
+    /// Open the stream before the handshake, using the previous connection's flow-control grant.
+    fn open_stream_early(&mut self) {
+        self.open_stream();
+    }
+
     fn pump_tls(&mut self) -> Result<(), String> {
         loop {
             let mut bytes = Vec::new();
@@ -907,7 +1067,44 @@ impl Engine {
                 self.apply_peer_params(&params)?;
             }
         }
+        if self.early_attempted && !self.early_decided && !self.tls.is_handshaking() {
+            self.early_decided = true;
+            if self.tls.is_early_data_accepted() {
+                self.compact_stream();
+            } else {
+                self.rollback_early();
+            }
+        }
+        if self.ready() {
+            self.remember();
+        }
         Ok(())
+    }
+
+    /// Store the handshake's initial grants once for the next 0-RTT dial.
+    fn remember(&mut self) {
+        if self.session_saved || self.session_name.is_empty() || self.dcid.is_empty() {
+            return;
+        }
+        let (data, stream, bidi) = self.initial_limits;
+        lock(sessions()).insert(self.session_name.clone(), Remembered { data, stream, bidi });
+        self.session_saved = true;
+    }
+
+    /// Drop early packets and resend their stream prefix after rejection.
+    fn rollback_early(&mut self) {
+        let mut kept = Vec::with_capacity(self.sent.len());
+        for packet in self.sent.drain(..) {
+            if packet.early {
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+            } else {
+                kept.push(packet);
+            }
+        }
+        self.sent = kept;
+        self.retx.clear();
+        self.stream_sent = 0;
+        self.zero_rtt = None;
     }
 
     fn apply_peer_params(&mut self, params: &[u8]) -> Result<(), String> {
@@ -924,23 +1121,24 @@ impl Engine {
                 .filter(|end| *end <= params.len())
                 .ok_or_else(|| "psiphon quic transport parameter".to_owned())?;
             match id {
-                0x04 => self.peer_max_data = get_varint(params, &mut at).unwrap_or(0),
-                0x06 => self.peer_max_stream = get_varint(params, &mut at).unwrap_or(0),
-                0x08 => self.peer_streams_bidi = get_varint(params, &mut at).unwrap_or(0),
+                0x04 => self.data = get_varint(params, &mut at).unwrap_or(0),
+                0x06 => self.stream = get_varint(params, &mut at).unwrap_or(0),
+                0x08 => self.bidi = get_varint(params, &mut at).unwrap_or(0),
                 _ => {}
             }
             at = end;
         }
         self.peer_params = true;
-        if self.peer_max_stream == 0 {
-            self.peer_max_stream = self.peer_max_data;
+        if self.stream == 0 {
+            self.stream = self.data;
         }
-        if self.peer_streams_bidi == 0 {
+        if self.bidi == 0 {
             return Err("psiphon quic: peer refuses a stream".to_owned());
         }
-        if self.peer_max_stream == 0 {
+        if self.stream == 0 {
             return Err("psiphon quic: peer grants no stream credit".to_owned());
         }
+        self.initial_limits = (self.data, self.stream, self.bidi);
         Ok(())
     }
 
@@ -972,13 +1170,87 @@ impl Engine {
             }
         }
         if self.one_rtt.is_some() {
+            self.plan_probe();
             for _ in 0..64 {
                 if !self.send_space(ONE_RTT, udp, now)? {
                     break;
                 }
             }
+        } else if self.zero_rtt.is_some() {
+            for _ in 0..64 {
+                if !self.send_early(udp, now)? {
+                    break;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Choose the next padded DPLPMTUD probe target.
+    fn plan_probe(&mut self) {
+        if self.disable_path_mtu
+            || self.probe_failed
+            || self.probe_inflight
+            || self.probe_target.is_some()
+            || self.max_datagram >= self.packet_limit
+        {
+            return;
+        }
+        self.probe_target = Some((self.max_datagram + PMTU_STEP).min(self.packet_limit));
+    }
+
+    /// Send queued stream bytes with the 0-RTT keys.
+    fn send_early(&mut self, udp: &mut Udp, now: Instant) -> Result<bool, String> {
+        if self.zero_rtt.is_none()
+            || !self.opened
+            || self.bidi == 0
+            || self.bytes_in_flight >= self.cwnd
+            || self.stream_sent >= self.stream_base + self.stream_data.len() as u64
+        {
+            return Ok(false);
+        }
+        let limit = self.stream.min(self.data).saturating_sub(self.stream_sent);
+        let available =
+            (self.stream_base + self.stream_data.len() as u64).saturating_sub(self.stream_sent);
+        let overhead = long_header_len(false, self.dcid.len(), self.scid.len(), 4) + 16;
+        let room = available
+            .min(limit)
+            .min(self.max_datagram.saturating_sub(overhead + 16) as u64);
+        if room == 0 {
+            return Ok(false);
+        }
+        let mut payload = Vec::with_capacity(self.max_datagram);
+        let Some((offset, len)) = self.write_stream_frame(&mut payload, self.stream_sent, room)
+        else {
+            return Ok(false);
+        };
+        let pn = self.next_pn[ONE_RTT];
+        let packet = {
+            let keys = self
+                .zero_rtt
+                .as_ref()
+                .ok_or_else(|| "psiphon quic 0-rtt keys".to_owned())?;
+            self.seal_with(1, keys, pn, &payload)?
+        };
+        self.stream_sent += len;
+        self.next_pn[ONE_RTT] += 1;
+        self.last_send = now;
+        let size = packet.len() as u64;
+        self.sent.push(SentPacket {
+            pn,
+            space: ONE_RTT,
+            sent_at: now,
+            size,
+            crypto: None,
+            stream: Some((offset, len)),
+            window: false,
+            early: true,
+            probe: None,
+        });
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
+        udp.send(&packet)
+            .map_err(|error| format!("psiphon quic send failed: {error}"))?;
+        Ok(true)
     }
 
     fn crypto_pending(&self, space: usize) -> bool {
@@ -1002,6 +1274,10 @@ impl Engine {
             if packet.window {
                 self.window_update = true;
             }
+            if packet.probe.is_some() {
+                self.probe_inflight = false;
+                self.probe_failed = true;
+            }
             at += 1;
         }
         if at > 0 {
@@ -1024,7 +1300,7 @@ impl Engine {
         };
         let mut payload = std::mem::take(&mut self.tx_scratch);
         payload.clear();
-        payload.reserve(head + MAX_PAYLOAD + 64);
+        payload.reserve(head + self.max_datagram.max(MAX_PAYLOAD) + 64);
         if head > 0 {
             payload.resize(head, 0);
         }
@@ -1066,13 +1342,10 @@ impl Engine {
             {
                 let available = (self.stream_base + self.stream_data.len() as u64)
                     .saturating_sub(self.stream_sent);
-                let limit = self
-                    .peer_max_stream
-                    .min(self.peer_max_data)
-                    .saturating_sub(self.stream_sent);
+                let limit = self.stream.min(self.data).saturating_sub(self.stream_sent);
                 let room = available
                     .min(limit)
-                    .min(Self::max_payload_room(payload.len() - head) as u64);
+                    .min(self.max_payload_room(space, payload.len() - head) as u64);
                 if room > 0 {
                     if let Some(frame) =
                         self.write_stream_frame(&mut payload, self.stream_sent, room)
@@ -1085,7 +1358,9 @@ impl Engine {
             }
         } else if self.crypto_pending(space) {
             let data = &self.crypto_send[space][self.crypto_sent[space]..];
-            let len = data.len().min(Self::max_payload_room(payload.len() - head));
+            let len = data
+                .len()
+                .min(self.max_payload_room(space, payload.len() - head));
             if len > 0 {
                 let offset = self.crypto_sent[space] as u64;
                 payload.push(0x06);
@@ -1096,13 +1371,30 @@ impl Engine {
                 ack_eliciting = true;
             }
         }
+        let probe = if space == ONE_RTT {
+            self.probe_target
+        } else {
+            None
+        };
         if payload.len() == head {
-            if space == ONE_RTT && now.saturating_duration_since(self.last_send) >= KEEPALIVE {
+            if probe.is_some()
+                || (space == ONE_RTT && now.saturating_duration_since(self.last_send) >= KEEPALIVE)
+            {
                 payload.push(0x01);
                 ack_eliciting = true;
             } else {
                 self.tx_scratch = payload;
                 return Ok(false);
+            }
+        }
+        if probe.is_some() && !ack_eliciting {
+            payload.push(0x01);
+            ack_eliciting = true;
+        }
+        if let Some(target) = probe {
+            let total = payload.len() + 16;
+            if target > total {
+                payload.resize(payload.len() + (target - total), 0);
             }
         }
         if space == INITIAL {
@@ -1121,8 +1413,14 @@ impl Engine {
                     crypto: crypto_frame,
                     stream: stream_frame,
                     window: window_frame,
+                    early: false,
+                    probe: probe.map(|_| size as usize),
                 });
                 self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
+            }
+            if probe.is_some() {
+                self.probe_inflight = true;
+                self.probe_target = None;
             }
             self.last_send = now;
             udp.send(&payload)
@@ -1143,6 +1441,8 @@ impl Engine {
                 crypto: crypto_frame,
                 stream: stream_frame,
                 window: window_frame,
+                early: false,
+                probe: None,
             });
             self.bytes_in_flight = self.bytes_in_flight.saturating_add(size);
         }
@@ -1152,8 +1452,14 @@ impl Engine {
         Ok(true)
     }
 
-    fn max_payload_room(used: usize) -> usize {
-        MAX_PAYLOAD.saturating_sub(used)
+    /// Return the payload room left in a packet for this space.
+    fn max_payload_room(&self, space: usize, used: usize) -> usize {
+        if space == ONE_RTT {
+            self.max_datagram
+                .saturating_sub(1 + self.dcid.len() + 4 + 16 + used + 16)
+        } else {
+            MAX_PAYLOAD.saturating_sub(used)
+        }
     }
 
     fn pad_initial(&self, payload: &mut Vec<u8>, _pn: u64) {
@@ -1195,12 +1501,23 @@ impl Engine {
         let keys = self
             .keys(space)
             .ok_or_else(|| "psiphon quic keys".to_owned())?;
-        let pn_len = 4usize;
         let packet_type = match space {
             INITIAL => 0u8,
             HANDSHAKE => 2u8,
             _ => 3u8,
         };
+        self.seal_with(packet_type, &keys.local, pn, payload)
+    }
+
+    /// Seal a packet with an explicit packet type and key set.
+    fn seal_with(
+        &self,
+        packet_type: u8,
+        local: &DirectionalKeys,
+        pn: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let pn_len = 4usize;
         let mut header = Vec::with_capacity(64);
         header.push(0x80 | packet_type << 4 | (pn_len as u8 - 1));
         header.extend_from_slice(&QUIC_VERSION.to_be_bytes());
@@ -1208,7 +1525,7 @@ impl Engine {
         header.extend_from_slice(&self.dcid);
         header.push(u8::try_from(self.scid.len()).unwrap_or(0));
         header.extend_from_slice(&self.scid);
-        if space == INITIAL {
+        if packet_type == 0 {
             put_varint(&mut header, 0);
         }
         let length = pn_len as u64 + payload.len() as u64 + 16;
@@ -1219,13 +1536,12 @@ impl Engine {
         let mut packet = header;
         packet.extend_from_slice(payload);
         let (head, body) = packet.split_at_mut(header_len);
-        let tag = keys
-            .local
+        let tag = local
             .packet
             .encrypt_in_place(pn, head, body)
             .map_err(|error| format!("psiphon quic seal: {error}"))?;
         packet.extend_from_slice(tag.as_ref());
-        let sample_len = keys.local.header.sample_len();
+        let sample_len = local.header.sample_len();
         let sample_at = pn_offset + 4;
         if packet.len() < sample_at + sample_len {
             return Err("psiphon quic short packet".to_owned());
@@ -1237,7 +1553,7 @@ impl Engine {
         sample.copy_from_slice(&packet[sample_at..sample_at + sample_len]);
         let (first, rest) = packet.split_at_mut(1);
         let pn_slice = &mut rest[pn_offset - 1..pn_offset + pn_len - 1];
-        keys.local
+        local
             .header
             .encrypt_in_place(sample, &mut first[0], pn_slice)
             .map_err(|error| format!("psiphon quic header: {error}"))?;
@@ -1343,11 +1659,13 @@ impl Engine {
                     2 => HANDSHAKE,
                     _ => break,
                 };
-                if !scid.is_empty() && scid != self.dcid {
+                let pn_offset = cursor - at;
+                if self.open(space, &mut datagram[at..end], pn_offset, now)?
+                    && !scid.is_empty()
+                    && scid != self.dcid
+                {
                     self.dcid = scid;
                 }
-                let pn_offset = cursor - at;
-                self.open(space, &mut datagram[at..end], pn_offset, now)?;
                 at = end;
             } else {
                 let pn_offset = 1 + self.scid.len();
@@ -1361,21 +1679,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Authenticate and decrypt a received packet, returning its space and payload range.
+    /// Authenticate and decrypt a received packet, returning whether the header was accepted.
     fn open(
         &mut self,
         space: usize,
         packet: &mut [u8],
         pn_offset: usize,
         now: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let (pn, header_end, key_phase) = {
             let Some(keys) = self.keys(space) else {
-                return Ok(());
+                return Ok(false);
             };
             let sample_len = keys.remote.header.sample_len();
             if packet.len() < pn_offset + 4 + sample_len {
-                return Ok(());
+                return Ok(false);
             }
             let mut sample = [0u8; 16];
             let sample = sample
@@ -1402,7 +1720,7 @@ impl Engine {
             packet[pn_offset..pn_offset + pn_len].copy_from_slice(&pnb[..pn_len]);
             let header_end = pn_offset + pn_len;
             if packet.len() <= header_end + 16 {
-                return Ok(());
+                return Ok(false);
             }
             (pn, header_end, space == ONE_RTT && first & 0x04 != 0)
         };
@@ -1428,7 +1746,7 @@ impl Engine {
             plain_len
         } else {
             let Some(keys) = self.keys(space) else {
-                return Ok(());
+                return Ok(false);
             };
             let (header, payload) = packet.split_at_mut(header_end);
             keys.remote
@@ -1443,7 +1761,8 @@ impl Engine {
             seen.insert(at, pn);
         }
         self.ack_pending[space] = true;
-        self.handle_frames(space, &packet[header_end..header_end + plain_len], now)
+        self.handle_frames(space, &packet[header_end..header_end + plain_len], now)?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1546,7 +1865,7 @@ impl Engine {
                 }
                 0x10 => {
                     if let Some(value) = get_varint(payload, &mut at) {
-                        self.peer_max_data = self.peer_max_data.max(value);
+                        self.data = self.data.max(value);
                     }
                 }
                 0x11 => {
@@ -1557,13 +1876,13 @@ impl Engine {
                         break;
                     };
                     if stream == self.stream_id {
-                        self.peer_max_stream = self.peer_max_stream.max(value);
+                        self.stream = self.stream.max(value);
                     }
                 }
                 0x12 | 0x13 => {
                     if let Some(value) = get_varint(payload, &mut at) {
                         if kind == 0x12 {
-                            self.peer_streams_bidi = self.peer_streams_bidi.max(value);
+                            self.bidi = self.bidi.max(value);
                         }
                     }
                 }
@@ -1640,6 +1959,10 @@ impl Engine {
             {
                 self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
                 acked_bytes += packet.size;
+                if let Some(candidate) = packet.probe {
+                    self.max_datagram = self.max_datagram.max(candidate);
+                    self.probe_inflight = false;
+                }
                 if newest.is_none_or(|newest| packet.sent_at > newest.sent_at) {
                     newest = Some(packet);
                 }
@@ -1670,6 +1993,9 @@ impl Engine {
     }
 
     fn compact_stream(&mut self) {
+        if self.early_attempted && !self.early_decided {
+            return;
+        }
         let first = self
             .sent
             .iter()
@@ -1798,7 +2124,7 @@ impl Engine {
             return 0;
         }
         let queued_end = self.stream_base + self.stream_data.len() as u64;
-        let limit = self.peer_max_stream.min(self.peer_max_data);
+        let limit = self.stream.min(self.data);
         let room = limit.saturating_sub(queued_end);
         let count = usize::try_from(room.min(data.len() as u64)).unwrap_or(0);
         self.stream_data.extend_from_slice(&data[..count]);
@@ -1961,23 +2287,23 @@ fn fail(shared: &Shared, why: impl Into<String>) {
     shared.writable.notify_all();
 }
 
-fn client_config(randomized: bool) -> Result<rustls::ClientConfig, String> {
+/// Build the rustls client config shared by every QUIC dial.
+fn client_config(randomized: bool, early: bool) -> Result<rustls::ClientConfig, String> {
     let mut provider = rustls::crypto::ring::default_provider();
     if randomized {
         randomize_cipher_suites(&mut provider)?;
         randomize_kx_groups(&mut provider)?;
     }
-    let schemes = provider
-        .signature_verification_algorithms
-        .supported_schemes();
     provider.secure_random = &PASSTHROUGH_RANDOM;
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| format!("psiphon quic tls: {error}"))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify { schemes }))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier())
+        .with_client_cert_resolver(client_auth());
     tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.resumption = resumption();
+    tls.enable_early_data = early;
     Ok(tls)
 }
 
@@ -2038,22 +2364,33 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
-fn quic_server_name() -> String {
-    let mut bytes = [0u8; 16];
-    if getrandom::fill(&mut bytes).is_err() {
-        return "psiphon.ca".to_owned();
+/// Derive a stable synthetic SNI from the server address and proof key.
+fn quic_server_name(remote: SocketAddr, proof_key: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(remote.to_string().as_bytes());
+    hash.update(proof_key.as_bytes());
+    let digest = hash.finalize();
+    let mut name = String::with_capacity(16 + 4);
+    for byte in &digest[..8] {
+        name.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        name.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
     }
-    let length = 4 + usize::from(bytes[0] % 12);
-    let mut name = String::with_capacity(length + 4);
-    for byte in &bytes[1..=length] {
-        name.push(char::from(b'a' + byte % 26));
-    }
-    name.push_str(match bytes[15] % 3 {
-        0 => ".com",
-        1 => ".net",
-        _ => ".org",
-    });
+    name.push_str(".com");
     name
+}
+
+/// Draw one probability coin from the system entropy source.
+fn coin(probability: f64) -> bool {
+    if probability <= 0.0 {
+        return false;
+    }
+    if probability >= 1.0 {
+        return true;
+    }
+    draw_below(65_536).is_ok_and(|draw| {
+        let draw = u16::try_from(draw).unwrap_or(u16::MAX);
+        f64::from(draw) / 65_536.0 < probability
+    })
 }
 
 fn transport_params(scid: &[u8], randomized: bool) -> Result<Vec<u8>, String> {
@@ -2257,12 +2594,24 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        get_varint, get_varint_byte, randomize_cipher_suites, randomize_kx_groups,
-        transport_params, Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, INITIAL_CWND,
-        MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
+        get_varint, get_varint_byte, lock, quic_server_name, randomize_cipher_suites,
+        randomize_kx_groups, sessions, transport_params, Engine, ObfuscatedUdp, PacketIo,
+        QuicNoise, SentPacket, INITIAL_CWND, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
     };
-    use std::net::UdpSocket;
+    use std::net::{SocketAddr, UdpSocket};
     use std::time::{Duration, Instant};
+
+    fn test_engine() -> Engine {
+        Engine::new(
+            "test",
+            false,
+            false,
+            true,
+            MAX_PACKET_SIZE,
+            "test.psiphon".to_owned(),
+        )
+        .expect("engine")
+    }
 
     #[test]
     fn quic_noise_presets_match_the_reference() {
@@ -2473,7 +2822,7 @@ mod tests {
 
     #[test]
     fn in_order_stream_data_lands_without_a_staging_allocation() {
-        let mut engine = Engine::new("test", false).expect("engine");
+        let mut engine = test_engine();
         engine.received.reserve(4096);
         engine.feed_stream(0, &[7u8; 1200], false).expect("first");
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
@@ -2491,7 +2840,7 @@ mod tests {
 
     #[test]
     fn a_gap_is_filled_by_the_packet_before_it() {
-        let mut engine = Engine::new("test", false).expect("engine");
+        let mut engine = test_engine();
         engine.feed_stream(4, b"efgh", false).expect("tail");
         engine.feed_stream(0, b"abcd", false).expect("head");
         assert_eq!(engine.received.as_slice(), b"abcdefgh");
@@ -2500,7 +2849,7 @@ mod tests {
 
     #[test]
     fn pull_received_hands_the_buffer_over_without_copying() {
-        let mut engine = Engine::new("test", false).expect("engine");
+        let mut engine = test_engine();
         engine.feed_stream(0, b"hello", false).expect("data");
         let mut out = Vec::new();
         let (count, counts) =
@@ -2513,7 +2862,7 @@ mod tests {
 
     #[test]
     fn expire_retransmits_the_old_prefix_and_drops_it() {
-        let mut engine = Engine::new("test", false).expect("engine");
+        let mut engine = test_engine();
         engine.cwnd = INITIAL_CWND * 2;
         engine.stream_sent = 400;
         engine.stream_data = vec![0u8; 400];
@@ -2528,6 +2877,8 @@ mod tests {
                 crypto: None,
                 stream: Some((index * 100, 100)),
                 window: false,
+                early: false,
+                probe: None,
             })
             .collect();
         engine.expire(base + Duration::from_millis(1000));
@@ -2542,7 +2893,7 @@ mod tests {
 
     #[test]
     fn ack_keeps_unacked_packets_in_order() {
-        let mut engine = Engine::new("test", false).expect("engine");
+        let mut engine = test_engine();
         engine.bytes_in_flight = 500;
         let base = Instant::now();
         engine.sent = (0..5)
@@ -2554,11 +2905,112 @@ mod tests {
                 crypto: None,
                 stream: None,
                 window: false,
+                early: false,
+                probe: None,
             })
             .collect();
         engine.ack(ONE_RTT, &[(1, 1), (3, 3)], base + Duration::from_millis(50));
         let left: Vec<u64> = engine.sent.iter().map(|packet| packet.pn).collect();
         assert_eq!(left, vec![0, 2, 4]);
         assert_eq!(engine.bytes_in_flight, 300);
+    }
+
+    #[test]
+    fn a_path_mtu_probe_commits_only_on_ack() {
+        let mut engine = test_engine();
+        engine.max_datagram = 1200;
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine.probe_inflight = true;
+        engine.sent.push(SentPacket {
+            pn: 7,
+            space: ONE_RTT,
+            sent_at: Instant::now(),
+            size: 1300,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: Some(1300),
+        });
+        engine.ack(ONE_RTT, &[(7, 7)], Instant::now());
+        assert_eq!(engine.max_datagram, 1300);
+        assert!(!engine.probe_inflight);
+    }
+
+    #[test]
+    fn a_lost_path_mtu_probe_stops_discovery() {
+        let mut engine = test_engine();
+        let sent_at = Instant::now();
+        engine.probe_inflight = true;
+        engine.sent.push(SentPacket {
+            pn: 7,
+            space: ONE_RTT,
+            sent_at,
+            size: 1300,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: Some(1300),
+        });
+        engine.expire(sent_at + Duration::from_secs(10));
+        assert!(engine.probe_failed);
+        assert!(!engine.probe_inflight);
+    }
+
+    #[test]
+    fn an_early_rollback_restores_the_stream_prefix() {
+        let mut engine = test_engine();
+        engine.early_attempted = true;
+        engine.opened = true;
+        engine.stream_data = b"hello".to_vec();
+        engine.stream_sent = 5;
+        engine.bytes_in_flight = 1200;
+        engine.sent.push(SentPacket {
+            pn: 0,
+            space: ONE_RTT,
+            sent_at: Instant::now(),
+            size: 1200,
+            crypto: None,
+            stream: Some((0, 5)),
+            window: false,
+            early: true,
+            probe: None,
+        });
+        engine.rollback_early();
+        assert_eq!(engine.stream_sent, 0);
+        assert_eq!(engine.stream_data, b"hello");
+        assert_eq!(engine.bytes_in_flight, 0);
+        assert!(engine.sent.is_empty());
+    }
+
+    #[test]
+    fn a_quic_session_name_is_stable_per_server_and_key() {
+        let remote = SocketAddr::from(([192, 0, 2, 1], 443));
+        assert_eq!(
+            quic_server_name(remote, "key"),
+            quic_server_name(remote, "key")
+        );
+        assert_ne!(
+            quic_server_name(remote, "key"),
+            quic_server_name(remote, "other")
+        );
+    }
+
+    #[test]
+    fn remembered_limits_stay_at_the_handshake_grant() {
+        let mut engine = test_engine();
+        engine.session_name = "remembered-limits".to_owned();
+        engine.initial_limits = (10, 20, 30);
+        engine.data = 100;
+        engine.stream = 200;
+        engine.bidi = 300;
+        engine.remember();
+        let guard = lock(sessions());
+        let remembered = guard.get("remembered-limits").unwrap();
+        assert_eq!(
+            (remembered.data, remembered.stream, remembered.bidi),
+            (10, 20, 30)
+        );
     }
 }

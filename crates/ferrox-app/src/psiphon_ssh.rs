@@ -474,6 +474,10 @@ pub(crate) struct TlsShape {
     pub(crate) tls_fragment_client_hello_protocols: Vec<String>,
     /// The chance an HTTP dial draws a browser User-Agent.
     pub(crate) user_agent_probability: f64,
+    /// The chance a QUIC dial attempts 0-RTT.
+    pub(crate) quic_dial_early: f64,
+    /// The chance a QUIC dial disables path-MTU discovery.
+    pub(crate) quic_disable_path_mtu: f64,
 }
 
 /// The reference defaults for one lane's TLS shape.
@@ -511,6 +515,8 @@ impl Default for TlsShape {
             tls_fragment_client_hello: 0.0,
             tls_fragment_client_hello_protocols: Vec::new(),
             user_agent_probability: 0.5,
+            quic_dial_early: 1.0,
+            quic_disable_path_mtu: 0.0,
         }
     }
 }
