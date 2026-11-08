@@ -5792,8 +5792,15 @@ mod tests {
             sock.send_to(&[0xc0, 0x00, 0x00, 0x01, salt], local)
                 .expect("queues");
         }
-        // The one-millisecond wait is also the floor, so it expires once the queue is dry: the third read is the first nothing arrived on, which is only true if the two before it were taken in the same visit.
-        assert!(pump_once(&mut conn, &sock, local, Duration::from_millis(1)));
+        // Loopback delivery is asynchronous, so let the burst land before the pump arms its floor.
+        std::thread::sleep(Duration::from_millis(100));
+        // The first wait is long enough for the burst; the one-millisecond tail expires once the queue is dry: the read after it is the first nothing arrived on, which is only true if the three before it were taken in the same visit.
+        assert!(pump_once(
+            &mut conn,
+            &sock,
+            local,
+            Duration::from_millis(100)
+        ));
         assert!(
             sock.recv_from(&mut [0u8; 64]).is_err(),
             "the queue was drained"
@@ -5808,6 +5815,8 @@ mod tests {
             sock.send_to(&[0xc0, 0x00, 0x00, 0x01, salt], local)
                 .expect("queues");
         }
+        // Loopback delivery is asynchronous, so let the burst land before the pump arms its floor.
+        std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
         assert!(pump_once(&mut conn, &sock, local, Duration::from_secs(1)));
         assert!(
