@@ -218,24 +218,23 @@ impl Liveness {
 
 /// The reference's protocol wildcard: `*` matches any run of bytes, everything else is literal.
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let first = parts[0];
-    if !text.starts_with(first) {
+    let mut parts = pattern.split('*');
+    let Some(mut rest) = text.strip_prefix(parts.next().unwrap_or_default()) else {
         return false;
-    }
-    let mut rest = &text[first.len()..];
-    for (index, part) in parts.iter().enumerate().skip(1) {
-        let part = *part;
-        if index + 1 == parts.len() {
-            return part.is_empty() || rest.ends_with(part);
+    };
+    let mut part = parts.next();
+    while let Some(current) = part {
+        part = parts.next();
+        if part.is_none() {
+            return current.is_empty() || rest.ends_with(current);
         }
-        if part.is_empty() {
+        if current.is_empty() {
             continue;
         }
-        let Some(at) = rest.find(part) else {
+        let Some(at) = rest.find(current) else {
             return false;
         };
-        rest = &rest[at + part.len()..];
+        rest = &rest[at + current.len()..];
     }
     rest.is_empty()
 }
@@ -10193,6 +10192,33 @@ mod tests {
         assert!(wildcard_match("A*B", "AB"));
         assert!(!wildcard_match("A*B", "AxBzC"));
         assert!(!wildcard_match("A*B", "BA"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "A"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("**", "anything"));
+        assert!(wildcard_match("A*", "A"));
+        assert!(wildcard_match("A*", "AB"));
+        assert!(wildcard_match("*B", "AB"));
+        assert!(wildcard_match("A*B*C", "AxByC"));
+        assert!(wildcard_match("A*B*C", "AxBzBzC"));
+        assert!(!wildcard_match("A*B*C", "AxBzCzB"));
+    }
+
+    /// Matching a wildcard takes no heap, even with several `*` runs.
+    #[test]
+    fn wildcard_matching_does_not_allocate() {
+        let (matched, counts) = ferrox_core::alloc_count::measure(|| {
+            wildcard_match("TLS-*", "TLS-OSSH")
+                && wildcard_match("*@psiphon.ca", "random@psiphon.ca")
+                && wildcard_match("A*B*C", "AxByC")
+                && !wildcard_match("A*B", "AxBzC")
+        });
+        assert!(matched);
+        assert_eq!(
+            counts.allocs, 0,
+            "wildcard matching takes no heap: {counts:?}"
+        );
     }
 
     #[test]
