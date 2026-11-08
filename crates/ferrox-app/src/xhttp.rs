@@ -1326,10 +1326,6 @@ impl XhttpSettings {
         } else {
             XhttpMode::auto_mode(settings, xhttp)
         };
-        let h2c = xhttp
-            .get("h2c")
-            .and_then(crate::json::Json::as_bool)
-            .unwrap_or(false);
         // Xray's `SplitHTTPConfig.Build` replaces every knob below but host, path and mode with the `extra` block a link carries, which arrives either as an object or as the JSON string the link query holds.
         let extra = xhttp.get("extra");
         let owned: Option<crate::json::Json> = match extra {
@@ -1348,7 +1344,7 @@ impl XhttpSettings {
         out.h2c = xhttp
             .get("h2c")
             .and_then(crate::json::Json::as_bool)
-            .unwrap_or(h2c);
+            .unwrap_or(false);
         out.headers = crate::config::masquerade_headers(xhttp.get("headers"));
         out.session_placement = placement_or(
             xhttp.get("sessionIDPlacement"),
@@ -4508,6 +4504,11 @@ mod tests {
         )
         .expect("parses");
         assert!(!XhttpSettings::from_json(Some(&cleared)).expect("h2c").h2c);
+        let replaced = crate::json::parse(
+            r#"{"network": "xhttp", "xhttpSettings": {"h2c": true, "extra": {}}}"#,
+        )
+        .expect("parses");
+        assert!(!XhttpSettings::from_json(Some(&replaced)).expect("h2c").h2c);
     }
 
     /// The path placements read the segments in order without collecting them: the default

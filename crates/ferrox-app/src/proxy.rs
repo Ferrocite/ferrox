@@ -50893,6 +50893,60 @@ mod tests {
         assert_vless_udp_over_xhttp(true);
     }
 
+    #[test]
+    fn a_vless_udp_association_crosses_plaintext_h2c() {
+        let path = "/udp-h2c";
+        let id = [0x4Cu8; 16];
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            h2c: true,
+            ..*xhttp_settings(path)
+        });
+        let server_settings = settings.clone();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&id),
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                true,
+                None,
+                None,
+            );
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Xhttp { settings },
+            host: "127.0.0.1".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        };
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        assert_vless_udp_echo_with("plain-h2c", &vless, &udp);
+        server.join().expect("joins");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|seen| seen == path),
+            "a plain h2c association must open with the H2 preface"
+        );
+    }
+
     fn assert_vless_udp_over_xhttp(h2: bool) {
         let tag = if h2 { "h2" } else { "h1" };
         let (server_config, client_config) = carried_tls_configs();
