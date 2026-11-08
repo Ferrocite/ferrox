@@ -3,9 +3,43 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// A connection's last moved byte, so a quiet direction does not idle a tunnel whose other direction is busy.
+#[derive(Debug)]
+pub(crate) struct Activity {
+    base: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    /// A clock whose first byte counts from now.
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Records a byte this connection moved in either direction.
+    pub(crate) fn touch(&self) {
+        let millis = Instant::now()
+            .saturating_duration_since(self.base)
+            .as_millis();
+        self.last_ms.store(millis as u64, Ordering::Relaxed);
+    }
+
+    /// How long since this connection last moved a byte.
+    pub(crate) fn age(&self) -> Duration {
+        let now = Instant::now()
+            .saturating_duration_since(self.base)
+            .as_millis() as u64;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now.saturating_sub(last))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct QuicDial {
@@ -65,6 +99,8 @@ pub(crate) struct PooledStream {
     pub(crate) sock: Arc<Datagram>,
     pub(crate) local: SocketAddr,
     pub(crate) id: u64,
+    /// The connection clock this lease's stream handles share.
+    activity: Arc<Activity>,
     /// The pool entry the stream was taken from, or none when it was built outside the pool: dropping the stream is what hands the id back, so no path that ends a flow has to remember to.
     entry: Option<PooledConn>,
 }
@@ -102,6 +138,9 @@ impl PooledStream {
             id: self.id,
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
+            prefaced: Arc::new(AtomicBool::new(true)),
+            activity: Arc::clone(&self.activity),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1267,6 +1306,23 @@ pub(crate) fn recv_batch(_sock: &Datagram, _batch: &mut Batch) -> Drain {
 /// The HTTP/3 opening, carried exactly once per connection: a second control stream is a connection error.
 pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
     for (stream, payload) in crate::foxy::H3::h3_opening() {
+        let mut rest = &payload[..];
+        while !rest.is_empty() {
+            match conn.stream_send(stream, rest, false) {
+                Ok(0) | Err(_) => return false,
+                Ok(wrote) => rest = &rest[wrote..],
+            }
+        }
+    }
+    flush_egress(conn, sock);
+    true
+}
+
+/// The server half of `send_h3_opening`: the same control stream on the server's unidirectional
+/// ids (3, 7, 11) rather than the client's (2, 6, 10).
+pub(crate) fn send_h3_server_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
+    for (index, (_, payload)) in crate::foxy::H3::h3_opening().into_iter().enumerate() {
+        let stream = [3u64, 7, 11][index];
         let mut rest = &payload[..];
         while !rest.is_empty() {
             match conn.stream_send(stream, rest, false) {
@@ -3373,6 +3429,7 @@ fn lease_within(dial: &QuicDial, budget: Duration, drive: bool) -> Option<Pooled
         sock: Arc::clone(&pooled.sock),
         local,
         id,
+        activity: Arc::new(Activity::new()),
         entry: Some(pooled),
     })
 }
@@ -3490,6 +3547,13 @@ pub(crate) struct QuicStream {
     meter: crate::stats::Meter,
     /// The peer's FIN can arrive with the last bytes, and `Read` has nowhere to report it; keeping it makes the next read the EOF instead of a read the poll repeats.
     peer_fin: Arc<AtomicBool>,
+    /// One H3 server preface per connection: the first request stream sends it, and a client-side
+    /// handle starts true because it must never send one.
+    prefaced: Arc<AtomicBool>,
+    /// The connection clock this stream's reads and writes refresh.
+    activity: Arc<Activity>,
+    /// Set by the serving driver when it stops: a worker parked in a read or write leaves instead of holding the socket past the loop.
+    stop: Arc<AtomicBool>,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -3504,6 +3568,9 @@ impl Read for QuicStream {
             return Ok(0);
         }
         if self.peer_fin.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        if self.stop.load(Ordering::Relaxed) {
             return Ok(0);
         }
         let deadline = Instant::now() + STREAM_QUANTUM;
@@ -3524,6 +3591,7 @@ impl Read for QuicStream {
                     };
                     if n > 0 {
                         self.peer_fin.store(fin, Ordering::Relaxed);
+                        self.activity.touch();
                         flush_egress(&mut conn, &self.sock);
                         self.meter.read(n);
                         return Ok(n);
@@ -3550,6 +3618,9 @@ impl Write for QuicStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = buf;
@@ -3563,6 +3634,7 @@ impl Write for QuicStream {
                 }
                 Ok(n) => {
                     self.meter.write(n);
+                    self.activity.touch();
                     rest = &rest[n..];
                 }
                 Err(error) => return Err(error),
@@ -3589,6 +3661,11 @@ impl crate::proxy::Duplicate for QuicStream {
 }
 
 impl QuicStream {
+    /// The connection clock this stream and its siblings share.
+    pub(crate) fn activity(&self) -> Arc<Activity> {
+        Arc::clone(&self.activity)
+    }
+
     /// Counts both directions against the caller's meters, keeping any an earlier layer already set.
     /// Adds counters to the stream while keeping the ones it already carries.
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
@@ -3615,7 +3692,8 @@ impl QuicStream {
 
     /// Half-close our direction: the peer reads everything sent, then EOF. A stream the peer already
     /// reset is finished, not a send to wait ten seconds for; and the wait itself takes the lock one
-    /// poll at a time, so a lane finishing never parks every other stream behind it.
+    /// poll at a time, so a lane finishing never parks every other stream behind it. `stream_finished`
+    /// is the peer's FIN, not ours, so it cannot stand in for the FIN this call exists to send.
     pub(crate) fn fin(&self) -> bool {
         let deadline = Instant::now() + SEND_WAIT;
         loop {
@@ -3623,7 +3701,7 @@ impl QuicStream {
                 let Ok(mut conn) = self.conn.lock() else {
                     return false;
                 };
-                if conn.is_closed() || conn.stream_finished(self.id) {
+                if conn.is_closed() {
                     Some(true)
                 } else {
                     match conn.stream_send(self.id, &[], true) {
@@ -3649,6 +3727,18 @@ impl QuicStream {
     pub(crate) fn close(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
     }
+
+    /// The H3 server preface, once per connection: SETTINGS and the QPACK hellos ride the server's
+    /// unidirectional ids, and a second control stream would be a connection error.
+    pub(crate) fn preface_h3(&self) -> bool {
+        if self.prefaced.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        let Ok(mut conn) = self.conn.lock() else {
+            return false;
+        };
+        send_h3_server_opening(&mut conn, &self.sock)
+    }
 }
 
 /// One serving session: the QUIC connection behind one lock, the stream ids already handed out.
@@ -3657,16 +3747,39 @@ struct ServerConn {
     seen: Mutex<HashSet<u64>>,
     visit: AtomicU64,
     gone: AtomicBool,
+    prefaced: Arc<AtomicBool>,
+    /// The clock every stream this connection serves shares.
+    activity: Arc<Activity>,
+    /// The serving loop's stop, so every stream on this connection leaves with the driver.
+    stop: Arc<AtomicBool>,
 }
 
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
+/// One stream a reap hands to a new worker: the connection, the stream id, the preface flag and the clock they share.
+type FreshStream = (
+    Arc<Mutex<quiche::Connection>>,
+    u64,
+    Arc<AtomicBool>,
+    Arc<Activity>,
+    Arc<AtomicBool>,
+);
+
+/// One worker's claim on the driver's socket, returned even when the session panics so the stop drain cannot wait on a thread that already ended.
+struct LiveGuard(Arc<AtomicUsize>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The driver's two datagram scratch buffers and the tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
-    fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)>,
+    fresh: Vec<FreshStream>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
     /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
@@ -3686,6 +3799,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let sock = Arc::new(sock);
+    let live = Arc::new(AtomicUsize::new(0));
     let mut conns: HashMap<Vec<u8>, Arc<ServerConn>> = HashMap::new();
     let mut scratch = Scratch {
         buf: [0u8; MAX_DATAGRAM],
@@ -3724,12 +3838,12 @@ pub(crate) fn serve_loop(
                     &mut batch,
                     &mut scratch.out,
                 );
-                reap(serve, &sock, &mut conns, &mut scratch);
+                reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
             Drain::Empty => {
                 run_timers(&mut conns, &sock, start.elapsed());
-                reap(serve, &sock, &mut conns, &mut scratch);
+                reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
             Drain::Unbatchable => {}
@@ -3751,7 +3865,17 @@ pub(crate) fn serve_loop(
             }
             Err(_) => return,
         }
-        reap(serve, &sock, &mut conns, &mut scratch);
+        reap(serve, &sock, &mut conns, &mut scratch, &live);
+    }
+    for state in conns.values() {
+        state.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut conn) = state.conn.lock() {
+            let _ = conn.close(false, 0, b"");
+            flush_egress(&mut conn, sock.as_ref());
+        }
+    }
+    while live.load(Ordering::SeqCst) != 0 {
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -3856,6 +3980,9 @@ fn route(
         seen: Mutex::new(HashSet::new()),
         visit: AtomicU64::new(0),
         gone: AtomicBool::new(false),
+        prefaced: Arc::new(AtomicBool::new(false)),
+        activity: Arc::new(Activity::new()),
+        stop: Arc::new(AtomicBool::new(false)),
     });
     conns.insert(scid.to_vec(), Arc::clone(&state));
     conns.insert(header.dcid.as_ref().to_vec(), state);
@@ -3916,6 +4043,7 @@ fn reap(
     sock: &Arc<Datagram>,
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
     scratch: &mut Scratch,
+    live: &Arc<AtomicUsize>,
 ) {
     scratch.fresh.clear();
     scratch.learned.clear();
@@ -3959,12 +4087,18 @@ fn reap(
                 if stream % 4 != 0 || !seen.insert(stream) {
                     continue;
                 }
-                scratch.fresh.push((Arc::clone(&state.conn), stream));
+                scratch.fresh.push((
+                    Arc::clone(&state.conn),
+                    stream,
+                    Arc::clone(&state.prefaced),
+                    Arc::clone(&state.activity),
+                    Arc::clone(&state.stop),
+                ));
                 spawned = true;
             }
-            // Only a pass that added a stream can leave a finished one behind: an idle connection's set has nothing to sweep.
+            // A peer FIN ends only its own direction, so a stream leaves the set once both are closed: else the next readable pass serves it again and resets the half-finished answer.
             if spawned {
-                seen.retain(|stream| !conn.stream_finished(*stream));
+                seen.retain(|stream| !conn.stream_closed(*stream));
             }
         }
     }
@@ -3975,16 +4109,24 @@ fn reap(
     for key in scratch.closed.drain(..) {
         conns.remove(&key);
     }
-    for (conn, stream) in scratch.fresh.drain(..) {
+    for (conn, stream, prefaced, activity, stop) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
             id: stream,
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
+            prefaced: Arc::clone(&prefaced),
+            activity: Arc::clone(&activity),
+            stop,
         };
         let serve = Arc::clone(serve);
-        std::thread::spawn(move || serve(session));
+        live.fetch_add(1, Ordering::SeqCst);
+        let guard = LiveGuard(Arc::clone(live));
+        std::thread::spawn(move || {
+            let _guard = guard;
+            serve(session);
+        });
     }
 }
 
@@ -4018,6 +4160,7 @@ pub(crate) fn direct_stream_on(
         sock: std::sync::Arc::new(sock),
         local,
         id: 4,
+        activity: Arc::new(Activity::new()),
         // Built outside the pool: nothing to hand back when the lane ends.
         entry: None,
     })
