@@ -5775,13 +5775,13 @@ mod tests {
             guard.stream_send(0, b"after", false).expect("sends");
             flush_egress(&mut guard, &moved_sock);
         }
-
+        let id = 0;
         let mut after = [0u8; 32];
         let mut got = 0;
         for _ in 0..64 {
             pass(
-                &mut client.conn,
-                &client.sock,
+                &mut conn.lock().expect("lock"),
+                &moved_sock,
                 &mut server.conn,
                 &server.sock,
                 server.addr,
@@ -5789,9 +5789,9 @@ mod tests {
             pass(
                 &mut server.conn,
                 &server.sock,
-                &mut client.conn,
-                &client.sock,
-                client.addr,
+                &mut conn.lock().expect("lock"),
+                &moved_sock,
+                moved_addr,
             );
             match server.conn.stream_recv(id, &mut after) {
                 Ok((n, _)) => {
