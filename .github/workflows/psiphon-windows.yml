@@ -1,19 +1,24 @@
 name: Psiphon Windows lane (live tunnel check)
 
-# Proves the native `psiphon` lane on Windows and measures it beside the engine
-# the working Windows client ships: `ferrox-app` starts with a socks and a mixed
-# front, waits for a front to carry a trace through the lane's first tunnel, then
+# Proves the native `psiphon` lane on Windows and measures it in a form a second
+# run can be compared with. `ferrox-app` starts with a socks and a mixed front,
+# waits for a front to carry a trace through the lane's first tunnel, then
 # carries an exact 10 MB file through each front and through the lane's own HTTP
-# edge. The pinned `psiphon-tunnel-core.exe` from Psiphon-Inc/psiphon-windows then
-# runs on the same ports, pinned to the server and SSH/OSSH protocol the native
-# lane selected, so a ratio is not a difference between two carriers. The runner's
-# own egress is
-# the control; the byte count is the gate. No Psiphon GUI is fetched or started,
-# and the engine is checked against the blob hash the pin names.
+# edge, once for a warm-up legs carrier and again after a second warm-up. The
+# pinned `psiphon-tunnel-core.exe` from Psiphon-Inc/psiphon-windows then runs on
+# the same ports, pinned to the server and SSH/OSSH protocol the native lane
+# selected, so a same-run ratio is not a difference between two carriers. The
+# comparison a second run can trust is the legs divided by the no-lane egress
+# control in the same run, which removes the runner's own route; every leg is
+# still gates through was the exact byte count and the sampled process tallies.
+# No Psiphon GUI is fetched or started, and the engine is checked against the
+# blob hash the pin names.
 #
 # The engine leg is a measurement, not a gate: its carrier set and its tactics
 # are external, and a refusal there is a line in the summary rather than a red
-# lane. The native legs are the gate.
+# lane. The native legs are the gate. A two-letter region pins both lanes to the
+# same egress; a blank region lets them choose, and the summary then names the
+# egress each lane reported so a mismatched run still reads as one.
 on:
   workflow_dispatch:
     inputs:
@@ -84,6 +89,7 @@ jobs:
         run: |
           : > psiphon-legs.tsv
           : > control.bin
+          : > route.bin
           code=0
           timing=$(curl -sS --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download}' \
@@ -96,6 +102,41 @@ jobs:
           else
             echo "::warning::this runner cannot itself download 10 MB (curl exit $code, ${got:-0} bytes)"
           fi
+          # The runner first reaches its traffic through a NAT/transit. The
+          # control measures that hop, so the same ten megabytes is fetched
+          # again directly with no lane, naming the hop to use as a
+          # certificate-transparency gate later. A leg that fails
+          # afterwards is not a performance number, and a hop that
+          # changes does not make two runs comparable.
+          code=0
+          timing=$(curl -sS --noproxy '*' --max-time 300 \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=10000000' -o route.bin) || code=$?
+          echo "control, route ${timing:-0 0 0}" >> psiphon-legs.tsv
+          got=$(wc -c < route.bin 2>/dev/null | tr -d ' ')
+          echo "route control: curl exit $code, ${got:-0} bytes of 10000000"
+          if test "$code" = 0 && test "${got:-0}" = 10000000; then
+            echo "route control carried the whole ten megabytes"
+          else
+            echo "::warning::the runner cannot itself download 10 MB on the route (curl exit $code, ${got:-0} bytes)"
+          fi
+          # The egress the lane's server actually reached. The trace loc is the
+          # egress the upstream connection presented; the native lane also
+          # logs the server it chose. A second run's legs are divided by this
+          # control, so a run whose server country differs still reads as
+          # the same units.
+          code=0
+          curl -sS --noproxy '*' --max-time 30 \
+            https://www.cloudflare.com/cdn-cgi/trace -o route-trace.txt || code=$?
+          echo "control, route trace ${code:-0} 0 0" >> psiphon-legs.tsv
+          {
+            grep -E '^(loc|ip)=' route-trace.txt || true
+            echo "server: none yet"
+            echo "protocol: none yet"
+            echo "region: ne-none"
+          } > route.txt
+          echo "route trace: curl exit $code"
+          grep -E '^(loc|ip)=' route-trace.txt || true
       - name: Carry ten megabytes through both implementations
         env:
           PSIPHON_REGION: ${{ inputs.region }}
@@ -108,6 +149,8 @@ jobs:
           : > psiphon-windows.log
           : > psiphon-reference.log
           : > psiphon-metrics.tsv
+          : > psiphon-egress.tsv
+          : > route.txt
           LANE_PID=""
           stop_lane() {
             if [ -n "$LANE_PID" ]; then
@@ -173,6 +216,11 @@ jobs:
             echo "$label trace ${timing:-0 0 0}" >> psiphon-legs.tsv
             if test "$code" = 0 && grep -q '^loc=' trace.txt; then
               grep -E '^(loc|ip)=' trace.txt || true
+              # A trace that names no peer egress pins no route: record it
+              # so the summary cannot call the leg comparable.
+              loc=$(grep '^loc=' trace.txt | cut -d= -f2)
+              [ -n "$loc" ] || loc="unknown"
+              echo "$label egress $loc" >> psiphon-egress.tsv
               return 0
             fi
             echo "$label trace FAILED: curl exit $code" >&2
@@ -192,6 +240,15 @@ jobs:
             fi
             echo "$label FAILED: curl exit $code after $got of 10000000 B" >&2
             return 1
+          }
+          # The peer the native lane chose. The tunnelling log hard-codes
+          # server host and port; the aggregate server a leg carries
+          # traffic through must be known, or no leg compares to another.
+          lane_route() {
+            grep 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null | tail -n 1 | \
+              sed -n 's/.*tunnel up via \([^ ]*\) \([^ ]*\).*/server: \1\nprotocol: \2/p'
+            loc=$(grep '^loc=' route-trace.txt 2>/dev/null | cut -d= -f2)
+            printf 'region: %s\n' "${loc:-unknown}"
           }
           # The two signature values are read out of the lane's own source, so the
           # shipped engine verifies the same list with the same key this tree pins.
@@ -318,11 +375,17 @@ jobs:
           printf 'native ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
           NATIVE_LANE=$(winpid "$LANE_PID")
           sample_native "native ready" "$NATIVE_LANE"
+          lane_route > route.txt
           trace_front socks 10808 "native socks" || FAILED="$FAILED native(socks trace)"
           fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
           fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
           fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
+          # A cold first fetch and a slow-start connection make an early leg
+          # read lower than the lane carries. One warm-up fetch warms both
+          # sides of the tunnel before the measured pair, so the measured
+          # legs carry steady-state traffic.
+          fetch_mb socks 10808 psiphon-socks-warm2.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
           if [ -n "${PSIPHON_LIGHT_ENTRY:-}" ] && ! grep -q 'light proxy carried speed.cloudflare.com:443' psiphon-windows.log; then
             echo "native light FAILED: the ten-megabyte legs did not use the light proxy" >&2
             FAILED="$FAILED native(light)"
@@ -378,6 +441,7 @@ jobs:
           fi
           stop_lane
 
+          lane_route > route.txt
           if ! python scripts/psiphon-target.py \
             --log psiphon-windows.log \
             --state "$RUNNER_TEMP/psiphon-state" \
@@ -409,6 +473,9 @@ jobs:
               REF_FAILED="$REF_FAILED http(unbound)"
             fi
             fetch_mb socks 10808 reference-socks-warm.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
+            # Same warm-up as the native lane, so both measured legs carry
+            # steady-state traffic.
+            fetch_mb socks 10808 reference-socks-warm2.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
             sample_native "reference done" "$REFERENCE_ENGINE"
             if [ -n "$REF_FAILED" ]; then
               echo "::warning::the shipped engine's legs failed:$REF_FAILED"
@@ -441,6 +508,8 @@ jobs:
             psiphon-metrics.tsv
             psiphon-windows.log
             psiphon-reference.log
+            psiphon-egress.tsv
+            route.txt
             lane-status.txt
           if-no-files-found: warn
       - name: Summarise
@@ -489,26 +558,57 @@ jobs:
                   return None, None
               return done[0], done[1] - ready[1]
 
+          # The route every leg in this run shared. A second run compares
+          # with this one only when the legs are divided by the no-lane
+          # control in the same run, so the raw bytes/s above are the
+          # runner's route and the ÷control column is the comparable one.
+          route = {}
+          try:
+              for line in open("route.txt").read().splitlines():
+                  if ":" in line:
+                      key, value = line.split(":", 1)
+                      route[key.strip()] = value.strip()
+          except OSError:
+              pass
+          egress = {}
+          try:
+              for line in open("psiphon-egress.tsv").read().splitlines():
+                  parts = line.rsplit(None, 1)
+                  if len(parts) == 2:
+                      egress[parts[0]] = parts[1]
+          except OSError:
+              pass
+          control = leg("control, no lane")
+          control_speed = control[2] if control and control[2] > 0 else None
+
           print("### Psiphon lane, Windows")
           print()
           print("The native lane and the engine `psiphon-windows` ships run back to")
           print("back on the same runner and the same ports; each carries 10 MB")
-          print("through its socks front, its HTTP front and a warm repeat. The")
-          print("engine is pinned to the server and SSH/OSSH protocol the native lane")
-          print("chose, so the ratio is the implementation and not a different carrier.")
-          print("When the dispatch asks for a pool above one, the reference is still")
-          print("pinned to one server, so the pool rows are native-only. A dispatch")
-          print("window sets the native channel window only; the engine keeps its own")
-          print("default, so the ratio includes it. Both verify the same signed list")
-          print("with the key this tree pins. The runner's own egress is the control;")
-          print("byte counts are the gate.")
+          print("through its socks front, its HTTP front and a warm repeat after")
+          print("a warm-up fetch, so the measured legs carry steady-state traffic.")
+          print("The engine is pinned to the server and SSH/OSSH protocol the native")
+          print("lane chose, so the ratio is the implementation and not a")
+          print("different carrier. The route is the no-lane control in this run:")
+          print("a leg's ÷control value divides that leg's MiB/s by the")
+          print("control's MiB/s, so two runs with different runners compare in")
+          print("the same units. When the dispatch asks for a pool above one,")
+          print("the reference is still pinned to one server, so the pool rows")
+          print("are native-only. A dispatch window sets the native channel")
+          print("window only; the engine keeps its own default, so the ratio")
+          print("includes it. Both verify the same signed list with the key this")
+          print("tree pins. Byte counts are the gate.")
           print()
-          print("| leg | bytes | seconds | MiB/s |")
-          print("| --- | --- | --- | --- |")
+          if route:
+              print("route: " + ", ".join(f"{key}={value}" for key, value in route.items()))
+              print()
+          print("| leg | bytes | seconds | MiB/s | ÷control |")
+          print("| --- | --- | --- | --- | --- |")
           for label, size, seconds, speed in legs:
-              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} |")
+              div = f"{(speed / 1048576) / (control_speed / 1048576):.2f}" if control_speed else "n/a"
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} | {div} |")
           if not legs:
-              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 |")
+              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | n/a |")
           print()
           print("| process | RSS KiB | CPU s |")
           print("| --- | ---: | ---: |")
