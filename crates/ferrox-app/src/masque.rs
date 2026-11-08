@@ -1656,16 +1656,16 @@ fn deliver_owned(
     let Some(to) = delivery(routes, &datagram[offset..]) else {
         return;
     };
-    datagram.drain(..offset);
     match to {
         Delivery::Udp(lane) => {
+            datagram.drain(..offset);
             let _ = lane.send(datagram);
         }
         Delivery::Stack => {
             let _ = to_stack.send(Packet {
                 peer: [0u8; 32],
                 bytes: datagram,
-                at: 0,
+                at: offset,
             });
         }
     }
@@ -3003,16 +3003,16 @@ fn forward_owned(
     let Some(to) = forward_to(shared, spec, addrs, &datagram[offset..]) else {
         return;
     };
-    datagram.drain(..offset);
     match to {
         Forward::Tunnel(other) => {
+            datagram.drain(..offset);
             let _ = other.try_send(datagram);
         }
         Forward::Stack => {
             let _ = shared.packets.send(Packet {
                 peer: peer_key(addrs),
                 bytes: datagram,
-                at: 0,
+                at: offset,
             });
         }
     }
@@ -3488,15 +3488,24 @@ mod tests {
         connectip::datagram_prefix(4, &mut datagram);
         datagram.extend_from_slice(&packet);
         let base = datagram.as_ptr();
-        let capacity = datagram.capacity();
         let offset = datagram.len() - packet.len();
+        let packet_base = datagram[offset..].as_ptr();
+        let length = datagram.len();
+        let capacity = datagram.capacity();
         forward_owned(&shared, &spec, &[owner], datagram, offset);
         let forwarded = packets_rx.recv().expect("forwarded");
-        assert_eq!(forwarded.bytes, packet);
+        assert_eq!(forwarded.at, offset);
+        assert_eq!(&forwarded.bytes[forwarded.at..], packet.as_slice());
+        assert_eq!(forwarded.bytes.len(), length);
         assert_eq!(
             forwarded.bytes.as_ptr(),
             base,
-            "the forwarded packet is the buffer that arrived"
+            "the forwarded datagram is the buffer that arrived"
+        );
+        assert_eq!(
+            forwarded.bytes[forwarded.at..].as_ptr(),
+            packet_base,
+            "the packet starts at its prefix, not at a moved copy"
         );
         assert_eq!(
             forwarded.bytes.capacity(),
@@ -3515,15 +3524,24 @@ mod tests {
         connectip::datagram_prefix(4, &mut datagram);
         datagram.extend_from_slice(&packet);
         let base = datagram.as_ptr();
-        let capacity = datagram.capacity();
         let offset = datagram.len() - packet.len();
+        let packet_base = datagram[offset..].as_ptr();
+        let length = datagram.len();
+        let capacity = datagram.capacity();
         deliver_owned(&to_stack, &routes, datagram, offset);
         let delivered = stack_rx.recv().expect("delivered");
-        assert_eq!(delivered.bytes, packet);
+        assert_eq!(delivered.at, offset);
+        assert_eq!(&delivered.bytes[delivered.at..], packet.as_slice());
+        assert_eq!(delivered.bytes.len(), length);
         assert_eq!(
             delivered.bytes.as_ptr(),
             base,
-            "the delivered packet is the buffer that arrived"
+            "the delivered datagram is the buffer that arrived"
+        );
+        assert_eq!(
+            delivered.bytes[delivered.at..].as_ptr(),
+            packet_base,
+            "the packet starts at its prefix, not at a moved copy"
         );
         assert_eq!(
             delivered.bytes.capacity(),
@@ -3578,7 +3596,8 @@ mod tests {
         let offset = datagram.len() - packet.len();
         deliver_owned(&to_stack, &routes, datagram, offset);
         let delivered = stack_rx.recv().expect("delivered from its datagram");
-        assert_eq!(delivered.bytes, packet);
+        assert_eq!(delivered.at, offset);
+        assert_eq!(&delivered.bytes[delivered.at..], packet.as_slice());
     }
 
     #[test]
