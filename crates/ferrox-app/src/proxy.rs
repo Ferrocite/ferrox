@@ -59731,7 +59731,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn vless_kcp_reality_echoes() {
-        let public = x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
         let client_reality = Arc::new(ferrox_core::tls::RealityClientConfig {
             server_name: REALITY_TEST_SNI.to_owned(),
             public_key: public,
