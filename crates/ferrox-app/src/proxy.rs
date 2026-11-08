@@ -19967,23 +19967,47 @@ fn serve_trojan_grpc(
     settings: &crate::config::GrpcSettings,
     freedom: bool,
 ) {
-    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
+    let Ok(write) = stream.try_clone() else {
         return;
     };
+    let _ = stream.set_read_timeout(Some(RELAY_POLL));
+    crate::grpc::serve_muxed_trojan_conn(
+        stream,
+        crate::grpc::Tail::new(Box::new(write)),
+        settings,
+        key,
+        freedom,
+    );
+}
+
+/// The trojan handler for one stream of a multiplexed gRPC connection: the demux has already
+/// answered the HTTP/2 head, so only the trojan header and the relay remain.
+pub(crate) fn serve_trojan_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    writer: crate::grpc::GrpcWriter,
+    key: &[[u8; 56]],
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
     let Some((cmd, target)) = under_handshake(&mut reader, |read| decode_trojan_request(read, key))
     else {
+        reader.abort();
         return;
     };
+    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::accesslog::record_current(&target);
     if !freedom {
+        reader.abort();
         return;
     }
-    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
         spawn_trojan_udp(reader, writer, move || closer.close());
         return;
     }
     if cmd != 1 {
+        reader.abort();
         return;
     }
     if target.is_mux() {
@@ -19992,19 +20016,25 @@ fn serve_trojan_grpc(
         return;
     }
     let Some(target) = target.socket() else {
+        reader.abort();
         return;
     };
     let Some(uplink) = dial_or_report(&target) else {
+        reader.abort();
         return;
     };
-    reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_window_with(
+    let reset = reader.reset_handle();
+    if relay_sink_drained_queued(
         reader,
         &writer,
         &uplink,
         crate::grpc::mark_reader_dead,
         |reader| crate::grpc::request_ended(reader),
-    );
+    )
+    .is_none()
+    {
+        reset();
+    }
 }
 
 fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
@@ -20861,63 +20891,14 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     relay_sink(creader, &sink, &uplink, |_| {});
 }
 
-fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     read: R,
     write: W,
     settings: &crate::config::GrpcSettings,
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    let Some((mut creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
-        echo_trace("session grpc trojan accept refused");
-        return;
-    };
-    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_trojan_request(&mut creader, key);
-    creader.set_handshake_budget(None);
-    let Some((cmd, target)) = decoded else {
-        echo_trace("session grpc trojan decode refused");
-        return;
-    };
-    crate::accesslog::record_current(&target);
-    if !freedom {
-        echo_trace("session grpc trojan cmd refused");
-        return;
-    }
-    if cmd == 3 {
-        let closer = cwriter.clone();
-        spawn_trojan_udp(creader, cwriter, move || closer.close());
-        return;
-    }
-    if cmd != 1 {
-        echo_trace("session grpc trojan cmd refused");
-        return;
-    }
-    if target.is_mux() {
-        let closer = cwriter.clone();
-        spawn_trojan_mux(
-            creader,
-            cwriter,
-            Arc::new(move || closer.close()),
-            Vec::new(),
-        );
-        return;
-    }
-    let Some(target) = target.socket() else {
-        return;
-    };
-    let Some(uplink) = dial_or_report(&target) else {
-        echo_trace("session grpc uplink refused");
-        return;
-    };
-    echo_trace("session grpc relaying");
-    relay_sink_window_with(
-        creader,
-        &cwriter,
-        &uplink,
-        crate::grpc::mark_reader_dead,
-        |reader| crate::grpc::request_ended(reader),
-    );
+    crate::grpc::serve_muxed_trojan(read, write, settings, key, freedom);
 }
 
 fn serve_vmess_kcp_tls(
