@@ -815,7 +815,7 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
         let scope = if prefer_alternate {
             servers
                 .first()
-                .map(|server| server.ip().to_string())
+                .map(|(server, _)| server.ip().to_string())
                 .unwrap_or_default()
         } else {
             String::new()
@@ -826,8 +826,8 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
     };
     let must_match = coin(config.qname_must_match_probability);
     let mut first = true;
-    for server in &servers {
-        let attempts = if config.preferred.iter().any(|preferred| preferred == server) {
+    for (server, preferred) in &servers {
+        let attempts = if *preferred {
             config.attempts_per_preferred.max(1)
         } else {
             config.attempts_per_server.max(1)
@@ -907,13 +907,13 @@ pub(crate) fn resolve_fronting(
 }
 
 /// Preferred servers first when the coin lands, then the configured alternates.
-fn alternate_servers(config: &Config) -> Vec<SocketAddr> {
+fn alternate_servers(config: &Config) -> Vec<(SocketAddr, bool)> {
     let mut servers = Vec::with_capacity(config.preferred.len() + config.servers.len());
-    servers.extend(config.preferred.iter().copied());
+    servers.extend(config.preferred.iter().map(|server| (*server, true)));
     let mut seen: HashSet<SocketAddr> = config.preferred.iter().copied().collect();
     for server in &config.servers {
         if seen.insert(*server) {
-            servers.push(*server);
+            servers.push((*server, false));
         }
     }
     servers
@@ -1311,11 +1311,11 @@ mod tests {
         assert_eq!(
             super::alternate_servers(&config),
             vec![
-                preferred[0],
-                preferred[1],
-                preferred[2],
-                configured[0],
-                configured[3]
+                (preferred[0], true),
+                (preferred[1], true),
+                (preferred[2], true),
+                (configured[0], false),
+                (configured[3], false)
             ]
         );
     }

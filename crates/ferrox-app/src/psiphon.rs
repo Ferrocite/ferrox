@@ -602,11 +602,11 @@ impl Inner {
 
     /// Record a live server: it becomes the affinity and, under the cap, the next first entry.
     fn remember(&self, host: &str) {
-        if let Some((host, port)) = host
+        let affinity = host
             .rsplit_once(':')
-            .and_then(|(host, port)| port.parse().ok().map(|port| (host, port)))
-        {
-            *lock(&self.affinity) = Some((host.to_owned(), port));
+            .and_then(|(name, port)| port.parse().ok().map(|port| (name, port)));
+        if let Some((name, port)) = affinity {
+            *lock(&self.affinity) = Some((name.to_owned(), port));
         }
         let mut guard = lock(&self.entries);
         let max = self.settings.server_entry_max_move_to_front;
@@ -617,8 +617,10 @@ impl Inner {
         if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
             return;
         }
-        if move_to_front(Arc::make_mut(&mut *guard), host) {
-            moved.insert(host.to_owned());
+        if let Some((name, port)) = affinity {
+            if move_to_front(Arc::make_mut(&mut *guard), name, port) {
+                moved.insert(host.to_owned());
+            }
         }
     }
 
@@ -1186,36 +1188,14 @@ impl Inner {
     /// Append entries the lane does not already dial, keeping the snapshot stable.
     fn add_entries(&self, entries: Vec<Server>) -> usize {
         let mut current = lock(&self.entries);
-        let mut list = (**current).clone();
-        let mut added = 0;
-        for entry in entries {
-            let key = (
-                entry.address,
-                entry.port,
-                entry.ssh_port,
-                entry.quic,
-                entry.ss,
-                entry.tls,
-            );
-            if list.iter().any(|existing| {
-                (
-                    existing.address,
-                    existing.port,
-                    existing.ssh_port,
-                    existing.quic,
-                    existing.ss,
-                    existing.tls,
-                ) == key
-            }) {
-                continue;
-            }
-            list.push(entry);
-            added += 1;
-        }
-        if added > 0 {
+        let added = new_entries(&**current, entries);
+        let count = added.len();
+        if count > 0 {
+            let mut list = (**current).clone();
+            list.extend(added);
             *current = Arc::new(list);
         }
-        added
+        count
     }
 }
 
@@ -6328,11 +6308,32 @@ fn shuffle<T>(items: &mut [T]) {
     }
 }
 
+/// The identity `add_entries` uses to keep the first copy of a server entry.
+fn server_key(entry: &Server) -> (IpAddr, u16, Option<u16>, bool, bool, bool) {
+    (
+        entry.address,
+        entry.port,
+        entry.ssh_port,
+        entry.quic,
+        entry.ss,
+        entry.tls,
+    )
+}
+
+/// The entries not already present, keeping their order and the first copy of each.
+fn new_entries(current: &[Server], entries: Vec<Server>) -> Vec<Server> {
+    let mut seen: HashSet<_> = current.iter().map(server_key).collect();
+    entries
+        .into_iter()
+        .filter(|entry| seen.insert(server_key(entry)))
+        .collect()
+}
+
 /// Move a live server to the front; returns whether it moved.
-fn move_to_front(entries: &mut Vec<Server>, host: &str) -> bool {
+fn move_to_front(entries: &mut Vec<Server>, host: &str, port: u16) -> bool {
     let Some(at) = entries
         .iter()
-        .position(|entry| format!("{}:{}", entry.host, entry.port) == host)
+        .position(|entry| entry.host == host && entry.port == port)
     else {
         return false;
     };
@@ -10149,10 +10150,25 @@ mod tests {
         let mut second = test_server(false);
         second.host = "b".to_owned();
         let mut entries = vec![first, second];
-        assert!(move_to_front(&mut entries, "b:22"));
+        let ((), new) = ferrox_core::alloc_count::measure(|| {
+            assert!(move_to_front(&mut entries, "b", 22));
+        });
+        assert_eq!(new.allocs, 0, "the field compare takes no heap: {new:?}");
         assert_eq!(entries[0].host, "b");
-        assert!(!move_to_front(&mut entries, "b:22"));
-        assert!(!move_to_front(&mut entries, "c:22"));
+        assert!(!move_to_front(&mut entries, "b", 22));
+        assert!(!move_to_front(&mut entries, "c", 22));
+    }
+
+    #[test]
+    fn new_entries_keep_the_first_copy_of_each_server() {
+        let mut first = test_server(false);
+        first.port = 22;
+        let mut next = test_server(false);
+        next.port = 23;
+        let current = vec![first.clone()];
+        let added = new_entries(&current, vec![first, next.clone(), next]);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].port, 23);
     }
 
     #[test]
