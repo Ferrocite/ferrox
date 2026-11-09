@@ -14384,10 +14384,7 @@ fn dial_vless_quic_reality(
 ) {
     let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
     else {
-        return note_dial_failure(
-            server,
-            Failure::new(Stage::RequestSent, Kind::Dropped),
-        );
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
     let handshake = SealHandshake::new(pooled.stream_handle(), budgets::handshake());
@@ -14432,30 +14429,18 @@ fn dial_vless_hysteria_reality(
     cfg: &ferrox_core::tls::RealityClientConfig,
 ) {
     let Some(dial) = hysteria_dial_session(vless) else {
-        return note_dial_failure(
-            server,
-            Failure::new(Stage::SocketConnected, Kind::Dropped),
-        );
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Dropped));
     };
     let Some(header) = vless_request_header(vless, target) else {
-        return note_dial_failure(
-            server,
-            Failure::new(Stage::RequestSent, Kind::Dropped),
-        );
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     };
     let Some(flow) = crate::hysteria::open(&dial, &header, 0) else {
-        return note_dial_failure(
-            server,
-            Failure::new(Stage::SocketConnected, Kind::Dropped),
-        );
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Dropped));
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
     let limiter = ferrox_core::tls::reality::RecordLimiter::new(flow);
     let Ok(mut session) = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) else {
-        return note_dial_failure(
-            server,
-            Failure::new(Stage::SocketConnected, Kind::Dropped),
-        );
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Dropped));
     };
     if read_vless_response(&mut session).is_none() {
         return;
