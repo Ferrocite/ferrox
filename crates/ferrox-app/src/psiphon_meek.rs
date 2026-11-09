@@ -14,7 +14,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_REQUEST_PAYLOAD: usize = 64 * 1024;
 const LIMITED_READ_CHUNK: usize = 4 * 1024;
@@ -695,6 +695,9 @@ pub(crate) struct MeekHttp {
     preconnected: bool,
     limit_buffer_sizes: bool,
     dns: crate::psiphon_dns::Config,
+    /// Candidate addresses named by a test instead of a live resolver.
+    #[cfg(test)]
+    injected_addresses: Option<Vec<SocketAddr>>,
 }
 
 impl MeekHttp {
@@ -748,6 +751,8 @@ impl MeekHttp {
             preconnected: false,
             limit_buffer_sizes: false,
             dns,
+            #[cfg(test)]
+            injected_addresses: None,
         })
     }
 
@@ -784,6 +789,8 @@ impl MeekHttp {
             preconnected: false,
             limit_buffer_sizes: false,
             dns,
+            #[cfg(test)]
+            injected_addresses: None,
         }
     }
 
@@ -835,6 +842,8 @@ impl MeekHttp {
             preconnected: true,
             limit_buffer_sizes: false,
             dns,
+            #[cfg(test)]
+            injected_addresses: None,
         })
     }
 
@@ -907,50 +916,83 @@ impl MeekHttp {
         Ok(reply)
     }
 
-    /// Dial the next front and start a TLS session when required.
-    #[allow(clippy::too_many_lines)]
+    /// Try each front and each resolved address until one handshakes. A single
+    /// refused front is a dead candidate, not the end of the relay.
     fn open(&mut self) -> Result<(), String> {
         if self.preconnected {
             return Err("psiphon meek connection is gone".to_owned());
         }
-        self.rotate_front();
+        let deadline = Instant::now() + self.timeout;
+        let mut last = "psiphon meek: no front to dial".to_owned();
+        let fronts = self.meek.fronts.len().max(1);
+        for _ in 0..fronts {
+            self.rotate_front();
+            if Self::remaining(deadline, self.timeout).is_none() {
+                break;
+            }
+            let addresses = match self.resolved_addresses() {
+                Ok(addresses) => addresses,
+                Err(why) => {
+                    last = why;
+                    continue;
+                }
+            };
+            for address in addresses {
+                let Some(timeout) = Self::remaining(deadline, self.timeout) else {
+                    break;
+                };
+                match self.open_once(address, timeout) {
+                    Ok(()) => {
+                        if self.meek.fronted {
+                            self.dns.verify_cache_extension(&self.meek.dial);
+                        }
+                        return Ok(());
+                    }
+                    Err(why) => last = why,
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// The candidate addresses for the current front. Tests name them directly
+    /// so the resolved-IP rotation does not need a live resolver.
+    fn resolved_addresses(&self) -> Result<Vec<SocketAddr>, String> {
+        #[cfg(test)]
+        if let Some(addresses) = &self.injected_addresses {
+            return Ok(addresses.clone());
+        }
+        crate::psiphon_dns::resolve_fronting(
+            &self.dns,
+            self.meek.provider_id.as_deref(),
+            &self.meek.dial,
+            self.meek.port,
+        )
+        .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))
+    }
+
+    /// Dial one address and start a TLS session when the front requires one.
+    #[allow(clippy::too_many_lines)]
+    fn open_once(&mut self, address: SocketAddr, timeout: Duration) -> Result<(), String> {
         if self.meek.quic && self.proxy.is_none() {
             let sni = if self.meek.disable_sni {
                 String::new()
             } else {
                 self.meek.sni.clone()
             };
-            let h3 = crate::psiphon_h3::H3::connect(
-                &self.meek.dial,
-                self.meek.port,
-                &sni,
-                self.timeout,
-                &self.dns,
-            )?;
+            let h3 =
+                crate::psiphon_h3::H3::connect_address(address, &self.meek.dial, &sni, timeout)?;
             self.stream = Some(MeekStream::H3(Box::new(h3)));
-            if self.meek.fronted {
-                self.dns.verify_cache_extension(&self.meek.dial);
-            }
             return Ok(());
         }
-        let address = crate::psiphon_dns::resolve_fronting(
-            &self.dns,
-            self.meek.provider_id.as_deref(),
-            &self.meek.dial,
-            self.meek.port,
-        )
-        .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("psiphon meek resolve {}: no address", self.meek.dial))?;
         let stream = match &self.proxy {
-            Some(proxy) => proxy.connect(address, self.timeout)?,
-            None => TcpStream::connect_timeout(&address, self.timeout)
+            Some(proxy) => proxy.connect(address, timeout)?,
+            None => TcpStream::connect_timeout(&address, timeout)
                 .map_err(|error| format!("psiphon meek connect {}: {error}", self.meek.dial))?,
         };
         stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
             .map_err(|error| format!("psiphon meek socket: {error}"))?;
         let fragment = self.meek.shape.may_fragment(self.meek.protocol);
         if !self.meek.https {
@@ -962,9 +1004,6 @@ impl MeekHttp {
             } else {
                 MeekStream::Plain(stream)
             });
-            if self.meek.fronted {
-                self.dns.verify_cache_extension(&self.meek.dial);
-            }
             return Ok(());
         }
         let stream = if fragment {
@@ -1029,10 +1068,13 @@ impl MeekHttp {
                 self.stream = Some(MeekStream::TlsFragment(tls));
             }
         }
-        if self.meek.fronted {
-            self.dns.verify_cache_extension(&self.meek.dial);
-        }
         Ok(())
+    }
+
+    /// The per-attempt budget left before the whole rotation's deadline.
+    fn remaining(deadline: Instant, cap: Duration) -> Option<Duration> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then(|| left.min(cap))
     }
 
     /// Advance to the next fronting address.
@@ -1283,6 +1325,76 @@ mod tests {
                 ..TlsShape::default()
             },
         }
+    }
+
+    /// Bind a port and release it so the next connect is refused immediately.
+    fn refused_address() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a dead front");
+        let address = listener.local_addr().expect("dead front address");
+        drop(listener);
+        address
+    }
+
+    #[test]
+    fn a_refused_front_does_not_end_the_dial() {
+        let live = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a live front");
+        let live_port = live.local_addr().expect("live front address").port();
+        let dead_port = refused_address().port();
+        let meek = Meek {
+            dial: "127.0.0.1".to_owned(),
+            port: dead_port,
+            fronts: vec![
+                (Ipv4Addr::LOCALHOST.to_string(), dead_port),
+                (Ipv4Addr::LOCALHOST.to_string(), live_port),
+            ],
+            hosts: vec!["cdn.example".to_owned()],
+            https: false,
+            quic: false,
+            ..entry()
+        };
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(2), "/");
+        http.open().expect("the second front handshakes");
+        assert!(http.stream.is_some());
+        assert_eq!(http.meek.port, live_port);
+    }
+
+    #[test]
+    fn a_refused_resolved_ip_does_not_end_the_dial() {
+        let live = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a live front");
+        let live = live.local_addr().expect("live front address");
+        let dead = refused_address();
+        let meek = Meek {
+            https: false,
+            quic: false,
+            ..entry()
+        };
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(2), "/");
+        http.injected_addresses = Some(vec![dead, live]);
+        http.open().expect("the next resolved IP handshakes");
+        assert!(http.stream.is_some());
+    }
+
+    #[test]
+    fn all_refused_fronts_report_the_last_failure() {
+        let first = refused_address().port();
+        let second = refused_address().port();
+        let meek = Meek {
+            dial: "127.0.0.1".to_owned(),
+            port: first,
+            fronts: vec![
+                (Ipv4Addr::LOCALHOST.to_string(), first),
+                (Ipv4Addr::LOCALHOST.to_string(), second),
+            ],
+            hosts: vec!["cdn.example".to_owned()],
+            https: false,
+            quic: false,
+            ..entry()
+        };
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(2), "/");
+        let why = http.open().expect_err("no front connects");
+        assert!(why.contains("psiphon meek connect"), "{why}");
+        assert!(http.stream.is_none());
+        assert_eq!(http.front_index, 2);
     }
 
     #[test]

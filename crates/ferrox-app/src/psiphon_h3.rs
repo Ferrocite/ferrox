@@ -9,12 +9,91 @@ use std::time::{Duration, Instant};
 
 const MAX_DATAGRAM: usize = 1350;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+/// How long a handshake still waits for a real datagram after an ICMP error.
+/// A refused front is skipped quickly, but a stale ICMP must not kill a
+/// connection whose `ServerHello` is already in flight.
+const DEAD_FRONT_GRACE: Duration = Duration::from_millis(500);
+/// The pause between receives while an ICMP error is being confirmed, so a
+/// socket that keeps reporting the same error cannot spin the loop.
+const DEAD_FRONT_POLL: Duration = Duration::from_millis(10);
 
 /// One HTTP/3 response.
 pub(crate) struct Response {
     pub(crate) status: u16,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
+}
+
+/// What one datagram receive reported when it returned no datagram.
+enum ReceiveError {
+    /// The read timeout elapsed; QUIC's own timer must be driven.
+    Timeout,
+    /// A connected UDP socket reported an ICMP error for its peer. The front
+    /// is a dead candidate, but a real datagram can still be in flight.
+    DeadFront(io::Error),
+    /// A genuine socket failure still aborts this dial.
+    Fatal(io::Error),
+}
+
+/// Classify a receive error the way both the handshake and response loops
+/// must treat it. A connected UDP socket reports an ICMP port-unreachable as
+/// `ConnectionRefused`; ending the relay there leaves the front rotation with
+/// nothing to rotate to.
+fn classify_receive(error: io::Error) -> ReceiveError {
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ReceiveError::Timeout,
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted => ReceiveError::DeadFront(error),
+        _ => ReceiveError::Fatal(error),
+    }
+}
+
+/// The short window in which one ICMP report is allowed to be stale.
+#[derive(Default)]
+struct DeadFront(Option<(Instant, String)>);
+
+impl DeadFront {
+    /// Fold a receive error into the window. Every outcome but a real socket
+    /// failure is a QUIC timeout: the caller keeps driving `on_timeout` and
+    /// the loop reaches its deadline instead of dying on the first ICMP.
+    fn receive(&mut self, error: io::Error, label: &str) -> Result<(), String> {
+        match classify_receive(error) {
+            ReceiveError::Timeout => Ok(()),
+            ReceiveError::DeadFront(error) => {
+                self.0.get_or_insert_with(|| {
+                    (
+                        Instant::now() + DEAD_FRONT_GRACE,
+                        format!("psiphon h3 dead front: {error}"),
+                    )
+                });
+                std::thread::sleep(DEAD_FRONT_POLL);
+                Ok(())
+            }
+            ReceiveError::Fatal(error) => Err(format!("psiphon h3 {label}: {error}")),
+        }
+    }
+
+    /// A real datagram proves the ICMP was stale; start fresh afterwards.
+    fn datagram(&mut self) {
+        self.0 = None;
+    }
+
+    /// The clean reason to return when the window expires without a datagram.
+    fn expired(&self, now: Instant) -> Option<String> {
+        self.0
+            .as_ref()
+            .filter(|(until, _)| now >= *until)
+            .map(|(_, why)| why.clone())
+    }
+
+    /// Cap the socket's read timeout at the grace window.
+    fn cap(&self, wait: Duration, now: Instant) -> Duration {
+        self.0.as_ref().map_or(wait, |(until, _)| {
+            wait.min(until.saturating_duration_since(now))
+                .max(Duration::from_millis(1))
+        })
+    }
 }
 
 /// A datagram path for QUIC: a UDP socket or an in-proxy WebRTC channel.
@@ -73,19 +152,15 @@ pub(crate) struct H3 {
 }
 
 impl H3 {
-    /// Open a QUIC connection carrying HTTP/3 to one front.
-    pub(crate) fn connect(
+    /// Open a QUIC connection carrying HTTP/3 to one already-resolved front
+    /// address. The caller owns the candidate list so a refused address can be
+    /// followed by the next resolved IP instead of ending the relay.
+    pub(crate) fn connect_address(
+        peer: SocketAddr,
         dial: &str,
-        port: u16,
         sni: &str,
         timeout: Duration,
-        dns: &crate::psiphon_dns::Config,
     ) -> Result<Self, String> {
-        let peer = crate::psiphon_dns::resolve_with(dns, dial, port)
-            .map_err(|error| format!("psiphon h3 resolve {dial}: {error}"))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("psiphon h3 resolve {dial}: no address"))?;
         let bind = if peer.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -148,18 +223,24 @@ impl H3 {
         let deadline = Instant::now() + timeout;
         let mut buffer = vec![0u8; 65535];
         let mut out = [0u8; MAX_DATAGRAM];
+        let mut dead = DeadFront::default();
         while !conn.is_established() {
             loop {
                 match conn.send(&mut out) {
                     Ok((write, _)) => {
-                        link.send(&out[..write])
-                            .map_err(|error| format!("psiphon h3 send: {error}"))?;
+                        if let Err(error) = link.send(&out[..write]) {
+                            dead.receive(error, "send")?;
+                            break;
+                        }
                     }
                     Err(quiche::Error::Done) => break,
                     Err(error) => return Err(format!("psiphon h3 send: {error}")),
                 }
             }
             let now = Instant::now();
+            if let Some(why) = dead.expired(now) {
+                return Err(why);
+            }
             if now >= deadline || conn.is_closed() {
                 return Err(format!("psiphon h3 handshake {dial} timed out"));
             }
@@ -167,10 +248,11 @@ impl H3 {
                 .saturating_duration_since(now)
                 .min(conn.timeout().unwrap_or(Duration::ZERO))
                 .max(Duration::from_millis(1));
-            link.set_read_timeout(wait)
+            link.set_read_timeout(dead.cap(wait, now))
                 .map_err(|error| format!("psiphon h3 socket: {error}"))?;
             match link.receive(&mut buffer) {
                 Ok(read) => {
+                    dead.datagram();
                     let info = quiche::RecvInfo {
                         from: peer,
                         to: local,
@@ -178,15 +260,10 @@ impl H3 {
                     conn.recv(&mut buffer[..read], info)
                         .map_err(|error| format!("psiphon h3 receive: {error}"))?;
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
+                Err(error) => {
+                    dead.receive(error, "receive")?;
                     conn.on_timeout();
                 }
-                Err(error) => return Err(format!("psiphon h3 receive: {error}")),
             }
         }
         let http3_config =
@@ -250,6 +327,7 @@ impl H3 {
         let deadline = Instant::now() + timeout;
         let mut buffer = vec![0u8; 65535];
         let mut out = [0u8; MAX_DATAGRAM];
+        let mut dead = DeadFront::default();
         if !body.is_empty() {
             let mut sent = 0;
             while sent < body.len() {
@@ -260,17 +338,17 @@ impl H3 {
                     Ok(0) => return Err("psiphon h3 body was not sent".to_owned()),
                     Ok(wrote) => sent += wrote,
                     Err(quiche::h3::Error::Done) => {
-                        self.flush(&mut out)?;
-                        self.receive(&mut buffer, deadline)?;
+                        self.flush(&mut out, &mut dead)?;
+                        self.receive(&mut buffer, deadline, &mut dead)?;
                     }
                     Err(error) => return Err(format!("psiphon h3 body: {error}")),
                 }
             }
         }
-        self.flush(&mut out)?;
+        self.flush(&mut out, &mut dead)?;
         while !self.finished {
-            self.receive(&mut buffer, deadline)?;
-            self.flush(&mut out)?;
+            self.receive(&mut buffer, deadline, &mut dead)?;
+            self.flush(&mut out, &mut dead)?;
         }
         if self.response.status == 0 {
             return Err("psiphon h3 response had no status".to_owned());
@@ -290,8 +368,16 @@ impl H3 {
         self.response.status != 0 || !self.response.body.is_empty()
     }
 
-    fn receive(&mut self, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
+    fn receive(
+        &mut self,
+        buffer: &mut [u8],
+        deadline: Instant,
+        dead: &mut DeadFront,
+    ) -> Result<(), String> {
         let now = Instant::now();
+        if let Some(why) = dead.expired(now) {
+            return Err(why);
+        }
         if now >= deadline || self.conn.is_closed() {
             return Err("psiphon h3 response timed out".to_owned());
         }
@@ -300,10 +386,11 @@ impl H3 {
             .min(self.conn.timeout().unwrap_or(Duration::ZERO))
             .max(Duration::from_millis(1));
         self.link
-            .set_read_timeout(wait)
+            .set_read_timeout(dead.cap(wait, now))
             .map_err(|error| format!("psiphon h3 socket: {error}"))?;
         match self.link.receive(buffer) {
             Ok(read) => {
+                dead.datagram();
                 let info = quiche::RecvInfo {
                     from: self.peer,
                     to: self.local,
@@ -312,27 +399,23 @@ impl H3 {
                     .recv(&mut buffer[..read], info)
                     .map_err(|error| format!("psiphon h3 receive: {error}"))?;
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
+            Err(error) => {
+                dead.receive(error, "receive")?;
                 self.conn.on_timeout();
             }
-            Err(error) => return Err(format!("psiphon h3 receive: {error}")),
         }
         self.poll()
     }
 
     /// Write every queued QUIC packet to the peer.
-    fn flush(&mut self, out: &mut [u8]) -> Result<(), String> {
+    fn flush(&mut self, out: &mut [u8], dead: &mut DeadFront) -> Result<(), String> {
         loop {
             match self.conn.send(out) {
                 Ok((write, _)) => {
-                    self.link
-                        .send(&out[..write])
-                        .map_err(|error| format!("psiphon h3 send: {error}"))?;
+                    if let Err(error) = self.link.send(&out[..write]) {
+                        dead.receive(error, "send")?;
+                        break;
+                    }
                 }
                 Err(quiche::Error::Done) => break,
                 Err(error) => return Err(format!("psiphon h3 send: {error}")),
@@ -397,4 +480,117 @@ impl H3 {
 /// Clamp a duration to the millisecond field a QUIC setting takes.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_error(kind: io::ErrorKind) -> io::Error {
+        io::Error::new(kind, "probe")
+    }
+
+    fn armed(until: Instant) -> DeadFront {
+        DeadFront(Some((until, "psiphon h3 dead front: probe".to_owned())))
+    }
+
+    #[test]
+    fn a_refused_front_is_a_dead_candidate_not_a_fatal_receive() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(matches!(
+                classify_receive(io_error(kind)),
+                ReceiveError::DeadFront(_)
+            ));
+        }
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            assert!(matches!(
+                classify_receive(io_error(kind)),
+                ReceiveError::Timeout
+            ));
+        }
+        assert!(matches!(
+            classify_receive(io_error(io::ErrorKind::PermissionDenied)),
+            ReceiveError::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn a_refused_front_drives_the_quic_timeout_path() {
+        let mut dead = DeadFront::default();
+        assert!(dead
+            .receive(io_error(io::ErrorKind::ConnectionRefused), "receive")
+            .is_ok());
+        assert!(dead.0.is_some(), "the dead-front window is armed");
+        let why = dead
+            .0
+            .as_ref()
+            .map(|(_, why)| why.as_str())
+            .unwrap_or_default();
+        assert!(why.starts_with("psiphon h3 dead front: "));
+        assert!(!why.contains("psiphon h3 receive:"));
+    }
+
+    #[test]
+    fn a_real_datagram_clears_a_late_icmp() {
+        let mut dead = armed(Instant::now() + DEAD_FRONT_GRACE);
+        dead.datagram();
+        assert!(dead.expired(Instant::now()).is_none());
+        assert_eq!(
+            dead.cap(Duration::from_secs(5), Instant::now()),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn an_expired_grace_returns_a_clean_reason_and_caps_the_wait() {
+        let until = Instant::now();
+        let dead = armed(until);
+        let now = until + Duration::from_millis(1);
+        assert_eq!(
+            dead.expired(now).as_deref(),
+            Some("psiphon h3 dead front: probe")
+        );
+        assert!(dead.cap(Duration::from_secs(5), now) <= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn a_real_socket_failure_still_aborts_the_dial() {
+        let mut dead = DeadFront::default();
+        assert_eq!(
+            dead.receive(io_error(io::ErrorKind::PermissionDenied), "receive")
+                .expect_err("fatal"),
+            "psiphon h3 receive: probe"
+        );
+        assert_eq!(
+            DeadFront::default()
+                .receive(io_error(io::ErrorKind::PermissionDenied), "send")
+                .expect_err("fatal"),
+            "psiphon h3 send: probe"
+        );
+        assert!(dead.0.is_none());
+    }
+
+    /// The socket that produced `Connection refused (os error 61)`: a connected
+    /// UDP socket whose peer has no listener. Whatever the platform calls the
+    /// ICMP report, it must not surface as a fatal receive error again.
+    #[test]
+    fn a_refused_udp_front_never_reports_a_fatal_receive() {
+        use std::net::Ipv4Addr;
+
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a probe");
+        let dead = probe.local_addr().expect("probe address");
+        drop(probe);
+        let Err(why) = H3::connect_address(dead, "127.0.0.1", "", Duration::from_secs(1)) else {
+            panic!("a closed UDP port cannot handshake");
+        };
+        assert!(!why.contains("psiphon h3 receive: "), "{why}");
+        assert!(
+            why.starts_with("psiphon h3 dead front: ") || why.ends_with("timed out"),
+            "{why}"
+        );
+    }
 }
