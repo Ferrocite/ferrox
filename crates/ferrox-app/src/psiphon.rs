@@ -2248,6 +2248,7 @@ impl Settings {
         let fronted_fallback = !conduit && !fronted;
         let selection_cdn = selection_enables_cdn(selection.as_deref());
         let selection_tactics_disabled = selection_disables_tactics(selection.as_deref());
+        // Explicit LimitTunnelProtocols wins; otherwise derive from protocolSelection.
         let mut protocols = protocol_list(settings);
         if protocols.is_empty() {
             protocols = selection_protocols(selection.as_deref());
@@ -2657,7 +2658,7 @@ impl Settings {
                     .and_then(Json::as_bool)
             })
             .or(beast);
-        // Shirokhorshid's Beast Mode defaults on; a plain reference config keeps it off.
+        // Shirokhorshid's Beast Mode defaults on for every selection mode; a plain reference config keeps it off.
         let aggressive = aggressive_setting.unwrap_or(selection.is_some())
             || env_flag("AETHER_PSIPHON_BEAST")
             || env_flag("AETHER_PSIPHON_AGGRESSIVE");
