@@ -140,7 +140,7 @@ Rows 1–26 are the proxy-protocol world; rows 27–52 are the xray-core config 
 | 27 | dokodemo-door transparent inbound | partial — transparent TCP on Linux/macOS, UDP on Linux; FreeBSD TCP and `userLevel` missing | Both roles transparent TCP on Linux/macOS and UDP on Linux; FreeBSD TCP and `userLevel` missing. xray scenarios 2/2. | [front-dokodemo](docs/function/front-dokodemo.md) |
 | 28 | blackhole sink, both roles | implemented — both roles | Outbound and inbound; three answers; TCP listener answers and drains only when it answered; datagram association refused with `0x07`. | [blackhole](docs/function/blackhole.md) |
 | 29 | DNS outbound | implemented — outbound; resolver rows are row 118 | Outbound only; pinned DNS bytes, rules, rewrite fields and hijack. | [dns-outbound](docs/function/dns-outbound.md) |
-| 30 | loopback re-inject inbound | partial — TCP+UDP | Partial TCP+UDP; own sniffing on re-inject; named inbound second pass and protobuf missing. SNI/Host routing behind a tun is row 204. | [loopback](docs/function/loopback.md) |
+| 30 | loopback re-inject inbound | implemented — TCP second pass; UDP via the named dial | Routed configs run the named inbound tag's rules as a second pass with the outbound's own sniffing and no DNS resolution; the unrouted path keeps the named-inbound dial. Protobuf `xray.proxy.loopback.Config` is carried. Datagrams keep the named dial's lane when one is built. SNI/Host routing behind a tun is row 204. | [loopback](docs/function/loopback.md) |
 | 31 | Shadowsocks-2022 ciphers | implemented — both roles, TCP+UDP, EIH multi-user, relay | Both roles, TCP+UDP, EIH multi-user and relay; conformance green. xray scenarios 4/4. | [shadowsocks-2022](docs/function/shadowsocks-2022.md) |
 | 32 | TUN inbound (native) | partial — high priority; both roles, IPv4 TCP/UDP + echo | Partial both roles, IPv4 TCP/UDP+echo; ICMPv6, errors, GSO/GRO and privileged opens missing. | [front-tun](docs/function/front-tun.md) |
 | 33 | Unix domain sockets | implemented, both roles, both hosts | Both roles and both hosts over `AF_UNIX`. | [unix](docs/function/unix.md) |
@@ -168,7 +168,7 @@ Rows 1–26 are the proxy-protocol world; rows 27–52 are the xray-core config 
 
 | # | method | state | notes | supported today by |
 | --- | --- | --- | --- | --- |
-| 53 | Engine sniffing (HTTP/TLS/QUIC/FakeDNS) | implemented — HTTP/TLS/QUIC/FakeDNS sniffers; second routing pass remains row 30 | — | Xray `app/dispatcher`; [page](docs/function/engine-sniffing-http-tls-quic-fakedns.md) |
+| 53 | Engine sniffing (HTTP/TLS/QUIC/FakeDNS) | implemented — HTTP/TLS/QUIC/FakeDNS sniffers; the named inbound's second pass is row 30 | — | Xray `app/dispatcher`; [page](docs/function/engine-sniffing-http-tls-quic-fakedns.md) |
 | 54 | Stats, metrics, access log, policy levels | partial — reference counters, online map, access log and policies; Trojan/Shadowsocks KCP and non-VLESS xdrive user counters missing | Exit-location gating is row 196. | Xray `app/stats`, `app/metrics`, `app/log`, `app/policy` |
 | 55 | `PROXYCHAIN` ordered member list | planned (chaining, section G) | Aether's `--upstream` SOCKS5/HTTP CONNECT dial is row 193. | PattNG — at most one `AETHER` member per chain |
 | 56 | `POLICYGROUP` / routing groups | planned | — | PattNG |
@@ -275,7 +275,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 
 | # | method | state | notes | supported today by |
 | --- | --- | --- | --- | --- |
-| 115 | Routing rules + geosite/geoip | partial — high priority; routing/selectors, balancers, webhook and geodata refresh; observatory row 124; second routing pass row 30; rule sets and scripts row 116; SNI/Host routing behind a tun row 204 | — | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; [page](docs/function/engine-router.md) |
+| 115 | Routing rules + geosite/geoip | partial — high priority; routing/selectors, balancers, webhook and geodata refresh; observatory row 124; rule sets and scripts row 116; SNI/Host routing behind a tun row 204 | — | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; [page](docs/function/engine-router.md) |
 | 116 | Routing rule sets + scripts | partial — inline and local rule sets plus Lua scripts; binary `.srs`, remote sets and script+rule mixing missing | — | Xray `app/router` + `common/lua`; sing-box `route/rule_set`; [page](docs/function/engine-router.md) |
 | 117 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | partial — high priority; four balancer strategies reading observatory row 124; urltest and selector planned | — | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory` |
 | 118 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | implemented — UDP/TCP/DoT/DoH/DoQ, cache, hosts, FakeDNS, filters and parallel groups; Lua script row 116 | xray scenarios 1/1. | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; [page](docs/function/engine-dns.md) |

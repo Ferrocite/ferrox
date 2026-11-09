@@ -674,6 +674,8 @@ loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_t
 loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_udp_association_carries_a_datagram
 loopback sniffed-http-host-dials-the-sniffed-name 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination
 loopback route-targets-resolved-at-startup 1 ferrox-app-proxy::tests::a_loopback_outbound_is_a_route_target
+loopback named-inbound-rules-consulted 1 ferrox-app-proxy::tests::a_loopback_consults_the_named_inbounds_rules
+loopback protobuf-outbound-decoded 1 ferrox-app-xray_pb::tests::the_loopback_outbound_decodes_to_the_json_this_tree_serves
 
 # --- unix domain sockets ------------------------------------------------------
 unix ops-retired-instructions UNBLESSED scripts/count-ops.sh

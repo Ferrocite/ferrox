@@ -67,8 +67,8 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | Stats, metrics (Prometheus), policy manager | planned: policy.rs is parse-level gate only |
 | `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | planned (row 121) |
 | Geodata (.dat) loader/downloader | planned (row 116) |
-| Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | implemented (engine-sniffing: HTTP/TLS/QUIC/FakeDNS, bittorrent, UDP, plain-HTTP protocol and loopback outbound sniffing carried; the named inbound's second routing pass is row 30) |
-| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shapes the http, dokodemo, vmess, vless, shadowsocks and shadowsocks_2022 scenarios write (`xray_pb.rs`), every other field refused by number or name |
+| Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | implemented (engine-sniffing: HTTP/TLS/QUIC/FakeDNS, bittorrent, UDP, plain-HTTP protocol, loopback outbound sniffing and the named inbound's second routing pass are carried) |
+| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shapes the http, dokodemo, vmess, vless, shadowsocks, shadowsocks_2022 and loopback scenarios write (`xray_pb.rs`), every other field refused by number or name |
 | OCSP, antireplay, time-window caches | planned |
 | Freedom fragment, VLESS encryption fragment | planned (rows 163, 37) |
 | finalmask: fragment, header/custom, noise, realm, salamander, sudoku, udphop, xdns, xicmp, xmc | `fragment` done (row 34), salamander on hysteria, mkcp-legacy on KCP; the rest planned (`obfs-finalmask`) |
