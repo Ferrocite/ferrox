@@ -4,7 +4,7 @@ module utlsoracle
 // golden is the bytes that reference actually puts on the wire. `go mod tidy`
 // resolves from the module cache offline once xray-core's own go.mod has been
 // fetched; the checksum file below pins every transitive module.
-go 1.26
+go 1.26.0
 
 require github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
 
@@ -12,8 +12,5 @@ require (
 	github.com/andybalholm/brotli v1.2.3 // indirect
 	github.com/klauspost/compress v1.20.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
 )
