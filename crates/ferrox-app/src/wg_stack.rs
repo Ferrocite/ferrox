@@ -45,6 +45,9 @@ const TCP_RECV_BUFFER: usize = 1024 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
 const TCP_SEND_BUFFER: usize = 1024 * 1024;
+/// The server's accepted socket may have this much unacknowledged before it
+/// waits; the bound keeps a windowless sender inside the shared tunnel queue.
+const SERVER_SEND_BUFFER: usize = 64 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
@@ -2001,11 +2004,12 @@ impl ServerStack {
         }
         let mut socket = TcpSocket::new(
             SocketBuffer::new(vec![0u8; TCP_RECV_BUFFER]),
-            SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
+            SocketBuffer::new(vec![0u8; SERVER_SEND_BUFFER]),
         );
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        socket.set_congestion_control(CongestionControl::Cubic);
+        // The client coalesces acknowledgements; the send buffer bounds flight, not a cwnd.
+        socket.set_congestion_control(CongestionControl::None);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
