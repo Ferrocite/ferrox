@@ -5455,6 +5455,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
             groups.push(vec![server]);
             continue;
         };
+        // CDN fronting includes the HTTP carrier, so HTTP fronts expand too.
         if !meek.fronted {
             groups.push(vec![server]);
             continue;
