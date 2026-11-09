@@ -8610,7 +8610,7 @@ fn serve_vless_tls(
                 serve_sealed_session(tls, peer, users, freedom, &close, Some(raw), decryption);
                 return;
             }
-            if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
+            if fallbacks.is_none() && users.iter().all(|user| user.reverse.is_none()) {
                 let users: Arc<[VlessUser]> = Arc::from(users);
                 park_request(tls, move |tls, prefix, deadline| {
                     let front = FrontNames::of(&tls);
@@ -9302,7 +9302,7 @@ fn finish_reality<S>(
         serve_sealed_session(session, peer, users, freedom, &close, raw, decryption);
         return;
     }
-    if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
+    if fallbacks.is_none() && users.iter().all(|user| user.reverse.is_none()) {
         let users: Arc<[VlessUser]> = Arc::from(users);
         park_request(session, move |session, prefix, deadline| {
             let front = FrontNames::of(&session);
@@ -9707,17 +9707,24 @@ fn relay_vless_reply<S>(
     let user_meter = crate::stats::user(&user.email, user.level);
     user_meter.write(2);
     let mut uplink = uplink.with_meter(user_meter.reversed());
-    if !carried.is_empty() && uplink.write_all(&carried).is_err() {
-        close();
-        return;
-    }
     if flow == Flow::Vision {
         if session.write_all(&[0, 0]).is_err() {
             close();
             return;
         }
-        relay_vision(session, raw, &wire_id, Half::socket(uplink), &close);
+        relay_vision(
+            session,
+            raw,
+            &wire_id,
+            Half::socket(uplink),
+            &close,
+            carried,
+        );
     } else {
+        if !carried.is_empty() && uplink.write_all(&carried).is_err() {
+            close();
+            return;
+        }
         // No direct switch coming: the limiter stops bounding and tracking reads, the transport's wait leaves the lock, and only the decryption stays under it. A session that reads its own transport stays on the shared shape.
         match driven_halves_prefixed(session, RELAY_POLL, vec![0, 0]) {
             Ok(half) => relay_shared(half, Half::socket(uplink), &close),
@@ -18015,6 +18022,7 @@ fn driven_link<S>(
     raw: Option<&Connection>,
     uuid: &[u8; 16],
     grain: Duration,
+    prefix: Vec<u8>,
 ) -> Result<DrivenLink<S>, S>
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + 'static,
@@ -18046,7 +18054,8 @@ where
     let out = Arc::new(Mutex::new(Sealed::new(out)));
     let read = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
     let write = DrivenHalf::new(session, cipher, out);
-    let (read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
+    let (mut read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
+    read.preload(prefix);
     Ok(Half::split(read, write))
 }
 
@@ -18060,7 +18069,7 @@ fn vision_stream<S>(
 where
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL) {
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, Vec::new()) {
         Ok(vision) => split_stream(vision),
         Err(session) => {
             let transport = session.transport();
@@ -18118,17 +18127,20 @@ fn relay_vision<S, B>(
     uuid: &[u8; 16],
     peer: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
+    prefix: Vec<u8>,
 ) where
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
     B: Read + Write + Send + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL) {
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, prefix.clone()) {
         Ok(vision) => relay_shared(vision, peer, close),
         Err(session) => {
             let transport = session.transport();
+            let mut link = crate::vision::Link::new(session, raw, uuid);
+            link.preload(prefix);
             relay_shared(
                 Half::shared_armed_capped(
-                    crate::vision::Link::new(session, raw, uuid),
+                    link,
                     move |link, grain| {
                         link.arm_read_timeout(grain)?;
                         match &transport {
@@ -19166,6 +19178,7 @@ fn dial_vless_reality(
                     &vless.id,
                     Half::socket(downstream),
                     &close,
+                    Vec::new(),
                 );
             } else {
                 // The limiter stops bounding, the transport's wait leaves the lock, and only the decryption stays under it.
@@ -45100,6 +45113,7 @@ mod tests {
                 &[0u8; 16],
                 Half::shared(EchoOnce { hold, sent: false }),
                 &close,
+                Vec::new(),
             );
         });
         let began = Instant::now();
@@ -45205,6 +45219,7 @@ mod tests {
                 &[0u8; 16],
                 Half::shared(EchoOnce { hold, sent: false }),
                 &close,
+                Vec::new(),
             );
         });
         assert!(
