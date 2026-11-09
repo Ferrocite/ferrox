@@ -127,6 +127,7 @@ static NEXT_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 pub(crate) struct Packet {
     pub(crate) peer: [u8; 32],
     pub(crate) bytes: Vec<u8>,
+    /// The inner IP packet starts at this offset in `bytes`; the prefix before it is retained.
     pub(crate) at: usize,
 }
 
@@ -646,9 +647,8 @@ impl Reassembly {
             }
             self.insert_set(key, at, StdInstant::now());
         }
-        if self.parts.get(&key).is_some_and(|part| part.at != at) {
-            self.remove(&key);
-            return Reassembled::Held;
+        if let Some(part) = self.parts.get_mut(&key) {
+            part.at = at;
         }
         let len = self.parts.get(&key).map_or(0, |part| part.payload.len());
         if end > len {
@@ -4356,6 +4356,24 @@ mod tests {
             }
         }
         assert_eq!(complete.as_deref(), Some(original.as_slice()));
+    }
+
+    /// A fragment set survives a moved prefix out of order: the early packet has no prefix and a later one does.
+    #[test]
+    fn fragments_with_different_prefix_offsets_reassemble_out_of_order() {
+        let original = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 5000]);
+        let fragments = fragment_packet(&original, 0, TUNNEL_FRAGMENT).expect("fragments");
+        let mut reassembly = Reassembly::default();
+        let mut complete = None;
+        for (index, fragment) in fragments.iter().enumerate().rev() {
+            let at = if index == 0 { 0 } else { 4 };
+            if let Reassembled::Complete(packet) = reassembly.accept([0u8; 32], fragment, at) {
+                complete = Some((packet, at));
+            }
+        }
+        let (packet, at) = complete.expect("the set completes after the prefix moves");
+        assert_eq!(at, 0);
+        assert_eq!(&packet[at..], original.as_slice());
     }
 
     /// The peer table matches the sets after an eviction and an expiry, and the
