@@ -867,6 +867,15 @@ impl MeekHttp {
         self.profile.request_limit
     }
 
+    /// Whether a data retry can resend this body without duplicating a reply.
+    fn retry_safe(&self) -> bool {
+        match self.stream.as_ref() {
+            Some(MeekStream::H3(h3)) => !h3.response_started(),
+            None => self.meek.quic,
+            _ => false,
+        }
+    }
+
     /// Send one request body and return the response body.
     pub(crate) fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
         if self.stream.is_none() {
@@ -882,7 +891,7 @@ impl MeekHttp {
         };
         let reply = match self.exchange(body) {
             Ok(reply) => reply,
-            Err(why) if poll && !self.preconnected => {
+            Err(why) if !self.preconnected && (poll || self.retry_safe()) => {
                 self.stream = None;
                 self.open()?;
                 self.exchange(body).map_err(|_| why)?
