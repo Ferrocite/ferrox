@@ -38,6 +38,10 @@ on:
         description: base64 signed LightProxyEntry; blank skips the light-proxy leg
         required: false
         default: ""
+      protocol_selection:
+        description: Android connection mode (auto, direct, cdn_fronting); blank keeps the lane default
+        required: false
+        default: ""
 
 concurrency:
   group: psiphon-windows-${{ github.ref }}
@@ -142,6 +146,7 @@ jobs:
           PSIPHON_POOL: ${{ inputs.pool }}
           PSIPHON_WINDOW: ${{ inputs.window }}
           PSIPHON_LIGHT_ENTRY: ${{ inputs.light_proxy_entry }}
+          PSIPHON_PROTOCOL_SELECTION: ${{ inputs.protocol_selection }}
         run: |
           BIN=target/release/ferrox-app.exe
           test -s "$BIN"
@@ -268,7 +273,7 @@ jobs:
             echo "::error::window must be an integer from 65536 to 67108864, got '$PSIPHON_WINDOW'"
             exit 1
           fi
-          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_WINDOW="$PSIPHON_WINDOW" PSIPHON_LIGHT_ENTRY="$PSIPHON_LIGHT_ENTRY" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_WINDOW="$PSIPHON_WINDOW" PSIPHON_LIGHT_ENTRY="$PSIPHON_LIGHT_ENTRY" PSIPHON_PROTOCOL_SELECTION="$PSIPHON_PROTOCOL_SELECTION" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
           import json, os
           settings = {
               "listen": "127.0.0.1:1821",
@@ -287,6 +292,8 @@ jobs:
               settings["LightProxyEntry"] = os.environ["PSIPHON_LIGHT_ENTRY"]
               settings["LightProxyTestFetchAddress"] = "speed.cloudflare.com:443"
               settings["LightProxyTunnelInactiveThresholdMilliseconds"] = 0
+          if os.environ.get("PSIPHON_PROTOCOL_SELECTION"):
+              settings["protocolSelection"] = os.environ["PSIPHON_PROTOCOL_SELECTION"]
           document = {
               "inbounds": [
                   {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
@@ -297,7 +304,7 @@ jobs:
           with open("psiphon-windows.json", "w") as handle:
               json.dump(document, handle)
           PY
-          PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-reference-state" python - <<'PY'
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_PROTOCOL_SELECTION="$PSIPHON_PROTOCOL_SELECTION" STATE="$RUNNER_TEMP/psiphon-reference-state" python - <<'PY'
           import base64, json, os, re
           source = open("crates/ferrox-core/src/psiphon.rs").read()
           url = re.search(r'SERVER_LIST_URL: &str =\s*"([^"]+)"', source).group(1)
@@ -321,6 +328,20 @@ jobs:
               config["EgressRegion"] = os.environ["PSIPHON_REGION"].upper()
           if os.environ.get("PSIPHON_POOL"):
               config["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
+          if os.environ.get("PSIPHON_PROTOCOL_SELECTION") == "cdn_fronting":
+              config["LimitTunnelProtocols"] = [
+                  "FRONTED-MEEK-CDN-OSSH",
+                  "FRONTED-MEEK-CDN-HTTP-OSSH",
+                  "FRONTED-MEEK-CDN-QUIC-OSSH",
+              ]
+              config["DisableTactics"] = True
+              config["FrontedMeekCDNScanUseBuiltInSpec"] = True
+              config["FrontedMeekDialOverridesProbability"] = 1.0
+              config["FrontedMeekDialOverrides"] = [{
+                  "DialAddresses": ["pypi.org"],
+                  "SNIServerName": "pypi.org",
+                  "ALPNProtocols": ["http/1.1"],
+              }]
           with open("psiphon-reference.json", "w") as handle:
               json.dump(config, handle)
           PY
@@ -522,8 +543,11 @@ jobs:
           if-no-files-found: warn
       - name: Summarise
         if: always()
+        env:
+          PSIPHON_PROTOCOL_SELECTION: ${{ inputs.protocol_selection }}
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
           legs = []
           try:
               lines = open("psiphon-legs.tsv").read().splitlines()
@@ -591,6 +615,10 @@ jobs:
 
           print("### Psiphon lane, Windows")
           print()
+          mode = os.environ.get("PSIPHON_PROTOCOL_SELECTION")
+          if mode:
+              print(f"connection mode: {mode}")
+              print()
           print("The native lane and the engine `psiphon-windows` ships run back to")
           print("back on the same runner and the same ports; each carries 10 MB")
           print("through its socks front, its HTTP front and a warm repeat after")

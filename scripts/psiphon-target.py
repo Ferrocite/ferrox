@@ -10,6 +10,7 @@ import sys
 MEEK_PROTOCOLS = {
     "FRONTED-MEEK-OSSH": "FRONTED-MEEK",
     "FRONTED-MEEK-HTTP-OSSH": "FRONTED-MEEK-HTTP",
+    "FRONTED-MEEK-QUIC-OSSH": "FRONTED-MEEK-QUIC",
     "UNFRONTED-MEEK-HTTPS-OSSH": "UNFRONTED-MEEK-HTTPS",
     "UNFRONTED-MEEK-OSSH": "UNFRONTED-MEEK",
 }
@@ -225,6 +226,11 @@ def selftest():
             "capabilities": ["FRONTED-MEEK"],
             "meekFrontingDomain": "front.example",
         },
+        {
+            "ipAddress": "192.0.2.17",
+            "capabilities": ["FRONTED-MEEK-QUIC"],
+            "meekFrontingDomain": "front.example",
+        },
     ]
     assert port(443) == 443
     assert port(443.0) == 0
@@ -255,6 +261,7 @@ def selftest():
         assert entry(state, "192.0.2.11", 53, "FRONTED-MEEK-OSSH") is not None
         assert entry(state, "192.0.2.11", 443, "FRONTED-MEEK-OSSH") is None
         assert entry(state, "192.0.2.12", 8443, "UNFRONTED-MEEK-HTTPS-OSSH") is not None
+        assert entry(state, "192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH") is not None
         assert entry(state, "192.0.2.12", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
         assert entry(state, "192.0.2.13", 443, "FRONTED-MEEK-OSSH") is None
         assert entry(state, "192.0.2.14", 443, "FRONTED-MEEK-OSSH") is None
@@ -267,6 +274,7 @@ def selftest():
             "psiphon: tunnel up via [2001:db8::1]:443 OSSH\n"
             "psiphon: tunnel up via 192.0.2.2:22 SSH\n"
             "psiphon: tunnel up via 192.0.2.8:443 FRONTED-MEEK-OSSH\n"
+            "psiphon: tunnel up via 192.0.2.17:443 FRONTED-MEEK-QUIC-OSSH\n"
         )
         log = handle.name
     try:
@@ -275,6 +283,7 @@ def selftest():
             ("2001:db8::1", 443, "OSSH"),
             ("192.0.2.2", 22, "SSH"),
             ("192.0.2.8", 443, "FRONTED-MEEK-OSSH"),
+            ("192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH"),
         }
     finally:
         os.unlink(log)
