@@ -8610,8 +8610,37 @@ fn serve_vless_tls(
                 serve_sealed_session(tls, peer, users, freedom, &close, Some(raw), decryption);
                 return;
             }
-            let front = FrontNames::of(&tls);
-            relay_vless(tls, Some(raw), users, freedom, true, fallbacks, &front);
+            if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
+                let users: Arc<[VlessUser]> = Arc::from(users);
+                park_request(tls, move |tls, prefix, deadline| {
+                    let front = FrontNames::of(&tls);
+                    relay_vless(
+                        tls,
+                        Some(raw),
+                        &users,
+                        freedom,
+                        true,
+                        None,
+                        &front,
+                        Some(Parked {
+                            prefix: &prefix,
+                            deadline,
+                        }),
+                    );
+                });
+            } else {
+                let front = FrontNames::of(&tls);
+                relay_vless(
+                    tls,
+                    Some(raw),
+                    users,
+                    freedom,
+                    true,
+                    fallbacks,
+                    &front,
+                    None,
+                );
+            }
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -8720,6 +8749,7 @@ fn serve_vless_kcp_tls(
         false,
         None,
         &FrontNames::default(),
+        None,
     );
 }
 
@@ -8824,6 +8854,55 @@ where
                     if let Some(finish) = finish.take() {
                         let _lane = HandshakeLane::enter();
                         finish(current, prefix);
+                    }
+                    Next::Done
+                }
+                Some(_) => {
+                    session = Some(current);
+                    Next::Idle
+                }
+                None => Next::Done,
+            }
+        }),
+        Box::new(|| {}),
+    );
+}
+
+/// Parks the peer's first request on a relay lane: an empty read hands the wait back instead of pinning a worker, and the bytes it drained ride ahead of the live stream.
+fn park_request<S, F>(session: S, finish: F)
+where
+    S: ferrox_core::tls::TlsProvider + Drivable + Send + 'static,
+    F: FnOnce(S, Vec<u8>, Instant) + Send + 'static,
+{
+    let deadline = Instant::now() + budgets::handshake();
+    let Some(transport) = session.transport() else {
+        finish(session, Vec::new(), deadline);
+        return;
+    };
+    if transport.set_nonblocking(true).is_err() {
+        finish(session, Vec::new(), deadline);
+        return;
+    }
+    let mut session = Some(session);
+    let mut finish = Some(finish);
+    let mut transport = Some(transport);
+    lane_pool::submit(
+        Box::new(move || {
+            let Some(mut current) = session.take() else {
+                return Next::Done;
+            };
+            if Instant::now() >= deadline {
+                return Next::Done;
+            }
+            match read_ready_prefix(&mut current) {
+                Some(prefix) if !prefix.is_empty() => {
+                    if let Some(transport) = transport.take() {
+                        let _ = transport.set_nonblocking(false);
+                        let _ = transport.set_read_timeout(Some(RELAY_POLL));
+                    }
+                    if let Some(finish) = finish.take() {
+                        let _lane = HandshakeLane::enter();
+                        finish(current, prefix, deadline);
                     }
                     Next::Done
                 }
@@ -9223,8 +9302,28 @@ fn finish_reality<S>(
         serve_sealed_session(session, peer, users, freedom, &close, raw, decryption);
         return;
     }
-    let front = FrontNames::of(&session);
-    relay_vless(session, raw, users, freedom, true, fallbacks, &front);
+    if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
+        let users: Arc<[VlessUser]> = Arc::from(users);
+        park_request(session, move |session, prefix, deadline| {
+            let front = FrontNames::of(&session);
+            relay_vless(
+                session,
+                raw,
+                &users,
+                freedom,
+                true,
+                None,
+                &front,
+                Some(Parked {
+                    prefix: &prefix,
+                    deadline,
+                }),
+            );
+        });
+    } else {
+        let front = FrontNames::of(&session);
+        relay_vless(session, raw, users, freedom, true, fallbacks, &front, None);
+    }
 }
 
 /// A carrier write end that can be handed to the relay lanes: the writer behind one lock, so the
@@ -9308,9 +9407,8 @@ impl ferrox_core::vless_encryption::SplitIo for Connection {
 
 type Opened = (Flow, Connection, Arc<dyn Fn() + Send + Sync>);
 
-/// The request read, the target dialed and the answer sent: what either relay below does before its first byte, so the two differ only in how the session's side is handed over.
-fn open_vless<S: Read + Write>(
-    session: &mut S,
+/// The request read and the target dialed: what either relay below does before its first byte, so the two differ only in how the session's side is handed over. The answer rides the first downlink slice.
+fn open_vless(
     raw: Option<&Connection>,
     freedom: bool,
     (_, flow, cmd, target): ([u8; 16], Flow, u8, SocketAddr),
@@ -9329,9 +9427,6 @@ fn open_vless<S: Read + Write>(
             eprintln!("tls: session timeout failed");
             return None;
         }
-    }
-    if session.write_all(&[0, 0]).is_err() {
-        return None;
     }
     // Either direction ending closes the other, or the far end waits out its own deadline.
     let close_uplink = uplink.try_clone().ok();
@@ -9369,6 +9464,14 @@ impl FrontNames {
     }
 }
 
+/// The bytes a parked read already drained and the deadline that read was under, so the request decode spends the remaining budget instead of a fresh one.
+#[derive(Clone, Copy)]
+struct Parked<'a> {
+    prefix: &'a [u8],
+    deadline: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn relay_vless<S>(
     mut session: S,
     raw: Option<Connection>,
@@ -9377,6 +9480,7 @@ fn relay_vless<S>(
     vision: bool,
     fallbacks: Option<&[Fallback]>,
     front: &FrontNames,
+    parked: Option<Parked<'_>>,
 ) where
     S: std::io::Read
         + std::io::Write
@@ -9386,34 +9490,62 @@ fn relay_vless<S>(
         + CipherOpen
         + 'static,
 {
-    let (probe, carried) = match fallbacks {
-        // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
-        Some(_) => {
-            let mut window = [0u8; PROBE_READ];
-            let (probe, consumed, carried) = probe_front(&mut session, users, &mut window);
-            return relay_vless_reply(
-                session,
-                raw,
-                users,
-                freedom,
-                vision,
-                fallbacks,
-                &window[..consumed],
-                (probe, carried),
-                front,
-            );
-        }
-        None => (
-            match decode_request_bounded_gated(
-                &mut session,
-                |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
-                resolve_endpoint,
-            ) {
+    // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
+    if fallbacks.is_some() {
+        let mut window = [0u8; PROBE_READ];
+        let (probe, consumed, carried) = probe_front(&mut session, users, &mut window);
+        return relay_vless_reply(
+            session,
+            raw,
+            users,
+            freedom,
+            vision,
+            fallbacks,
+            &window[..consumed],
+            (probe, carried),
+            front,
+        );
+    }
+    let mut carried = Vec::new();
+    let probe = match parked.filter(|parked| !parked.prefix.is_empty()) {
+        None => match decode_request_bounded_gated(
+            &mut session,
+            |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+            resolve_endpoint,
+        ) {
+            Some(header) => Probe::Decoded(header),
+            None => Probe::Dropped,
+        },
+        Some(Parked { prefix, deadline }) => {
+            let mut bounded = HandshakeDeadline {
+                inner: &mut session,
+                until: deadline,
+            };
+            let (decoded, consumed) = {
+                let mut replay = Prefixed {
+                    head: prefix,
+                    at: 0,
+                    tail: &mut bounded,
+                    carried: &mut carried,
+                };
+                let decoded = decode_request_gated(
+                    &mut replay,
+                    |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+                    resolve_endpoint,
+                );
+                (decoded, replay.at)
+            };
+            if consumed < prefix.len() {
+                let mut rest = Vec::with_capacity(prefix.len() - consumed + carried.len());
+                rest.extend_from_slice(&prefix[consumed..]);
+                rest.extend_from_slice(&carried);
+                carried = rest;
+            }
+            match decoded {
                 Some(header) => Probe::Decoded(header),
                 None => Probe::Dropped,
-            },
-            Vec::new(),
-        ),
+            }
+        }
     };
     relay_vless_reply(
         session,
@@ -9567,8 +9699,7 @@ fn relay_vless_reply<S>(
         return;
     }
     let wire_id = header.0;
-    let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
-    else {
+    let Some((flow, uplink, close)) = open_vless(raw.as_ref(), freedom, header) else {
         let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
         return seize_fallback_tls(session, &raw, rows, window, &carried, front);
@@ -9581,13 +9712,21 @@ fn relay_vless_reply<S>(
         return;
     }
     if flow == Flow::Vision {
+        if session.write_all(&[0, 0]).is_err() {
+            close();
+            return;
+        }
         relay_vision(session, raw, &wire_id, Half::socket(uplink), &close);
     } else {
         // No direct switch coming: the limiter stops bounding and tracking reads, the transport's wait leaves the lock, and only the decryption stays under it. A session that reads its own transport stays on the shared shape.
-        match driven_halves(session, RELAY_POLL) {
+        match driven_halves_prefixed(session, RELAY_POLL, vec![0, 0]) {
             Ok(half) => relay_shared(half, Half::socket(uplink), &close),
-            Err(session) => {
+            Err(mut session) => {
                 // The raw clone is the same socket on unix, so the grain it arms is the one the session's own read waits in.
+                if session.write_all(&[0, 0]).is_err() {
+                    close();
+                    return;
+                }
                 relay_shared(
                     Half::shared_armed(session, move |_, grain| match &raw {
                         Some(raw) => raw.set_read_timeout(Some(grain)),
@@ -17770,7 +17909,20 @@ fn driven_halves<S>(session: S, grain: Duration) -> Result<Half<DrivenHalf<S, Co
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
 {
-    driven_halves_with(session, grain, None)
+    driven_halves_with(session, grain, None, None)
+}
+
+/// A dropped VLESS dial whose answer rides the first downlink slice: the reference buffers it,
+/// so a two-byte record never reaches the reader on its own.
+fn driven_halves_prefixed<S>(
+    session: S,
+    grain: Duration,
+    prefix: Vec<u8>,
+) -> Result<Half<DrivenHalf<S, Connection>>, S>
+where
+    S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
+{
+    driven_halves_with(session, grain, None, Some(prefix))
 }
 
 /// A dial that has not read the VLESS answer yet: the reader strips it on the read that
@@ -17783,13 +17935,14 @@ fn driven_halves_answering<S>(
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
 {
-    driven_halves_with(session, grain, Some(refused))
+    driven_halves_with(session, grain, Some(refused), None)
 }
 
 fn driven_halves_with<S>(
     session: S,
     grain: Duration,
     refused: Option<Arc<dyn Fn() + Send + Sync>>,
+    prefix: Option<Vec<u8>>,
 ) -> Result<Half<DrivenHalf<S, Connection>>, S>
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
@@ -17812,7 +17965,11 @@ where
     if let Some(refused) = refused {
         reader.expecting_answer(Some(refused));
     }
-    Ok(Half::split(reader, DrivenHalf::new(session, cipher, out)))
+    let mut writer = DrivenHalf::new(session, cipher, out);
+    if let Some(prefix) = prefix {
+        writer.coalescing(prefix);
+    }
+    Ok(Half::split(reader, writer))
 }
 
 /// The ciphertext side a Vision link reads: a plain outer TLS stops at the byte after the
@@ -18080,6 +18237,9 @@ struct DrivenHalf<S, R> {
     /// Reports a refused or truncated answer once, so the dial keeps the accounting the
     /// eager read used to.
     refused: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The answer the writer owes before its first payload: the reference buffers it, so one
+    /// record carries both and the reader's first `Read` never sees a two-byte record alone.
+    write_prefix: Option<Vec<u8>>,
 }
 
 impl<S, R> Clone for DrivenHalf<S, R> {
@@ -18095,6 +18255,7 @@ impl<S, R> Clone for DrivenHalf<S, R> {
             closed: self.closed,
             answer: self.answer,
             refused: self.refused.clone(),
+            write_prefix: self.write_prefix.clone(),
         }
     }
 }
@@ -18115,7 +18276,13 @@ impl<S, R> DrivenHalf<S, R> {
             closed: false,
             answer: crate::vision::Answer::None,
             refused: None,
+            write_prefix: None,
         }
+    }
+
+    /// The answer this writer owes before its first payload, carried in the same sealed slice.
+    fn coalescing(&mut self, prefix: Vec<u8>) {
+        self.write_prefix = Some(prefix);
     }
 
     /// The reader strips the VLESS answer before its first payload byte, on the read that
@@ -18263,10 +18430,17 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
 
 impl<S: CipherOpen, R> Write for DrivenHalf<S, R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(prefix) = self.write_prefix.take() {
+            seal_slices_out(&self.session, &self.out, &[&prefix, buf])?;
+            return Ok(buf.len());
+        }
         seal_out(&self.session, &self.out, buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(prefix) = self.write_prefix.take() {
+            return seal_slices_out(&self.session, &self.out, &[&prefix]);
+        }
         seal_out(&self.session, &self.out, &[]).map(|_| ())
     }
 }
@@ -39040,6 +39214,7 @@ mod tests {
                 true,
                 None,
                 &FrontNames::default(),
+                None,
             );
         });
 
@@ -55852,6 +56027,51 @@ mod tests {
         want.extend_from_slice(&body);
         want.extend_from_slice(&tail);
         assert_eq!(seam.out, want, "the same bytes, in the same order");
+    }
+
+    /// The VLESS answer rides the first downlink slice: the reference buffers it, so one record
+    /// carries both and a two-byte record never reaches the reader on its own.
+    #[test]
+    fn the_vless_answer_rides_the_first_downlink_slice() {
+        let seam = Arc::new(Mutex::new(Seam::default()));
+        let session = Arc::new(Mutex::new(CountedSession {
+            seam: Arc::clone(&seam),
+        }));
+        let transport = CountedTransport::default();
+        let out = Arc::new(Mutex::new(Sealed::new(transport.clone())));
+        let mut writer = DrivenHalf::new(session, Arc::new(Mutex::new(std::io::empty())), out);
+        writer.coalescing(vec![0, 0]);
+        let payload: Vec<u8> = (0..1400).map(|i| (i as u8) ^ 0x5A).collect();
+
+        let wrote = writer.write(&payload).expect("the answer and payload seal");
+
+        assert_eq!(
+            wrote,
+            payload.len(),
+            "the write reports the payload it sealed"
+        );
+        let seam = seam.lock().expect("records");
+        assert_eq!(
+            seam.writes, 0,
+            "the answer never leaves as a write of its own"
+        );
+        assert_eq!(
+            seam.calls.len(),
+            1,
+            "one seal carries the answer and the payload"
+        );
+        assert_eq!(seam.calls[0].0, 2, "the answer, then the payload");
+        assert_eq!(
+            seam.calls[0].1[1],
+            payload.as_ptr() as usize,
+            "the payload segment is the caller's buffer, not a copy of it"
+        );
+        assert_eq!(&seam.out[..2], &[0, 0], "the answer leads the record");
+        assert_eq!(
+            seam.out.len(),
+            2 + payload.len(),
+            "the same bytes, in the same order"
+        );
     }
 
     /// What the write side of the halves put on the wire: one entry per send, holding the bytes it
