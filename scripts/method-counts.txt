@@ -810,7 +810,7 @@ carrier-foxy h3-read-calls-per-16k-download 5 ferrox-app-foxy::loopback::an_h3_r
 carrier-foxy h3-bytes-lost-when-the-peer-finishes 0 ferrox-app-foxy::loopback::an_h3_stream_the_peer_finished_ends_the_tunnel
 carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carrier_cache_lookup_allocates_nothing
 
-# --- blackhole sink outbound --------------------------------------------------
+# --- blackhole sink, both roles -----------------------------------------------
 blackhole ops-retired-instructions UNBLESSED scripts/count-ops.sh
 blackhole answer-bytes-the-reference-writes 101 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
 blackhole inbound-http-answer-bytes 101 ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers
