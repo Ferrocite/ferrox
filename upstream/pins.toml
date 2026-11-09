@@ -13,7 +13,7 @@ note          = "Xray-core at this pin. The unit tests are in-process with no se
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
-rev           = "8295e4910f14d3041c948d2ad74bf3af384a064d"
+rev           = "fda5d4865e6f6a7877a44e0c3451c4275f58b565"
 always        = true
 default_branch = "testing"
 path          = "protocol/shadowsocks"
