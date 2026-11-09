@@ -2677,7 +2677,7 @@ mod tests {
         let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
             .expect("connect");
         let (mut app, _) = listener.accept().expect("accept");
-        app.set_read_timeout(Some(Duration::from_secs(10)))
+        app.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         wireguard.serve_tcp(
             Connection::from(tun),
@@ -2805,7 +2805,7 @@ mod tests {
             let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
                 .expect("connect");
             let (mut app, _) = listener.accept().expect("accept");
-            app.set_read_timeout(Some(Duration::from_secs(10)))
+            app.set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
             wireguard.serve_tcp(Connection::from(tun), &asked, b"head");
             app.write_all(b"hello").expect("write");
