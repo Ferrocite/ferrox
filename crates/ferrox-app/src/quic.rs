@@ -3019,14 +3019,20 @@ fn resumption_remember(key: &QuicServer, conn: &quiche::Connection) {
         return;
     };
     if let Ok(mut entries) = RESUMPTION.get_or_init(Default::default).lock() {
-        if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
-            entry.1 = blob;
-            return;
-        }
-        entries.push((key.clone(), blob));
-        while entries.len() > RESUMPTION_CAP {
-            entries.remove(0);
-        }
+        remember(&mut entries, key, blob);
+    }
+}
+
+/// Keep one session per edge and evict the oldest once the cache is full, so a process that dials
+/// many edges cannot grow the table without bound.
+fn remember(entries: &mut ResumptionCache, key: &QuicServer, blob: Vec<u8>) {
+    if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
+        entry.1 = blob;
+        return;
+    }
+    entries.push((key.clone(), blob));
+    while entries.len() > RESUMPTION_CAP {
+        entries.remove(0);
     }
 }
 
@@ -4406,6 +4412,36 @@ pub(crate) fn issue_spare_scids_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resumption table keeps the newest edges and updates one in place, so many distinct
+    /// dials cannot grow it without bound.
+    #[test]
+    fn the_resumption_cache_evicts_the_oldest_edge() {
+        let key = |port: u16| QuicServer {
+            address: std::sync::Arc::from("127.0.0.1"),
+            port,
+            host: std::sync::Arc::from("quic.test"),
+            upstream: None,
+            roots: None,
+            ech_config_list: None,
+        };
+        let mut entries = ResumptionCache::new();
+        for port in 0..=RESUMPTION_CAP as u16 {
+            remember(&mut entries, &key(port), vec![port as u8]);
+        }
+        assert_eq!(entries.len(), RESUMPTION_CAP);
+        assert!(!entries.iter().any(|(k, _)| k == &key(0)));
+        assert!(entries
+            .iter()
+            .any(|(k, _)| k == &key(RESUMPTION_CAP as u16)));
+        remember(&mut entries, &key(1), vec![0xAA]);
+        assert_eq!(entries.len(), RESUMPTION_CAP);
+        let updated = entries
+            .iter()
+            .find(|(k, _)| k == &key(1))
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(updated, Some([0xAA].as_slice()));
+    }
 
     /// A returned buffer is the next one handed out, so the pool never zeroes a datagram twice.
     #[test]

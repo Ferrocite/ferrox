@@ -3309,6 +3309,34 @@ mod tests {
         assert!(router.by_initial_dcid.is_empty());
     }
 
+    /// Forgetting a route drops its source-id aliases and leaves another route's aliases alone.
+    #[test]
+    fn forgetting_a_route_removes_only_its_source_id_aliases() {
+        let key = vec![1u8; 4];
+        let other = vec![2u8; 4];
+        let client = b"client".to_vec();
+        let initial = b"initial".to_vec();
+        let alias = b"alias".to_vec();
+        let foreign = b"foreign".to_vec();
+        let mut by_client_cid = HashMap::from([(client.clone(), key.clone())]);
+        let mut by_initial_dcid = HashMap::from([
+            (initial.clone(), key.clone()),
+            (alias.clone(), key.clone()),
+            (foreign.clone(), other.clone()),
+        ]);
+        forget_route(
+            &mut by_client_cid,
+            &mut by_initial_dcid,
+            &key,
+            &client,
+            &initial,
+            &[alias.clone()],
+        );
+        assert!(by_client_cid.is_empty());
+        assert_eq!(by_initial_dcid.len(), 1);
+        assert_eq!(by_initial_dcid.get(&foreign), Some(&other));
+    }
+
     fn idle_session() -> Session {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
         config
