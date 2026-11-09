@@ -27,11 +27,13 @@ pub(crate) enum Network {
 }
 
 impl Network {
-    fn parse(value: &str) -> Option<Self> {
+    /// xray's `conf.Network.Build`: `tcp`, `udp`, `unix`, and every other spelling as `unknown` (0).
+    fn parse(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
-            "tcp" => Some(Self::Tcp),
-            "udp" => Some(Self::Udp),
-            _ => None,
+            "tcp" => Self::Tcp,
+            "udp" => Self::Udp,
+            "unix" => Self::Other(4),
+            _ => Self::Other(0),
         }
     }
 }
@@ -1157,6 +1159,51 @@ impl Routing {
             wants_attrs,
             wants_process,
         }))
+    }
+
+    /// Whether a script owns the decisions, so a geodata reload must leave the parsed table alone:
+    /// the script's own `xray.geodata` matchers read the files on every call.
+    pub(crate) fn carries_script(&self) -> bool {
+        self.script.is_some()
+    }
+
+    /// Move the runtime state a reparse cannot rebuild — a balancer's forced tag, weights and
+    /// rotation — onto the freshly parsed table, matched by tag.
+    pub(crate) fn adopt_balancer_state(&mut self, old: &mut Self) {
+        for balancer in &mut self.balancers {
+            let Some(previous) = old
+                .balancers
+                .iter_mut()
+                .find(|previous| previous.tag == balancer.tag)
+            else {
+                continue;
+            };
+            balancer
+                .index
+                .store(previous.index.load(Ordering::Relaxed), Ordering::Relaxed);
+            balancer
+                .seed
+                .store(previous.seed.load(Ordering::Relaxed), Ordering::Relaxed);
+            let weights = std::mem::take(
+                &mut *previous
+                    .weights
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            *balancer
+                .weights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = weights;
+            let forced = previous
+                .forced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            *balancer
+                .forced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = forced;
+        }
     }
 
     /// Append a decoded `AddRule` rule list, or replace the table with it when `append` is false.
@@ -2875,14 +2922,9 @@ fn network_list(value: &Json) -> Result<Option<Vec<Network>>, String> {
     let Some(items) = string_list(value, "network")? else {
         return Ok(None);
     };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        out.push(
-            Network::parse(&item)
-                .ok_or_else(|| format!("routing network `{item}` is not tcp or udp"))?,
-        );
-    }
-    Ok(Some(out))
+    Ok(Some(
+        items.iter().map(|item| Network::parse(item)).collect(),
+    ))
 }
 
 fn port_set(value: &Json, field: &str) -> Result<Option<PortSet>, String> {
@@ -2921,8 +2963,16 @@ fn add_port_pieces(set: &mut PortSet, text: &str, field: &str) -> Result<(), Str
         if piece.is_empty() {
             continue;
         }
-        if piece.starts_with("env:") {
-            return Err(format!("routing {field} `env:` is not carried"));
+        let resolved;
+        let piece = match piece.strip_prefix("env:") {
+            Some(name) => {
+                resolved = std::env::var(name).unwrap_or_default();
+                resolved.trim()
+            }
+            None => piece,
+        };
+        if piece.is_empty() {
+            continue;
         }
         let (from, to) = match piece.split_once('-') {
             Some((from, to)) => (from, to),
@@ -3809,6 +3859,9 @@ fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>
         .unwrap_or_default();
     (ips, 0)
 }
+
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -5422,16 +5475,26 @@ mod tests {
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(102);
         assert_eq!(parsed.route(&flow), None);
-        let root = object(vec![(
-            "routing",
-            routing(vec![rule("direct", vec![("network", text("unix"))])]),
-        )]);
-        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("unix"), "{error}");
+        for (name, carried) in [("unix", Network::Other(4)), ("sctp", Network::Other(0))] {
+            let root = object(vec![(
+                "routing",
+                routing(vec![rule("direct", vec![("network", text(name))])]),
+            )]);
+            let parsed = Routing::parse_in(&root, vec![dir()])
+                .expect("parses")
+                .expect("routing");
+            flow.network = Network::Tcp;
+            assert_eq!(parsed.route(&flow), None, "{name}");
+            flow.network = carried;
+            assert_eq!(parsed.route(&flow), Some("direct"), "{name}");
+        }
     }
 
     #[test]
     fn env_names_the_address_and_port_a_rule_reads() {
+        let _env = crate::router::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("FERROX_ROUTING_ENV_IP", "198.51.100.7");
         std::env::set_var("FERROX_ROUTING_ENV_PORT", "101-102");
         let root = crate::json::parse(
@@ -5466,6 +5529,19 @@ mod tests {
         flow.port = Some(101);
         flow.ip = Some("198.51.100.8".parse().expect("ip"));
         assert_eq!(parsed.route(&flow), None);
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("port", text("100, env:FERROX_ROUTING_ENV_PORT"))],
+            )]),
+        )]);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        flow.ip = None;
+        flow.port = Some(102);
+        assert_eq!(parsed.route(&flow), Some("direct"));
         std::env::remove_var("FERROX_ROUTING_ENV_IP");
         std::env::remove_var("FERROX_ROUTING_ENV_PORT");
     }

@@ -3617,6 +3617,9 @@ mod tests {
         let key = format!("key-location-{stamp}.pem");
         std::fs::write(dir.join(&cert), minted.cert.pem()).expect("cert");
         std::fs::write(dir.join(&key), minted.signing_key.serialize_pem()).expect("key");
+        let _env = crate::router::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var_os("XRAY_LOCATION_CERT");
         std::env::set_var("XRAY_LOCATION_CERT", &dir);
         let config = crate::json::parse(&format!(
