@@ -148,6 +148,23 @@ impl MasqueOut {
         }
     }
 
+    /// A data-plane probe for the auto race: the tunnel answers a DNS name
+    /// before it is trusted with a flow.
+    pub(crate) fn probe(&self, host: &str, port: u16) -> bool {
+        let Ok(inner) = self.ensure() else {
+            return false;
+        };
+        wg_stack::resolve_over_tunnel(
+            &inner.config,
+            &inner.to_tunnel,
+            &inner.routes,
+            &self.spec.remote_dns,
+            host,
+            port,
+        )
+        .is_some()
+    }
+
     pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
         match self.ensure() {
             Ok(inner) => {

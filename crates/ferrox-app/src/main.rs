@@ -85,6 +85,7 @@ mod tun_system;
 mod veepn;
 mod vision;
 mod vmess;
+mod warp;
 mod webhook;
 mod wg;
 #[cfg(target_os = "linux")]
@@ -133,6 +134,8 @@ fn usage() -> ! {
     );
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
+    eprintln!("  ferrox-app warp-register [-o warp-identity.json] [--mode auto|wireguard|masque] [--api URL]");
+    eprintln!("                                register a WARP device once, save the identity (0600), print the outbound");
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"
     );
@@ -575,6 +578,28 @@ fn main() {
                 (!code.is_empty()).then_some(code.as_str()),
                 no_open,
             );
+        }
+        "warp-register" => {
+            let mut identity = String::from("warp-identity.json");
+            let mut mode = String::from("auto");
+            let mut api = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-o" | "--out" | "--identity" => {
+                        identity = args.next().unwrap_or_else(|| usage());
+                    }
+                    "--mode" => mode = args.next().unwrap_or_else(|| usage()),
+                    "--api" => api = Some(args.next().unwrap_or_else(|| usage())),
+                    _ => usage(),
+                }
+            }
+            match warp::one_tap(&identity, &mode, api.as_deref()) {
+                Ok(text) => println!("{text}"),
+                Err(reason) => {
+                    eprintln!("warp-register: {reason}");
+                    std::process::exit(1);
+                }
+            }
         }
         "edges" => {
             let mut ping = false;

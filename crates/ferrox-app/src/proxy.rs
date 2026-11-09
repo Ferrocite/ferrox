@@ -2119,6 +2119,9 @@ pub(crate) enum Outbound {
     /// The flow rides a MASQUE CONNECT-IP tunnel: one HTTP/3 conversation carries
     /// every destination as inner IP packets over QUIC datagrams.
     Masque(Arc<crate::masque::MasqueOut>),
+    /// WARP's two halves: WireGuard and MASQUE, with the first data-plane answer
+    /// in auto mode deciding which one carries the flows.
+    Warp(Arc<crate::warp::WarpOut>),
     /// The metrics app's tag: a flow routed here reaches its own HTTP handler on a loopback lane.
     Metrics {
         address: SocketAddr,
@@ -2140,6 +2143,7 @@ impl Outbound {
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
             Self::Masque(masque) => masque.edge(),
+            Self::Warp(warp) => warp.edge(),
             Self::Psiphon(lane) => Some(lane.endpoint()),
             Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
@@ -22745,6 +22749,10 @@ fn serve_connect_at(
         masque.serve_tcp(client, asked, prefix);
         return;
     }
+    if let Outbound::Warp(warp) = out {
+        warp.serve_tcp(client, asked, prefix);
+        return;
+    }
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
@@ -22925,6 +22933,7 @@ fn dial_socks_outbound(
         | Outbound::ReversePortal(_)
         | Outbound::WireGuard(_)
         | Outbound::Masque(_)
+        | Outbound::Warp(_)
         | Outbound::Metrics { .. }
         | Outbound::Api(_) => {}
     }
@@ -24466,6 +24475,7 @@ fn serve_udp_lane_with(
         },
         Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
         Outbound::Masque(masque) => masque.serve_udp(relay, associate),
+        Outbound::Warp(warp) => warp.serve_udp(relay, associate),
         Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out, source, sockopts),
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
@@ -34783,6 +34793,9 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     if let Some(masque) = find_masque_outbound(root)? {
         return Ok(Some(Outbound::Masque(Arc::new(masque))));
     }
+    if let Some(warp) = find_warp_outbound(root)? {
+        return Ok(Some(Outbound::Warp(Arc::new(warp))));
+    }
     if let Some(freedom) = find_freedom_outbound(root)? {
         return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
     }
@@ -34828,6 +34841,30 @@ fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut
     crate::wg::WireGuardOut::new(config)
         .map(Some)
         .map_err(|reason| format!("wireguard outbound: {reason}"))
+}
+
+/// The WARP outbound's identity, registration and both halves, built once at
+/// startup so a bad identity or an unusable API refuses the config.
+fn find_warp_outbound(root: &Json) -> Result<Option<crate::warp::WarpOut>, String> {
+    let Some(outbound) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|outbounds| outbounds.first())
+    else {
+        return Ok(None);
+    };
+    if canonical_protocol(
+        outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    ) != "warp"
+    {
+        return Ok(None);
+    }
+    crate::warp::WarpOut::new(outbound)
+        .map(Some)
+        .map_err(|reason| format!("warp outbound: {reason}"))
 }
 
 /// The MASQUE outbound's transport and account, built once at startup so a bad
