@@ -50,6 +50,9 @@ const DEFAULT_REMOTE_DNS: [IpAddr; 4] = [
 ];
 pub(crate) const DEFAULT_MTU: usize = 1280;
 pub(crate) const QUEUE: usize = 512;
+/// A windowless server socket can have a full send buffer in flight, so its
+/// tunnel inbox must hold the burst before the worker drains it.
+const SERVER_QUEUE: usize = 8192;
 /// Datagrams a client may hold before its stack attaches, and their total bytes.
 pub(crate) const EARLY_PACKETS: usize = 64;
 pub(crate) const EARLY_BYTES: usize = 1 << 20;
@@ -2499,7 +2502,7 @@ fn worker(
     routes: Routes,
     worker_id: u64,
 ) {
-    let (sender, outgoing) = mpsc::sync_channel(QUEUE);
+    let (sender, outgoing) = mpsc::sync_channel(SERVER_QUEUE);
     let mut tunnel = Tunnel {
         stream: None,
         buf: Vec::new(),
