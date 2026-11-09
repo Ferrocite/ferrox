@@ -67,14 +67,11 @@ graph TD
 | ss-flatten-write-probe-ops | 47621538 | scripts/count-ops.sh |
 | quic-varint-probe-ops | 131079 | scripts/count-ops.sh |
 | seconds-per-live-transfer | UNBLESSED | .github/workflows/psiphon-live.yml |
-| rc4-passes-per-byte | 1 | ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length |
 <!-- counts:end -->
 
 `flow-clone-allocations` clones a validated `PsiphonOut` inside the counting allocator and holds the count at zero. The credential is one `Arc<Credential>` shared by every clone, and the test checks the allocation count and the `Arc` pointer identity, so a future field that goes back to owning the words fails the row.
 
 `quic-varint-probe-ops` decodes the same eight-octet QUIC varint 4,096 times through the one-load read, `131079` retired instructions, and through the byte walk it replaced, `360460`; the load takes `229381` (63.6%) out. Both rows come from one ops job and one binary, so their difference is the decode and not the build. `the_word_read_is_the_byte_walk_at_every_width_and_buffer_end` sweeps every width, every trailing length and every truncation against the byte walk.
-
-`rc4-passes-per-byte` is one because the OSSH obfuscation stream is drawn into a block and folded over the payload as a second step, with the same state machine and the same bytes as the bytewise loop it replaces; `rc4_apply_matches_the_stream_across_every_length` sweeps three keys against twelve lengths, block-aligned and with a remainder, each against a bytewise re-derivation and a split-call continuity check, so a drift in either half fails the row. What was not removed: the RC4 state machine stays serial, one keystream byte per step; only the payload fold leaves it.
 
 `download-staging-copies-per-byte` is zero because `Channel::next_batch` hands the receiver the pooled packet buffer itself, and `pump_channel` writes that slice to the client before handing it back to the pool; the test asserts the chunk's base pointer is inside the queued buffer, that the buffer's pointer does not move, and that its capacity does not grow. The upload path encrypts the caller's read buffer in place and sends it with one vectored write, so neither direction copies a payload into a relay staging buffer. The kernel copy into and out of those buffers is not a userspace copy, so `relay-staging-copies-per-byte` stays `UNBLESSED` rather than claiming it.
 

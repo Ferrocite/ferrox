@@ -2975,30 +2975,12 @@ impl Rc4 {
     }
 
     pub(crate) fn apply(&mut self, bytes: &mut [u8]) {
-        const BLOCK: usize = 16;
-        let (blocks, tail) = bytes.as_chunks_mut::<BLOCK>();
-        let mut block = [0u8; BLOCK];
-        for chunk in blocks {
-            self.keystream(&mut block);
-            for (cell, key) in chunk.iter_mut().zip(block.iter()) {
-                *cell ^= key;
-            }
-        }
-        if !tail.is_empty() {
-            self.keystream(&mut block[..tail.len()]);
-            for (cell, key) in tail.iter_mut().zip(block.iter()) {
-                *cell ^= key;
-            }
-        }
-    }
-
-    fn keystream(&mut self, out: &mut [u8]) {
-        for cell in out.iter_mut() {
+        for byte in bytes {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
             self.s.swap(usize::from(self.i), usize::from(self.j));
             let k = self.s[usize::from(self.i)].wrapping_add(self.s[usize::from(self.j)]);
-            *cell = self.s[usize::from(k)];
+            *byte ^= self.s[usize::from(k)];
         }
     }
 }
@@ -4406,49 +4388,6 @@ mod tests {
         let mut data = *b"Plaintext";
         rc4.apply(&mut data);
         assert_eq!(&data, b"\xBB\xF3\x16\xE8\xD9\x40\xAF\x0A\xD3");
-    }
-
-    /// Twelve vectors, block-aligned and remainder lengths, each checked against a standing-bytewise
-    /// re-derivation so the split keystream/crypt halves cannot drift the stream.
-    #[test]
-    fn rc4_apply_matches_the_stream_across_every_length() {
-        const LENS: [usize; 12] = [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 257, 4096];
-        for key in [b"Key".as_slice(), b"Wiki".as_slice(), b"Secret".as_slice()] {
-            for len in LENS {
-                let plain = (0..len)
-                    .map(|at| u8::try_from(at.wrapping_mul(37).wrapping_add(11)).unwrap_or(0))
-                    .collect::<Vec<u8>>();
-                // Reference: standing bytewise stream, drawn in one segment.
-                let mut reference = Rc4::new(key);
-                let mut expect = plain.clone();
-                for byte in &mut expect {
-                    reference.i = reference.i.wrapping_add(1);
-                    reference.j = reference
-                        .j
-                        .wrapping_add(reference.s[usize::from(reference.i)]);
-                    reference
-                        .s
-                        .swap(usize::from(reference.i), usize::from(reference.j));
-                    let k = reference.s[usize::from(reference.i)]
-                        .wrapping_add(reference.s[usize::from(reference.j)]);
-                    *byte ^= reference.s[usize::from(k)];
-                }
-                // Production: block keystream folded over the payload.
-                let mut rc4 = Rc4::new(key);
-                let mut data = plain.clone();
-                rc4.apply(&mut data);
-                assert_eq!(data, expect, "key {key:?} len {len}");
-                // Continuity: two shorter calls equal one long call on a fresh stream.
-                let mut split = Rc4::new(key);
-                let mut first = plain[..len / 2].to_vec();
-                let mut second = plain[len / 2..].to_vec();
-                split.apply(&mut first);
-                split.apply(&mut second);
-                let mut joined = first;
-                joined.extend_from_slice(&second);
-                assert_eq!(joined, expect, "split key {key:?} len {len}");
-            }
-        }
     }
 
     #[test]

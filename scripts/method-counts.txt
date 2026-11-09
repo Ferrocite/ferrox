@@ -972,4 +972,3 @@ carrier-psiphon ss-direct-write-probe-ops 47483770 scripts/count-ops.sh
 carrier-psiphon ss-flatten-write-probe-ops 47621538 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
-carrier-psiphon rc4-passes-per-byte 1 ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length
