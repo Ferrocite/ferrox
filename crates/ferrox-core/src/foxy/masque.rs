@@ -162,6 +162,23 @@ pub fn datagram_prefix_into(out: &mut [u8; 10], payload: usize) -> usize {
     2 + n
 }
 
+/// The framing of a DATAGRAM capsule whose header is complete in `body`: the header's own length and the payload's, or `None` while the header is short or the capsule names a context this lane does not read. The payload may extend past `body`; its length is what a reader needs to hand the bytes to the caller without staging them.
+#[must_use]
+pub fn datagram_header(body: &[u8]) -> Option<(usize, usize)> {
+    let mut at = 0usize;
+    if quic_read(body, &mut at)? != 0 {
+        return None;
+    }
+    let length = usize::try_from(quic_read(body, &mut at)?).ok()?;
+    let context_at = at;
+    let context = quic_read(body, &mut at)?;
+    let context_len = at - context_at;
+    if context != 0 || length < context_len {
+        return None;
+    }
+    Some((at, length - context_len))
+}
+
 /// The first complete DATAGRAM capsule in a stream buffer: bytes consumed and the payload, or `None` while it is not whole; unknown types and nonzero contexts are skipped rather than refused, since neither carries bytes this lane reads.
 #[must_use]
 pub fn datagram_split(buf: &[u8]) -> Option<(usize, &[u8])> {
@@ -350,6 +367,22 @@ mod tests {
             assert_eq!(&coded[..plen], &prefix[..plen], "{payload} header");
             assert_eq!(&coded[plen..], body.as_slice(), "{payload} payload");
         }
+    }
+
+    /// The header-only reader names the same run the concatenating encoder puts before the payload, at every varint width, and refuses a header that is short or names a context this lane does not read.
+    #[test]
+    fn the_datagram_header_names_the_run_before_the_payload() {
+        for payload in [0usize, 1, 62, 63, 64, 16_382, 16_383, 16_384, 70_000] {
+            let mut coded = Vec::new();
+            datagram_encode(&vec![0u8; payload], &mut coded);
+            let (head, body) = datagram_header(&coded).expect("a whole header");
+            assert_eq!(head, datagram_len(payload) - payload, "{payload}");
+            assert_eq!(body, payload, "{payload}");
+            for cut in 1..head {
+                assert_eq!(datagram_header(&coded[..cut]), None, "{payload} cut {cut}");
+            }
+        }
+        assert_eq!(datagram_header(&[0x00, 0x02, 0x01, 0xaa]), None);
     }
 
     #[test]

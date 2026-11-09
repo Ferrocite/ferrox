@@ -2121,6 +2121,8 @@ pub(crate) struct H3 {
     capsule_buf: Vec<u8>,
     /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
     handed: usize,
+    /// Payload octets still owed by a DATA frame that held exactly one DATAGRAM capsule: the capsule's bytes are read from the stream straight into the caller, so the frame is not first staged in `capsule_buf`.
+    direct: usize,
     fin: bool,
     /// The peer sent its fin: nothing more will arrive on the request stream, so a reader that has the bytes it was given is at the end of the tunnel and a reader that has none is at the end of a stream that carried none.
     closed: bool,
@@ -2189,6 +2191,7 @@ impl H3 {
             packet: Vec::new(),
             capsule_buf: Vec::new(),
             handed: 0,
+            direct: 0,
             fin: false,
             closed: false,
             deadline: Instant::now(),
@@ -2268,6 +2271,7 @@ impl H3 {
             packet: Vec::new(),
             capsule_buf: Vec::new(),
             handed: 0,
+            direct: 0,
             fin: false,
             closed: false,
             deadline: Instant::now(),
@@ -2294,6 +2298,7 @@ impl H3 {
             packet: Vec::new(),
             capsule_buf: Vec::new(),
             handed: 0,
+            direct: 0,
             fin: false,
             closed: false,
             deadline: Instant::now(),
@@ -2493,7 +2498,35 @@ impl H3 {
         let started = Instant::now();
         // One wait per call, armed from its start: re-armed inside the loop the check below could never see an expiry, so a peer that stopped answering cost this lane nothing but its own parking.
         self.deadline = started + HEADER_TIMEOUT;
+        if self.direct > 0 {
+            return self.direct_into(buf, started);
+        }
         loop {
+            // A DATA frame that is exactly one DATAGRAM capsule is handed straight to the caller: the capsule header is spent in the peek window, the payload lands in the caller's own buffer, and the frame never enters `capsule_buf`.
+            if self.capsule_buf.is_empty() && self.pending.is_none() {
+                if let Some((frame, head)) = self.peek().map_err(io)? {
+                    let body = self
+                        .carried
+                        .checked_add(head)
+                        .ok_or_else(|| io(Failure::Frame))?;
+                    if frame.kind == frames::H3_DATA && body < self.filled {
+                        let length =
+                            usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
+                        if let Some((capsule_head, payload)) =
+                            masque::datagram_header(&self.head[body..self.filled])
+                        {
+                            if length == capsule_head + payload
+                                && payload > 0
+                                && payload <= DATAGRAM_BUF_MAX
+                            {
+                                self.carried = body + capsule_head;
+                                self.direct = payload;
+                                return self.direct_into(buf, started);
+                            }
+                        }
+                    }
+                }
+            }
             if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
                 let len = payload.len();
                 let at = self.handed;
@@ -2533,6 +2566,90 @@ impl H3 {
             }
             self.fill_capsules().map_err(io)?;
         }
+    }
+
+    /// The payload of a DATA frame that held exactly one DATAGRAM capsule, read from the stream into the caller's own buffer: the capsule's header is spent in the window and its payload never enters `capsule_buf`. A caller whose buffer is shorter keeps the rest on the lane, and the next read resumes at the cursor.
+    fn direct_into(&mut self, buf: &mut [u8], started: Instant) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut left = self.direct;
+        let mut delivered = 0usize;
+        while left > 0 && delivered < buf.len() {
+            if self.carried < self.filled {
+                let n = (self.filled - self.carried)
+                    .min(left)
+                    .min(buf.len() - delivered);
+                buf[delivered..delivered + n]
+                    .copy_from_slice(&self.head[self.carried..self.carried + n]);
+                self.carried += n;
+                left -= n;
+                delivered += n;
+                continue;
+            }
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                break;
+            }
+            if self.closed {
+                self.direct = left;
+                if delivered > 0 {
+                    return Ok(delivered);
+                }
+                return Err(io(Failure::Stream));
+            }
+            let want = left.min(buf.len() - delivered);
+            let id = self.quic.id;
+            match self.with_conn(|conn| conn.stream_recv(id, &mut buf[delivered..delivered + want]))
+            {
+                Some(Ok((0, true))) => {
+                    self.direct = left;
+                    self.closed = true;
+                    if delivered > 0 {
+                        return Ok(delivered);
+                    }
+                    return Err(io(Failure::Stream));
+                }
+                Some(Ok((read, fin))) => {
+                    delivered += read;
+                    left -= read;
+                    if fin {
+                        self.closed = true;
+                        if left > 0 {
+                            self.direct = left;
+                            if delivered > 0 {
+                                return Ok(delivered);
+                            }
+                            return Err(io(Failure::Stream));
+                        }
+                    }
+                }
+                Some(Err(quiche::Error::Done)) => {
+                    if Instant::now() >= self.deadline {
+                        self.direct = left;
+                        if delivered > 0 {
+                            return Ok(delivered);
+                        }
+                        return Err(io(Failure::Stream));
+                    }
+                    self.pump(self.pump_wait());
+                }
+                _ => {
+                    self.direct = left;
+                    if delivered > 0 {
+                        return Ok(delivered);
+                    }
+                    return Err(io(Failure::Io));
+                }
+            }
+        }
+        self.direct = left;
+        if delivered == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        Ok(delivered)
     }
 
     fn request(&mut self, target: &str, bearer: &str) -> Result<u16, Failure> {
@@ -9142,6 +9259,56 @@ pub(crate) mod loopback {
             }
         }
         got
+    }
+
+    /// A frame that is exactly one DATAGRAM capsule is read into the caller's own buffer: the staged capsule buffer never grows, so a payload that was copied through it is gone, and a short caller still takes the tail one piece at a time.
+    #[test]
+    fn a_quic_datagram_in_one_frame_never_enters_the_capsule_buffer() {
+        const BODY: usize = 1_350;
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let wide: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+        let mut capsules = Vec::new();
+        masque::datagram_encode(&wide, &mut capsules);
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(&capsules), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_secs(5));
+        let staged = lane.capsule_buf.capacity();
+        let mut piece = [0u8; 64];
+        let mut got = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < BODY {
+            assert!(std::time::Instant::now() < until, "the pieces arrive");
+            match lane.read_datagram(&mut piece) {
+                Ok(0) => panic!("a short read called the end of the stream with its payload owed"),
+                Ok(read) => {
+                    assert!(read > 0 && read <= piece.len());
+                    got.extend_from_slice(&piece[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        }
+        assert_eq!(got, wide, "every octet once, in the order it was sent");
+        assert_eq!(
+            lane.capsule_buf.capacity(),
+            staged,
+            "the payload crossed straight into the caller, not through the capsule buffer"
+        );
+        assert_eq!(lane.direct, 0, "the frame is spent");
+        edge.join().expect("joins");
     }
 
     /// A DATAGRAM capsule that spans two DATA frames, the second of them 400 ms behind the first: the old lane marked the stream finished on the strength of a frame header, so the first half was the whole answer it reported and the association lost the rest of it.
