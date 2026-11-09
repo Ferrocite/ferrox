@@ -67,3 +67,17 @@ vless-grpc-duplex-8|server-cpu|5.77|1276
 # Trojan over REALITY loses only to the Go xray client: it reads 0.56 on EPYC and 0.78 on Xeon,
 # so the worse pairing is filed.
 trojan-reality-raw-down-8|server|0.56|486|ceiling
+# Worst observed pairing from fork benchmark-matrix run 42631614669 (standard, ferrox+xray-core, three
+# repeats): the VMess and Trojan TLS servers pay the 500 ms setup wave the VLESS park removed, and the
+# HTTPUpgrade frame adds one more round trip, so these file 0.68, 0.47 and 0.70 of the ceiling.
+vmess-tls-raw-down-8|server|0.68|486|ceiling
+trojan-tls-httpupgrade-down-8|server|0.47|486|ceiling
+shadowsocks-httpupgrade-down-8|server|0.70|486|ceiling
+# KCP keeps the relay lane armed per packet, so the server peaks two threads above the reference in the
+# same run; all four dialects file the identical 1.20.
+vmess-kcp-down-8|server-threads|1.20|696
+trojan-kcp-down-8|server-threads|1.20|696
+shadowsocks-kcp-down-8|server-threads|1.20|696
+shadowsocks2022-kcp-down-8|server-threads|1.20|696
+# The Hysteria relay peaks 11-18 threads against the reference's 10-11 across runs; file the worst pairing.
+trojan-hysteria-down-8|server-threads|1.64|696
