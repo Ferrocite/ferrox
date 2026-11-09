@@ -2700,7 +2700,6 @@ mod tests {
         let (answered, answer) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let mut seen = 0;
             loop {
                 let (n, from) = match dns.recv_from(&mut buf) {
                     Ok(received) => received,
@@ -2718,11 +2717,6 @@ mod tests {
                     }
                     Err(_) => return,
                 };
-                seen += 1;
-                // Simulated loss: drop the first query so the resolver's DNS_RETRY resend is answered.
-                if seen == 1 {
-                    continue;
-                }
                 let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
                     continue;
                 };

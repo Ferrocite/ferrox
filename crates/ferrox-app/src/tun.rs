@@ -865,9 +865,10 @@ impl Handler {
                 );
                 let _ = dev_writer.write_all(&pkt);
             }
+            // Queue the entry's removal before the shutdown that wakes the relay leg, so a caller that sees the leg end can reap the entry at its next dispatch.
+            let _ = ended_tx.send(Ended::Stream(key));
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
             let _ = read_half.shutdown(Shutdown::Both);
-            let _ = ended_tx.send(Ended::Stream(key));
         });
 
         Ok(())
