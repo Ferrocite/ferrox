@@ -12547,10 +12547,23 @@ fn serve_blackhole_inbound(
     };
     let address = address.to_owned();
     thread::spawn(move || {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
+            return;
+        }
         let target = parse_target(&address)
             .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
         let listener = Listener::bind(&target)
             .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            drop(listener);
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
+            return;
+        }
         for stream in listener.incoming() {
             if stop.as_ref().is_some_and(|stop| stop.stopped()) {
                 break;
