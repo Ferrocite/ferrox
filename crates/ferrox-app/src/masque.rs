@@ -2345,7 +2345,7 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
             if tunnel.sender.try_send(packet).is_ok() {
                 // Wake after the packet is visible, so a worker that cleared `pending` finds it.
                 if let Some(wake) = &tunnel.wake {
-                    if !tunnel.pending.swap(true, Ordering::AcqRel) {
+                    if !tunnel.pending.swap(true, Ordering::Release) {
                         let _ = wake.send(Arrival::Ready);
                     }
                 }
