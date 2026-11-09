@@ -5695,8 +5695,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
         }
         let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
         let mut variants = 0;
-        let override_only = !settings.fronted_overrides.is_empty();
-        if !override_only && settings.cdn_ips.is_empty() && settings.cdn_snis.is_empty() {
+        if settings.cdn_ips.is_empty() && settings.cdn_snis.is_empty() {
             group.push(server.clone());
             variants += 1;
         }
@@ -5728,7 +5727,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut variants,
             );
         }
-        if !override_only && (!settings.cdn_ips.is_empty() || !settings.cdn_snis.is_empty()) {
+        if !settings.cdn_ips.is_empty() || !settings.cdn_snis.is_empty() {
             let dials: Vec<(String, u16)> = if settings.cdn_ips.is_empty() {
                 vec![(meek.dial.clone(), meek.port)]
             } else {
@@ -8378,7 +8377,11 @@ mod tests {
                         "SNIServerName": "sni.example",
                         "DisableSNI": false,
                         "ALPNProtocols": ["http/1.1"]
-                    }]
+                    }],
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7:443"],
+                        "SNIServerNames": ["scan.example"]
+                    }
                 }"#,
             )
             .expect("settings"),
@@ -8395,6 +8398,8 @@ mod tests {
             settings.fronted_overrides[0].alpn,
             vec![b"http/1.1".to_vec()]
         );
+        assert!(settings.cdn_ips.iter().any(|ip| ip == "198.51.100.7:443"));
+        assert!(settings.cdn_snis.iter().any(|sni| sni == "scan.example"));
 
         let mut server = test_server(true);
         server.meek = Some(crate::psiphon_meek::Meek {
@@ -8514,7 +8519,12 @@ mod tests {
         apply_fronting_overrides(&mut servers, &settings);
         let front = servers
             .iter()
-            .find(|server| server.meek.as_ref().is_some_and(|meek| meek.dial == "pypi.org"))
+            .find(|server| {
+                server
+                    .meek
+                    .as_ref()
+                    .is_some_and(|meek| meek.dial == "pypi.org")
+            })
             .expect("pypi front");
         assert_eq!(
             front.meek.as_ref().expect("fronted").alpn,

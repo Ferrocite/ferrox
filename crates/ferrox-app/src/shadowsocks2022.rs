@@ -2841,9 +2841,10 @@ mod tests {
         let snapshot = loop {
             let snapshot = crate::stats::snapshot();
             let counted = ["alice@example", "ss-in#1#"].iter().all(|user| {
-                snapshot.user.get(*user).is_some_and(|traffic| {
-                    traffic.uplink == 38 && traffic.downlink >= 4
-                })
+                snapshot
+                    .user
+                    .get(*user)
+                    .is_some_and(|traffic| traffic.uplink == 38 && traffic.downlink >= 4)
             });
             if counted || std::time::Instant::now() >= deadline {
                 break snapshot;
