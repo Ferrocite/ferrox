@@ -12,6 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
+const MAX_HEAD_LINE: usize = 8192;
+const MAX_HEADERS: usize = 128;
+const MAX_TRAILERS: usize = 128;
 const LUA_GUARD: &[u8] = b"\x12\x01\x00";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144 Safari/537.36";
 
@@ -887,13 +890,30 @@ fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
     read_response(&mut session)
 }
 
+/// One head line, bounded: `read_line` grows a `String` without limit, so a malicious
+/// server pads a status, header, chunk-size or trailer line until the process is out
+/// of memory. The take caps the bytes the read may consume, and a line that does not
+/// end inside them is refused; a clean end of stream reads as an empty line, as before.
+fn capped_line(reader: &mut impl BufRead, what: &str) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let read = reader
+        .by_ref()
+        .take((MAX_HEAD_LINE + 2) as u64)
+        .read_until(b'\n', &mut buf)
+        .map_err(|error| error.to_string())?;
+    if read == 0 {
+        return Ok(String::new());
+    }
+    if !buf.ends_with(b"\n") {
+        return Err(format!("geodata {what} exceeds {MAX_HEAD_LINE} bytes"));
+    }
+    String::from_utf8(buf).map_err(|_| format!("geodata {what} is not UTF-8"))
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_response(reader: &mut impl Read) -> Result<Response, String> {
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| error.to_string())?;
+    let line = capped_line(&mut reader, "status line")?;
     let mut status = line.split_whitespace();
     let version = status.next().unwrap_or_default();
     let code = status
@@ -905,13 +925,13 @@ fn read_response(reader: &mut impl Read) -> Result<Response, String> {
     }
     let mut headers = Vec::new();
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
+        let line = capped_line(&mut reader, "header line")?;
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
+        }
+        if headers.len() >= MAX_HEADERS {
+            return Err(format!("geodata response headers exceed {MAX_HEADERS}"));
         }
         if let Some((name, value)) = line.split_once(':') {
             headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
@@ -976,10 +996,7 @@ fn read_response(reader: &mut impl Read) -> Result<Response, String> {
 
 fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), String> {
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
+        let line = capped_line(reader, "chunk size line")?;
         let size = line
             .trim()
             .split(';')
@@ -987,13 +1004,15 @@ fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), Str
             .and_then(|size| usize::from_str_radix(size, 16).ok())
             .ok_or_else(|| format!("invalid chunk size: {line}"))?;
         if size == 0 {
+            let mut trailers = 0;
             loop {
-                let mut trailer = String::new();
-                reader
-                    .read_line(&mut trailer)
-                    .map_err(|error| error.to_string())?;
+                let trailer = capped_line(reader, "chunk trailer")?;
                 if trailer.trim().is_empty() {
                     break;
+                }
+                trailers += 1;
+                if trailers > MAX_TRAILERS {
+                    return Err(format!("geodata chunk trailers exceed {MAX_TRAILERS}"));
                 }
             }
             return Ok(());
@@ -1056,6 +1075,64 @@ mod tests {
 
     fn config(geodata: &str) -> Json {
         crate::json::parse(&format!(r#"{{"geodata": {geodata}}}"#)).expect("parses")
+    }
+
+    /// CWE-400: the downloader read status, header and chunk lines with an unbounded
+    /// `read_line`, so one malicious geo server grew a line or header run without limit.
+    #[test]
+    fn a_geodata_response_over_an_oversized_head_line_is_refused() {
+        let long = "x".repeat(8193);
+        for (name, wire) in [
+            (
+                "status line",
+                format!("HTTP/1.1 200 {long}\r\nContent-Length: 3\r\n\r\nabc"),
+            ),
+            (
+                "header line",
+                format!("HTTP/1.1 200 OK\r\nServer: {long}\r\nContent-Length: 3\r\n\r\nabc"),
+            ),
+            (
+                "chunk size line",
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{long}\r\nabc\r\n0\r\n\r\n"
+                ),
+            ),
+            (
+                "chunk trailer line",
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Trailer: {long}\r\n\r\n"
+                ),
+            ),
+        ] {
+            let mut cursor = std::io::Cursor::new(wire.into_bytes());
+            let error = read_response(&mut cursor).expect_err(name);
+            assert!(error.contains("8192"), "{name}: {error}");
+        }
+    }
+
+    /// CWE-400: a header block with an unbounded field count grew without limit.
+    #[test]
+    fn a_geodata_response_over_a_header_run_is_refused() {
+        let heads: Vec<String> = (0..129)
+            .map(|index| format!("X-Head-{index}: v\r\n"))
+            .collect();
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\n{}Content-Length: 3\r\n\r\nabc",
+            heads.join("")
+        );
+        let mut cursor = std::io::Cursor::new(wire.into_bytes());
+        let error = read_response(&mut cursor).expect_err("a header run is refused");
+        assert!(error.contains("128"), "{error}");
+    }
+
+    /// A small well-formed response still reads: the caps only bite the runs above them.
+    #[test]
+    fn a_geodata_response_within_the_caps_still_reads() {
+        let mut cursor =
+            std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec());
+        let response = read_response(&mut cursor).expect("small head reads");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"abc");
     }
 
     #[test]

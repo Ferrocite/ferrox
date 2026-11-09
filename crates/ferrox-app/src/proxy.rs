@@ -60358,7 +60358,6 @@ mod tests {
             heartbeat: 0,
             encryption: None,
         };
-        let _ = vless;
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let target = Destination::from(
