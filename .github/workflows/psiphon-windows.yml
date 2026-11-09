@@ -294,6 +294,13 @@ jobs:
               settings["LightProxyTunnelInactiveThresholdMilliseconds"] = 0
           if os.environ.get("PSIPHON_PROTOCOL_SELECTION"):
               settings["protocolSelection"] = os.environ["PSIPHON_PROTOCOL_SELECTION"]
+          if os.environ.get("PSIPHON_PROTOCOL_SELECTION") == "cdn_fronting":
+              settings["FrontedMeekDialOverridesProbability"] = 1.0
+              settings["FrontedMeekDialOverrides"] = [{
+                  "DialAddresses": ["pypi.org"],
+                  "SNIServerName": "pypi.org",
+                  "ALPNProtocols": ["http/1.1"],
+              }]
           document = {
               "inbounds": [
                   {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},

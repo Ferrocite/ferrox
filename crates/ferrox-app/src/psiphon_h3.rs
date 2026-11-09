@@ -285,6 +285,11 @@ impl H3 {
         ))
     }
 
+    /// Whether the server has begun answering the current request.
+    pub(crate) fn response_started(&self) -> bool {
+        self.response.status != 0 || !self.response.body.is_empty()
+    }
+
     fn receive(&mut self, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
         let now = Instant::now();
         if now >= deadline || self.conn.is_closed() {
