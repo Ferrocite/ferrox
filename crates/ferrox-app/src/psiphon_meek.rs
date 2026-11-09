@@ -22,6 +22,8 @@ const MIN_COOKIE_PADDING: usize = 16;
 const MAX_COOKIE_PADDING: usize = 256;
 const POLL: Duration = Duration::from_millis(100);
 const MAX_POLL: Duration = Duration::from_secs(5);
+/// One stalled connect is a dead candidate, not the whole rotation's budget.
+const MAX_CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
 const POLL_GROWTH: f64 = 1.5;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
@@ -985,9 +987,11 @@ impl MeekHttp {
             self.stream = Some(MeekStream::H3(Box::new(h3)));
             return Ok(());
         }
+        // A stalled direct connect is one candidate; the proxy leg keeps its full handshake budget.
+        let connect = timeout.min(MAX_CONNECT_ATTEMPT);
         let stream = match &self.proxy {
             Some(proxy) => proxy.connect(address, timeout)?,
-            None => TcpStream::connect_timeout(&address, timeout)
+            None => TcpStream::connect_timeout(&address, connect)
                 .map_err(|error| format!("psiphon meek connect {}: {error}", self.meek.dial))?,
         };
         stream
@@ -1352,7 +1356,7 @@ mod tests {
             quic: false,
             ..entry()
         };
-        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(2), "/");
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(8), "/");
         http.open().expect("the second front handshakes");
         assert!(http.stream.is_some());
         assert_eq!(http.meek.port, live_port);
@@ -1368,7 +1372,7 @@ mod tests {
             quic: false,
             ..entry()
         };
-        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(2), "/");
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(8), "/");
         http.injected_addresses = Some(vec![dead, live]);
         http.open().expect("the next resolved IP handshakes");
         assert!(http.stream.is_some());
@@ -1390,7 +1394,7 @@ mod tests {
             quic: false,
             ..entry()
         };
-        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(2), "/");
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(8), "/");
         let why = http.open().expect_err("no front connects");
         assert!(why.contains("psiphon meek connect"), "{why}");
         assert!(http.stream.is_none());

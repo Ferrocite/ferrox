@@ -38,13 +38,18 @@ enum ReceiveError {
 /// Classify a receive error the way both the handshake and response loops
 /// must treat it. A connected UDP socket reports an ICMP port-unreachable as
 /// `ConnectionRefused`; ending the relay there leaves the front rotation with
-/// nothing to rotate to.
-fn classify_receive(error: io::Error) -> ReceiveError {
+/// nothing to rotate to. A WebRTC data channel reports `ConnectionAborted`
+/// when it breaks, which is a real transport failure, not a stale ICMP.
+fn classify_receive(error: io::Error, udp: bool) -> ReceiveError {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ReceiveError::Timeout,
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionAborted => ReceiveError::DeadFront(error),
+        | io::ErrorKind::ConnectionAborted
+            if udp =>
+        {
+            ReceiveError::DeadFront(error)
+        }
         _ => ReceiveError::Fatal(error),
     }
 }
@@ -54,11 +59,11 @@ fn classify_receive(error: io::Error) -> ReceiveError {
 struct DeadFront(Option<(Instant, String)>);
 
 impl DeadFront {
-    /// Fold a receive error into the window. Every outcome but a real socket
-    /// failure is a QUIC timeout: the caller keeps driving `on_timeout` and
-    /// the loop reaches its deadline instead of dying on the first ICMP.
-    fn receive(&mut self, error: io::Error, label: &str) -> Result<(), String> {
-        match classify_receive(error) {
+    /// Fold a receive error into the window. Only a UDP socket's ICMP report
+    /// gets the grace window; every other outcome is a QUIC timeout or a real
+    /// transport failure that must surface at once.
+    fn receive(&mut self, error: io::Error, label: &str, udp: bool) -> Result<(), String> {
+        match classify_receive(error, udp) {
             ReceiveError::Timeout => Ok(()),
             ReceiveError::DeadFront(error) => {
                 self.0.get_or_insert_with(|| {
@@ -136,11 +141,17 @@ impl Link {
             )),
         }
     }
+
+    fn is_udp(&self) -> bool {
+        matches!(self, Self::Udp(_))
+    }
 }
 
 /// A persistent HTTP/3 connection to one front.
 pub(crate) struct H3 {
     link: Link,
+    /// Only a UDP socket reports an ICMP error for its peer.
+    udp: bool,
     peer: SocketAddr,
     local: SocketAddr,
     conn: quiche::Connection,
@@ -198,6 +209,7 @@ impl H3 {
         let (local, peer) = link
             .addresses()
             .map_err(|error| format!("psiphon h3 local address: {error}"))?;
+        let udp = link.is_udp();
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|error| format!("psiphon h3 config: {error}"))?;
         // The front certificate is cover; the inner SSH host key authenticates the server.
@@ -229,7 +241,7 @@ impl H3 {
                 match conn.send(&mut out) {
                     Ok((write, _)) => {
                         if let Err(error) = link.send(&out[..write]) {
-                            dead.receive(error, "send")?;
+                            dead.receive(error, "send", udp)?;
                             break;
                         }
                     }
@@ -261,7 +273,7 @@ impl H3 {
                         .map_err(|error| format!("psiphon h3 receive: {error}"))?;
                 }
                 Err(error) => {
-                    dead.receive(error, "receive")?;
+                    dead.receive(error, "receive", udp)?;
                     conn.on_timeout();
                 }
             }
@@ -272,6 +284,7 @@ impl H3 {
             .map_err(|error| format!("psiphon h3 transport: {error}"))?;
         Ok(Self {
             link,
+            udp,
             peer,
             local,
             conn,
@@ -400,7 +413,7 @@ impl H3 {
                     .map_err(|error| format!("psiphon h3 receive: {error}"))?;
             }
             Err(error) => {
-                dead.receive(error, "receive")?;
+                dead.receive(error, "receive", self.udp)?;
                 self.conn.on_timeout();
             }
         }
@@ -413,7 +426,7 @@ impl H3 {
             match self.conn.send(out) {
                 Ok((write, _)) => {
                     if let Err(error) = self.link.send(&out[..write]) {
-                        dead.receive(error, "send")?;
+                        dead.receive(error, "send", self.udp)?;
                         break;
                     }
                 }
@@ -502,27 +515,48 @@ mod tests {
             io::ErrorKind::ConnectionAborted,
         ] {
             assert!(matches!(
-                classify_receive(io_error(kind)),
+                classify_receive(io_error(kind), true),
                 ReceiveError::DeadFront(_)
             ));
         }
         for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
             assert!(matches!(
-                classify_receive(io_error(kind)),
+                classify_receive(io_error(kind), true),
                 ReceiveError::Timeout
             ));
         }
         assert!(matches!(
-            classify_receive(io_error(io::ErrorKind::PermissionDenied)),
+            classify_receive(io_error(io::ErrorKind::PermissionDenied), true),
             ReceiveError::Fatal(_)
         ));
+    }
+
+    /// A WebRTC data channel reports `ConnectionAborted` when it breaks; it is
+    /// a terminal transport failure, not an ICMP report about a dead front.
+    #[test]
+    fn a_failed_webrtc_channel_is_not_a_dead_front() {
+        assert!(matches!(
+            classify_receive(io_error(io::ErrorKind::ConnectionAborted), false),
+            ReceiveError::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_receive(io_error(io::ErrorKind::TimedOut), false),
+            ReceiveError::Timeout
+        ));
+        let mut dead = DeadFront::default();
+        assert_eq!(
+            dead.receive(io_error(io::ErrorKind::ConnectionAborted), "receive", false)
+                .expect_err("a broken channel fails at once"),
+            "psiphon h3 receive: probe"
+        );
+        assert!(dead.0.is_none(), "no grace window is armed");
     }
 
     #[test]
     fn a_refused_front_drives_the_quic_timeout_path() {
         let mut dead = DeadFront::default();
         assert!(dead
-            .receive(io_error(io::ErrorKind::ConnectionRefused), "receive")
+            .receive(io_error(io::ErrorKind::ConnectionRefused), "receive", true)
             .is_ok());
         assert!(dead.0.is_some(), "the dead-front window is armed");
         let why = dead
@@ -561,13 +595,13 @@ mod tests {
     fn a_real_socket_failure_still_aborts_the_dial() {
         let mut dead = DeadFront::default();
         assert_eq!(
-            dead.receive(io_error(io::ErrorKind::PermissionDenied), "receive")
+            dead.receive(io_error(io::ErrorKind::PermissionDenied), "receive", true)
                 .expect_err("fatal"),
             "psiphon h3 receive: probe"
         );
         assert_eq!(
             DeadFront::default()
-                .receive(io_error(io::ErrorKind::PermissionDenied), "send")
+                .receive(io_error(io::ErrorKind::PermissionDenied), "send", true)
                 .expect_err("fatal"),
             "psiphon h3 send: probe"
         );
