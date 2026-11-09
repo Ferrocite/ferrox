@@ -5653,9 +5653,15 @@ fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
     if !settings.fronted_overrides.is_empty() {
         servers.sort_by_key(|server| {
             let pinned = server.meek.as_ref().is_some_and(|meek| {
+                let names = std::iter::once(&meek.host)
+                    .chain(std::iter::once(&meek.dial))
+                    .chain(meek.fronts.iter().map(|(front, _)| front));
                 settings.fronted_overrides.iter().any(|fronted| {
-                    fronted.dials.iter().any(|dial| dial == &meek.host)
-                        || fronted.snis.iter().any(|sni| sni == &meek.host)
+                    fronted
+                        .dials
+                        .iter()
+                        .chain(fronted.snis.iter())
+                        .any(|wanted| names.clone().any(|name| name == wanted))
                 })
             });
             !pinned
