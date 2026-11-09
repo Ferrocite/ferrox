@@ -346,6 +346,7 @@ fn rewrite_tcp(
     source_port: u16,
     destination_port: u16,
 ) -> bool {
+    // `tcp_view` returns `l4` as 20 or 40 only after the IP length fits the packet.
     let Some(l4_end) = view.l4.checked_add(20) else {
         return false;
     };
