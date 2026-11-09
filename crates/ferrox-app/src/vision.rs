@@ -39,6 +39,10 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     /// wide while the framing lives. Nothing stages the content again on the way out.
     have: Vec<u8>,
     dot: usize,
+    /// Plaintext a parked read already drained, served before the session: the body addons
+    /// follow the request header, so they must be the walk's first bytes.
+    source: Vec<u8>,
+    source_at: usize,
     walk: Walk,
     #[cfg(test)]
     staged: usize,
@@ -305,6 +309,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             uuid: *uuid,
             have: Vec::with_capacity(WINDOW),
             dot: 0,
+            source: Vec::new(),
+            source_at: 0,
             walk: Walk {
                 framed: false,
                 want_header: 0,
@@ -334,6 +340,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             },
             tls: TlsCell::Owned(Tls::new()),
         }
+    }
+
+    /// Hands the link plaintext a parked read already drained, ahead of the session.
+    pub(crate) fn preload(&mut self, prefix: Vec<u8>) {
+        self.source = prefix;
+        self.source_at = 0;
     }
 
     /// The reader strips the VLESS answer before its first frame, on the read that first
@@ -376,6 +388,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             uuid: *uuid,
             have: Vec::with_capacity(WINDOW),
             dot: 0,
+            source: Vec::new(),
+            source_at: 0,
             walk: Walk {
                 framed: false,
                 want_header: 0,
@@ -869,6 +883,24 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         loop {
             self.compact();
             let base = self.have.len();
+            if self.source_at < self.source.len() {
+                let room = WINDOW - base;
+                if room > 0 {
+                    let n = room.min(self.source.len() - self.source_at);
+                    self.have
+                        .extend_from_slice(&self.source[self.source_at..self.source_at + n]);
+                    self.source_at += n;
+                    if self.source_at == self.source.len() {
+                        self.source = Vec::new();
+                        self.source_at = 0;
+                    }
+                    self.stage(n);
+                    if !self.read.padding || self.dot < self.have.len() {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+            }
             self.have.reserve_exact(WINDOW - base);
             // The read lands in spare capacity held steady at the window; nothing here copies a framed byte into a staging buffer any more.
             let read = unsafe {
