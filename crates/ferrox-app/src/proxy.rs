@@ -1409,6 +1409,7 @@ fn dial_through_proxy(
                 Front::Probe,
                 &[],
                 Some(&name),
+                FlowFacts::default(),
             );
         })
         .map_err(|error| std::io::Error::other(format!("dialerProxy: {error}")))?;
