@@ -119,6 +119,8 @@ matrix_engine_skip_reason() {
       printf '%s\n' "xray-rust at this pin removed the QUIC transport" ;;
     zeronet:*-quic-*)
       printf '%s\n' "zeronet at this pin has no VLESS over QUIC transport" ;;
+    leaf:*-quic-*)
+      printf '%s\n' "leaf at this pin has no QUIC transport" ;;
     leaf:*-xhttp-*)
       printf '%s\n' "leaf at this pin has no xhttp transport" ;;
     leaf:*-kcp-*)
@@ -812,6 +814,19 @@ standard_scenarios() {
   echo "shadowsocks-grpc-down-8 download 8 256 65536"
   echo "shadowsocks2022-tls-raw-down-8 download 8 256 65536"
   echo "shadowsocks2022-ws-down-8 download 8 256 65536"
+  # Carriers every protocol already serves but the standard tier did not measure: KCP and
+  # Hysteria for all four families, QUIC for Trojan, TLS-raw for VMess, and HTTPUpgrade for
+  # both Shadowsocks dialects. The plain ws cells flap on the server leg, so they wait.
+  echo "vmess-tls-raw-down-8 download 8 256 65536"
+  echo "vmess-kcp-down-8 download 8 256 65536"
+  echo "trojan-tls-httpupgrade-down-8 download 8 256 65536"
+  echo "trojan-kcp-down-8 download 8 256 65536"
+  echo "trojan-quic-down-8 download 8 256 65536"
+  echo "trojan-hysteria-down-8 download 8 256 65536"
+  echo "shadowsocks-httpupgrade-down-8 download 8 256 65536"
+  echo "shadowsocks-kcp-down-8 download 8 256 65536"
+  echo "shadowsocks2022-httpupgrade-down-8 download 8 256 65536"
+  echo "shadowsocks2022-kcp-down-8 download 8 256 65536"
   echo "socks-raw-down-8 download 8 256 65536"
   echo "http-raw-down-8 download 8 256 65536"
 }

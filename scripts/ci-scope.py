@@ -974,9 +974,9 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         print(f"selftest: {'ok  ' if ok else 'FAIL'} {label}")
     plan = build_plan(root, ["crates/ferrox-app/src/vmess.rs"])
     vmess_cells = [
-        "vmess-raw-down-8", "vmess-tls-ws-down-8", "vmess-raw-down-64",
-        "vmess-raw-up-1", "vmess-raw-duplex-8", "vmess-tls-ws-up-1",
-        "vmess-tls-ws-duplex-8", "vmess-tls-raw-down-8", "vmess-tls-raw-up-1",
+        "vmess-raw-down-8", "vmess-tls-ws-down-8", "vmess-tls-raw-down-8",
+        "vmess-raw-down-64", "vmess-raw-up-1", "vmess-raw-duplex-8",
+        "vmess-tls-ws-up-1", "vmess-tls-ws-duplex-8", "vmess-tls-raw-up-1",
         "vmess-tls-raw-duplex-8", "vmess-tls-ws-ed-down-8", "vmess-raw-udp-8",
         "vmess-raw-idle-100", "vmess-raw-tcp-latency-1",
     ]
