@@ -2342,11 +2342,12 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
             .and_then(|tunnels| tunnels.get(&destination).cloned());
         if let Some(tunnel) = tunnel {
             // A full queue drops the packet; the dispatcher must keep serving other tunnels.
-            let _ = tunnel.sender.try_send(packet);
-            // Wake after the packet is visible, so a worker that cleared `pending` finds it.
-            if let Some(wake) = &tunnel.wake {
-                if !tunnel.pending.swap(true, Ordering::Relaxed) {
-                    let _ = wake.send(Arrival::Ready);
+            if tunnel.sender.try_send(packet).is_ok() {
+                // Wake after the packet is visible, so a worker that cleared `pending` finds it.
+                if let Some(wake) = &tunnel.wake {
+                    if !tunnel.pending.swap(true, Ordering::Relaxed) {
+                        let _ = wake.send(Arrival::Ready);
+                    }
                 }
             }
         }
