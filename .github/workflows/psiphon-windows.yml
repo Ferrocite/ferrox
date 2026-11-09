@@ -244,10 +244,19 @@ jobs:
           # server host and port; the aggregate server a leg carries
           # traffic through must be known, or no leg compares to another.
           lane_route() {
-            grep 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null | tail -n 1 | \
-              sed -n 's/.*tunnel up via \([^ ]*\) \([^ ]*\).*/server: \1\nprotocol: \2/p'
+            # The region is the trace's egress and the server is the last
+            # tunnel the log named. With a pool above one the two can belong
+            # to different sessions, so a multi-server run is marked mixed.
+            servers=$(grep 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null | \
+              sed -n 's/.*tunnel up via \([^ ]*\) \([^ ]*\).*/\1/p' | sort -u)
+            count=$(printf '%s\n' "$servers" | grep -c .)
+            server="${servers:-none}"
+            [ "$count" -gt 1 ] && server="mixed"
+            protocol=$(grep 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null | tail -n 1 | \
+              sed -n 's/.*tunnel up via [^ ]* \([^\ ]*\).*/\1/p')
             loc=$(awk '$1" "$2=="native socks" {print $4}' psiphon-egress.tsv 2>/dev/null | head -n 1)
-            printf 'region: %s\n' "${loc:-unknown}"
+            printf 'server: %s\nprotocol: %s\nregion: %s\n' \
+              "$server" "${protocol:-unknown}" "${loc:-unknown}"
           }
           # The two signature values are read out of the lane's own source, so the
           # shipped engine verifies the same list with the same key this tree pins.
@@ -602,7 +611,10 @@ jobs:
               print("route: " + ", ".join(f"{key}={value}" for key, value in route.items()))
               print()
           if egress:
-              print("egress: " + ", ".join(f"{k}={v}" for k, v in egress.items()))
+              # The trace goes to www.cloudflare.com while the legs go to
+              # speed.cloudflare.com; with a light-proxy entry the downloads
+              # can ride a different path than the trace names.
+              print("egress (trace): " + ", ".join(f"{k}={v}" for k, v in egress.items()))
               print()
           print("| leg | bytes | seconds | MiB/s | ÷control |")
           print("| --- | --- | --- | --- | --- |")
