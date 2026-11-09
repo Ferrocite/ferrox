@@ -7,6 +7,12 @@ on:
       - "scripts/check-upstream-pins.sh"
       - "scripts/fetch-upstream.sh"
       - "scripts/run-upstream-suite.sh"
+      - "scripts/utls-oracle/go.mod"
+      - "scripts/utls-oracle/go.sum"
+      - "scripts/utls-oracle/main.go"
+      - "scripts/utls-oracle/script.txt"
+      - "scripts/utls-oracle/expected.txt"
+      - "scripts/check-utls-oracle.sh"
       - ".github/workflows/pins.yml"
   schedule:
     - cron: "23 5 * * 1"
@@ -32,6 +38,12 @@ jobs:
       - name: check the upstream pins resolve
         shell: bash
         run: ./scripts/check-upstream-pins.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: check the uTLS oracle matches
+        shell: bash
+        run: ./scripts/check-utls-oracle.sh
 
   result:
     name: result
