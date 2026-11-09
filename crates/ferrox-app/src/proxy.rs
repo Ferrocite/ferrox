@@ -6884,7 +6884,7 @@ fn tunnel_stream(
                     &[],
                     None,
                     FlowFacts::default(),
-                )
+                );
             }
         })
         .ok()?;
@@ -22317,6 +22317,7 @@ fn sniff_lane<'a>(
 /// A loopback outbound's own sniffer runs before its named inbound sees the flow, as the
 /// reference's second dispatch does: the sniffed name routes, and only a dial override changes
 /// the target `routeOnly` keeps at the original address.
+#[allow(clippy::type_complexity)]
 fn loopback_sniffed(
     loopback: &LoopbackOut,
     asked: &Destination,
@@ -23631,6 +23632,7 @@ fn trim_bytes(mut bytes: &[u8]) -> &[u8] {
 }
 
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
+#[allow(clippy::too_many_lines)]
 fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     let Some(mut head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival())
     else {
@@ -66649,7 +66651,7 @@ mod tests {
         );
         let front_port = socks_front_with(out);
         let mut client = socks_tcp_client(front_port, echo_port);
-        let head = format!("GET / HTTP/1.1\r\nHost: sniffed.example\r\nConnection: close\r\n\r\n");
+        let head = "GET / HTTP/1.1\r\nHost: sniffed.example\r\nConnection: close\r\n\r\n";
         client.write_all(head.as_bytes()).expect("writes the head");
         let mut back = vec![0u8; head.len()];
         client.read_exact(&mut back).expect("echoes");
