@@ -363,8 +363,18 @@ pub(crate) fn serve_grpc_muxed(
     serve_accepted(accepted, reader, writer, close, meter);
 }
 
-pub(crate) fn serve_xhttp(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
-    let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
+pub(crate) fn serve_xhttp(
+    stream: Connection,
+    users: &[SsUser],
+    settings: &crate::xhttp::XhttpSettings,
+    freedom: bool,
+) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let Some((mut reader, mut writer)) =
+        crate::xhttp::accept_split_with_settings(read, stream, settings, None)
+    else {
         return;
     };
     let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
@@ -2697,6 +2707,11 @@ mod tests {
         ) {
             serve_httpupgrade(stream, users, path, "", freedom);
         }
+        fn serve_xhttp_path(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
+            let mut settings = crate::xhttp::XhttpSettings::stream_one();
+            settings.path = path.to_owned();
+            serve_xhttp(stream, users, &settings, freedom);
+        }
         fn sealed(target: &Destination) -> (Vec<u8>, Uplink, Recv) {
             let mut packet = Vec::new();
             let Ok((send, recv)) = client_send_handshake(&mut packet, PASSWORD, METHOD, target)
@@ -2738,7 +2753,7 @@ mod tests {
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
         let (mut reader, mut writer) = crate::xhttp::connect(
-            tunnel(serve_xhttp, "/ss-xhttp"),
+            tunnel(serve_xhttp_path, "/ss-xhttp"),
             "127.0.0.1",
             "/ss-xhttp",
             &[],

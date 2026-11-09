@@ -4117,12 +4117,7 @@ fn serve_shadowsocks(
             }
             Carrier::Xhttp { settings, .. } => {
                 crate::shadowsocks2022::serve_xhttp(
-                    stream,
-                    password,
-                    method,
-                    identities,
-                    settings.path.as_str(),
-                    freedom,
+                    stream, password, method, identities, settings, freedom,
                 );
             }
             Carrier::HttpHeader { path } => {
@@ -4152,7 +4147,7 @@ fn serve_shadowsocks(
             crate::shadowsocks::serve_grpc_with(stream, users, settings, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::shadowsocks::serve_xhttp(stream, users, settings.path.as_str(), freedom);
+            crate::shadowsocks::serve_xhttp(stream, users, settings, freedom);
         }
         Carrier::HttpHeader { path } => {
             crate::shadowsocks::serve_httpheader(stream, users, path.as_str(), freedom);
@@ -52559,7 +52554,33 @@ mod tests {
             Carrier::Xhttp {
                 settings: xhttp_settings("/ss-xhttp"),
             },
-            ss_serve(crate::shadowsocks::serve_xhttp),
+            |stream, password, method, path, freedom| {
+                crate::shadowsocks::serve_xhttp(
+                    stream,
+                    &crate::shadowsocks::account(password, method),
+                    &xhttp_settings(path),
+                    freedom,
+                );
+            },
+            "/ss-xhttp",
+            ("aes-256-gcm", "an-example-shared-password"),
+        );
+    }
+
+    #[test]
+    fn socks_dials_ss_over_xhttp_packet_up_to_echo() {
+        socks_dials_ss_via(
+            Carrier::Xhttp {
+                settings: xhttp_settings_mode("/ss-xhttp", crate::xhttp::XhttpMode::PacketUp),
+            },
+            |stream, password, method, path, freedom| {
+                crate::shadowsocks::serve_xhttp(
+                    stream,
+                    &crate::shadowsocks::account(password, method),
+                    &xhttp_settings_mode(path, crate::xhttp::XhttpMode::PacketUp),
+                    freedom,
+                );
+            },
             "/ss-xhttp",
             ("aes-256-gcm", "an-example-shared-password"),
         );
