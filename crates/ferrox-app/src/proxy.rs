@@ -14383,6 +14383,7 @@ fn dial_vless_quic_reality(
 ) {
     let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
     else {
+        eprintln!("vless: reality quic stream failed");
         return;
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
@@ -14427,12 +14428,14 @@ fn dial_vless_hysteria_reality(
     cfg: &ferrox_core::tls::RealityClientConfig,
 ) {
     let Some(dial) = hysteria_dial_session(vless) else {
+        eprintln!("vless: reality hysteria dial failed");
         return;
     };
     let Some(header) = vless_request_header(vless, target) else {
         return;
     };
     let Some(flow) = crate::hysteria::open(&dial, &header, 0) else {
+        eprintln!("vless: reality hysteria open failed");
         return;
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
