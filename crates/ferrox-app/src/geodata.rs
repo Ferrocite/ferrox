@@ -1070,6 +1070,7 @@ mod tests {
         );
     }
 
+    /// The scheme is case-insensitive, and the config stores the normalized URL.
     #[test]
     fn a_geodata_asset_url_scheme_is_read_without_case() {
         let dir = asset_dir();
