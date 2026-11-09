@@ -2595,6 +2595,9 @@ impl H3 {
             }
             if self.closed {
                 self.direct = left;
+                if delivered > 0 {
+                    return Ok(delivered);
+                }
                 return Err(io(Failure::Stream));
             }
             let want = left.min(buf.len() - delivered);
@@ -2603,28 +2606,41 @@ impl H3 {
             {
                 Some(Ok((0, true))) => {
                     self.direct = left;
+                    self.closed = true;
+                    if delivered > 0 {
+                        return Ok(delivered);
+                    }
                     return Err(io(Failure::Stream));
                 }
                 Some(Ok((read, fin))) => {
                     delivered += read;
                     left -= read;
                     if fin {
+                        self.closed = true;
                         if left > 0 {
                             self.direct = left;
+                            if delivered > 0 {
+                                return Ok(delivered);
+                            }
                             return Err(io(Failure::Stream));
                         }
-                        self.closed = true;
                     }
                 }
                 Some(Err(quiche::Error::Done)) => {
                     if Instant::now() >= self.deadline {
                         self.direct = left;
+                        if delivered > 0 {
+                            return Ok(delivered);
+                        }
                         return Err(io(Failure::Stream));
                     }
                     self.pump(self.pump_wait());
                 }
                 _ => {
                     self.direct = left;
+                    if delivered > 0 {
+                        return Ok(delivered);
+                    }
                     return Err(io(Failure::Io));
                 }
             }
