@@ -11544,6 +11544,15 @@ fn dial_vless_kcp(
         });
         return;
     }
+    if let Some(cfg) = vless.reality.as_deref() {
+        let Some(session) = kcp_reality_connect(conn, cfg) else {
+            return;
+        };
+        relay_kcp_under(client, conn, session, &header, |session| {
+            read_vless_response(session).is_some()
+        });
+        return;
+    }
     if conn.write(&header).is_err() {
         return;
     }
@@ -35876,7 +35885,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         let out = tls_carried_vless(outbound, address, port, id, &flow, mux, encryption)?;
         return Some(out);
     }
-    // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
+    // REALITY dials raw TCP and every carried carrier the client reaches; QUIC and Hysteria stay refused.
     if security == "reality" {
         let (carrier, host) = outbound_carrier(outbound, &address);
         if !matches!(
@@ -35887,6 +35896,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
                 | Carrier::Grpc(_)
                 | Carrier::Xhttp { .. }
                 | Carrier::HttpHeader { .. }
+                | Carrier::Kcp(_)
         ) {
             return None;
         }
@@ -41590,8 +41600,8 @@ mod tests {
             "quic REALITY stays refused, no UDP leg"
         );
         assert!(
-            !dials(r#""network": "kcp""#),
-            "kcp REALITY stays refused, raw-carrier only"
+            dials(r#""network": "kcp""#),
+            "kcp REALITY dials the carried tunnel"
         );
         let bare = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
@@ -59722,6 +59732,96 @@ mod tests {
         conn.close();
     }
 
+    /// REALITY sits above KCP as it does upstream: a VLESS session that declares reality is served and dialled through the raw connection.
+    #[test]
+    #[cfg(unix)]
+    fn vless_kcp_reality_echoes() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let client_reality = Arc::new(ferrox_core::tls::RealityClientConfig {
+            server_name: REALITY_TEST_SNI.to_owned(),
+            public_key: public,
+            short_id: [1, 35, 69, 103, 137, 171, 205, 239],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+        });
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut socket, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = socket.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp_reality(
+                &conn,
+                &one_vless_user(&id),
+                true,
+                &reality_server_config(),
+                crate::stats::Meter::default(),
+            );
+            let _ = done_rx.recv();
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: Some(client_reality),
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vless_kcp(&socket, &conn, &vless, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "reality over kcp echoes");
+        drop(sock);
+        let _ = done_tx.send(());
+        server.join().expect("joins");
+    }
+
     /// The security sits above KCP, as it does upstream: a VLESS session that declares tls is served and dialled through the raw connection.
     fn vless_kcp_tls_echoes(fingerprint: Option<ferrox_core::tls::Fingerprint>) {
         let (cert, key, base) = tls_cert_json();
@@ -59787,6 +59887,7 @@ mod tests {
             heartbeat: 0,
             encryption: None,
         };
+        let _ = vless;
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let target = Destination::from(
