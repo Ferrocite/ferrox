@@ -547,6 +547,7 @@ jobs:
           PSIPHON_PROTOCOL_SELECTION: ${{ inputs.protocol_selection }}
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
           legs = []
           try:
               lines = open("psiphon-legs.tsv").read().splitlines()
