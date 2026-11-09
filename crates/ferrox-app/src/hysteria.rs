@@ -3330,7 +3330,7 @@ mod tests {
             &key,
             &client,
             &initial,
-            &[alias.clone()],
+            std::slice::from_ref(&alias),
         );
         assert!(by_client_cid.is_empty());
         assert_eq!(by_initial_dcid.len(), 1);
