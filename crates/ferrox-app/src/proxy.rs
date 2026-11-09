@@ -67099,6 +67099,11 @@ mod tests {
     /// after the named HTTP proxy has seen the CONNECT, and it sees it exactly once.
     #[test]
     fn a_dialer_proxy_hop_carries_the_outbound_dial() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_dialer_proxy_hop_carries_the_outbound_dial",
+        ) {
+            return;
+        }
         let echo_port = echo_loop();
         let (hop_port, recorded) = fake_http_proxy_recording();
         let config = format!(
