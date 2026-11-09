@@ -3,7 +3,7 @@ fn version_of(mod_text: &str, module: &str) -> Option<(u32, u32, u32)> {
         let mut fields = line.split_whitespace();
         if fields.next() == Some(module) {
             let version = fields.next()?.strip_prefix("v")?;
-            let mut numbers = version.split('.').map(|part| part.parse::<u32>());
+            let mut numbers = version.split('.').map(str::parse::<u32>);
             let major = numbers.next()?.ok()?;
             let minor = numbers.next()?.ok()?;
             let patch = numbers.next()?.ok()?;
@@ -21,12 +21,11 @@ fn utls_oracle_does_not_pin_a_vulnerable_crypto() {
         if candidate.is_file() {
             break candidate;
         }
-        if !root.pop() {
-            panic!(
-                "utls-oracle go.mod not found; searched upward from {root}",
-                root = env!("CARGO_MANIFEST_DIR")
-            );
-        }
+        assert!(
+            root.pop(),
+            "utls-oracle go.mod not found; searched upward from {root}",
+            root = env!("CARGO_MANIFEST_DIR")
+        );
     };
     let go_mod = std::fs::read_to_string(&godot).expect("utls go.mod");
     let crypto = version_of(&go_mod, "golang.org/x/crypto").expect("crypto pin");
