@@ -34855,7 +34855,7 @@ fn loopback_carrier(carrier: &Carrier) -> bool {
 }
 
 /// How many loopback hops a single flow may take before the chain is refused. The reference has
-/// no cap and can spin on a tag cycle; ZeroNet's bound is the shape kept here.
+/// no cap and can spin on a tag cycle; `ZeroNet`'s bound is the shape kept here.
 const MAX_LOOPBACK_DEPTH: u8 = 8;
 
 /// A loopback's named-inbound tag, its own sniffer, and the dial an unrouted config still uses.

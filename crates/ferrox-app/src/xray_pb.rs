@@ -4587,7 +4587,7 @@ mod tests {
     fn the_loopback_outbound_decodes_to_the_json_this_tree_serves() {
         let sniffing = message(&[varint_field(1, 1), bytes_field(2, b"tls")]);
         let json = to_json(&config(
-            &http_scenario(5000),
+            &http_inbound(&receiver(5000, Some(&[127, 0, 0, 1])), &[]),
             &loopback_outbound(b"target-in", Some(&sniffing)),
         ))
         .expect("the loopback shape decodes");
