@@ -52205,19 +52205,22 @@ mod tests {
             for _ in 0..FLOWS {
                 let (stream, _) = listener.accept().expect("accepts");
                 stream.set_read_timeout(Some(RELAY_POLL)).expect("poll");
-                let Ok(out) = stream.try_clone() else {
-                    continue;
-                };
-                let Ok(session) = ferrox_core::tls::accept(&server_config, stream) else {
-                    continue;
-                };
                 let settings = server_settings.clone();
                 let keys = keys.clone();
-                run_tls_handshake(session, move |session, prefix| {
-                    let _flow = lane_flow(None, None, "", 0);
-                    let (reader, writer) = session_halves(session, out);
-                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
-                    serve_trojan_xhttp_carrier(reader, writer, &settings, &keys, true);
+                let server_config = Arc::clone(&server_config);
+                thread::spawn(move || {
+                    let Ok(out) = stream.try_clone() else {
+                        return;
+                    };
+                    let Ok(session) = ferrox_core::tls::accept(&server_config, stream) else {
+                        return;
+                    };
+                    run_tls_handshake(session, move |session, prefix| {
+                        let _flow = lane_flow(None, None, "", 0);
+                        let (reader, writer) = session_halves(session, out);
+                        let reader = crate::xhttp::ChainReader::new(prefix, reader);
+                        serve_trojan_xhttp_carrier(reader, writer, &settings, &keys, true);
+                    });
                 });
             }
         });
@@ -52243,7 +52246,7 @@ mod tests {
         let mut readers = Vec::new();
         for _ in 0..FLOWS {
             let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
-            sock.set_read_timeout(Some(Duration::from_secs(60)))
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
             readers.push(thread::spawn(move || {
                 let mut got = 0usize;

@@ -2837,7 +2837,19 @@ mod tests {
         for psk in [key(2), key(3)] {
             echo_through(port, &format!("{}:{psk}", key(1)), method, target);
         }
-        let snapshot = crate::stats::snapshot();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let snapshot = loop {
+            let snapshot = crate::stats::snapshot();
+            let counted = ["alice@example", "ss-in#1#"].iter().all(|user| {
+                snapshot.user.get(*user).is_some_and(|traffic| {
+                    traffic.uplink == 38 && traffic.downlink >= 4
+                })
+            });
+            if counted || std::time::Instant::now() >= deadline {
+                break snapshot;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(snapshot.user["alice@example"].uplink, 38);
         assert_eq!(snapshot.user["ss-in#1#"].uplink, 38);
         assert!(snapshot.user["alice@example"].downlink >= 4);
