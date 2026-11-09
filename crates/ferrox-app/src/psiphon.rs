@@ -973,7 +973,9 @@ impl Inner {
             if guard.is_empty() {
                 return (0, Duration::ZERO);
             }
-            if coin(self.settings.server_entry_reset_probability) {
+            if self.settings.fronted_overrides.is_empty()
+                && coin(self.settings.server_entry_reset_probability)
+            {
                 let entries = Arc::make_mut(&mut *guard);
                 shuffle(entries.as_mut_slice());
                 lock(&self.moved_to_front).clear();
