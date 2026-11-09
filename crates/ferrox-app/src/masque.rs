@@ -2341,13 +2341,15 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
             .ok()
             .and_then(|tunnels| tunnels.get(&destination).cloned());
         if let Some(tunnel) = tunnel {
-            if let Some(wake) = &tunnel.wake {
-                if !tunnel.pending.swap(true, Ordering::Relaxed) {
-                    let _ = wake.send(Arrival::Ready);
+            // A full queue drops the packet; the dispatcher must keep serving other tunnels.
+            if tunnel.sender.try_send(packet).is_ok() {
+                // Wake after the packet is visible, so a worker that cleared `pending` finds it.
+                if let Some(wake) = &tunnel.wake {
+                    if !tunnel.pending.swap(true, Ordering::Release) {
+                        let _ = wake.send(Arrival::Ready);
+                    }
                 }
             }
-            // A full queue drops the packet; the dispatcher must keep serving other tunnels.
-            let _ = tunnel.sender.try_send(packet);
         }
     }
 }
@@ -2531,7 +2533,7 @@ fn worker(
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut bytes, info);
             }
-            Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Relaxed),
+            Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Release),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
