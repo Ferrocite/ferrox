@@ -8612,13 +8612,34 @@ fn serve_vless_tls(
             }
             if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
                 let users: Arc<[VlessUser]> = Arc::from(users);
-                park_request(tls, move |tls, prefix| {
+                park_request(tls, move |tls, prefix, deadline| {
                     let front = FrontNames::of(&tls);
-                    relay_vless(tls, Some(raw), &users, freedom, true, None, &front, &prefix);
+                    relay_vless(
+                        tls,
+                        Some(raw),
+                        &users,
+                        freedom,
+                        true,
+                        None,
+                        &front,
+                        Some(Parked {
+                            prefix: &prefix,
+                            deadline,
+                        }),
+                    );
                 });
             } else {
                 let front = FrontNames::of(&tls);
-                relay_vless(tls, Some(raw), users, freedom, true, fallbacks, &front, &[]);
+                relay_vless(
+                    tls,
+                    Some(raw),
+                    users,
+                    freedom,
+                    true,
+                    fallbacks,
+                    &front,
+                    None,
+                );
             }
         }
         Carrier::Ws { path, .. } => {
@@ -8728,7 +8749,7 @@ fn serve_vless_kcp_tls(
         false,
         None,
         &FrontNames::default(),
-        &[],
+        None,
     );
 }
 
@@ -8851,17 +8872,17 @@ where
 fn park_request<S, F>(session: S, finish: F)
 where
     S: ferrox_core::tls::TlsProvider + Drivable + Send + 'static,
-    F: FnOnce(S, Vec<u8>) + Send + 'static,
+    F: FnOnce(S, Vec<u8>, Instant) + Send + 'static,
 {
+    let deadline = Instant::now() + budgets::handshake();
     let Some(transport) = session.transport() else {
-        finish(session, Vec::new());
+        finish(session, Vec::new(), deadline);
         return;
     };
     if transport.set_nonblocking(true).is_err() {
-        finish(session, Vec::new());
+        finish(session, Vec::new(), deadline);
         return;
     }
-    let deadline = Instant::now() + budgets::handshake();
     let mut session = Some(session);
     let mut finish = Some(finish);
     let mut transport = Some(transport);
@@ -8881,7 +8902,7 @@ where
                     }
                     if let Some(finish) = finish.take() {
                         let _lane = HandshakeLane::enter();
-                        finish(current, prefix);
+                        finish(current, prefix, deadline);
                     }
                     Next::Done
                 }
@@ -9283,13 +9304,25 @@ fn finish_reality<S>(
     }
     if fallbacks.is_none() && users.iter().all(|user| !matches!(user.flow, Flow::Vision)) {
         let users: Arc<[VlessUser]> = Arc::from(users);
-        park_request(session, move |session, prefix| {
+        park_request(session, move |session, prefix, deadline| {
             let front = FrontNames::of(&session);
-            relay_vless(session, raw, &users, freedom, true, None, &front, &prefix);
+            relay_vless(
+                session,
+                raw,
+                &users,
+                freedom,
+                true,
+                None,
+                &front,
+                Some(Parked {
+                    prefix: &prefix,
+                    deadline,
+                }),
+            );
         });
     } else {
         let front = FrontNames::of(&session);
-        relay_vless(session, raw, users, freedom, true, fallbacks, &front, &[]);
+        relay_vless(session, raw, users, freedom, true, fallbacks, &front, None);
     }
 }
 
@@ -9431,6 +9464,13 @@ impl FrontNames {
     }
 }
 
+/// The bytes a parked read already drained and the deadline that read was under, so the request decode spends the remaining budget instead of a fresh one.
+#[derive(Clone, Copy)]
+struct Parked<'a> {
+    prefix: &'a [u8],
+    deadline: Instant,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn relay_vless<S>(
     mut session: S,
@@ -9440,7 +9480,7 @@ fn relay_vless<S>(
     vision: bool,
     fallbacks: Option<&[Fallback]>,
     front: &FrontNames,
-    prefix: &[u8],
+    parked: Option<Parked<'_>>,
 ) where
     S: std::io::Read
         + std::io::Write
@@ -9467,43 +9507,44 @@ fn relay_vless<S>(
         );
     }
     let mut carried = Vec::new();
-    let probe = if prefix.is_empty() {
-        match decode_request_bounded_gated(
+    let probe = match parked.filter(|parked| !parked.prefix.is_empty()) {
+        None => match decode_request_bounded_gated(
             &mut session,
             |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
             resolve_endpoint,
         ) {
             Some(header) => Probe::Decoded(header),
             None => Probe::Dropped,
-        }
-    } else {
-        let mut bounded = HandshakeDeadline {
-            inner: &mut session,
-            until: Instant::now() + budgets::handshake(),
-        };
-        let (decoded, consumed) = {
-            let mut replay = Prefixed {
-                head: prefix,
-                at: 0,
-                tail: &mut bounded,
-                carried: &mut carried,
+        },
+        Some(Parked { prefix, deadline }) => {
+            let mut bounded = HandshakeDeadline {
+                inner: &mut session,
+                until: deadline,
             };
-            let decoded = decode_request_gated(
-                &mut replay,
-                |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
-                resolve_endpoint,
-            );
-            (decoded, replay.at)
-        };
-        if consumed < prefix.len() {
-            let mut rest = Vec::with_capacity(prefix.len() - consumed + carried.len());
-            rest.extend_from_slice(&prefix[consumed..]);
-            rest.extend_from_slice(&carried);
-            carried = rest;
-        }
-        match decoded {
-            Some(header) => Probe::Decoded(header),
-            None => Probe::Dropped,
+            let (decoded, consumed) = {
+                let mut replay = Prefixed {
+                    head: prefix,
+                    at: 0,
+                    tail: &mut bounded,
+                    carried: &mut carried,
+                };
+                let decoded = decode_request_gated(
+                    &mut replay,
+                    |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+                    resolve_endpoint,
+                );
+                (decoded, replay.at)
+            };
+            if consumed < prefix.len() {
+                let mut rest = Vec::with_capacity(prefix.len() - consumed + carried.len());
+                rest.extend_from_slice(&prefix[consumed..]);
+                rest.extend_from_slice(&carried);
+                carried = rest;
+            }
+            match decoded {
+                Some(header) => Probe::Decoded(header),
+                None => Probe::Dropped,
+            }
         }
     };
     relay_vless_reply(
@@ -39173,7 +39214,7 @@ mod tests {
                 true,
                 None,
                 &FrontNames::default(),
-                &[],
+                None,
             );
         });
 
