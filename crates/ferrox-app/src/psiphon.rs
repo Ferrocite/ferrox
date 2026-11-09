@@ -5879,7 +5879,7 @@ fn push_fronted_variant(
     if !alpn.is_empty() {
         meek.alpn = alpn.to_vec();
     }
-    meek.verify_server_names = if skip_cert_verify || meek.quic {
+    meek.verify_server_names = if skip_cert_verify || meek.quic || !meek.https {
         Vec::new()
     } else {
         verify_server_names.to_vec()
