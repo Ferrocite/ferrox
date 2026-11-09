@@ -2215,20 +2215,19 @@ mod tests {
         small_buffer(side.as_raw_fd(), libc::SO_SNDBUF);
         small_buffer(peer.as_raw_fd(), libc::SO_RCVBUF);
         let mut stream = Connection::Tcp(side);
+        let step = crate::proxy::RelayStep::enter();
         let mut filled = 0usize;
-        loop {
+        let (began, error) = loop {
+            let began = std::time::Instant::now();
             match stream.write_ready(&[&[0u8; 64][..]]) {
-                Ok(n) => filled += n,
-                Err(error) if crate::proxy::is_descriptor_wait(&error) => break,
+                Ok(n) => {
+                    filled += n;
+                    assert!(filled < 64 * 1024 * 1024, "the socket never filled");
+                }
+                Err(error) if crate::proxy::is_descriptor_wait(&error) => break (began, error),
                 Err(error) => panic!("the fill ended: {error:?}"),
             }
-            assert!(filled < 64 * 1024 * 1024, "the socket never filled");
-        }
-        let step = crate::proxy::RelayStep::enter();
-        let began = std::time::Instant::now();
-        let error = stream
-            .write_ready(&[&[0u8; 64][..]])
-            .expect_err("a full socket took the bytes");
+        };
         assert!(
             matches!(
                 error.kind(),
