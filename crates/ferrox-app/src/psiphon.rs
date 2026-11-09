@@ -5650,6 +5650,17 @@ impl Front {
 }
 
 fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
+    if !settings.fronted_overrides.is_empty() {
+        servers.sort_by_key(|server| {
+            let pinned = server.meek.as_ref().is_some_and(|meek| {
+                settings.fronted_overrides.iter().any(|fronted| {
+                    fronted.dials.iter().any(|dial| dial == &meek.host)
+                        || fronted.snis.iter().any(|sni| sni == &meek.host)
+                })
+            });
+            !pinned
+        });
+    }
     expand_fronted(servers, settings, Front::Tunnel);
 }
 
