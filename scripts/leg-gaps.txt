@@ -65,10 +65,6 @@ vmess-reality-raw-down-8|server-threads|1.08|696
 # 1.54-1.67.
 vless-grpc-duplex-8|server-threads|1.64|1276
 vless-grpc-duplex-8|server-cpu|5.77|1276
-# The REALITY server leg loses only to the Go xray client (xray-rust 2148, sing-box 2142 on the
-# same ferrox server); trojan reads 0.56 on EPYC and 0.78 on Xeon, so the worse pairing is filed.
+# Trojan over REALITY loses only to the Go xray client: it reads 0.56 on EPYC and 0.78 on Xeon,
+# so the worse pairing is filed.
 trojan-reality-raw-down-8|server|0.56|486|ceiling
-vless-reality-raw-down-8|server|0.41|486|ceiling
-# VLESS over a TLS record layer, not REALITY: xray-core 81 vs xray-rust 1063 on the ferrox server,
-# while plain vless-raw reads 1.02x. Same Go-client record framing as the REALITY legs above.
-vless-tls-raw-down-8|server|0.40|486|ceiling
