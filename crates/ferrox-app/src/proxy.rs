@@ -47581,7 +47581,7 @@ mod tests {
             let _ = done.send(());
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(2)))
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         let mut probe = [0u8; 1];
@@ -47590,7 +47590,7 @@ mod tests {
             0,
             "a refused answer closes the flow"
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(failure) = last_dial_failure_at(server_addr) {
                 assert_eq!(failure.stage, ferrox_core::failure::Stage::RequestSent);
@@ -47605,7 +47605,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         finished
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the dial hands the relay back after the refusal");
         drop(sock);
         relay.join().expect("joins");

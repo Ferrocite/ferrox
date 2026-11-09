@@ -2192,24 +2192,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_full_socket_write_never_waits_out_the_clock() {
+        use std::os::unix::io::AsRawFd;
+
+        fn small_buffer(fd: std::os::unix::io::RawFd, name: libc::c_int) {
+            let want: libc::c_int = 4096;
+            // SAFETY: `want` outlives the call, and the size is its own.
+            let set = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    name,
+                    std::ptr::addr_of!(want).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "a small socket buffer is refused");
+        }
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let _peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connects");
+        let peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connects");
         let (side, _) = listener.accept().expect("accepts");
+        small_buffer(side.as_raw_fd(), libc::SO_SNDBUF);
+        small_buffer(peer.as_raw_fd(), libc::SO_RCVBUF);
         let mut stream = Connection::Tcp(side);
+        let step = crate::proxy::RelayStep::enter();
         let mut filled = 0usize;
-        loop {
-            match stream.write_ready(&[&[0u8; 4096][..]]) {
-                Ok(n) => filled += n,
-                Err(error) if crate::proxy::is_descriptor_wait(&error) => break,
+        let (began, error) = loop {
+            let began = std::time::Instant::now();
+            match stream.write_ready(&[&[0u8; 64][..]]) {
+                Ok(n) => {
+                    filled += n;
+                    assert!(filled < 64 * 1024 * 1024, "the socket never filled");
+                }
+                Err(error) if crate::proxy::is_descriptor_wait(&error) => break (began, error),
                 Err(error) => panic!("the fill ended: {error:?}"),
             }
-            assert!(filled < 64 * 1024 * 1024, "the socket never filled");
-        }
-        let step = crate::proxy::RelayStep::enter();
-        let began = std::time::Instant::now();
-        let error = stream
-            .write_ready(&[&[0u8; 64][..]])
-            .expect_err("a full socket took the bytes");
+        };
         assert!(
             matches!(
                 error.kind(),

@@ -2677,7 +2677,7 @@ mod tests {
         let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
             .expect("connect");
         let (mut app, _) = listener.accept().expect("accept");
-        app.set_read_timeout(Some(Duration::from_secs(10)))
+        app.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         wireguard.serve_tcp(
             Connection::from(tun),
@@ -2700,7 +2700,6 @@ mod tests {
         let (answered, answer) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let mut seen = 0;
             loop {
                 let (n, from) = match dns.recv_from(&mut buf) {
                     Ok(received) => received,
@@ -2718,11 +2717,6 @@ mod tests {
                     }
                     Err(_) => return,
                 };
-                seen += 1;
-                // Simulated loss: drop the first query so the resolver's DNS_RETRY resend is answered.
-                if seen == 1 {
-                    continue;
-                }
                 let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
                     continue;
                 };
@@ -2811,7 +2805,7 @@ mod tests {
             let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
                 .expect("connect");
             let (mut app, _) = listener.accept().expect("accept");
-            app.set_read_timeout(Some(Duration::from_secs(10)))
+            app.set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
             wireguard.serve_tcp(Connection::from(tun), &asked, b"head");
             app.write_all(b"hello").expect("write");

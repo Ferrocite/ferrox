@@ -143,7 +143,7 @@ jobs:
     # and scripts answers false here; a schedule, with no diff to read, answers true.
     if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -168,13 +168,16 @@ jobs:
       - name: run the full suite
         id: test
         shell: bash
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           # Stage tracing for the loopback echo family: captured per test and
           # printed only on failure, so the next scheduler stall names where
           # it stopped (P47) at zero cost to a green run.
           FERROX_ECHO_TRACE: 1
+          # The Windows image runs the relay pool's ceiling against four cores, so the multi-flow loopback tests run in series there.
+          RUST_TEST_THREADS: ${{ runner.os == 'Windows' && '1' || '' }}
         run: |
+          if [[ -z "$RUST_TEST_THREADS" ]]; then unset RUST_TEST_THREADS; fi
           ./scripts/watch-test.sh --out "target/ci/test-${{ matrix.os }}.log" -- \
             cargo test --workspace --locked 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: publish the log the stall was cut from
