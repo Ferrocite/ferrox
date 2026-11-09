@@ -1295,6 +1295,9 @@ impl Inner {
             else {
                 continue;
             };
+            if !entry_allowed(&server, &self.settings.protocols, self.settings.fronted) {
+                continue;
+            }
             if !list
                 .iter()
                 .any(|known| known.host == server.host && known.port == server.port)
@@ -5536,6 +5539,29 @@ fn matches_direct_limit(server: &Server, shape: Shape, protocols: &[String]) -> 
 }
 
 /// Whether a server is allowed by a limit, with a direct-only limit dropping every meek entry.
+/// Whether a server the reference hands back at runtime still belongs to the selected lane.
+fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
+    let normal = shape_filter(protocols, "LimitTunnelProtocols");
+    if fronted {
+        let shadowsocks_named = normal.is_some_and(|shape| shape.shadowsocks);
+        let quic_named = normal.is_some_and(|shape| shape.quic);
+        if !(server.meek.as_ref().is_some_and(|meek| meek.fronted)
+            || (shadowsocks_named && server.ss)
+            || (quic_named && server.quic_port.is_some()))
+        {
+            return false;
+        }
+    }
+    normal.is_none_or(|filter| {
+        matches_limit(
+            server,
+            filter,
+            protocols.iter().any(|protocol| is_meek_protocol(protocol)),
+            protocols,
+        )
+    })
+}
+
 fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[String]) -> bool {
     if meek_named {
         matches_shape(server, filter) && matches_meek_protocol(server, protocols)
@@ -9630,6 +9656,36 @@ mod tests {
             inproxy_shadowsocks_key: None,
             channel_window: crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW,
         }
+    }
+
+    #[test]
+    fn a_runtime_entry_must_still_match_the_cdn_lane() {
+        let protocols = selection_protocols(Some("cdn_fronting"));
+        assert!(!entry_allowed(&test_server(true), &protocols, true));
+        let mut fronted = test_server(false);
+        fronted.direct = false;
+        fronted.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-CDN-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            verify_server_names: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        assert!(entry_allowed(&fronted, &protocols, true));
     }
 
     #[test]
