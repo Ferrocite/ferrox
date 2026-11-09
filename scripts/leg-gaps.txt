@@ -64,3 +64,6 @@ vmess-reality-raw-down-8|server-threads|1.08|696
 # 1.54-1.67.
 vless-grpc-duplex-8|server-threads|1.64|1276
 vless-grpc-duplex-8|server-cpu|5.77|1276
+# Trojan over REALITY loses only to the Go xray client: it reads 0.56 on EPYC and 0.78 on Xeon,
+# so the worse pairing is filed.
+trojan-reality-raw-down-8|server|0.56|486|ceiling
