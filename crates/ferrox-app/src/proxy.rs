@@ -13186,6 +13186,10 @@ fn serve_vmess_xhttp_carrier<
     if !h2 {
         return crate::vmess::serve_xhttp_split(chained, write, settings, users, freedom, close);
     }
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(settings.path.clone());
+    }
     let users = Arc::clone(users);
     let service = crate::xhttp_h2::XhttpSessionService::new(
         settings.clone(),
@@ -19003,7 +19007,7 @@ fn dial_vless_reality(
                 }
             }
         }
-        Carrier::Xhttp { settings } => {
+        Carrier::Xhttp { settings } if settings.mode == crate::xhttp::XhttpMode::StreamOne => {
             let pool = reality_xmux(server, vless, reality, settings);
             let lease = pool.lease(|| {
                 let (reader, writer, raw) = session.into_halves()?;
@@ -19016,6 +19020,16 @@ fn dial_vless_reality(
                 note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
         }
+        Carrier::Xhttp { .. } => ride_carrier(
+            server,
+            session,
+            || reality_lane(server, vless),
+            vless,
+            &header,
+            client,
+            // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82); dual modes open both streams on it.
+            true,
+        ),
         _ => ride_carrier(
             server,
             session,
@@ -19068,7 +19082,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     {
         return;
     }
-    dial_trojan_session(client, server, trojan, header, session, || {
+    dial_trojan_session(client, server, trojan, header, session, false, || {
         dial_tls_session(server, cfg, trojan.carrier.tcp_mask())
     });
 }
@@ -19085,7 +19099,7 @@ fn dial_trojan_reality(
     let Some(session) = dial_reality_session(server, cfg, trojan.carrier.tcp_mask()) else {
         return;
     };
-    dial_trojan_session(client, server, trojan, header, session, || {
+    dial_trojan_session(client, server, trojan, header, session, true, || {
         dial_reality_session(server, cfg, trojan.carrier.tcp_mask())
     });
 }
@@ -19097,6 +19111,7 @@ fn dial_trojan_session<S, D>(
     trojan: &TrojanOut,
     header: &[u8],
     mut session: S,
+    h2: bool,
     second: impl FnOnce() -> Option<D>,
 ) where
     S: Dialed + Drivable + CipherOpen + 'static,
@@ -19159,7 +19174,7 @@ fn dial_trojan_session<S, D>(
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) =
-                tls_xhttp(server, session, second, &trojan.host, settings, false)
+                tls_xhttp(server, session, second, &trojan.host, settings, h2)
             else {
                 return;
             };
@@ -19264,6 +19279,7 @@ fn vmess_tls_carried<S: Dialed, D: Dialed>(
     session: S,
     vmess: &VmessOut,
     target: &Destination,
+    h2: bool,
     second: impl FnOnce() -> Option<D>,
 ) {
     let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
@@ -19341,7 +19357,7 @@ fn vmess_tls_carried<S: Dialed, D: Dialed>(
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) =
-                tls_xhttp(server, session, second, &vmess.host, settings, false)
+                tls_xhttp(server, session, second, &vmess.host, settings, h2)
             else {
                 return;
             };
@@ -19455,7 +19471,7 @@ fn dial_vmess_tls(
     };
     match &vmess.carrier {
         Carrier::Raw(_) => vmess_tls_raw(client, server, session, vmess, target),
-        _ => vmess_tls_carried(client, server, session, vmess, target, || {
+        _ => vmess_tls_carried(client, server, session, vmess, target, false, || {
             dial_tls_session(server, cfg, vmess.carrier.tcp_mask())
         }),
     }
@@ -19475,7 +19491,7 @@ fn dial_vmess_reality(
     };
     match &vmess.carrier {
         Carrier::Raw(_) => vmess_tls_raw(client, server, session, vmess, target),
-        _ => vmess_tls_carried(client, server, session, vmess, target, || {
+        _ => vmess_tls_carried(client, server, session, vmess, target, true, || {
             dial_reality_session(server, cfg, vmess.carrier.tcp_mask())
         }),
     }
@@ -20574,7 +20590,7 @@ fn serve_trojan_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_trojan_xhttp(reader, writer, settings, key, freedom);
+                serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom);
             });
         }
         Carrier::HttpUpgrade { path, host, .. } => {
@@ -21013,6 +21029,10 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     };
     if !h2 {
         return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
+    }
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(settings.path.clone());
     }
     // The demux parks on the socket between frames, so eight connections add lanes, not threads.
     let keys: Vec<[u8; 56]> = key.to_vec();
@@ -42138,6 +42158,23 @@ mod tests {
         reality_pair_logged(flow, network, carrier, None, None)
     }
 
+    fn reality_xhttp_pair(mode: crate::xhttp::XhttpMode, path: &str) -> RealityPair {
+        let mut pair = reality_pair_at_path(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings_mode(path, mode),
+            },
+            path,
+        );
+        if let Outbound::Vless(vless) = &mut pair.outbound {
+            if let Carrier::Xhttp { settings } = &mut vless.carrier {
+                settings.mode = mode;
+            }
+        }
+        pair
+    }
+
     fn reality_pair_at_path(
         flow: &str,
         network: &str,
@@ -42467,6 +42504,44 @@ mod tests {
                 .any(|path| path == WITNESS),
             "the REALITY xHTTP dial did not open with the H2 preface"
         );
+    }
+
+    /// The reference dials HTTP/2 for a REALITY carrier in every mode, so the dual modes must open
+    /// their GET and POST as streams on that connection rather than taking the stream-one pool.
+    #[test]
+    fn reality_xhttp_dual_modes_reach_echo_over_h2() {
+        for (mode, path) in [
+            (crate::xhttp::XhttpMode::StreamUp, "/reality-stream-up-h2"),
+            (crate::xhttp::XhttpMode::PacketUp, "/reality-packet-up-h2"),
+        ] {
+            let pair = reality_xhttp_pair(mode, path);
+            let (mut user, dialled) = dial_pair(&pair);
+            let length = if mode == crate::xhttp::XhttpMode::PacketUp {
+                8192
+            } else {
+                64 * 1024
+            };
+            let payload: Vec<u8> = (0..length)
+                .map(|index| (index as u8).wrapping_mul(23).wrapping_add(9))
+                .collect();
+            assert_eq!(
+                echo_bulk(&mut user, &payload),
+                payload,
+                "{mode:?} payload came back altered through REALITY xHTTP"
+            );
+            drop(user);
+            dialled.join().expect("joins");
+            pair.echo.join().expect("joins");
+            pair.front.join().expect("joins");
+            assert!(
+                H2_DIAL_WITNESS
+                    .lock()
+                    .expect("witness lock")
+                    .iter()
+                    .any(|seen| seen == path),
+                "{mode:?} did not open with the H2 preface"
+            );
+        }
     }
 
     /// `maxConnections: 1` is the reference's multiplexing shape: the second session opens a stream on
@@ -48474,6 +48549,57 @@ mod tests {
         }
     }
 
+    /// The reference chooses HTTP/2 for every REALITY xHTTP session, so a Trojan REALITY dial must
+    /// open with the preface rather than an H1 head.
+    #[test]
+    fn a_trojan_reality_xhttp_dial_opens_with_the_h2_preface() {
+        const WITNESS: &str = "/trojan-reality-h2";
+        let stream = format!(
+            r#""network": "xhttp", "xhttpSettings": {{"path": "{WITNESS}", "mode": "stream-one"}}"#
+        );
+        let inbound = trojan_reality_inbound(&stream);
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let echo_port = echo_loop();
+        let trojan = find_trojan_outbound(&trojan_reality_outbound(&stream, port))
+            .expect("reality xhttp outbound");
+        assert!(trojan.reality.is_some());
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let server: SocketAddr = address.parse().expect("addr");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan(&socket, &server, &trojan, &target, Ladder::global());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the Trojan REALITY xHTTP dial did not open with the H2 preface"
+        );
+    }
+
     /// KCP carries the REALITY session above the connection both roles, as it carries TLS.
     #[test]
     fn a_trojan_reality_kcp_inbound_answers_the_session() {
@@ -51275,6 +51401,59 @@ mod tests {
                 )
             },
             tls_xhttp_accept,
+        );
+    }
+
+    /// The reference chooses HTTP/2 for every REALITY xHTTP session, so a `VMess` REALITY dial
+    /// must open with the preface rather than an H1 head.
+    #[test]
+    fn a_vmess_reality_xhttp_dial_opens_with_the_h2_preface() {
+        const WITNESS: &str = "/vmess-reality-h2";
+        let echo_port = echo_loop();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let id = [0x65u8; 16];
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings(WITNESS),
+        };
+        let server_carrier = carrier.clone();
+        let server_config = reality_server_config();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vmess_reality(
+                stream,
+                &crate::vmess::Users::single(id),
+                &server_carrier,
+                true,
+                &server_config,
+            );
+        });
+        let mut out = vmess_test_out(port, id, carrier, None);
+        out.reality = Some(trojan_reality_client());
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            dial_vmess(&client, &server, &out, &target, Ladder::global());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the VMess REALITY xHTTP dial did not open with the H2 preface"
         );
     }
 
