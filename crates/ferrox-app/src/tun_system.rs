@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::connectip::{
-    ipv4_checksum, ipv4_head, ipv6_head, tcp_checksum, IPV4_HEADER, IPV6_HEADER,
+    checksum_update, ipv4_head, ipv6_head, IPV4_HEADER, IPV6_HEADER,
 };
 
 const FLAG_FIN: u8 = 0x01;
@@ -87,7 +87,6 @@ struct TcpView {
     destination_port: u16,
     flags: u8,
     l4: usize,
-    total: usize,
 }
 
 impl Nat {
@@ -336,7 +335,6 @@ fn tcp_view(packet: &[u8]) -> Option<TcpView> {
         destination_port,
         flags: *packet.get(l4 + 13)?,
         l4,
-        total,
     })
 }
 
@@ -348,72 +346,66 @@ fn rewrite_tcp(
     source_port: u16,
     destination_port: u16,
 ) -> bool {
-    match (source, destination) {
-        (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            let Some(bytes) = packet.get_mut(12..16) else {
+    // `tcp_view` returns `l4` as 20 or 40 only after the IP length fits the packet.
+    let Some(l4_end) = view.l4.checked_add(20) else {
+        return false;
+    };
+    let Some(tcp) = packet.get(view.l4..l4_end) else {
+        return false;
+    };
+    let mut checksum = u16::from_be_bytes([tcp[16], tcp[17]]);
+    // The view and the NAT peer share a family; a mismatch stays with the userspace stack.
+    match (view.source, view.destination, source, destination) {
+        (
+            IpAddr::V4(old_source),
+            IpAddr::V4(old_destination),
+            IpAddr::V4(source),
+            IpAddr::V4(destination),
+        ) => {
+            let Some(ip) = packet.get_mut(10..20) else {
                 return false;
             };
-            bytes.copy_from_slice(&source.octets());
-            let Some(bytes) = packet.get_mut(16..20) else {
-                return false;
-            };
-            bytes.copy_from_slice(&destination.octets());
-            let Some(checksum) = packet.get_mut(10..12) else {
-                return false;
-            };
-            checksum.fill(0);
-            let Some(header) = packet.get(..20) else {
-                return false;
-            };
-            let checksum = ipv4_checksum(header);
-            let Some(bytes) = packet.get_mut(10..12) else {
-                return false;
-            };
-            bytes.copy_from_slice(&checksum.to_be_bytes());
+            ip[2..6].copy_from_slice(&source.octets());
+            ip[6..10].copy_from_slice(&destination.octets());
+            let mut header = u16::from_be_bytes([ip[0], ip[1]]);
+            header = checksum_update(header, &old_source.octets(), &source.octets());
+            header = checksum_update(header, &old_destination.octets(), &destination.octets());
+            ip[0..2].copy_from_slice(&header.to_be_bytes());
+            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
+            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
         }
-        (IpAddr::V6(source), IpAddr::V6(destination)) => {
-            let Some(bytes) = packet.get_mut(8..24) else {
+        (
+            IpAddr::V6(old_source),
+            IpAddr::V6(old_destination),
+            IpAddr::V6(source),
+            IpAddr::V6(destination),
+        ) => {
+            let Some(ip) = packet.get_mut(8..40) else {
                 return false;
             };
-            bytes.copy_from_slice(&source.octets());
-            let Some(bytes) = packet.get_mut(24..40) else {
-                return false;
-            };
-            bytes.copy_from_slice(&destination.octets());
+            ip[..16].copy_from_slice(&source.octets());
+            ip[16..].copy_from_slice(&destination.octets());
+            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
+            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
         }
         _ => return false,
     }
-    let Some(bytes) = packet.get_mut(view.l4..view.l4 + 2) else {
+    checksum = checksum_update(
+        checksum,
+        &view.source_port.to_be_bytes(),
+        &source_port.to_be_bytes(),
+    );
+    checksum = checksum_update(
+        checksum,
+        &view.destination_port.to_be_bytes(),
+        &destination_port.to_be_bytes(),
+    );
+    let Some(tcp) = packet.get_mut(view.l4..l4_end) else {
         return false;
     };
-    bytes.copy_from_slice(&source_port.to_be_bytes());
-    let Some(bytes) = packet.get_mut(view.l4 + 2..view.l4 + 4) else {
-        return false;
-    };
-    bytes.copy_from_slice(&destination_port.to_be_bytes());
-    let Some(checksum_at) = view.l4.checked_add(16) else {
-        return false;
-    };
-    let Some(bytes) = packet.get_mut(checksum_at..checksum_at + 2) else {
-        return false;
-    };
-    bytes.fill(0);
-    let Some(segment) = packet.get(view.l4..view.total) else {
-        return false;
-    };
-    let checksum = match (source, destination) {
-        (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            tcp_checksum(&source.octets(), &destination.octets(), segment)
-        }
-        (IpAddr::V6(source), IpAddr::V6(destination)) => {
-            tcp_checksum(&source.octets(), &destination.octets(), segment)
-        }
-        _ => return false,
-    };
-    let Some(bytes) = packet.get_mut(checksum_at..checksum_at + 2) else {
-        return false;
-    };
-    bytes.copy_from_slice(&checksum.to_be_bytes());
+    tcp[0..2].copy_from_slice(&source_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
     true
 }
 
@@ -661,6 +653,7 @@ fn accept_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrox_core::foxy::connectip::{ipv4_checksum, tcp_checksum};
 
     fn ipv4_packet(
         source: Ipv4Addr,
@@ -669,7 +662,25 @@ mod tests {
         destination_port: u16,
         flags: u8,
     ) -> Vec<u8> {
-        let mut packet = vec![0u8; 40];
+        ipv4_packet_with_payload(
+            source,
+            destination,
+            source_port,
+            destination_port,
+            flags,
+            &[],
+        )
+    }
+
+    fn ipv4_packet_with_payload(
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        source_port: u16,
+        destination_port: u16,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 40 + payload.len()];
         let total = packet.len() as u16;
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&total.to_be_bytes());
@@ -682,6 +693,7 @@ mod tests {
         packet[32] = 0x50;
         packet[33] = flags;
         packet[34..36].copy_from_slice(&65_535u16.to_be_bytes());
+        packet[40..].copy_from_slice(payload);
         let checksum = ipv4_checksum(&packet[..20]);
         packet[10..12].copy_from_slice(&checksum.to_be_bytes());
         let checksum = tcp_checksum(&source.octets(), &destination.octets(), &packet[20..]);
@@ -696,9 +708,27 @@ mod tests {
         destination_port: u16,
         flags: u8,
     ) -> Vec<u8> {
-        let mut packet = vec![0u8; 60];
+        ipv6_packet_with_payload(
+            source,
+            destination,
+            source_port,
+            destination_port,
+            flags,
+            &[],
+        )
+    }
+
+    fn ipv6_packet_with_payload(
+        source: Ipv6Addr,
+        destination: Ipv6Addr,
+        source_port: u16,
+        destination_port: u16,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 60 + payload.len()];
         packet[0] = 0x60;
-        packet[4..6].copy_from_slice(&20u16.to_be_bytes());
+        packet[4..6].copy_from_slice(&(20u16 + payload.len() as u16).to_be_bytes());
         packet[6] = 6;
         packet[7] = 64;
         packet[8..24].copy_from_slice(&source.octets());
@@ -708,6 +738,7 @@ mod tests {
         packet[52] = 0x50;
         packet[53] = flags;
         packet[54..56].copy_from_slice(&65_535u16.to_be_bytes());
+        packet[60..].copy_from_slice(payload);
         let checksum = tcp_checksum(&source.octets(), &destination.octets(), &packet[40..]);
         packet[56..58].copy_from_slice(&checksum.to_be_bytes());
         packet
@@ -813,6 +844,161 @@ mod tests {
             tcp_checksum(&source.octets(), &destination.octets(), &reverse[40..]),
             0
         );
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_checksum_of_every_payload_length() {
+        let local = Ipv4Addr::new(198, 18, 0, 1);
+        let peer = Ipv4Addr::new(198, 18, 0, 2);
+        let remote = Ipv4Addr::new(203, 0, 113, 7);
+        let local6 = "fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap();
+        let peer6 = "fdfe:dcba:9876::2".parse::<Ipv6Addr>().unwrap();
+        let remote6 = "2001:db8::7".parse::<Ipv6Addr>().unwrap();
+        for len in [0usize, 1, 2, 3, 17, 64, 1_460, 4_096, 65_475] {
+            let payload: Vec<u8> = (0..len)
+                .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+                .collect();
+            let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
+            let mut packet = ipv4_packet_with_payload(local, remote, 1234, 443, FLAG_SYN, &payload);
+            assert!(nat.rewrite(&mut packet) == Outcome::Handled);
+            assert_eq!(ipv4_checksum(&packet[..20]), 0, "ipv4 header len {len}");
+            let mut expected_header = packet[..20].to_vec();
+            expected_header[10..12].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([packet[10], packet[11]]),
+                ipv4_checksum(&expected_header),
+                "ipv4 header bytes len {len}"
+            );
+            assert_eq!(
+                tcp_checksum(&peer.octets(), &local.octets(), &packet[20..]),
+                0,
+                "ipv4 tcp len {len}"
+            );
+            let mut expected = packet.clone();
+            expected[36..38].fill(0);
+            let want = tcp_checksum(&peer.octets(), &local.octets(), &expected[20..]);
+            assert_eq!(
+                u16::from_be_bytes([packet[36], packet[37]]),
+                want,
+                "ipv4 tcp bytes len {len}"
+            );
+            let mut nat = Nat::new(local6.into(), peer6.into(), 40_000, false);
+            let mut packet =
+                ipv6_packet_with_payload(local6, remote6, 1234, 443, FLAG_SYN, &payload);
+            assert!(nat.rewrite(&mut packet) == Outcome::Handled);
+            assert_eq!(
+                tcp_checksum(&peer6.octets(), &local6.octets(), &packet[40..]),
+                0,
+                "ipv6 tcp len {len}"
+            );
+            let mut expected = packet.clone();
+            expected[56..58].fill(0);
+            let want = tcp_checksum(&peer6.octets(), &local6.octets(), &expected[40..]);
+            assert_eq!(
+                u16::from_be_bytes([packet[56], packet[57]]),
+                want,
+                "ipv6 tcp bytes len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reverse_rewrite_keeps_the_checksum_of_every_payload_length() {
+        let local = Ipv4Addr::new(198, 18, 0, 1);
+        let peer = Ipv4Addr::new(198, 18, 0, 2);
+        let remote = Ipv4Addr::new(203, 0, 113, 7);
+        let local6 = "fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap();
+        let peer6 = "fdfe:dcba:9876::2".parse::<Ipv6Addr>().unwrap();
+        let remote6 = "2001:db8::7".parse::<Ipv6Addr>().unwrap();
+        for len in [0usize, 1, 2, 3, 17, 64, 1_460, 4_096, 65_475] {
+            let payload: Vec<u8> = (0..len)
+                .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+                .collect();
+            let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
+            let mut forward =
+                ipv4_packet_with_payload(local, remote, 1234, 443, FLAG_SYN, &payload);
+            assert!(nat.rewrite(&mut forward) == Outcome::Handled);
+            let nat_port = u16::from_be_bytes([forward[20], forward[21]]);
+            let mut reverse = ipv4_packet_with_payload(
+                local,
+                peer,
+                40_000,
+                nat_port,
+                FLAG_SYN | FLAG_ACK,
+                &payload,
+            );
+            assert!(nat.rewrite(&mut reverse) == Outcome::Handled);
+            assert_eq!(
+                fields(&reverse),
+                (remote, local, 443, 1234),
+                "ipv4 reverse fields len {len}"
+            );
+            assert_eq!(
+                ipv4_checksum(&reverse[..20]),
+                0,
+                "ipv4 reverse header len {len}"
+            );
+            let mut expected_header = reverse[..20].to_vec();
+            expected_header[10..12].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([reverse[10], reverse[11]]),
+                ipv4_checksum(&expected_header),
+                "ipv4 reverse header bytes len {len}"
+            );
+            assert_eq!(
+                tcp_checksum(&remote.octets(), &local.octets(), &reverse[20..]),
+                0,
+                "ipv4 reverse tcp len {len}"
+            );
+            let mut expected = reverse.clone();
+            expected[36..38].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([reverse[36], reverse[37]]),
+                tcp_checksum(&remote.octets(), &local.octets(), &expected[20..]),
+                "ipv4 reverse tcp bytes len {len}"
+            );
+
+            let mut nat = Nat::new(local6.into(), peer6.into(), 40_000, false);
+            let mut forward =
+                ipv6_packet_with_payload(local6, remote6, 1234, 443, FLAG_SYN, &payload);
+            assert!(nat.rewrite(&mut forward) == Outcome::Handled);
+            let nat_port = u16::from_be_bytes([forward[40], forward[41]]);
+            let mut reverse = ipv6_packet_with_payload(
+                local6,
+                peer6,
+                40_000,
+                nat_port,
+                FLAG_SYN | FLAG_ACK,
+                &payload,
+            );
+            assert!(nat.rewrite(&mut reverse) == Outcome::Handled);
+            let source = Ipv6Addr::from(<[u8; 16]>::try_from(&reverse[8..24]).unwrap());
+            let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&reverse[24..40]).unwrap());
+            assert_eq!(source, remote6, "ipv6 reverse source len {len}");
+            assert_eq!(destination, local6, "ipv6 reverse destination len {len}");
+            assert_eq!(
+                u16::from_be_bytes([reverse[40], reverse[41]]),
+                443,
+                "ipv6 reverse source port len {len}"
+            );
+            assert_eq!(
+                u16::from_be_bytes([reverse[42], reverse[43]]),
+                1234,
+                "ipv6 reverse destination port len {len}"
+            );
+            assert_eq!(
+                tcp_checksum(&remote6.octets(), &local6.octets(), &reverse[40..]),
+                0,
+                "ipv6 reverse tcp len {len}"
+            );
+            let mut expected = reverse.clone();
+            expected[56..58].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([reverse[56], reverse[57]]),
+                tcp_checksum(&remote6.octets(), &local6.octets(), &expected[40..]),
+                "ipv6 reverse tcp bytes len {len}"
+            );
+        }
     }
 
     #[test]
