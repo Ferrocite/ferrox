@@ -5695,7 +5695,8 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
         }
         let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
         let mut variants = 0;
-        if settings.cdn_ips.is_empty() && settings.cdn_snis.is_empty() {
+        let override_only = !settings.fronted_overrides.is_empty();
+        if !override_only && settings.cdn_ips.is_empty() && settings.cdn_snis.is_empty() {
             group.push(server.clone());
             variants += 1;
         }
@@ -5727,7 +5728,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut variants,
             );
         }
-        if !settings.cdn_ips.is_empty() || !settings.cdn_snis.is_empty() {
+        if !override_only && (!settings.cdn_ips.is_empty() || !settings.cdn_snis.is_empty()) {
             let dials: Vec<(String, u16)> = if settings.cdn_ips.is_empty() {
                 vec![(meek.dial.clone(), meek.port)]
             } else {
@@ -5767,6 +5768,9 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                     &mut variants,
                 );
             }
+        }
+        if group.is_empty() {
+            group.push(server);
         }
         groups.push(group);
     }
@@ -8374,11 +8378,7 @@ mod tests {
                         "SNIServerName": "sni.example",
                         "DisableSNI": false,
                         "ALPNProtocols": ["http/1.1"]
-                    }],
-                    "FrontedMeekCDNScanSpec": {
-                        "IPCandidates": ["198.51.100.7:443"],
-                        "SNIServerNames": ["scan.example"]
-                    }
+                    }]
                 }"#,
             )
             .expect("settings"),
@@ -8388,8 +8388,6 @@ mod tests {
             settings.fronted_overrides[0].dials,
             vec!["edge.example:8443", "192.0.2.9:443"]
         );
-        assert!(settings.cdn_ips.iter().any(|ip| ip == "198.51.100.7:443"));
-        assert!(settings.cdn_snis.iter().any(|sni| sni == "scan.example"));
         assert_eq!(settings.fronted_overrides[0].snis, vec!["sni.example"]);
         assert_eq!(settings.fronted_overrides.len(), 1);
         assert!(!settings.fronted_overrides[0].disable_sni);
@@ -8429,6 +8427,46 @@ mod tests {
                 && meek.sni == "sni.example"
                 && !meek.disable_sni
         }));
+    }
+
+    #[test]
+    fn a_fronted_scan_adds_candidates_without_an_override() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7:443"],
+                        "SNIServerNames": ["scan.example"]
+                    }
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            verify_server_names: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
         assert!(servers.iter().any(|server| {
             let meek = server.meek.as_ref().expect("fronted");
             meek.dial == "198.51.100.7" && meek.sni == "scan.example"
