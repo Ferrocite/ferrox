@@ -902,6 +902,105 @@ mod tests {
     }
 
     #[test]
+    fn a_reverse_rewrite_keeps_the_checksum_of_every_payload_length() {
+        let local = Ipv4Addr::new(198, 18, 0, 1);
+        let peer = Ipv4Addr::new(198, 18, 0, 2);
+        let remote = Ipv4Addr::new(203, 0, 113, 7);
+        let local6 = "fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap();
+        let peer6 = "fdfe:dcba:9876::2".parse::<Ipv6Addr>().unwrap();
+        let remote6 = "2001:db8::7".parse::<Ipv6Addr>().unwrap();
+        for len in [0usize, 1, 2, 3, 17, 64, 1_460, 4_096, 65_475] {
+            let payload: Vec<u8> = (0..len)
+                .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+                .collect();
+            let mut nat = Nat::new(local.into(), peer.into(), 40_000, false);
+            let mut forward =
+                ipv4_packet_with_payload(local, remote, 1234, 443, FLAG_SYN, &payload);
+            assert!(nat.rewrite(&mut forward) == Outcome::Handled);
+            let nat_port = u16::from_be_bytes([forward[20], forward[21]]);
+            let mut reverse = ipv4_packet_with_payload(
+                local,
+                peer,
+                40_000,
+                nat_port,
+                FLAG_SYN | FLAG_ACK,
+                &payload,
+            );
+            assert!(nat.rewrite(&mut reverse) == Outcome::Handled);
+            assert_eq!(
+                fields(&reverse),
+                (remote, local, 443, 1234),
+                "ipv4 reverse fields len {len}"
+            );
+            assert_eq!(
+                ipv4_checksum(&reverse[..20]),
+                0,
+                "ipv4 reverse header len {len}"
+            );
+            let mut expected_header = reverse[..20].to_vec();
+            expected_header[10..12].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([reverse[10], reverse[11]]),
+                ipv4_checksum(&expected_header),
+                "ipv4 reverse header bytes len {len}"
+            );
+            assert_eq!(
+                tcp_checksum(&remote.octets(), &local.octets(), &reverse[20..]),
+                0,
+                "ipv4 reverse tcp len {len}"
+            );
+            let mut expected = reverse.clone();
+            expected[36..38].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([reverse[36], reverse[37]]),
+                tcp_checksum(&remote.octets(), &local.octets(), &expected[20..]),
+                "ipv4 reverse tcp bytes len {len}"
+            );
+
+            let mut nat = Nat::new(local6.into(), peer6.into(), 40_000, false);
+            let mut forward =
+                ipv6_packet_with_payload(local6, remote6, 1234, 443, FLAG_SYN, &payload);
+            assert!(nat.rewrite(&mut forward) == Outcome::Handled);
+            let nat_port = u16::from_be_bytes([forward[40], forward[41]]);
+            let mut reverse = ipv6_packet_with_payload(
+                local6,
+                peer6,
+                40_000,
+                nat_port,
+                FLAG_SYN | FLAG_ACK,
+                &payload,
+            );
+            assert!(nat.rewrite(&mut reverse) == Outcome::Handled);
+            let source = Ipv6Addr::from(<[u8; 16]>::try_from(&reverse[8..24]).unwrap());
+            let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&reverse[24..40]).unwrap());
+            assert_eq!(source, remote6, "ipv6 reverse source len {len}");
+            assert_eq!(destination, local6, "ipv6 reverse destination len {len}");
+            assert_eq!(
+                u16::from_be_bytes([reverse[40], reverse[41]]),
+                443,
+                "ipv6 reverse source port len {len}"
+            );
+            assert_eq!(
+                u16::from_be_bytes([reverse[42], reverse[43]]),
+                1234,
+                "ipv6 reverse destination port len {len}"
+            );
+            assert_eq!(
+                tcp_checksum(&remote6.octets(), &local6.octets(), &reverse[40..]),
+                0,
+                "ipv6 reverse tcp len {len}"
+            );
+            let mut expected = reverse.clone();
+            expected[56..58].fill(0);
+            assert_eq!(
+                u16::from_be_bytes([reverse[56], reverse[57]]),
+                tcp_checksum(&remote6.octets(), &local6.octets(), &expected[40..]),
+                "ipv6 reverse tcp bytes len {len}"
+            );
+        }
+    }
+
+    #[test]
     fn a_fragment_stays_for_the_userspace_stack() {
         let local = Ipv4Addr::new(198, 18, 0, 1);
         let mut nat = Nat::new(
