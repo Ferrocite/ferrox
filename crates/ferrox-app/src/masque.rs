@@ -1647,6 +1647,7 @@ pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u
     }
 }
 
+/// Hand a datagram's inner packet to the stack or a UDP lane, retaining the prefix the stack records as its offset.
 fn deliver_owned(
     to_stack: &Sender<Packet>,
     routes: &UdpRoutes,
@@ -2993,6 +2994,7 @@ pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr],
     }
 }
 
+/// Forward a datagram's inner packet to a peer or the stack, retaining the prefix the stack records as its offset.
 fn forward_owned(
     shared: &Arc<Shared>,
     spec: &ServerSpec,
