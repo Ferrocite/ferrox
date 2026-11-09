@@ -404,7 +404,6 @@ jobs:
           printf 'native ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
           NATIVE_LANE=$(winpid "$LANE_PID")
           sample_native "native ready" "$NATIVE_LANE"
-          lane_route > route.txt
           trace_front socks 10808 "native socks" || FAILED="$FAILED native(socks trace)"
           fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"

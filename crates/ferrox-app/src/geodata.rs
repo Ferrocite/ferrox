@@ -1085,10 +1085,12 @@ mod tests {
                 normalized
             );
             let root = config(&format!(
-                r#"{{"assets": [{{"url": "{url}", "file": "geosite.dat"}}]}}"#
+                r#"{{"cron": "0 3 * * *", "assets": [{{"url": "{url}", "file": "geosite.dat"}}]}}"#
             ));
-            parse(&root, std::slice::from_ref(&dir))
-                .expect("the reference accepts the mixed-case scheme");
+            let parsed = parse(&root, std::slice::from_ref(&dir))
+                .expect("the reference accepts the mixed-case scheme")
+                .expect("a cron builds the config");
+            assert_eq!(parsed.assets[0].url, normalized);
         }
         let root =
             config(r#"{"assets": [{"url": "https:///geosite.dat", "file": "geosite.dat"}]}"#);
