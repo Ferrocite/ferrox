@@ -733,13 +733,16 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !fold(word_sum(header))
 }
 
-/// The checksum a stored value becomes when the words it covered change from `old` to `new`: RFC 1624's incremental update, reading only the replaced words instead of the whole run.
+/// The checksum a stored value becomes when the words it covered change from `old` to `new`: RFC 1624's incremental update, reading only the replaced words instead of the whole run. The covered run must hold a non-zero word, as every IP or TCP header does, so its folded residue is `0xffff` rather than `0x0000` at the zero boundary.
 pub fn checksum_update(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
     debug_assert_eq!(old.len(), new.len());
     let delta = i64::from(word_sum(new)) - i64::from(word_sum(old));
     let mut sum = i64::from(!checksum) + delta;
     while !(0..=0xffff).contains(&sum) {
         sum = (sum & 0xffff) + (sum >> 16);
+    }
+    if sum == 0 {
+        sum = 0xffff;
     }
     !(sum as u16)
 }
@@ -1623,6 +1626,9 @@ mod tests {
     fn an_incremental_checksum_is_the_full_checksum_after_the_words_move() {
         for old_len in 0..=17usize {
             for payload_len in 0..=34usize {
+                if old_len == 0 && payload_len == 0 {
+                    continue;
+                }
                 let old: Vec<u8> = (0..old_len)
                     .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
                     .collect();
@@ -1653,6 +1659,18 @@ mod tests {
         assert_eq!(
             checksum_update(checksum(&before), &old, &new),
             checksum(&after)
+        );
+        let old = [0x01u8];
+        let new = [0x00u8];
+        let payload = [0xffu8; 2];
+        let mut before = old.to_vec();
+        before.extend_from_slice(&payload);
+        let mut after = new.to_vec();
+        after.extend_from_slice(&payload);
+        assert_eq!(
+            checksum_update(checksum(&before), &old, &new),
+            checksum(&after),
+            "the zero boundary stays the full checksum"
         );
     }
 

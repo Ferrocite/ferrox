@@ -895,6 +895,14 @@ mod tests {
                 0,
                 "ipv4 tcp len {len}"
             );
+            let mut expected = packet.clone();
+            expected[36..38].fill(0);
+            let want = tcp_checksum(&peer.octets(), &local.octets(), &expected[20..]);
+            assert_eq!(
+                u16::from_be_bytes([packet[36], packet[37]]),
+                want,
+                "ipv4 tcp bytes len {len}"
+            );
             let mut nat = Nat::new(local6.into(), peer6.into(), 40_000, false);
             let mut packet =
                 ipv6_packet_with_payload(local6, remote6, 1234, 443, FLAG_SYN, &payload);
@@ -903,6 +911,14 @@ mod tests {
                 tcp_checksum(&peer6.octets(), &local6.octets(), &packet[40..]),
                 0,
                 "ipv6 tcp len {len}"
+            );
+            let mut expected = packet.clone();
+            expected[56..58].fill(0);
+            let want = tcp_checksum(&peer6.octets(), &local6.octets(), &expected[40..]);
+            assert_eq!(
+                u16::from_be_bytes([packet[56], packet[57]]),
+                want,
+                "ipv6 tcp bytes len {len}"
             );
         }
     }
