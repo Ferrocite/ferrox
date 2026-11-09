@@ -99,15 +99,6 @@ impl Mode {
             Self::Masque => "masque",
         }
     }
-
-    /// The halves this mode can race: auto names both, a fixed mode one.
-    #[cfg(test)]
-    fn candidates(self) -> usize {
-        match self {
-            Self::Auto => 2,
-            Self::WireGuard | Self::Masque => 1,
-        }
-    }
 }
 
 /// One parsed `warp` outbound setting list. Everything has a WARP default so a
@@ -256,7 +247,9 @@ impl WarpSpec {
             }
         }
         if !self.register {
-            return Err("warp: the identity file does not exist and `register` is false".to_owned());
+            return Err(
+                "warp: the identity file does not exist and `register` is false".to_owned(),
+            );
         }
         let path = self
             .identity_file
@@ -388,7 +381,7 @@ where
     let headers = registration_headers(None);
     let headers = borrow_headers(&headers);
     let reply = call("POST", "/reg", &headers, &body)
-        .map_err(|_| RegisterError::retryable("the WARP registration request failed"))?;
+        .map_err(|error| RegisterError::retryable(error.reason))?;
     let registered = parse_registration(&reply)?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
@@ -399,19 +392,17 @@ where
         .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
-    let reply = call(
-        "PATCH",
-        &path,
-        &headers,
-        &enrollment_body(&spki),
-    )
-    .map_err(|error| RegisterError::fatal(error.reason))?;
+    let reply = call("PATCH", &path, &headers, &enrollment_body(&spki))
+        .map_err(|error| RegisterError::fatal(error.reason))?;
     let server = parse_masque_server(&reply)?;
 
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
     if let Err(error) = call("PATCH", &path, &headers, ENABLE_BODY) {
-        eprintln!("warp: {}; the tunnel may carry nothing until it is enabled", error.reason);
+        eprintln!(
+            "warp: {}; the tunnel may carry nothing until it is enabled",
+            error.reason
+        );
     }
 
     Ok(Identity {
@@ -535,7 +526,9 @@ fn parse_registration(reply: &Reply) -> Result<Registered, RegisterError> {
 }
 
 fn reply_addresses(config: &crate::json::Json) -> Vec<IpAddr> {
-    let interface = config.get("interface").and_then(|value| value.get("addresses"));
+    let interface = config
+        .get("interface")
+        .and_then(|value| value.get("addresses"));
     ["v4", "v6"]
         .iter()
         .filter_map(|family| {
@@ -597,7 +590,9 @@ impl Identity {
             .and_then(crate::json::Json::as_str)
             .unwrap_or_default()
             .to_owned();
-        let wireguard = value.get("wireguard").ok_or("warp identity has no `wireguard`")?;
+        let wireguard = value
+            .get("wireguard")
+            .ok_or("warp identity has no `wireguard`")?;
         let private = wireguard
             .get("privateKey")
             .and_then(crate::json::Json::as_str)
@@ -707,14 +702,16 @@ impl Identity {
             .map_err(|error| format!("warp: cannot read `{}`: {error}", path.display()))?;
         let value = crate::json::parse(&text)
             .map_err(|error| format!("warp: `{}` is not JSON: {error}", path.display()))?;
-        Self::from_json(&value)
-            .map_err(|error| format!("warp: `{}`: {error}", path.display()))
+        Self::from_json(&value).map_err(|error| format!("warp: `{}`: {error}", path.display()))
     }
 
     fn save(&self, path: &Path) -> Result<(), String> {
         let mut text = String::new();
         crate::json::write(&self.to_json(), &mut text);
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("warp: cannot create `{}`: {error}", parent.display()))?;
         }
@@ -819,10 +816,7 @@ fn masque_outbound(identity: &Identity, spec: &WarpSpec) -> Result<crate::json::
     ]);
     let settings = obj_pairs(vec![
         ("address", string(&spec.masque_address)),
-        (
-            "port",
-            crate::json::Json::Num(f64::from(spec.masque_port)),
-        ),
+        ("port", crate::json::Json::Num(f64::from(spec.masque_port))),
         ("remoteDNS", address_json(&spec.dns)),
     ]);
     Ok(obj_pairs(vec![
@@ -921,53 +915,33 @@ impl WarpOut {
             Mode::Masque => return Lane::Masque,
             Mode::Auto => {}
         }
-        if let Ok(chosen) = self.chosen.lock() {
-            if let Some(lane) = *chosen {
-                return lane;
-            }
+        // The lock spans the race: a second flow waits for the first one's
+        // answer instead of probing both halves again.
+        let mut chosen = match self.chosen.lock() {
+            Ok(chosen) => chosen,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(lane) = *chosen {
+            return lane;
         }
         let lane = match (&self.wireguard, &self.masque) {
             (Some(_), None) => Lane::WireGuard,
             (None, Some(_)) => Lane::Masque,
-            (Some(wireguard), Some(masque)) => self.race(wireguard, masque),
+            (Some(wireguard), Some(masque)) => {
+                let wg = Arc::clone(wireguard);
+                let mq = Arc::clone(masque);
+                let (host, port) = (self.probe_host.clone(), self.probe_port);
+                let masque_host = host.clone();
+                race_probes(
+                    move || wg.probe(&host, port),
+                    move || mq.probe(&masque_host, port),
+                    RACE_DEADLINE,
+                )
+            }
             (None, None) => Lane::WireGuard,
         };
-        if let Ok(mut chosen) = self.chosen.lock() {
-            *chosen = Some(lane);
-        }
+        *chosen = Some(lane);
         lane
-    }
-
-    /// The first half to answer the probe wins; if neither does, WireGuard is
-    /// the fallback a fixed config would have chosen.
-    fn race(&self, wireguard: &Arc<crate::wg::WireGuardOut>, masque: &Arc<crate::masque::MasqueOut>) -> Lane {
-        let (sender, receiver) = mpsc::channel();
-        let wg = Arc::clone(wireguard);
-        let host = self.probe_host.clone();
-        let port = self.probe_port;
-        let wg_sender = sender.clone();
-        std::thread::spawn(move || {
-            let _ = wg_sender.send((Lane::WireGuard, wg.probe(&host, port)));
-        });
-        let mq = Arc::clone(masque);
-        let host = self.probe_host.clone();
-        let port = self.probe_port;
-        std::thread::spawn(move || {
-            let _ = sender.send((Lane::Masque, mq.probe(&host, port)));
-        });
-        let deadline = Instant::now() + RACE_DEADLINE;
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match receiver.recv_timeout(left) {
-                Ok((lane, true)) => return lane,
-                Ok((_, false)) | Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        if self.wireguard.is_some() {
-            Lane::WireGuard
-        } else {
-            Lane::Masque
-        }
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -1026,6 +1000,37 @@ impl WarpOut {
     }
 }
 
+/// The first half to answer the probe wins. A failed answer is not the race's
+/// end: the other half may still carry. If neither answers by the deadline,
+/// WireGuard is the fallback a fixed config would have chosen.
+fn race_probes<W, M>(wireguard: W, masque: M, budget: Duration) -> Lane
+where
+    W: FnOnce() -> bool + Send + 'static,
+    M: FnOnce() -> bool + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let wg_sender = sender.clone();
+    std::thread::spawn(move || {
+        let _ = wg_sender.send((Lane::WireGuard, wireguard()));
+    });
+    std::thread::spawn(move || {
+        let _ = sender.send((Lane::Masque, masque()));
+    });
+    let deadline = Instant::now() + budget;
+    let mut failed = 0;
+    while failed < 2 {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match receiver.recv_timeout(left) {
+            Ok((lane, true)) => return lane,
+            Ok((_, false)) => failed += 1,
+            Err(_) => break,
+        }
+    }
+    Lane::WireGuard
+}
+
 fn build_wireguard(
     identity: &Identity,
     spec: &WarpSpec,
@@ -1079,10 +1084,7 @@ pub(crate) fn one_tap(path: &str, mode: &str, api: Option<&str>) -> Result<Strin
             ]),
         ),
     ]);
-    let config = obj_pairs(vec![(
-        "outbounds",
-        crate::json::Json::Arr(vec![outbound]),
-    )]);
+    let config = obj_pairs(vec![("outbounds", crate::json::Json::Arr(vec![outbound]))]);
     let mut text = String::new();
     crate::json::write(&config, &mut text);
     Ok(text)
@@ -1247,10 +1249,11 @@ mod tests {
         let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
         let masque_reply = sample_reply(&server);
         let call = |method: &str, path: &str, _headers: &[(&str, &str)], body: &[u8]| {
-            calls
-                .lock()
-                .expect("the call log")
-                .push((method.to_owned(), path.to_owned(), body.to_vec()));
+            calls.lock().expect("the call log").push((
+                method.to_owned(),
+                path.to_owned(),
+                body.to_vec(),
+            ));
             let reply = if method == "POST" {
                 wireguard_reply.clone()
             } else {
@@ -1328,17 +1331,116 @@ mod tests {
         assert_eq!(config.peers[0].endpoint, Some(identity.wireguard.endpoint));
         let outbound = masque_outbound(&identity, &spec).expect("the MASQUE half");
         crate::masque::MasqueOut::new(&outbound).expect("the MASQUE carrier");
-        assert_eq!(wireguard_settings(&identity, &spec).get("mtu").and_then(crate::json::Json::as_u32), Some(u32::from(DEFAULT_MTU)));
+        assert_eq!(
+            wireguard_settings(&identity, &spec)
+                .get("mtu")
+                .and_then(crate::json::Json::as_u32),
+            Some(u32::from(DEFAULT_MTU))
+        );
     }
 
     #[test]
     fn the_auto_mode_races_both_tunnels() {
-        assert_eq!(Mode::parse(None).expect("default").candidates(), 2);
-        assert_eq!(
-            Mode::parse(Some("wireguard")).expect("wg").candidates(),
-            1
-        );
-        assert_eq!(Mode::parse(Some("masque")).expect("masque").candidates(), 1);
+        assert_eq!(Mode::parse(None).expect("default"), Mode::Auto);
+        assert_eq!(Mode::parse(Some("wg")).expect("wg"), Mode::WireGuard);
+        assert_eq!(Mode::parse(Some("masque")).expect("masque"), Mode::Masque);
         assert!(Mode::parse(Some("other")).is_err());
+    }
+
+    #[test]
+    fn the_first_answering_half_wins_the_race() {
+        // MASQUE cannot answer until released, so WireGuard's answer is first
+        // by construction, not by a sleep.
+        let (release, wait) = mpsc::channel::<()>();
+        let lane = race_probes(
+            || true,
+            move || {
+                let _ = wait.recv();
+                true
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(lane, Lane::WireGuard);
+        drop(release);
+    }
+
+    #[test]
+    fn a_failed_probe_does_not_end_the_race() {
+        // WireGuard answers false at once; MASQUE answers true later. The race
+        // must wait for the second answer, not fall back on the first refusal.
+        let lane = race_probes(
+            || false,
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                true
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(lane, Lane::Masque);
+    }
+
+    #[test]
+    fn two_failed_probes_fall_back_to_wireguard() {
+        assert_eq!(
+            race_probes(|| false, || false, Duration::from_secs(5)),
+            Lane::WireGuard
+        );
+    }
+
+    #[test]
+    fn a_silent_pair_falls_back_at_the_deadline() {
+        let start = Instant::now();
+        let lane = race_probes(
+            || {
+                std::thread::sleep(Duration::from_secs(30));
+                true
+            },
+            || {
+                std::thread::sleep(Duration::from_secs(30));
+                true
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(lane, Lane::WireGuard);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the deadline bound the wait"
+        );
+    }
+
+    #[test]
+    fn an_identity_survives_a_save_and_load() {
+        let identity = Identity {
+            device_id: "a-device".to_owned(),
+            token: "a-token".to_owned(),
+            wireguard: WireGuardIdentity {
+                private: [7u8; 32],
+                peer: [8u8; 32],
+                endpoint: "162.159.192.1:2408".parse().expect("an endpoint"),
+                addresses: vec!["172.16.0.2".parse().expect("a v4 address")],
+                reserved: [1, 2, 3],
+            },
+            masque: None,
+        };
+        let dir = std::env::temp_dir().join(format!("ferrox-warp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("identity.json");
+        identity.save(&path).expect("saves");
+        let loaded = Identity::load(&path).expect("loads");
+        assert_eq!(loaded.device_id, identity.device_id);
+        assert_eq!(loaded.wireguard.private, identity.wireguard.private);
+        assert_eq!(loaded.wireguard.peer, identity.wireguard.peer);
+        assert_eq!(loaded.wireguard.endpoint, identity.wireguard.endpoint);
+        assert_eq!(loaded.wireguard.reserved, [1, 2, 3]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the identity is owner-only");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
