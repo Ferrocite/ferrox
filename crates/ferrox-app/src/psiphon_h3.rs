@@ -165,12 +165,15 @@ pub(crate) struct H3 {
 impl H3 {
     /// Open a QUIC connection carrying HTTP/3 to one already-resolved front
     /// address. The caller owns the candidate list so a refused address can be
-    /// followed by the next resolved IP instead of ending the relay.
+    /// followed by the next resolved IP instead of ending the relay. `timeout`
+    /// bounds only this candidate's handshake; `idle` is the whole connection's
+    /// QUIC idle timeout and must not shrink with the rotation budget.
     pub(crate) fn connect_address(
         peer: SocketAddr,
         dial: &str,
         sni: &str,
         timeout: Duration,
+        idle: Duration,
     ) -> Result<Self, String> {
         let bind = if peer.is_ipv4() {
             "0.0.0.0:0"
@@ -183,19 +186,20 @@ impl H3 {
             .map_err(|error| format!("psiphon h3 connect {dial}: {error}"))?;
         socket
             .set_read_timeout(Some(timeout))
-            .and_then(|()| socket.set_write_timeout(Some(timeout)))
+            .and_then(|()| socket.set_write_timeout(Some(idle)))
             .map_err(|error| format!("psiphon h3 socket: {error}"))?;
-        Self::connect_link(Link::Udp(socket), dial, sni, timeout)
+        Self::connect_link(Link::Udp(socket), dial, sni, timeout, idle)
     }
 
-    /// Open HTTP/3 over an in-proxy WebRTC datagram channel.
+    /// Open HTTP/3 over an in-proxy WebRTC datagram channel. There is no front
+    /// rotation here, so the dial budget and the idle budget are the same.
     pub(crate) fn connect_over(
         stream: WebRtcStream,
         dial: &str,
         sni: &str,
         timeout: Duration,
     ) -> Result<Self, String> {
-        Self::connect_link(Link::WebRtc(stream), dial, sni, timeout)
+        Self::connect_link(Link::WebRtc(stream), dial, sni, timeout, timeout)
     }
 
     /// Open HTTP/3 over one datagram path.
@@ -205,6 +209,7 @@ impl H3 {
         dial: &str,
         sni: &str,
         timeout: Duration,
+        idle: Duration,
     ) -> Result<Self, String> {
         let (local, peer) = link
             .addresses()
@@ -217,7 +222,7 @@ impl H3 {
         config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .map_err(|error| format!("psiphon h3 protocol: {error}"))?;
-        config.set_max_idle_timeout(millis(timeout));
+        config.set_max_idle_timeout(millis(idle));
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
         config.set_max_send_udp_payload_size(MAX_DATAGRAM);
         config.set_initial_max_data(16 * 1024 * 1024);
@@ -618,7 +623,13 @@ mod tests {
         let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a probe");
         let dead = probe.local_addr().expect("probe address");
         drop(probe);
-        let Err(why) = H3::connect_address(dead, "127.0.0.1", "", Duration::from_secs(1)) else {
+        let Err(why) = H3::connect_address(
+            dead,
+            "127.0.0.1",
+            "",
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+        ) else {
             panic!("a closed UDP port cannot handshake");
         };
         assert!(!why.contains("psiphon h3 receive: "), "{why}");
@@ -626,5 +637,31 @@ mod tests {
             why.starts_with("psiphon h3 dead front: ") || why.ends_with("timed out"),
             "{why}"
         );
+    }
+
+    /// A front that silently drops every datagram must not hold the rotation
+    /// for the connection's whole idle budget: the handshake has its own cap.
+    #[test]
+    fn a_silent_udp_front_expires_with_the_handshake_budget() {
+        use std::net::Ipv4Addr;
+
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a silent front");
+        let peer = silent.local_addr().expect("front address");
+        let started = Instant::now();
+        let Err(why) = H3::connect_address(
+            peer,
+            "127.0.0.1",
+            "",
+            Duration::from_millis(300),
+            Duration::from_secs(20),
+        ) else {
+            panic!("a silent UDP port cannot handshake");
+        };
+        assert!(why.ends_with("timed out"), "{why}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the idle budget held the handshake"
+        );
+        drop(silent);
     }
 }

@@ -5141,6 +5141,20 @@ fn filter_region(mut servers: Vec<Server>, settings: &Settings) -> Vec<Server> {
     servers
 }
 
+/// The protocol limit that actually selected this run's candidates. The caller
+/// passes the coin-drawn lists, so the scan gate sees exactly what selection saw.
+fn effective_scan_protocols(
+    protocols: &[String],
+    initial: &[String],
+    initial_count: usize,
+) -> Vec<String> {
+    let mut limits = protocols.to_vec();
+    if initial_count > 0 {
+        limits.extend_from_slice(initial);
+    }
+    limits
+}
+
 fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     let servers = load_source_entries(settings, true, settings.conduit)?;
     let servers: Vec<Server> = servers
@@ -5152,7 +5166,10 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
                 || (settings.conduit && server.inproxy.is_some())
         })
         .collect();
+    // The scan gate reads the same effective limit that selected these candidates.
+    let mut scan_protocols: Vec<String> = Vec::new();
     let mut servers = if settings.target.is_some() {
+        scan_protocols.extend_from_slice(target_protocol_filter(settings).0);
         servers
     } else {
         let protocols: &[String] = if coin(settings.limit_protocols_probability) {
@@ -5170,6 +5187,7 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
         } else {
             settings.initial_count
         };
+        scan_protocols = effective_scan_protocols(protocols, initial, initial_count);
         let dial_ports = if coin(settings.dial_ports_probability) {
             Some(settings.dial_ports.as_slice())
         } else {
@@ -5193,7 +5211,7 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
         }
         selected
     };
-    apply_fronting_overrides(&mut servers, settings);
+    apply_fronting_overrides_with(&mut servers, settings, &scan_protocols);
     apply_session_settings(&mut servers, settings);
     if servers.is_empty() {
         return Err("psiphon: no usable server entries".to_owned());
@@ -5650,6 +5668,17 @@ impl Front {
 }
 
 fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
+    apply_fronting_overrides_with(servers, settings, &settings.protocols);
+}
+
+/// Apply the overrides with the protocol limit that selected the candidates.
+/// A configured limit that the probability coin rejected must not suppress
+/// the CDN scan, and an active initial limit must be able to enable it.
+fn apply_fronting_overrides_with(
+    servers: &mut Vec<Server>,
+    settings: &Settings,
+    scan_protocols: &[String],
+) {
     if !settings.fronted_overrides.is_empty() {
         servers.sort_by_key(|server| {
             let pinned = server.meek.as_ref().is_some_and(|meek| {
@@ -5667,11 +5696,12 @@ fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
             !pinned
         });
     }
-    expand_fronted(servers, settings, Front::Tunnel);
+    expand_fronted(servers, settings, Front::Tunnel, scan_protocols);
 }
 
 fn apply_tactics_overrides(servers: &mut Vec<Server>, settings: &Settings) {
-    expand_fronted(servers, settings, Front::Tactics);
+    // Tactics fronts take their overrides without the tunnel protocol gate.
+    expand_fronted(servers, settings, Front::Tactics, &[]);
 }
 
 /// Upstream's `TunnelProtocolUsesFrontedMeekCDN`: only CDN-suffixed fronted
@@ -5686,19 +5716,23 @@ fn uses_fronted_meek_cdn(protocol: &str) -> bool {
 /// CDN marker, so bare and CDN entries decode to the same string. A bare
 /// `FRONTED-MEEK-QUIC-OSSH` limit therefore keeps the fronting host its entry
 /// advertised; an empty limit (auto) still includes the CDN protocols.
-fn scan_uses_fronted_meek_cdn(meek: &crate::psiphon_meek::Meek, settings: &Settings) -> bool {
-    if settings.protocols.is_empty() {
+fn scan_uses_fronted_meek_cdn(meek: &crate::psiphon_meek::Meek, scan_protocols: &[String]) -> bool {
+    if scan_protocols.is_empty() {
         return true;
     }
     let base = protocol_base(meek.protocol);
-    settings
-        .protocols
+    scan_protocols
         .iter()
         .any(|protocol| uses_fronted_meek_cdn(protocol) && protocol_base(protocol) == base)
 }
 
 #[allow(clippy::too_many_lines)]
-fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) {
+fn expand_fronted(
+    servers: &mut Vec<Server>,
+    settings: &Settings,
+    front: Front,
+    scan_protocols: &[String],
+) {
     if settings.cdn_ips.is_empty()
         && settings.cdn_snis.is_empty()
         && settings.fronted_overrides.is_empty()
@@ -5717,7 +5751,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
             continue;
         }
         // Only CDN tunnel protocols take the scan; tactics overrides stay open.
-        if matches!(front, Front::Tunnel) && !scan_uses_fronted_meek_cdn(meek, settings) {
+        if matches!(front, Front::Tunnel) && !scan_uses_fronted_meek_cdn(meek, scan_protocols) {
             groups.push(vec![server]);
             continue;
         }
@@ -8954,6 +8988,73 @@ mod tests {
             servers[0].meek.as_ref().expect("fronted").dial,
             "front.example"
         );
+    }
+
+    /// A configured limit that the probability coin rejected never selected
+    /// these candidates, so it cannot remove their CDN scan.
+    #[test]
+    fn a_rejected_protocol_limit_keeps_the_scan_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"LimitTunnelProtocols":["FRONTED-MEEK-QUIC-OSSH"],"LimitTunnelProtocolsProbability":0,"cdnIps":["198.51.100.7"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let drawn: &[String] = if coin(settings.limit_protocols_probability) {
+            &settings.protocols
+        } else {
+            &[]
+        };
+        assert!(drawn.is_empty(), "the coin rejected the configured limit");
+        let effective = effective_scan_protocols(drawn, &[], 0);
+        let mut server = test_server(true);
+        server.meek = Some(scan_front());
+        let mut servers = vec![server];
+        apply_fronting_overrides_with(&mut servers, &settings, &effective);
+        assert!(servers.iter().any(|server| {
+            server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| meek.dial == "198.51.100.7")
+        }));
+    }
+
+    /// An active initial limit can name CDN protocols even when the configured
+    /// limit is bare; the gate must follow the limit selection really used.
+    #[test]
+    fn an_initial_cdn_limit_keeps_the_scan_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"LimitTunnelProtocols":["FRONTED-MEEK-QUIC-OSSH"],"InitialLimitTunnelProtocols":["FRONTED-MEEK-CDN-QUIC-OSSH"],"InitialLimitTunnelProtocolsCandidateCount":1,"cdnIps":["198.51.100.7"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let effective = effective_scan_protocols(
+            &settings.protocols,
+            &settings.initial_protocols,
+            settings.initial_count,
+        );
+        let mut server = test_server(true);
+        server.meek = Some(scan_front());
+        let mut configured = vec![server];
+        apply_fronting_overrides(&mut configured, &settings);
+        assert_eq!(
+            configured.len(),
+            1,
+            "the bare configured limit gates the scan"
+        );
+        let mut server = test_server(true);
+        server.meek = Some(scan_front());
+        let mut servers = vec![server];
+        apply_fronting_overrides_with(&mut servers, &settings, &effective);
+        assert!(servers.iter().any(|server| {
+            server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| meek.dial == "198.51.100.7")
+        }));
     }
 
     #[test]

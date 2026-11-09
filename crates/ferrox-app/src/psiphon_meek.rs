@@ -24,6 +24,9 @@ const POLL: Duration = Duration::from_millis(100);
 const MAX_POLL: Duration = Duration::from_secs(5);
 /// One stalled connect is a dead candidate, not the whole rotation's budget.
 const MAX_CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
+/// A UDP front that drops datagrams without an ICMP report is also a dead
+/// candidate; a full QUIC handshake fits in this budget on a slow link.
+const MAX_HANDSHAKE_ATTEMPT: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
@@ -982,8 +985,15 @@ impl MeekHttp {
             } else {
                 self.meek.sni.clone()
             };
-            let h3 =
-                crate::psiphon_h3::H3::connect_address(address, &self.meek.dial, &sni, timeout)?;
+            // A silent UDP front gets a capped handshake so the next front still runs.
+            let handshake = timeout.min(MAX_HANDSHAKE_ATTEMPT);
+            let h3 = crate::psiphon_h3::H3::connect_address(
+                address,
+                &self.meek.dial,
+                &sni,
+                handshake,
+                self.timeout,
+            )?;
             self.stream = Some(MeekStream::H3(Box::new(h3)));
             return Ok(());
         }
@@ -994,11 +1004,16 @@ impl MeekHttp {
             None => TcpStream::connect_timeout(&address, connect)
                 .map_err(|error| format!("psiphon meek connect {}: {error}", self.meek.dial))?,
         };
-        stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|error| format!("psiphon meek socket: {error}"))?;
+        // A plain stream has no handshake, so it goes straight to the full timeout.
         let fragment = self.meek.shape.may_fragment(self.meek.protocol);
+        Self::set_timeouts(
+            &stream,
+            if self.meek.https {
+                timeout
+            } else {
+                self.timeout
+            },
+        )?;
         if !self.meek.https {
             self.stream = Some(if fragment {
                 MeekStream::Fragment(crate::psiphon_fragment::FragmentStream::new(
@@ -1060,6 +1075,7 @@ impl MeekHttp {
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;
+                Self::set_timeouts(tls.get_ref().inner(), self.timeout)?;
                 self.stream = Some(MeekStream::Tls(tls));
             }
             FragmentOrTcp::Fragment(stream) => {
@@ -1069,10 +1085,19 @@ impl MeekHttp {
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;
+                Self::set_timeouts(tls.get_ref().inner().get_ref(), self.timeout)?;
                 self.stream = Some(MeekStream::TlsFragment(tls));
             }
         }
         Ok(())
+    }
+
+    /// Both socket timeouts on the TCP stream under any meek wrapper.
+    fn set_timeouts(stream: &TcpStream, timeout: Duration) -> Result<(), String> {
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|error| format!("psiphon meek socket: {error}"))
     }
 
     /// The per-attempt budget left before the whole rotation's deadline.
