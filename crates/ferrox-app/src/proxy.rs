@@ -2119,7 +2119,7 @@ pub(crate) enum Outbound {
     /// The flow rides a MASQUE CONNECT-IP tunnel: one HTTP/3 conversation carries
     /// every destination as inner IP packets over QUIC datagrams.
     Masque(Arc<crate::masque::MasqueOut>),
-    /// WARP's two halves: WireGuard and MASQUE, with the first data-plane answer
+    /// WARP's two halves: `WireGuard` and MASQUE, with the first data-plane answer
     /// in auto mode deciding which one carries the flows.
     Warp(Arc<crate::warp::WarpOut>),
     /// The metrics app's tag: a flow routed here reaches its own HTTP handler on a loopback lane.
@@ -35734,6 +35734,7 @@ fn foxy_candidates(
     country: &str,
     city: &str,
     roots: ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
 ) -> Vec<ferrox_core::foxy::Candidate> {
     let named = link.host();
     let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
@@ -35749,7 +35750,7 @@ fn foxy_candidates(
     if !configured_edges.is_empty() {
         return configured_edges;
     }
-    crate::foxy_catalog::edges(roots)
+    crate::foxy_catalog::edges_via(roots, upstream)
 }
 
 /// A configured edge address, resolved once for every dial; otherwise catalogue names resolve per dial.
@@ -35907,6 +35908,7 @@ fn foxy_account(
     guardian: &str,
     token_file: &str,
     roots: &ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
 ) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
     let pass = pasted.clone();
     if email.is_empty() && pass.token.is_empty() {
@@ -35916,12 +35918,17 @@ fn foxy_account(
     let session = tokens
         .as_ref()
         .and_then(crate::foxy_account::TokenFile::load);
+    let mut fxa = crate::foxy_account::Endpoint::parse(
+        ferrox_core::foxy::account::FXA_SERVER,
+        std::sync::Arc::clone(roots),
+    )?;
+    let mut guardian =
+        crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?;
+    fxa.upstream = upstream.cloned();
+    guardian.upstream = upstream.cloned();
     let account = std::sync::Arc::new(crate::foxy_account::Account {
-        fxa: crate::foxy_account::Endpoint::parse(
-            ferrox_core::foxy::account::FXA_SERVER,
-            std::sync::Arc::clone(roots),
-        )?,
-        guardian: crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?,
+        fxa,
+        guardian,
         jar: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_challenge::Jar::default())),
         pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_method: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -36181,7 +36188,14 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let roots = ca_roots(settings);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
         let edge_address = foxy_edge_address(settings);
-        let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
+        let candidates = foxy_candidates(
+            outbound,
+            &link,
+            &country,
+            &city,
+            roots.clone(),
+            upstream.as_ref(),
+        );
         let carrier = foxy_carrier(settings, &link);
         // An HTTP hop carries streams not datagrams, so this is a refusal, not a silent carrier switch.
         if foxy_h3_over_http(upstream.as_ref(), carrier) {
@@ -36199,6 +36213,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             link.guardian(),
             &token_file,
             &roots,
+            upstream.as_ref(),
         );
         let pass = account
             .as_ref()

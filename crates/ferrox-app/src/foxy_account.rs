@@ -491,6 +491,8 @@ pub(crate) struct Endpoint {
     pub(crate) base: String,
     pub(crate) address: Option<SocketAddr>,
     pub(crate) roots: ferrox_core::tls::Anchors,
+    /// The hop every dial to this origin chains through; the TLS name stays the origin's.
+    pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
 }
 
 impl Endpoint {
@@ -515,6 +517,7 @@ impl Endpoint {
             // An origin that already is an address is read here, once, so an ask does not build the name and ask the resolver what it means.
             address: edge_peer(host, port),
             roots,
+            upstream: None,
         })
     }
 
@@ -583,16 +586,21 @@ impl Endpoint {
         &self,
         cfg: &TlsConfig,
     ) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
-        let peer = match self.address {
-            Some(address) => address,
-            None => format!("{}:{}", self.host, self.port)
-                .to_socket_addrs()
-                .map_err(|why| format!("resolve {}: {why}", self.host))?
-                .next()
-                .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
+        let stream = if let Some(proxy) = &self.upstream {
+            crate::foxy::tcp_via(proxy, &self.host, self.port)
+                .map_err(|why| format!("connect {} via the hop: {why:?}", self.host))?
+        } else {
+            let peer = match self.address {
+                Some(address) => address,
+                None => format!("{}:{}", self.host, self.port)
+                    .to_socket_addrs()
+                    .map_err(|why| format!("resolve {}: {why}", self.host))?
+                    .next()
+                    .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
+            };
+            crate::conn::dial_tcp(&peer, IO_TIMEOUT)
+                .map_err(|why| format!("connect {peer}: {why}"))?
         };
-        let stream = crate::conn::dial_tcp(&peer, IO_TIMEOUT)
-            .map_err(|why| format!("connect {peer}: {why}"))?;
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         let mut tls = ferrox_core::tls::connect(cfg, stream)

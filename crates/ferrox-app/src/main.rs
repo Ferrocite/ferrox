@@ -579,28 +579,7 @@ fn main() {
                 no_open,
             );
         }
-        "warp-register" => {
-            let mut identity = String::from("warp-identity.json");
-            let mut mode = String::from("auto");
-            let mut api = None;
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "-o" | "--out" | "--identity" => {
-                        identity = args.next().unwrap_or_else(|| usage());
-                    }
-                    "--mode" => mode = args.next().unwrap_or_else(|| usage()),
-                    "--api" => api = Some(args.next().unwrap_or_else(|| usage())),
-                    _ => usage(),
-                }
-            }
-            match warp::one_tap(&identity, &mode, api.as_deref()) {
-                Ok(text) => println!("{text}"),
-                Err(reason) => {
-                    eprintln!("warp-register: {reason}");
-                    std::process::exit(1);
-                }
-            }
-        }
+        "warp-register" => warp::register_command(&mut args, usage),
         "edges" => {
             let mut ping = false;
             while let Some(arg) = args.next() {

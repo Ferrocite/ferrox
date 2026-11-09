@@ -1,4 +1,4 @@
-//! WARP as one outbound: a device registration, a WireGuard half and a
+//! WARP as one outbound: a device registration, a `WireGuard` half and a
 //! MASQUE CONNECT-IP half, and the race that picks the first half that carries
 //! a real DNS answer. Registering a device is a POST, a MASQUE key enrollment
 //! is a PATCH, and switching the device on is a second PATCH. The identity the
@@ -16,7 +16,7 @@ use base64::Engine as _;
 
 use crate::foxy_account::{Endpoint, Reply};
 
-/// The API host Aether dials first, and the host ZeroNet still uses.
+/// The API host Aether dials first, and the host `ZeroNet` still uses.
 const API_HOSTS: [&str; 2] = ["api.devices.cloudflare.com", "api.cloudflareclient.com"];
 /// The API version both pinned clients call.
 const API_VERSION: &str = "v0a4471";
@@ -24,7 +24,7 @@ const API_VERSION: &str = "v0a4471";
 const CONNECT_HOST: &str = "cloudflareaccess.com";
 /// The SNI the MASQUE edge presents.
 const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
-/// WARP's WireGuard endpoint port; the API lists many and this one is the documented one.
+/// WARP's `WireGuard` endpoint port; the API lists many and this one is the documented one.
 const WIREGUARD_PORT: u16 = 2408;
 /// The MASQUE edge's UDP port.
 const QUIC_PORT: u16 = 443;
@@ -45,7 +45,7 @@ const DEFAULT_KEEPALIVE: u16 = 25;
 /// The tunnel's DNS servers, reachable from either half once it is up.
 const TUNNEL_DNS: [&str; 2] = ["1.1.1.1", "2606:4700:4700::1111"];
 
-/// The API reply holds the WireGuard half's private key only on this side; the
+/// The API reply holds the `WireGuard` half's private key only on this side; the
 /// peer key, endpoint, reserved bytes and tunnel addresses come back over the
 /// wire, and the MASQUE key is the one enrolled after the device exists.
 #[derive(Debug, Clone)]
@@ -186,35 +186,8 @@ impl WarpSpec {
                 .filter_map(|text| text.parse().ok())
                 .collect(),
         };
-        let masque = settings.get("masque");
-        let masque_address = masque
-            .and_then(|masque| masque.get("address"))
-            .and_then(crate::json::Json::as_str)
-            .filter(|address| !address.is_empty())
-            .unwrap_or(CONNECT_HOST)
-            .to_owned();
-        let masque_port = masque
-            .and_then(|masque| masque.get("port"))
-            .and_then(crate::json::Json::as_port)
-            .unwrap_or(QUIC_PORT);
-        let masque_server_name = masque
-            .and_then(|masque| masque.get("serverName"))
-            .and_then(crate::json::Json::as_str)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(CONNECT_SNI)
-            .to_owned();
-        let masque_host = masque
-            .and_then(|masque| masque.get("host"))
-            .and_then(crate::json::Json::as_str)
-            .filter(|host| !host.is_empty())
-            .unwrap_or(CONNECT_HOST)
-            .to_owned();
-        let masque_path = masque
-            .and_then(|masque| masque.get("path"))
-            .and_then(crate::json::Json::as_str)
-            .filter(|path| !path.is_empty())
-            .unwrap_or("/")
-            .to_owned();
+        let (masque_address, masque_port, masque_server_name, masque_host, masque_path) =
+            masque_settings(settings.get("masque"));
         Ok(Self {
             mode,
             register,
@@ -269,6 +242,29 @@ impl WarpSpec {
                 .collect(),
         }
     }
+}
+
+/// The `masque` block's five fields, each defaulting to the WARP edge the API names.
+fn masque_settings(masque: Option<&crate::json::Json>) -> (String, u16, String, String, String) {
+    let field = |key: &str, fallback: &str| {
+        masque
+            .and_then(|masque| masque.get(key))
+            .and_then(crate::json::Json::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback)
+            .to_owned()
+    };
+    let port = masque
+        .and_then(|masque| masque.get("port"))
+        .and_then(crate::json::Json::as_port)
+        .unwrap_or(QUIC_PORT);
+    (
+        field("address", CONNECT_HOST),
+        port,
+        field("serverName", CONNECT_SNI),
+        field("host", CONNECT_HOST),
+        field("path", "/"),
+    )
 }
 
 fn parse_endpoint(text: &str) -> Option<SocketAddr> {
@@ -355,7 +351,7 @@ fn register(spec: &WarpSpec) -> Result<Identity, String> {
         };
         match register_with(spec, &|method, path, headers, body| {
             crate::foxy_account::ask(&endpoint, method, &endpoint.url(path), headers, body)
-                .map_err(|reason| RegisterError::retryable(reason))
+                .map_err(RegisterError::retryable)
         }) {
             Ok(identity) => return Ok(identity),
             Err(error) if error.fatal => return Err(error.reason),
@@ -760,7 +756,7 @@ fn address_json(addresses: &[IpAddr]) -> crate::json::Json {
     )
 }
 
-/// The WireGuard half as the existing `wireguard` outbound reads it.
+/// The `WireGuard` half as the existing `wireguard` outbound reads it.
 fn wireguard_settings(identity: &Identity, spec: &WarpSpec) -> crate::json::Json {
     let wireguard = &identity.wireguard;
     let peer = obj_pairs(vec![
@@ -915,8 +911,7 @@ impl WarpOut {
             Mode::Masque => return Lane::Masque,
             Mode::Auto => {}
         }
-        // The lock spans the race: a second flow waits for the first one's
-        // answer instead of probing both halves again.
+        // The lock spans the race so a second flow waits for the answer instead of probing again.
         let mut chosen = match self.chosen.lock() {
             Ok(chosen) => chosen,
             Err(poisoned) => poisoned.into_inner(),
@@ -925,7 +920,7 @@ impl WarpOut {
             return lane;
         }
         let lane = match (&self.wireguard, &self.masque) {
-            (Some(_), None) => Lane::WireGuard,
+            (Some(_) | None, None) => Lane::WireGuard,
             (None, Some(_)) => Lane::Masque,
             (Some(wireguard), Some(masque)) => {
                 let wg = Arc::clone(wireguard);
@@ -938,7 +933,6 @@ impl WarpOut {
                     RACE_DEADLINE,
                 )
             }
-            (None, None) => Lane::WireGuard,
         };
         *chosen = Some(lane);
         lane
@@ -1002,7 +996,7 @@ impl WarpOut {
 
 /// The first half to answer the probe wins. A failed answer is not the race's
 /// end: the other half may still carry. If neither answers by the deadline,
-/// WireGuard is the fallback a fixed config would have chosen.
+/// `WireGuard` is the fallback a fixed config would have chosen.
 fn race_probes<W, M>(wireguard: W, masque: M, budget: Duration) -> Lane
 where
     W: FnOnce() -> bool + Send + 'static,
@@ -1148,7 +1142,7 @@ fn tos_now() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let seconds = now.as_secs();
-    let days = (seconds / 86_400) as i64;
+    let days = i64::try_from(seconds / 86_400).unwrap_or_default();
     let rest = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
     format!(
@@ -1349,8 +1343,7 @@ mod tests {
 
     #[test]
     fn the_first_answering_half_wins_the_race() {
-        // MASQUE cannot answer until released, so WireGuard's answer is first
-        // by construction, not by a sleep.
+        // MASQUE cannot answer until released, so WireGuard's answer is first by construction.
         let (release, wait) = mpsc::channel::<()>();
         let lane = race_probes(
             || true,
@@ -1366,8 +1359,7 @@ mod tests {
 
     #[test]
     fn a_failed_probe_does_not_end_the_race() {
-        // WireGuard answers false at once; MASQUE answers true later. The race
-        // must wait for the second answer, not fall back on the first refusal.
+        // A false answer must not end the race: the other half may still carry.
         let lane = race_probes(
             || false,
             || {
@@ -1442,5 +1434,42 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "the identity is owner-only");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The `warp-register` command: parse the flags, register once, print the outbound.
+pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage: fn() -> !) {
+    let mut identity = String::from("warp-identity.json");
+    let mut mode = String::from("auto");
+    let mut api = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-o" | "--out" | "--identity" => {
+                identity = match args.next() {
+                    Some(v) => v,
+                    None => usage(),
+                };
+            }
+            "--mode" => {
+                mode = match args.next() {
+                    Some(v) => v,
+                    None => usage(),
+                }
+            }
+            "--api" => {
+                api = Some(match args.next() {
+                    Some(v) => v,
+                    None => usage(),
+                })
+            }
+            _ => usage(),
+        }
+    }
+    match one_tap(&identity, &mode, api.as_deref()) {
+        Ok(text) => println!("{text}"),
+        Err(reason) => {
+            eprintln!("warp-register: {reason}");
+            std::process::exit(1);
+        }
     }
 }
