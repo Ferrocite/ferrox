@@ -127,6 +127,7 @@ static NEXT_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 pub(crate) struct Packet {
     pub(crate) peer: [u8; 32],
     pub(crate) bytes: Vec<u8>,
+    /// The inner IP packet starts at this offset in `bytes`; the prefix before it is retained.
     pub(crate) at: usize,
 }
 
