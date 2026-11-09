@@ -4358,21 +4358,21 @@ mod tests {
         assert_eq!(complete.as_deref(), Some(original.as_slice()));
     }
 
-    /// A fragment set survives a moved prefix: the early packet has no prefix and a later one does.
+    /// A fragment set survives a moved prefix out of order: the early packet has no prefix and a later one does.
     #[test]
-    fn fragments_with_different_prefix_offsets_reassemble() {
+    fn fragments_with_different_prefix_offsets_reassemble_out_of_order() {
         let original = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 5000]);
         let fragments = fragment_packet(&original, 0, TUNNEL_FRAGMENT).expect("fragments");
         let mut reassembly = Reassembly::default();
         let mut complete = None;
-        for (index, fragment) in fragments.iter().enumerate() {
+        for (index, fragment) in fragments.iter().enumerate().rev() {
             let at = if index == 0 { 0 } else { 4 };
             if let Reassembled::Complete(packet) = reassembly.accept([0u8; 32], fragment, at) {
                 complete = Some((packet, at));
             }
         }
         let (packet, at) = complete.expect("the set completes after the prefix moves");
-        assert_eq!(at, 4);
+        assert_eq!(at, 0);
         assert_eq!(&packet[at..], original.as_slice());
     }
 
