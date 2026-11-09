@@ -14453,7 +14453,7 @@ fn dial_vless_hysteria_reality(
     let limiter = ferrox_core::tls::reality::RecordLimiter::new(flow);
     let Ok(mut session) = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) else {
         return note_dial_failure(
-            client,
+            server,
             Failure::new(Stage::SocketConnected, Kind::Dropped),
         );
     };
