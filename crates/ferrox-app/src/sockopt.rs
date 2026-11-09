@@ -17,7 +17,7 @@ pub(crate) enum Tproxy {
     Tproxy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SocketOptions {
     mark: Option<i32>,
     tfo: Option<i32>,
@@ -35,7 +35,7 @@ pub(crate) struct SocketOptions {
 }
 
 /// The owning route, held weakly so the table's socket options do not keep the table alive. The
-/// link is invisible to `Debug`, which keys the ECH cache, and cloned links share the one route.
+/// link is invisible to `Debug` and equality, and cloned links share the one route.
 #[derive(Default)]
 struct RouteLink(OnceLock<Weak<crate::proxy::RouteShared>>);
 
@@ -54,6 +54,14 @@ impl std::fmt::Debug for RouteLink {
         f.write_str("RouteLink")
     }
 }
+
+impl PartialEq for RouteLink {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RouteLink {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeepAlive {
