@@ -179,16 +179,29 @@ struct Gate {
 
 impl Gate {
     fn take(&mut self, name: &[u8], value: &[u8], path: &str, multi_path: &str) {
-        if self.status.is_none() && name.eq_ignore_ascii_case(b":status") {
-            self.status = Some(value == b"200");
-        } else if self.served.is_none() && name.eq_ignore_ascii_case(b":path") {
-            let multi = multi_path != path && value == multi_path.as_bytes();
-            self.multi = Some(multi);
-            self.served = Some(multi || value == path.as_bytes());
-        } else if self.posted.is_none() && name.eq_ignore_ascii_case(b":method") {
-            self.posted = Some(value == b"POST");
-        } else if self.typed.is_none() && name.eq_ignore_ascii_case(b"content-type") {
-            self.typed = Some(value.starts_with(b"application/grpc"));
+        // One comparison per length at most: `eq_ignore_ascii_case` is false on a length mismatch, so a head that carries eight fields need no longer pay four of them each.
+        match name.len() {
+            5 if name.eq_ignore_ascii_case(b":path") => {
+                if self.served.is_none() {
+                    let multi = multi_path != path && value == multi_path.as_bytes();
+                    self.multi = Some(multi);
+                    self.served = Some(multi || value == path.as_bytes());
+                }
+            }
+            7 if name.eq_ignore_ascii_case(b":status") => {
+                if self.status.is_none() {
+                    self.status = Some(value == b"200");
+                }
+            }
+            7 if name.eq_ignore_ascii_case(b":method") => {
+                if self.posted.is_none() {
+                    self.posted = Some(value == b"POST");
+                }
+            }
+            12 if self.typed.is_none() && name.eq_ignore_ascii_case(b"content-type") => {
+                self.typed = Some(value.starts_with(b"application/grpc"));
+            }
+            _ => {}
         }
     }
 }
@@ -1124,8 +1137,13 @@ impl GrpcWriter {
             }
             let element = element.min(fits).max(1);
             target = target.max(element);
-            let (payload_len, count) = multi_group(data, at, element, cap, &mut lengths);
-            if !self.send_multi_group(&data[at..at + payload_len], &lengths[..count], &mut batch) {
+            let (payload_len, count, inner) = multi_group(data, at, element, cap, &mut lengths);
+            if !self.send_multi_group(
+                &data[at..at + payload_len],
+                &lengths[..count],
+                inner,
+                &mut batch,
+            ) {
                 return false;
             }
             at += payload_len;
@@ -1139,12 +1157,9 @@ impl GrpcWriter {
         &self,
         payload: &'a [u8],
         lengths: &[usize],
+        inner: usize,
         batch: &mut Gather<'a>,
     ) -> bool {
-        let inner: usize = lengths
-            .iter()
-            .map(|&len| 1 + varint_len(len as u64) + len)
-            .sum();
         let total = 5 + inner;
         if batch.used + lengths.len() > FRAMES_PER_WRITE && !batch.flush_blocking(&self.shared) {
             return false;
@@ -1308,10 +1323,11 @@ impl GrpcWriter {
             }
             let element = element.min(fits).max(1);
             target = target.max(element);
-            let (payload_len, count) = multi_group(data, at, element, cap, &mut lengths);
+            let (payload_len, count, inner) = multi_group(data, at, element, cap, &mut lengths);
             if let Some(stop) = self.try_multi_group(
                 &data[at..at + payload_len],
                 &lengths[..count],
+                inner,
                 &mut batch,
                 &mut flushed,
                 &mut held,
@@ -1351,14 +1367,11 @@ impl GrpcWriter {
         &self,
         payload: &'a [u8],
         lengths: &[usize],
+        inner: usize,
         batch: &mut Gather<'a>,
         flushed: &mut usize,
         held: &mut usize,
     ) -> Option<crate::proxy::Push> {
-        let inner: usize = lengths
-            .iter()
-            .map(|&len| 1 + varint_len(len as u64) + len)
-            .sum();
         let total = 5 + inner;
         if batch.used + lengths.len() > FRAMES_PER_WRITE
             || (batch.used > 0 && batch.credit + total as u64 > self.send_room())
@@ -1650,14 +1663,16 @@ fn multi_payload(cap: u64) -> usize {
 }
 
 /// One `MultiHunk` group from `data[at..]`: whole `element`-sized pieces until the frame count or
-/// the actual envelope cost would cross `cap`, so only a group that cannot fit is split.
+/// the actual envelope cost would cross `cap`, so only a group that cannot fit is split. The third
+/// value is the body's own length — the tag and varint bytes this walk added plus the payload
+/// lengths it recorded — so the caller need not walk `lengths` a second time to name the message.
 fn multi_group(
     data: &[u8],
     at: usize,
     element: usize,
     cap: u64,
     lengths: &mut [usize; FRAMES_PER_WRITE],
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     let mut end = at;
     let mut count = 0usize;
     let mut payload_len = 0usize;
@@ -1675,7 +1690,7 @@ fn multi_group(
         prefix_len += add;
         end += len;
     }
-    (payload_len, count)
+    (payload_len, count, prefix_len - 5 + payload_len)
 }
 
 /// The number of bytes a protobuf varint takes for `value`: seven bits per byte, never fewer than one.
