@@ -2509,7 +2509,7 @@ impl H3 {
                         .carried
                         .checked_add(head)
                         .ok_or_else(|| io(Failure::Frame))?;
-                    if frame.kind == frames::H3_DATA && body <= self.filled {
+                    if frame.kind == frames::H3_DATA && body < self.filled {
                         let length =
                             usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
                         if let Some((capsule_head, payload)) =
