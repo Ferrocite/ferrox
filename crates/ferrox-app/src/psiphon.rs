@@ -68,6 +68,27 @@ const BUILTIN_CDN_SNIS: &[&str] = &[
     "a.akamaihd-staging.net",
     "www.akamai.com",
 ];
+const CDN_FRONTING_PROTOCOLS: &[&str] = &[
+    "FRONTED-MEEK-CDN-OSSH",
+    "FRONTED-MEEK-CDN-HTTP-OSSH",
+    "FRONTED-MEEK-CDN-QUIC-OSSH",
+];
+const DIRECT_PROTOCOLS: &[&str] = &[
+    "SSH",
+    "OSSH",
+    "TLS-OSSH",
+    "UNFRONTED-MEEK-OSSH",
+    "UNFRONTED-MEEK-HTTPS-OSSH",
+    "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+    "QUIC-OSSH",
+    "SHADOWSOCKS-OSSH",
+    "FRONTED-MEEK-OSSH",
+    "FRONTED-MEEK-CDN-OSSH",
+    "FRONTED-MEEK-HTTP-OSSH",
+    "FRONTED-MEEK-CDN-HTTP-OSSH",
+    "FRONTED-MEEK-QUIC-OSSH",
+    "FRONTED-MEEK-CDN-QUIC-OSSH",
+];
 const MAX_REQUEST: usize = 16 * 1024;
 const DIAL_ATTEMPTS: usize = 64;
 const DIAL_WORKERS: usize = 10;
@@ -2077,6 +2098,12 @@ impl Settings {
             }
         };
         let fronted_fallback = !conduit && !fronted;
+        let selection_cdn = selection_enables_cdn(selection.as_deref());
+        let selection_tactics_disabled = selection_disables_tactics(selection.as_deref());
+        let mut protocols = protocol_list(settings);
+        if protocols.is_empty() {
+            protocols = selection_protocols(selection.as_deref());
+        }
         let conduit_mode = match text(settings, "conduitMode")
             .or_else(|| text(settings, "conduit_mode"))
             .map(|mode| mode.to_ascii_lowercase())
@@ -2359,27 +2386,30 @@ impl Settings {
             .into_iter()
             .chain(string_list(settings, "cdnSets"))
             .collect();
-        let builtin_scan = flag(
-            settings,
-            "FrontedMeekCDNScanUseBuiltInSpec",
-            "AETHER_PSIPHON_CDN_BUILTIN",
-        ) || cdn_sets.iter().any(|set| {
-            matches!(
-                set.to_ascii_lowercase().as_str(),
-                "builtin" | "legacy" | "fronted-meek" | "akamai"
+        let builtin_scan = selection_cdn
+            || flag(
+                settings,
+                "FrontedMeekCDNScanUseBuiltInSpec",
+                "AETHER_PSIPHON_CDN_BUILTIN",
             )
-        });
+            || cdn_sets.iter().any(|set| {
+                matches!(
+                    set.to_ascii_lowercase().as_str(),
+                    "builtin" | "legacy" | "fronted-meek" | "akamai"
+                )
+            });
         if builtin_scan {
             for edge in BUILTIN_CDN_EDGES {
-                push_unique(&mut cdn_ips, format!("{}:443", Ipv4Addr::from(*edge)));
+                push_unique(&mut cdn_ips, Ipv4Addr::from(*edge).to_string());
             }
             for sni in BUILTIN_CDN_SNIS {
                 push_unique(&mut cdn_snis, (*sni).to_owned());
             }
         }
-        if cdn_sets
-            .iter()
-            .any(|set| set.eq_ignore_ascii_case("fastly"))
+        if selection_cdn
+            || cdn_sets
+                .iter()
+                .any(|set| set.eq_ignore_ascii_case("fastly"))
         {
             fronted_overrides.push(FrontedOverride {
                 dials: vec!["pypi.org".to_owned()],
@@ -2606,7 +2636,7 @@ impl Settings {
             ready: Duration::from_secs(ready),
             entries: server_entries(settings),
             target,
-            protocols: protocol_list(settings),
+            protocols,
             initial_protocols,
             fronted,
             fronted_fallback,
@@ -2694,7 +2724,8 @@ impl Settings {
             initial_limit_probability,
             replay: replay_settings(settings),
             keepalive,
-            disable_tactics: flag(settings, "DisableTactics", "AETHER_PSIPHON_DISABLE_TACTICS"),
+            disable_tactics: selection_tactics_disabled
+                || flag(settings, "DisableTactics", "AETHER_PSIPHON_DISABLE_TACTICS"),
             meek_headers: dial_headers(settings),
             ssh_channel_window: number(settings, "SSHChannelWindowSize")
                 .map_or(crate::psiphon_ssh::DEFAULT_CHANNEL_WINDOW, |window| {
@@ -3556,6 +3587,35 @@ fn protocol_list_named(settings: Option<&Json>, key: &str) -> Vec<String> {
         .into_iter()
         .map(|protocol| protocol.to_ascii_uppercase())
         .collect()
+}
+
+/// The protocol limit the Android client derives from its connection mode.
+fn selection_protocols(selection: Option<&str>) -> Vec<String> {
+    let named = match selection {
+        Some("cdn_fronting" | "fronted" | "fronted-meek" | "cdn") => CDN_FRONTING_PROTOCOLS,
+        Some("direct") => DIRECT_PROTOCOLS,
+        _ => return Vec::new(),
+    };
+    named
+        .iter()
+        .map(|protocol| (*protocol).to_owned())
+        .collect()
+}
+
+/// Whether the Android client enables its CDN fronting overrides for this mode.
+fn selection_enables_cdn(selection: Option<&str>) -> bool {
+    matches!(
+        selection,
+        Some("auto" | "direct" | "cdn_fronting" | "fronted" | "fronted-meek" | "cdn")
+    )
+}
+
+/// Whether the Android client disables tactics for this mode.
+fn selection_disables_tactics(selection: Option<&str>) -> bool {
+    matches!(
+        selection,
+        Some("direct" | "cdn_fronting" | "fronted" | "fronted-meek" | "cdn")
+    )
 }
 
 fn protocol_list(settings: Option<&Json>) -> Vec<String> {
@@ -5228,7 +5288,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
             groups.push(vec![server]);
             continue;
         };
-        if !meek.fronted || !meek.https {
+        if !meek.fronted {
             groups.push(vec![server]);
             continue;
         }
@@ -5245,7 +5305,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 fronted
                     .dials
                     .iter()
-                    .map(|raw| split_fronting_address(raw))
+                    .map(|raw| split_fronting_address_with(raw, meek.port))
                     .collect()
             };
             add_fronted_variants(
@@ -5267,7 +5327,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 settings
                     .cdn_ips
                     .iter()
-                    .map(|raw| split_fronting_address(raw))
+                    .map(|raw| split_fronting_address_with(raw, meek.port))
                     .collect()
             };
             add_fronted_variants(
@@ -5281,6 +5341,19 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut group,
                 &mut variants,
             );
+            if !settings.cdn_snis.is_empty() && !meek.disable_sni {
+                add_fronted_variants(
+                    &server,
+                    &dials,
+                    &[],
+                    true,
+                    &[],
+                    settings.cdn_ips.is_empty(),
+                    front,
+                    &mut group,
+                    &mut variants,
+                );
+            }
         }
         groups.push(group);
     }
@@ -5430,8 +5503,7 @@ fn expand_cidr(raw: &str) -> Vec<String> {
     }
     (0..take)
         .map(|offset| {
-            let ip = Ipv4Addr::from(base.wrapping_add(u32::try_from(offset).unwrap_or(0)));
-            format!("{ip}:443")
+            Ipv4Addr::from(base.wrapping_add(u32::try_from(offset).unwrap_or(0))).to_string()
         })
         .collect()
 }
@@ -6453,11 +6525,6 @@ fn meek_entry(
         dns: Vec::new(),
         shape: TlsShape::default(),
     })
-}
-
-/// Split a fronting address, defaulting to HTTPS port 443.
-fn split_fronting_address(raw: &str) -> (String, u16) {
-    split_fronting_address_with(raw, 443)
 }
 
 /// Split a fronting address, using the supplied default port.
@@ -8065,12 +8132,119 @@ mod tests {
             &json::parse(r#"{"FrontedMeekCDNScanUseBuiltInSpec":true}"#).expect("settings"),
         ))
         .expect("settings");
-        let first = format!("{}:443", Ipv4Addr::from(BUILTIN_CDN_EDGES[0]));
+        let first = Ipv4Addr::from(BUILTIN_CDN_EDGES[0]).to_string();
         assert!(settings.cdn_ips.iter().any(|ip| ip == &first));
         assert!(settings
             .cdn_snis
             .iter()
             .any(|sni| sni == BUILTIN_CDN_SNIS[0]));
+    }
+
+    #[test]
+    fn cdn_fronting_selects_the_android_protocols_and_scan() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"cdn_fronting"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings.fronted);
+        assert!(!settings.fronted_fallback);
+        assert!(settings.disable_tactics);
+        assert_eq!(
+            settings.protocols,
+            CDN_FRONTING_PROTOCOLS
+                .iter()
+                .map(|protocol| (*protocol).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(!settings.cdn_ips.is_empty());
+        assert!(!settings.cdn_snis.is_empty());
+        assert!(settings
+            .fronted_overrides
+            .iter()
+            .any(|fronted| fronted.dials.iter().any(|dial| dial.as_str() == "pypi.org")));
+    }
+
+    #[test]
+    fn direct_selects_the_android_protocols() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"direct"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(!settings.fronted);
+        assert!(settings.fronted_fallback);
+        assert!(settings.disable_tactics);
+        assert_eq!(
+            settings.protocols,
+            DIRECT_PROTOCOLS
+                .iter()
+                .map(|protocol| (*protocol).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_explicit_limit_overrides_the_connection_mode() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"protocolSelection":"cdn_fronting","LimitTunnelProtocols":["TLS-OSSH"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.protocols, vec!["TLS-OSSH".to_owned()]);
+        assert!(settings.disable_tactics);
+    }
+
+    #[test]
+    fn auto_enables_the_android_scan_without_a_limit() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"auto"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings.protocols.is_empty());
+        assert!(!settings.disable_tactics);
+        assert!(!settings.cdn_ips.is_empty());
+    }
+
+    #[test]
+    fn a_builtin_scan_dials_an_http_front_on_port_80() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"cdn_fronting"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.direct = false;
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 80,
+            host: "cdn.example".to_owned(),
+            sni: String::new(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 80)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: false,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-HTTP-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            shape: TlsShape::default(),
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        let edge = Ipv4Addr::from(BUILTIN_CDN_EDGES[0]).to_string();
+        assert!(servers.iter().any(|server| {
+            let meek = server.meek.as_ref().expect("fronted");
+            meek.dial == edge && meek.port == 80 && !meek.https && !meek.disable_sni
+        }));
+        assert!(servers.iter().any(|server| {
+            let meek = server.meek.as_ref().expect("fronted");
+            meek.dial == edge && meek.port == 80 && !meek.https && meek.disable_sni
+        }));
     }
 
     #[test]
@@ -8269,9 +8443,9 @@ mod tests {
     fn a_cidr_candidate_expands_to_its_first_256_addresses() {
         let candidates = expand_cidr("198.51.100.0/24");
         assert_eq!(candidates.len(), 256);
-        assert_eq!(candidates[0], "198.51.100.0:443");
-        assert_eq!(candidates[255], "198.51.100.255:443");
-        assert_eq!(expand_cidr("198.51.100.7/32"), vec!["198.51.100.7:443"]);
+        assert_eq!(candidates[0], "198.51.100.0");
+        assert_eq!(candidates[255], "198.51.100.255");
+        assert_eq!(expand_cidr("198.51.100.7/32"), vec!["198.51.100.7"]);
         assert_eq!(
             expand_cidr("front.example:8443"),
             vec!["front.example:8443"]
@@ -8281,7 +8455,7 @@ mod tests {
     #[test]
     fn a_bare_ipv6_front_keeps_its_address() {
         assert_eq!(
-            split_fronting_address("2001:db8::1"),
+            split_fronting_address_with("2001:db8::1", 443),
             ("2001:db8::1".to_owned(), 443)
         );
     }
@@ -9362,6 +9536,20 @@ mod tests {
                 "unsafe-traffic-alerts".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn egress_region_selects_the_named_country() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"EgressRegion":" us "}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.region.as_deref(), Some("US"));
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"EgressRegion":""}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.region, None);
     }
 
     #[test]
