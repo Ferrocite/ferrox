@@ -5805,8 +5805,7 @@ fn add_fronted_variants(
         }
         return;
     }
-    // A candidate list wider than the cap still names every dial once, with a
-    // rotating SNI, instead of spending the whole budget on the first dial.
+    // A candidate list wider than the cap still names every dial once.
     for (index, (dial, port)) in dials.iter().enumerate() {
         let sni = &snis[index % snis.len()];
         if !push_fronted_variant(
@@ -8661,8 +8660,8 @@ mod tests {
                 .map(|protocol| (*protocol).to_owned())
                 .collect::<Vec<_>>()
         );
-        assert!(!settings.cdn_ips.is_empty());
-        assert!(!settings.cdn_snis.is_empty());
+        assert_ne!(settings.cdn_ips, Vec::<String>::new());
+        assert_ne!(settings.cdn_snis, Vec::<String>::new());
         assert!(settings
             .fronted_overrides
             .iter()
@@ -8706,9 +8705,9 @@ mod tests {
             &json::parse(r#"{"protocolSelection":"auto"}"#).expect("settings"),
         ))
         .expect("settings");
-        assert!(settings.protocols.is_empty());
+        assert_eq!(settings.protocols, Vec::<String>::new());
         assert!(!settings.disable_tactics);
-        assert!(!settings.cdn_ips.is_empty());
+        assert_ne!(settings.cdn_ips, Vec::<String>::new());
     }
 
     #[test]
