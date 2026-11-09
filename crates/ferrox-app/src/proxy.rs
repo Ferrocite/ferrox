@@ -68922,8 +68922,8 @@ end
             "the hop borrows the registry: {borrowed:?}"
         );
         assert_eq!(
-            hop.map(|out| out as *const Outbound),
-            shared.tagged.get("hop").map(|out| out as *const Outbound),
+            hop.map(std::ptr::from_ref),
+            shared.tagged.get("hop").map(std::ptr::from_ref),
             "the hop is the registry's own outbound"
         );
         let (copied, cloned) = ferrox_core::alloc_count::measure(|| shared.outbound_for("hop"));
