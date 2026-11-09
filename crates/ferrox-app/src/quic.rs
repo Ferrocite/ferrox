@@ -4441,6 +4441,9 @@ mod tests {
             .find(|(k, _)| k == &key(1))
             .map(|(_, v)| v.as_slice());
         assert_eq!(updated, Some([0xAA].as_slice()));
+        remember(&mut entries, &key(RESUMPTION_CAP as u16 + 1), vec![0]);
+        assert!(!entries.iter().any(|(k, _)| k == &key(1)));
+        assert!(entries.iter().any(|(k, _)| k == &key(2)));
     }
 
     /// A returned buffer is the next one handed out, so the pool never zeroes a datagram twice.

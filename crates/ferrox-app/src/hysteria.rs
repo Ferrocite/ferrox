@@ -3317,11 +3317,16 @@ mod tests {
         let client = b"client".to_vec();
         let initial = b"initial".to_vec();
         let alias = b"alias".to_vec();
+        let alias2 = b"alias2".to_vec();
         let foreign = b"foreign".to_vec();
-        let mut by_client_cid = HashMap::from([(client.clone(), key.clone())]);
+        let mut by_client_cid = HashMap::from([
+            (client.clone(), key.clone()),
+            (foreign.clone(), other.clone()),
+        ]);
         let mut by_initial_dcid = HashMap::from([
             (initial.clone(), key.clone()),
             (alias.clone(), key.clone()),
+            (alias2.clone(), key.clone()),
             (foreign.clone(), other.clone()),
         ]);
         forget_route(
@@ -3330,9 +3335,10 @@ mod tests {
             &key,
             &client,
             &initial,
-            std::slice::from_ref(&alias),
+            &[alias, alias2, foreign.clone()],
         );
-        assert!(by_client_cid.is_empty());
+        assert_eq!(by_client_cid.len(), 1);
+        assert_eq!(by_client_cid.get(&foreign), Some(&other));
         assert_eq!(by_initial_dcid.len(), 1);
         assert_eq!(by_initial_dcid.get(&foreign), Some(&other));
     }
