@@ -23,6 +23,12 @@ pub(crate) struct Config {
     assets: Vec<Asset>,
 }
 
+impl Config {
+    pub(crate) fn outbound(&self) -> &str {
+        &self.outbound
+    }
+}
+
 #[derive(Debug)]
 struct Asset {
     url: String,
@@ -69,8 +75,8 @@ pub(crate) fn parse(root: &Json, dirs: &[PathBuf]) -> Result<Option<Config>, Str
         ),
         None => None,
     };
-    for asset in &assets {
-        https_url(&asset.url)?;
+    for asset in &mut assets {
+        asset.url = https_url(&asset.url)?;
     }
     let Some(schedule) = schedule else {
         return Ok(None);
@@ -157,8 +163,8 @@ fn asset_path(file: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// The reference's `validateHTTPS`: the scheme compared without case, as Go's URL parser lowercases it, and a host that is not empty.
-fn https_url(url: &str) -> Result<(), String> {
+/// The reference's `validateHTTPS`: the scheme compared without case, as Go's URL parser lowercases it, and a host that is not empty. The normalized URL is what the downloader later parses.
+fn https_url(url: &str) -> Result<String, String> {
     let refused = |reason: &str| format!("invalid geodata asset url: {url}: {reason}");
     let Some((scheme, rest)) = url.split_once("://") else {
         return Err(refused("URL names no scheme"));
@@ -166,8 +172,9 @@ fn https_url(url: &str) -> Result<(), String> {
     if !scheme.eq_ignore_ascii_case("https") {
         return Err(refused("scheme must be https"));
     }
-    crate::conn::HttpUrl::parse(&format!("https://{rest}")).map_err(|error| refused(&error))?;
-    Ok(())
+    let normalized = format!("https://{rest}");
+    crate::conn::HttpUrl::parse(&normalized).map_err(|error| refused(&error))?;
+    Ok(normalized)
 }
 
 /// One cron field's bounds and the names it accepts, in the reference's parser's own ranges.
@@ -242,18 +249,18 @@ struct Schedule {
 }
 
 impl Schedule {
-    fn delay(&self, now: SystemTime) -> Duration {
+    fn delay(&self, now: SystemTime) -> Option<Duration> {
         if let Some(every) = self.every {
-            return every;
+            return Some(every);
         }
         let mut candidate = next_minute(now);
         for _ in 0..(366 * 24 * 60 * 8) {
             if local_parts(candidate).is_some_and(|parts| self.matches(parts)) {
-                return candidate.duration_since(now).unwrap_or(Duration::ZERO);
+                return Some(candidate.duration_since(now).unwrap_or(Duration::ZERO));
             }
             candidate += Duration::from_secs(60);
         }
-        Duration::from_secs(60)
+        None
     }
 
     fn matches(&self, parts: Parts) -> bool {
@@ -379,9 +386,21 @@ fn fields_schedule(fields: &[&str]) -> Result<Schedule, String> {
         days,
         months,
         weekdays,
-        dom_star: fields[2].starts_with('*') || fields[2].starts_with('?'),
-        dow_star: fields[4].starts_with('*') || fields[4].starts_with('?'),
+        dom_star: is_star(fields[2]),
+        dow_star: is_star(fields[4]),
         every: None,
+    })
+}
+
+/// robfig's star bit: a `*`/`?` range whose step is absent or 1. A step above 1 clears it, so the
+/// day fields then combine with OR rather than AND.
+fn is_star(field: &str) -> bool {
+    field.split(',').any(|expr| {
+        let (range, step) = expr
+            .split_once('/')
+            .map_or((expr, None), |(range, step)| (range, Some(step)));
+        let low = range.split('-').next().unwrap_or(range);
+        matches!(low, "*" | "?") && step.is_none_or(|step| parse_uint(step).ok() == Some(1))
     })
 }
 
@@ -572,7 +591,10 @@ pub(crate) fn start(
     let _ = std::thread::Builder::new()
         .name("geodata".to_owned())
         .spawn(move || loop {
-            std::thread::sleep(schedule.delay(SystemTime::now()));
+            let Some(delay) = schedule.delay(SystemTime::now()) else {
+                return;
+            };
+            std::thread::sleep(delay);
             if let Err(reason) = run(
                 &assets,
                 route.as_deref(),
@@ -1051,15 +1073,22 @@ mod tests {
     #[test]
     fn a_geodata_asset_url_scheme_is_read_without_case() {
         let dir = asset_dir();
-        for url in [
-            "HTTPS://example.test/geosite.dat",
-            "Https://example.test/a/b",
+        for (url, normalized) in [
+            (
+                "HTTPS://example.test/geosite.dat",
+                "https://example.test/geosite.dat",
+            ),
+            ("Https://example.test/a/b", "https://example.test/a/b"),
         ] {
+            assert_eq!(
+                https_url(url).expect("Go's URL parser lowercases the scheme"),
+                normalized
+            );
             let root = config(&format!(
                 r#"{{"assets": [{{"url": "{url}", "file": "geosite.dat"}}]}}"#
             ));
             parse(&root, std::slice::from_ref(&dir))
-                .expect("Go's URL parser lowercases the scheme, so the reference accepts it");
+                .expect("the reference accepts the mixed-case scheme");
         }
         let root =
             config(r#"{"assets": [{"url": "https:///geosite.dat", "file": "geosite.dat"}]}"#);
@@ -1247,6 +1276,29 @@ mod tests {
         assert!(schedule.matches(parts(2, 1)), "a Monday matches");
         assert!(schedule.matches(parts(1, 2)), "the first matches");
         assert!(!schedule.matches(parts(2, 2)), "neither matches");
+    }
+
+    #[test]
+    fn a_stepped_wildcard_is_not_a_star_field() {
+        let schedule = parse_standard("0 0 */2 * mon").expect("parses");
+        assert!(!schedule.dom_star);
+        assert!(!schedule.dow_star);
+        let parts = |day, weekday| Parts {
+            minute: 0,
+            hour: 0,
+            day,
+            month: 6,
+            weekday,
+        };
+        assert!(schedule.matches(parts(1, 2)), "an odd day matches");
+        assert!(schedule.matches(parts(2, 1)), "a Monday matches");
+        assert!(!schedule.matches(parts(2, 2)), "neither matches");
+    }
+
+    #[test]
+    fn a_schedule_that_never_matches_has_no_delay() {
+        let schedule = parse_standard("0 0 30 2 *").expect("parses");
+        assert_eq!(schedule.delay(SystemTime::now()), None);
     }
 
     #[test]

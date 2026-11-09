@@ -308,8 +308,14 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
     let refused = outbound.is_none().then(|| diagnose_outbounds(root));
     let portals = reverse_portals(root);
-    let routing =
-        routing_for(root).unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let routing = routing_for(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
+        .or_else(|| {
+            geodata
+                .as_ref()
+                .filter(|geodata| !geodata.outbound().is_empty())
+                .map(|_| crate::router::Routing::empty())
+        });
     let observatory = start_observatory(root, test)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let api_config = match seed.and_then(|seed| seed.api.clone()) {
@@ -331,6 +337,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
             observatory.clone(),
             api.as_ref(),
             configured.as_ref(),
+            geodata.as_ref().map(crate::geodata::Config::outbound),
         )
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
@@ -3002,7 +3009,7 @@ fn route_shared(
     portals: &crate::reverse::Portals,
     observatory: Option<Arc<crate::observatory::Observatory>>,
 ) -> Result<Arc<RouteShared>, String> {
-    route_shared_with_api(root, routing, portals, observatory, None, None)
+    route_shared_with_api(root, routing, portals, observatory, None, None, None)
 }
 
 /// The same table with the commander's tag reachable: a rule naming it hands the flow to the
@@ -3015,6 +3022,7 @@ fn route_shared_with_api(
     observatory: Option<Arc<crate::observatory::Observatory>>,
     api: Option<&Arc<crate::commander::Api>>,
     default: Option<&Outbound>,
+    geodata_outbound: Option<&str>,
 ) -> Result<Arc<RouteShared>, String> {
     let list = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let Some(first) = list.first() else {
@@ -3079,7 +3087,7 @@ fn route_shared_with_api(
         || !sockopts.is_empty()
         || default_strategy.is_some()
         || !strategies.is_empty();
-    let targets: Vec<&str> = if routing.script().is_some() {
+    let mut targets: Vec<&str> = if routing.script().is_some() {
         configs.keys().copied().collect()
     } else {
         routing
@@ -3090,6 +3098,11 @@ fn route_shared_with_api(
             })
             .collect()
     };
+    if let Some(tag) = geodata_outbound.filter(|tag| !tag.is_empty()) {
+        if configs.contains_key(tag) {
+            targets.push(tag);
+        }
+    }
     for target in targets {
         if tagged.contains_key(target) {
             continue;
@@ -36370,6 +36383,26 @@ mod tests {
     }
 
     #[test]
+    fn a_geodata_outbound_is_built_without_a_routing_table() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"geo","protocol":"freedom"}]}"#,
+        )
+        .expect("parses");
+        let shared = route_shared_with_api(
+            &root,
+            crate::router::Routing::empty(),
+            &crate::reverse::Portals::default(),
+            None,
+            None,
+            None,
+            Some("geo"),
+        )
+        .expect("shared");
+        assert!(shared.outbound_for("geo").is_some());
+        assert!(shared.outbound_for("").is_some());
+    }
+
+    #[test]
     fn a_dynamic_inbound_naming_a_source_selector_is_not_served() {
         let root = crate::json::parse(
             r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"direct","inboundTag":["dyn"],"source":["192.0.2.0/24"]}]}}"#,
@@ -36566,6 +36599,9 @@ mod tests {
 
     #[test]
     fn an_env_name_supplies_an_address_and_port() {
+        let _env = crate::router::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("FERROX_ENV_ADDRESS", "198.51.100.7");
         std::env::set_var("FERROX_ENV_PORT", "8443");
         let outbound = crate::json::parse(

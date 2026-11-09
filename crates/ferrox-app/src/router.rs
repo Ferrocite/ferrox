@@ -3861,6 +3861,9 @@ fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>
 }
 
 #[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5489,6 +5492,9 @@ mod tests {
 
     #[test]
     fn env_names_the_address_and_port_a_rule_reads() {
+        let _env = crate::router::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("FERROX_ROUTING_ENV_IP", "198.51.100.7");
         std::env::set_var("FERROX_ROUTING_ENV_PORT", "101-102");
         let root = crate::json::parse(
