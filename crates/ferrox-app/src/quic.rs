@@ -5934,6 +5934,16 @@ mod tests {
         let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let moved_addr = moved.local_addr().expect("addr");
         stream.migrate_source(moved_addr).expect("migrates");
+        let widths: Vec<_> = conn
+            .lock()
+            .expect("lock")
+            .source_ids()
+            .map(|id| id.len())
+            .collect();
+        assert!(
+            widths.contains(&quiche::MAX_CONN_ID_LEN),
+            "the migration's spare IDs must be router-width: {widths:?}"
+        );
         let moved_sock = std::sync::Arc::new(moved);
         {
             let mut guard = conn.lock().expect("lock");
