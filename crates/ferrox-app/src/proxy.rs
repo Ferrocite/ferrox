@@ -14377,14 +14377,17 @@ fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
 /// A REALITY session held over one borrowed QUIC stream: the handshake rides the pooled connection's stream, and the relay that follows it is the pooled relay's own.
 fn dial_vless_quic_reality(
     client: &Connection,
+    server: &SocketAddr,
     vless: &VlessOut,
     target: Option<&Destination>,
     cfg: &ferrox_core::tls::RealityClientConfig,
 ) {
     let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
     else {
-        eprintln!("vless: reality quic stream failed");
-        return;
+        return note_dial_failure(
+            server,
+            Failure::new(Stage::RequestSent, Kind::Dropped),
+        );
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
     let handshake = SealHandshake::new(pooled.stream_handle(), budgets::handshake());
@@ -14423,26 +14426,36 @@ fn dial_vless_quic_reality(
 /// A REALITY session held over one Hysteria flow: the handshake rides the same flow vmess opens.
 fn dial_vless_hysteria_reality(
     client: &Connection,
+    server: &SocketAddr,
     vless: &VlessOut,
     target: Option<&Destination>,
     cfg: &ferrox_core::tls::RealityClientConfig,
 ) {
     let Some(dial) = hysteria_dial_session(vless) else {
-        eprintln!("vless: reality hysteria dial failed");
-        return;
+        return note_dial_failure(
+            server,
+            Failure::new(Stage::SocketConnected, Kind::Dropped),
+        );
     };
     let Some(header) = vless_request_header(vless, target) else {
-        return;
+        return note_dial_failure(
+            server,
+            Failure::new(Stage::RequestSent, Kind::Dropped),
+        );
     };
     let Some(flow) = crate::hysteria::open(&dial, &header, 0) else {
-        eprintln!("vless: reality hysteria open failed");
-        return;
+        return note_dial_failure(
+            server,
+            Failure::new(Stage::SocketConnected, Kind::Dropped),
+        );
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
     let limiter = ferrox_core::tls::reality::RecordLimiter::new(flow);
     let Ok(mut session) = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) else {
-        eprintln!("vless: reality hysteria handshake failed");
-        return;
+        return note_dial_failure(
+            client,
+            Failure::new(Stage::SocketConnected, Kind::Dropped),
+        );
     };
     if read_vless_response(&mut session).is_none() {
         return;
@@ -19190,10 +19203,10 @@ fn dial_vless_reality(
     };
     // A QUIC or Hysteria lease carries a client-initiated stream; the REALITY handshake rides it the same way it does a TCP one.
     if matches!(vless.carrier, Carrier::Quic) {
-        return dial_vless_quic_reality(client, vless, target, cfg);
+        return dial_vless_quic_reality(client, server, vless, target, cfg);
     }
     if matches!(vless.carrier, Carrier::Hysteria(_)) {
-        return dial_vless_hysteria_reality(client, vless, target, cfg);
+        return dial_vless_hysteria_reality(client, server, vless, target, cfg);
     }
     // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82), so this dial can take a pool entry without a handshake.
     if let Carrier::Xhttp { settings } = &vless.carrier {
