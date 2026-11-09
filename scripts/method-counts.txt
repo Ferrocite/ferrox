@@ -813,7 +813,7 @@ carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carri
 # --- blackhole sink outbound --------------------------------------------------
 blackhole ops-retired-instructions UNBLESSED scripts/count-ops.sh
 blackhole answer-bytes-the-reference-writes 101 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
-blackhole inbound-answer-bytes-the-reference-writes 101 ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers
+blackhole inbound-http-answer-bytes 101 ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers
 blackhole answer-writes-per-flow 1 ferrox-core-blackhole::tests::the_answer_is_one_write
 blackhole answer-copies-per-byte-written 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
 blackhole answer-allocations-per-flow 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
@@ -824,6 +824,7 @@ blackhole peer-reads-for-the-end 1 ferrox-app-blackhole::tests::the_peers_bytes_
 blackhole drain-allocations-per-flow 0 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
 blackhole upstream-connections-per-flow 0 ferrox-app-proxy::tests::a_blackhole_front_answers_the_client_and_dials_nothing
 blackhole scenario-map-tests-passing 1 scripts/run-xray-scenario-map.sh
+blackhole seconds-per-answered-flow UNBLESSED CI bench.yml (no cell yet)
 carrier-foxy h2-connections-per-two-flows 1 ferrox-app-foxy::loopback::two_live_flows_ride_one_session
 carrier-foxy dial-order-allocations-per-flow 0 ferrox-core-foxy::tests::a_dial_order_walks_without_touching_the_heap
 carrier-foxy ladder-walk-allocations-per-flow 0 ferrox-app-proxy::tests::a_flow_walks_the_ladder_without_touching_the_heap
