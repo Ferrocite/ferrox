@@ -4421,7 +4421,7 @@ mod tests {
                 // Reference: standing bytewise stream, drawn in one segment.
                 let mut reference = Rc4::new(key);
                 let mut expect = plain.clone();
-                for byte in expect.iter_mut() {
+                for byte in &mut expect {
                     reference.i = reference.i.wrapping_add(1);
                     reference.j = reference
                         .j
