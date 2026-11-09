@@ -353,6 +353,7 @@ fn rewrite_tcp(
         return false;
     };
     let mut checksum = u16::from_be_bytes([bytes[0], bytes[1]]);
+    // The view and the NAT peer share a family; a mismatch stays with the userspace stack.
     match (view.source, view.destination, source, destination) {
         (
             IpAddr::V4(old_source),
