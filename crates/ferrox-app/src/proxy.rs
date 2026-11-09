@@ -1358,11 +1358,86 @@ fn dial_from(
     Ok(Connection::Tcp(std::net::TcpStream::from(socket)))
 }
 
+/// Hand the target to the outbound a `dialerProxy` names over a loopback pipe, then return the
+/// other end to the dialer. The hop owns its own source, options and strategy; the pipe owns none.
+fn dial_through_proxy(
+    target: SocketAddr,
+    tag: &str,
+    options: &crate::sockopt::SocketOptions,
+) -> std::io::Result<Connection> {
+    let Some(shared) = options.route() else {
+        return Err(std::io::Error::other(
+            "there is no outbound handler for dialerProxy",
+        ));
+    };
+    if OUTBOUND_TAG.with(|cell| cell.borrow().as_deref() == Some(tag)) {
+        return Err(std::io::Error::other(format!(
+            "dialerProxy loops through `{tag}`"
+        )));
+    }
+    let Some(out) = shared.outbound_for(tag) else {
+        return Err(std::io::Error::other(
+            "there is no outbound handler for dialerProxy",
+        ));
+    };
+    let (source, sockopts, strategy) = if shared.default_tag.as_deref() == Some(tag) {
+        (
+            shared.default_source,
+            shared.default_sockopts.clone(),
+            shared.default_strategy,
+        )
+    } else {
+        (
+            shared.sources.get(tag).copied(),
+            shared.sockopts.get(tag).cloned(),
+            shared.strategies.get(tag).copied(),
+        )
+    };
+    let (client, server) = crate::reverse::loopback_pair()
+        .ok_or_else(|| std::io::Error::other("dialerProxy: no loopback pipe"))?;
+    let name = tag.to_owned();
+    thread::Builder::new()
+        .name("ferrox-dialer-proxy".to_owned())
+        .spawn(move || {
+            let _source = SendThroughGuard::enter(source);
+            let _sockopts = DialSockoptsGuard::enter(sockopts);
+            let _target = TargetStrategyGuard::enter(strategy);
+            serve_connect(
+                server,
+                &out,
+                &Destination::Address(target),
+                Front::Probe,
+                &[],
+                Some(&name),
+            );
+        })
+        .map_err(|error| std::io::Error::other(format!("dialerProxy: {error}")))?;
+    Ok(client)
+}
+
 fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
     // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
     let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
         .map_err(|_| Failure::new(Stage::SocketConnected, Kind::Local))?;
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
+    if let Some(tag) = sockopts
+        .as_deref()
+        .and_then(crate::sockopt::SocketOptions::dialer_proxy)
+    {
+        let options = sockopts.as_deref().expect("a tag came from the options");
+        let stream = dial_through_proxy(*target, tag, options)
+            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
+        no_delay(&stream);
+        let meter = OUTBOUND_TAG.with(|cell| {
+            cell.borrow()
+                .as_deref()
+                .map(|tag| crate::stats::outbound(Some(tag)))
+        });
+        return Ok(match meter {
+            Some(meter) => stream.with_meter(meter),
+            None => stream,
+        });
+    }
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
@@ -3049,6 +3124,76 @@ fn route_shared(
     route_shared_with_api(root, routing, portals, observatory, None, None, None)
 }
 
+/// The tag an outbound's `streamSettings.sockopt.dialerProxy` names, with the empty string the
+/// reference reads as a direct dial.
+fn dialer_proxy_tag(config: &Json) -> Option<&str> {
+    config
+        .get("streamSettings")
+        .and_then(|settings| settings.get("sockopt"))
+        .and_then(|sockopt| sockopt.get("dialerProxy"))
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+}
+
+/// One outbound's chain: every named hop exists, none names itself, and the walk terminates. A
+/// missing handler, a self-reference and a cycle are startup refusals, as they are in xray.
+fn check_dialer_proxy<'a>(
+    configs: &HashMap<&'a str, &'a Json>,
+    label: &'a str,
+    config: &'a Json,
+) -> Result<(), String> {
+    let mut cursor = dialer_proxy_tag(config);
+    if cursor == Some(label) {
+        return Err(format!("outbound `{label}` dialerProxy names itself"));
+    }
+    let mut seen = HashSet::new();
+    seen.insert(label);
+    while let Some(hop) = cursor {
+        if !seen.insert(hop) {
+            return Err(format!("dialerProxy loop through `{hop}`"));
+        }
+        let Some(next) = configs.get(hop) else {
+            return Err(format!(
+                "outbound `{label}` dialerProxy names `{hop}`, which no outbound names"
+            ));
+        };
+        cursor = dialer_proxy_tag(next);
+    }
+    Ok(())
+}
+
+fn check_dialer_proxies<'a>(
+    configs: &HashMap<&'a str, &'a Json>,
+    default_tag: Option<&str>,
+    first: &'a Json,
+) -> Result<(), String> {
+    for (&tag, &config) in configs {
+        check_dialer_proxy(configs, tag, config)?;
+    }
+    if default_tag.is_none() {
+        check_dialer_proxy(configs, "<default>", first)?;
+    }
+    Ok(())
+}
+
+/// Every hop a `dialerProxy` names is a route target the dial seam must reach, even when no rule
+/// names it directly.
+fn add_dialer_proxy_targets<'a>(
+    configs: &HashMap<&'a str, &'a Json>,
+    default_tag: Option<&str>,
+    first: &'a Json,
+    targets: &mut Vec<&'a str>,
+) {
+    let default = default_tag.is_none().then_some(first);
+    for config in configs.values().copied().chain(default) {
+        let mut cursor = dialer_proxy_tag(config);
+        while let Some(hop) = cursor {
+            targets.push(hop);
+            cursor = configs.get(hop).and_then(|config| dialer_proxy_tag(config));
+        }
+    }
+}
+
 /// The same table with the commander's tag reachable: a rule naming it hands the flow to the
 /// in-process API rather than to a configured outbound.
 #[allow(clippy::too_many_lines)]
@@ -3096,6 +3241,7 @@ fn route_shared_with_api(
             return Err(format!("outbound tag `{tag}` is named twice"));
         }
     }
+    check_dialer_proxies(&configs, default_tag.as_deref(), first)?;
     let mut tagged = HashMap::new();
     let default_source = parse_send_through(first)?;
     let mut sources = HashMap::new();
@@ -3140,6 +3286,7 @@ fn route_shared_with_api(
             targets.push(tag);
         }
     }
+    add_dialer_proxy_targets(&configs, default_tag.as_deref(), first, &mut targets);
     for target in targets {
         if tagged.contains_key(target) {
             continue;
@@ -3243,7 +3390,7 @@ fn route_shared_with_api(
     } else {
         None
     };
-    Ok(Arc::new(RouteShared {
+    let shared = Arc::new(RouteShared {
         routing,
         tagged,
         balancers,
@@ -3264,7 +3411,14 @@ fn route_shared_with_api(
         dynamic,
         changed: AtomicBool::new(false),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
-    }))
+    });
+    for options in shared.sockopts.values() {
+        options.install_route(&shared);
+    }
+    if let Some(options) = &shared.default_sockopts {
+        options.install_route(&shared);
+    }
+    Ok(shared)
 }
 
 /// `xray.router.PickOutbound`: a balancer tag picks one candidate (its fallback when a strategy
@@ -34203,6 +34357,11 @@ pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, S
         }
         freedom.noises = parse_freedom_noises(settings)?;
         freedom.final_rules = parse_freedom_final_rules(settings)?;
+        if !freedom.final_rules.is_empty() && dialer_proxy_tag(outbound).is_some() {
+            eprintln!(
+                "The \"finalRules\" setting is ignored when \"sockopt.dialerProxy\" is set, since freedom is not the final outbound."
+            );
+        }
         if settings
             .get("ipsBlocked")
             .is_some_and(|value| !matches!(value, Json::Null))
@@ -65140,6 +65299,39 @@ mod tests {
         assert_eq!(&back, b"ping");
     }
 
+    /// The same fake proxy, with every CONNECT destination reported so a test can prove the hop
+    /// was not bypassed.
+    fn fake_http_proxy_recording() -> (u16, std::sync::mpsc::Receiver<SocketAddr>) {
+        let (send, recorded) = std::sync::mpsc::channel();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in front.incoming() {
+                let Ok(mut client) = stream else { continue };
+                let send = send.clone();
+                thread::spawn(move || {
+                    let Some(head) = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+                    else {
+                        return;
+                    };
+                    let Some(ProxyRequest::Connect(asked)) = http_proxy_request(head) else {
+                        return;
+                    };
+                    let Some(target) = asked.socket() else { return };
+                    let _ = send.send(target);
+                    let Ok(upstream) = Connection::connect(target) else {
+                        return;
+                    };
+                    if client.write_all(Front::Http.grant_line()).is_err() {
+                        return;
+                    }
+                    relay(&client, &upstream);
+                });
+            }
+        });
+        (port, recorded)
+    }
+
     /// This outbound dials *upstream* of a proxy, so no front test reaches it: a fake proxy is the only witness.
     fn fake_http_proxy() -> u16 {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -66903,6 +67095,39 @@ mod tests {
         }
     }
 
+    /// A `dialerProxy` hop carries the outbound's own dial: the freedom lane reaches the echo only
+    /// after the named HTTP proxy has seen the CONNECT, and it sees it exactly once.
+    #[test]
+    fn a_dialer_proxy_hop_carries_the_outbound_dial() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_dialer_proxy_hop_carries_the_outbound_dial",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"proxy","protocol":"freedom","streamSettings":{{"sockopt":{{"dialerProxy":"hop"}}}}}},
+                {{"tag":"hop","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}}
+            ],"routing":{{}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = socks_tcp_client(front, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the hop carried the dial");
+        assert_eq!(seen.port(), echo_port);
+        assert!(
+            recorded.recv_timeout(Duration::from_millis(100)).is_err(),
+            "one connection, one hop dial"
+        );
+    }
+
     /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its
     /// dial makes carries, not the OS defaults.
     #[cfg(unix)]
@@ -68202,6 +68427,65 @@ end
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, None);
         assert!(matches!(&*picked, Outbound::Freedom(_)));
         assert_eq!(tag.as_deref(), Some("pool"));
+    }
+
+    /// A `dialerProxy` that names a missing, self or cyclic outbound is a startup refusal, and a
+    /// `fragment` the config names is built as the hop it is; an empty name stays a direct dial.
+    #[test]
+    fn the_route_registry_resolves_dialer_proxy_hops() {
+        let build = |text: &str| {
+            let root = crate::json::parse(text).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+        };
+
+        let missing = build(
+            r#"{"outbounds":[{"tag":"proxy","protocol":"freedom",
+                "streamSettings":{"sockopt":{"dialerProxy":"nope"}}}],"routing":{}}"#,
+        )
+        .expect_err("a missing hop is refused");
+        assert!(missing.contains("nope"), "{missing}");
+
+        let itself = build(
+            r#"{"outbounds":[{"tag":"proxy","protocol":"freedom",
+                "streamSettings":{"sockopt":{"dialerProxy":"proxy"}}}],"routing":{}}"#,
+        )
+        .expect_err("a self hop is refused");
+        assert!(itself.contains("proxy"), "{itself}");
+
+        let cyclic = build(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"proxy"}}}
+            ],"routing":{}}"#,
+        )
+        .expect_err("a cycle is refused");
+        assert!(
+            cyclic.contains("dialerProxy") && cyclic.contains("loop"),
+            "{cyclic}"
+        );
+
+        let empty = build(
+            r#"{"outbounds":[{"tag":"proxy","protocol":"freedom",
+                "streamSettings":{"sockopt":{"dialerProxy":""}}}],"routing":{}}"#,
+        )
+        .expect("an empty name is direct");
+        assert!(
+            empty.tagged.is_empty(),
+            "no hop entry is built for an empty name"
+        );
+
+        let fragment = build(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"fragment"}}},
+                {"tag":"fragment","protocol":"freedom","settings":{"fragment":{"packets":"tlshello","lengths":[11]}}}
+            ],"routing":{}}"#,
+        )
+        .expect("a fragment hop builds");
+        assert!(
+            fragment.tagged.contains_key("fragment"),
+            "the named fragment is reachable at the dial seam"
+        );
     }
 
     /// A tag a rule names but no outbound carries, a tag named twice, and a blackhole mode this tree

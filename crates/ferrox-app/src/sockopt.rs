@@ -2,6 +2,7 @@ use crate::json::Json;
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 /// The outbound half of xray's `SocketConfig`: the options an ECH DNS query puts on the
@@ -29,7 +30,38 @@ pub(crate) struct SocketOptions {
     max_seg: Option<i32>,
     interface: Option<String>,
     custom: Vec<CustomSockopt>,
+    dialer_proxy: Option<Arc<str>>,
+    route: RouteLink,
 }
+
+/// The owning route, held weakly so the table's socket options do not keep the table alive. The
+/// link is invisible to `Debug` and equality, and cloned links share the one route.
+#[derive(Default)]
+struct RouteLink(OnceLock<Weak<crate::proxy::RouteShared>>);
+
+impl Clone for RouteLink {
+    fn clone(&self) -> Self {
+        let link = OnceLock::new();
+        if let Some(route) = self.0.get() {
+            let _ = link.set(route.clone());
+        }
+        Self(link)
+    }
+}
+
+impl std::fmt::Debug for RouteLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RouteLink")
+    }
+}
+
+impl PartialEq for RouteLink {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RouteLink {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeepAlive {
@@ -147,6 +179,7 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
     let max_seg = int(node, "tcpMaxSeg")?.filter(|value| *value > 0);
     let interface = text(node, "interface")?;
     let custom = custom(node.get("customSockopt"))?;
+    let dialer_proxy = text(node, "dialerProxy")?.map(Arc::from);
     warn_unsupported(node, dialer);
     Ok(Some(SocketOptions {
         mark,
@@ -160,17 +193,12 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
         max_seg,
         interface,
         custom,
+        dialer_proxy,
+        route: RouteLink::default(),
     }))
 }
 
 fn warn_unsupported(node: &Json, dialer: &str) {
-    if node
-        .get("dialerProxy")
-        .and_then(Json::as_str)
-        .is_some_and(|text| !text.is_empty())
-    {
-        eprintln!("sockopt.dialerProxy is not wired; {dialer} dials directly");
-    }
     if node
         .get("addressPortStrategy")
         .and_then(Json::as_str)
@@ -304,6 +332,21 @@ impl SocketOptions {
     /// The DNS cache key differs whenever an option that changes the query socket differs.
     pub(crate) fn cache_key(&self) -> String {
         format!("{self:?}")
+    }
+
+    /// The outbound a `streamSettings.sockopt.dialerProxy` names, or `None` for a direct dial.
+    pub(crate) fn dialer_proxy(&self) -> Option<&str> {
+        self.dialer_proxy.as_deref()
+    }
+
+    /// Give this outbound's options the table that resolves its `dialerProxy` hop.
+    pub(crate) fn install_route(&self, route: &Arc<crate::proxy::RouteShared>) {
+        let _ = self.route.0.set(Arc::downgrade(route));
+    }
+
+    /// The table the hop is resolved in, while the server that built it is alive.
+    pub(crate) fn route(&self) -> Option<Arc<crate::proxy::RouteShared>> {
+        self.route.0.get().and_then(std::sync::Weak::upgrade)
     }
 
     fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, String> {
