@@ -1,6 +1,6 @@
 # The loopback re-inject outbound
 
-A `loopback` outbound names an inbound by tag. In a routed config, a flow that reaches it is re-injected under that tag: the outbound's own `sniffing` runs first, then the named tag's rules run a second time without resolving a name, and the lane they choose is served in-process. The tag is the whole address — no inbound has to exist for it, matching the reference's dispatcher, which does not look the tag up when it re-routes. The no-resolve pass is the reference's `SkipDNSResolve`: a name reaches only the named tag's domain rules, never an IP rule, which the router's `a_skip_dns_route_does_not_resolve_a_name` holds. A chain of loopbacks ends after eight hops or when the same tag is selected again; a named server inbound then falls back to its own dial, and a front tag closes.
+A `loopback` outbound names an inbound by tag. In a routed config, a flow that reaches it is re-injected under that tag: the outbound's own `sniffing` runs first, then the named tag's rules run a second time without resolving a name, and the lane they choose is served in-process. A `routeOnly` sniffer routes by the name it found while the dial keeps the address the front asked for, the reference dispatcher's `RouteTarget`/`Target` split. The tag is the whole address — no inbound has to exist for it, matching the reference's dispatcher, which does not look the tag up when it re-routes. The no-resolve pass is the reference's `SkipDNSResolve`: a name reaches only the named tag's domain rules, never an IP rule, which the router's `a_skip_dns_route_does_not_resolve_a_name` holds. A chain of loopbacks ends after eight hops or when the same tag is selected again; a named server inbound then falls back to its own dial, and a front tag closes.
 
 A config with no routing keeps the startup convenience: the tag resolves once into the client dial the named inbound's own credentials imply, so the re-injected flow carries a real handshake on the loopback wire. A front is refused there because it would re-enter the same resolution. The outbound's `sniffing` block runs before that dial too, so an HTTP `Host` or TLS SNI can replace the destination the front was asked for.
 
@@ -14,7 +14,7 @@ What refuses, and where: in the unrouted path an empty or missing `inboundTag` s
 graph TD
     C["front: SOCKS / HTTP / mixed<br/>parses the destination"] --> R["routing: first pass picks the loopback"]
     R --> N["loopback sniffing, when enabled<br/>HTTP Host / TLS SNI → a name"]
-    N --> P["named tag: second routing pass<br/>same rules, same balancers, no DNS"]
+    N --> P["named tag: second routing pass<br/>same rules, same balancers, no DNS<br/>routeOnly: name routes, original dials"]
     P --> O["chosen lane: freedom / proxy / block<br/>served in-process"]
     P -->|same tag or depth cap| D["named inbound's own dial<br/>when one was built"]
     D --> S["named inbound serves<br/>checks its own id, key or password"]
@@ -78,6 +78,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: -
-- symbols: find_loopback_outbound, resolve_loopback, resolve_routed_loopback, loopback_out, loopback_dial, loopback_dial_for_inbound, loopback_carrier, loopback_carrier_of, loopback_sniffing, loopback_asked, loopback_settings, LoopbackOut, MAX_LOOPBACK_DEPTH
+- symbols: find_loopback_outbound, resolve_loopback, resolve_routed_loopback, loopback_out, loopback_dial, loopback_dial_for_inbound, loopback_carrier, loopback_carrier_of, loopback_sniffing, loopback_sniffed, loopback_settings, LoopbackOut, MAX_LOOPBACK_DEPTH
 - go: ./proxy/loopback/...
 <!-- scope:end -->

@@ -2718,6 +2718,14 @@ impl RoutePlan {
         self
     }
 
+    fn wants_attrs(&self) -> bool {
+        self.shared
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wants_attrs()
+    }
+
     /// The lane a SOCKS association picks, read from the live table so a rule the management API
     /// added or removed after startup reaches the UDP path.
     fn association(&self) -> Association {
@@ -6866,7 +6874,17 @@ fn tunnel_stream(
         .name(name.to_owned())
         .spawn({
             let out = out.clone();
-            move || serve_connect(Connection::Tcp(server), &out, &dest, front, &[], None)
+            move || {
+                serve_connect(
+                    Connection::Tcp(server),
+                    &out,
+                    &dest,
+                    front,
+                    &[],
+                    None,
+                    FlowFacts::default(),
+                )
+            }
         })
         .ok()?;
     Some(Connection::Tcp(client))
@@ -21900,7 +21918,21 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
         None => sniff_lane(out, &handshake.asked, &client, user, level),
     };
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
-    serve_connect(client, &out, asked, Front::Socks, &[], tag.as_deref());
+    serve_connect(
+        client,
+        &out,
+        asked,
+        Front::Socks,
+        &[],
+        tag.as_deref(),
+        FlowFacts {
+            source: None,
+            local: None,
+            user,
+            level,
+            ..FlowFacts::default()
+        },
+    );
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -21917,7 +21949,15 @@ pub(crate) fn serve_device_flow(
     let (dial, lane, tag) = sniff_lane(out, dest, &client, None, None);
     let dest = dial.as_ref().unwrap_or(dest);
     let ((), dial_report) = observe_dial(|| {
-        serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
+        serve_connect(
+            client,
+            &lane,
+            dest,
+            Front::Socks,
+            &[],
+            tag.as_deref(),
+            FlowFacts::default(),
+        );
     });
     match dial_report {
         Some(false) => Err(std::io::Error::new(
@@ -22274,33 +22314,49 @@ fn sniff_lane<'a>(
 }
 
 /// A loopback outbound's own sniffer runs before its named inbound sees the flow, as the
-/// reference's second dispatch does; `routeOnly` leaves the dial target at the original address.
-fn loopback_asked(
+/// reference's second dispatch does: the sniffed name routes, and only a dial override changes
+/// the target `routeOnly` keeps at the original address.
+fn loopback_sniffed(
     loopback: &LoopbackOut,
     asked: &Destination,
     client: &Connection,
-) -> Option<Destination> {
-    let sniffing = loopback.sniffing.as_ref()?;
-    let (found, _) = sniffing.inspect(asked, crate::router::Network::Tcp, client, false);
-    let found = found?;
-    sniffing
+    want_attrs: bool,
+) -> (
+    Option<Destination>,
+    Option<Destination>,
+    Option<&'static str>,
+    Vec<(String, String)>,
+) {
+    let Some(sniffing) = loopback.sniffing.as_ref() else {
+        return (None, None, None, Vec::new());
+    };
+    let (found, pairs) = sniffing.inspect(asked, crate::router::Network::Tcp, client, want_attrs);
+    let Some(found) = found else {
+        return (None, None, None, pairs);
+    };
+    let route = found
+        .override_destination
+        .then(|| Destination::Name(found.domain.clone(), asked.port()));
+    let dial = sniffing
         .should_dial_override(&found)
-        .then(|| Destination::Name(found.domain, asked.port()))
+        .then(|| Destination::Name(found.domain, asked.port()));
+    (dial, route, Some(found.protocol), pairs)
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
-pub(crate) fn serve_connect(
+fn serve_connect(
     client: Connection,
     out: &Outbound,
     asked: &Destination,
     front: Front,
     prefix: &[u8],
     tag: Option<&str>,
+    facts: FlowFacts<'_>,
 ) {
-    serve_connect_at(client, out, asked, front, prefix, tag, 0);
+    serve_connect_at(client, out, asked, front, prefix, tag, facts, 0);
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn serve_connect_at(
     mut client: Connection,
     out: &Outbound,
@@ -22308,6 +22364,7 @@ fn serve_connect_at(
     front: Front,
     prefix: &[u8],
     tag: Option<&str>,
+    facts: FlowFacts<'_>,
     depth: u8,
 ) {
     let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
@@ -22316,30 +22373,46 @@ fn serve_connect_at(
     let _sockopts = DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
     let _target = TargetStrategyGuard::enter(TARGET_STRATEGY.with(std::cell::Cell::take));
     if let Outbound::Loopback(loopback) = out {
-        let overridden = loopback_asked(loopback, asked, &client);
-        let asked = overridden.as_ref().unwrap_or(asked);
-        if let Some(shared) = loopback.shared().filter(|_| depth < MAX_LOOPBACK_DEPTH) {
-            let plan = RoutePlan::new(
-                shared,
-                Some(loopback.inbound_tag.clone()),
-                loopback.inbound_name.clone(),
-                loopback.source_known,
-            )
-            .without_dns();
-            let (lane, lane_tag) = plan.lane_with_protocol(
-                asked,
-                crate::router::Network::Tcp,
-                Some(&client),
-                FlowFacts::default(),
-            );
+        let plan = loopback
+            .shared()
+            .filter(|_| depth < MAX_LOOPBACK_DEPTH)
+            .map(|shared| {
+                RoutePlan::new(
+                    shared,
+                    Some(loopback.inbound_tag.clone()),
+                    loopback.inbound_name.clone(),
+                    loopback.source_known,
+                )
+                .without_dns()
+            });
+        let want_attrs = plan.as_ref().is_some_and(RoutePlan::wants_attrs);
+        let (dial, route, protocol, pairs) = loopback_sniffed(loopback, asked, &client, want_attrs);
+        let target = dial.as_ref().unwrap_or(asked);
+        if let Some(plan) = plan {
+            let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
+            let owner = plan.process_owner(crate::router::Network::Tcp, Some(&client));
+            let second = FlowFacts {
+                protocol,
+                user: facts.user,
+                level: facts.level,
+                attrs: attrs.as_ref(),
+                process: owner.as_ref(),
+                original: Some(asked),
+                route: route.as_ref().filter(|_| dial.is_none()),
+                ..FlowFacts::default()
+            };
+            let route = route.as_ref().unwrap_or(asked);
+            let (lane, lane_tag) =
+                plan.lane_with_protocol(route, crate::router::Network::Tcp, Some(&client), second);
             if !same_loopback(&lane, loopback) {
                 return serve_connect_at(
                     client,
                     &lane,
-                    asked,
+                    target,
                     front,
                     prefix,
                     lane_tag.as_deref(),
+                    facts,
                     depth + 1,
                 );
             }
@@ -22348,10 +22421,11 @@ fn serve_connect_at(
             return serve_connect_at(
                 client,
                 dial,
-                asked,
+                target,
                 front,
                 prefix,
                 tag.as_deref(),
+                facts,
                 depth + 1,
             );
         }
@@ -23627,7 +23701,21 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 None => sniff_lane(out, &asked, &client, user, level),
             };
             let asked = dial.as_ref().unwrap_or(&asked);
-            serve_connect(client, &out, asked, Front::Http, &[], tag.as_deref());
+            serve_connect(
+                client,
+                &out,
+                asked,
+                Front::Http,
+                &[],
+                tag.as_deref(),
+                FlowFacts {
+                    source: None,
+                    local: None,
+                    user,
+                    level,
+                    ..FlowFacts::default()
+                },
+            );
         }
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
@@ -23639,21 +23727,30 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 forward_headers(&origin, &mut attrs);
                 attrs
             });
+            let facts = FlowFacts {
+                source: None,
+                local: None,
+                protocol: Some("http/1.1"),
+                user,
+                level,
+                attrs: attrs.as_ref(),
+                ..FlowFacts::default()
+            };
             let (out, tag) = out.resolved_lane_with_protocol(
                 &asked,
                 crate::router::Network::Tcp,
                 Some(&client),
-                FlowFacts {
-                    source: None,
-                    local: None,
-                    protocol: Some("http/1.1"),
-                    user,
-                    level,
-                    attrs: attrs.as_ref(),
-                    ..FlowFacts::default()
-                },
+                facts,
             );
-            serve_connect(client, &out, &asked, Front::Http, &origin, tag.as_deref());
+            serve_connect(
+                client,
+                &out,
+                &asked,
+                Front::Http,
+                &origin,
+                tag.as_deref(),
+                facts,
+            );
         }
     }
 }
@@ -66523,6 +66620,90 @@ mod tests {
         assert_eq!(back, head.as_bytes(), "the sniffed name is dialled");
     }
 
+    /// A `routeOnly` sniffer routes by the sniffed name but leaves the dial target where the front
+    /// asked, as the reference's dispatcher does.
+    #[test]
+    fn a_route_only_loopback_sniffer_routes_by_name_and_dials_the_original_address() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1,"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in","sniffing":{{"enabled":true,"routeOnly":true,"destOverride":["http"]}}}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[{{"type":"field","domain":["sniffed.example"],"outboundTag":"direct"}}]}}}}"#,
+            ),
+            Some("front"),
+            true,
+        );
+        let front_port = socks_front_with(out);
+        let mut client = socks_tcp_client(front_port, echo_port);
+        let head = format!("GET / HTTP/1.1\r\nHost: sniffed.example\r\nConnection: close\r\n\r\n");
+        client.write_all(head.as_bytes()).expect("writes the head");
+        let mut back = vec![0u8; head.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(
+            back,
+            head.as_bytes(),
+            "the domain rule routes while the original address is dialled"
+        );
+    }
+
+    /// The second pass keeps the account the front authenticated, so a `user` rule reaches it.
+    #[test]
+    fn a_loopback_second_pass_keeps_the_authenticated_user() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1,"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in"}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[{{"type":"field","inboundTag":["tunnel-in"],"user":["alice"],"outboundTag":"direct"}}]}}}}"#,
+            ),
+            Some("front"),
+            true,
+        );
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![SocksAccount {
+                user: "alice".to_owned(),
+                pass: "secret".to_owned(),
+                email: "alice".to_owned(),
+                level: 0,
+            }],
+        };
+        let front_port = socks_front_with_accounts(out, accounts);
+        let mut client = socks_ask_with_credential(front_port, echo_addr, "alice", "secret");
+        client.write_all(b"user").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(
+            &back, b"user",
+            "the user rule sees the authenticated account"
+        );
+    }
+
     /// A loopback outbound is a routing target, not just the single front lane:
     /// a config whose default is loopback builds and re-injects.
     #[test]
@@ -72381,7 +72562,15 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             let Some(asked) = asked else { return };
             let (dial, target, tag) = sniff_lane(&out, &asked, &stream, None, None);
             let dest = dial.as_ref().unwrap_or(&asked);
-            serve_connect(stream, &target, dest, Front::Socks, &[], tag.as_deref());
+            serve_connect(
+                stream,
+                &target,
+                dest,
+                Front::Socks,
+                &[],
+                tag.as_deref(),
+                FlowFacts::default(),
+            );
         }
         Role::Proxied(inner) => dispatch(stream, *inner, None),
     }
