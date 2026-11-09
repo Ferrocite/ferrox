@@ -3827,6 +3827,7 @@ fn tunnel_protocol_base(protocol: &'static str) -> &'static str {
     match protocol {
         "FRONTED-MEEK-CDN-OSSH" => "FRONTED-MEEK-OSSH",
         "FRONTED-MEEK-CDN-HTTP-OSSH" => "FRONTED-MEEK-HTTP-OSSH",
+        "FRONTED-MEEK-CDN-QUIC-OSSH" => "FRONTED-MEEK-QUIC-OSSH",
         _ => protocol,
     }
 }
@@ -5151,6 +5152,10 @@ mod tests {
         assert_eq!(
             tunnel_protocol_base("FRONTED-MEEK-CDN-HTTP-OSSH"),
             "FRONTED-MEEK-HTTP-OSSH"
+        );
+        assert_eq!(
+            tunnel_protocol_base("FRONTED-MEEK-CDN-QUIC-OSSH"),
+            "FRONTED-MEEK-QUIC-OSSH"
         );
         assert_eq!(
             tunnel_protocol_base("UNFRONTED-MEEK-HTTPS-OSSH"),
