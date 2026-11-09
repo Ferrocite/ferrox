@@ -346,6 +346,13 @@ fn rewrite_tcp(
     source_port: u16,
     destination_port: u16,
 ) -> bool {
+    let Some(checksum_at) = view.l4.checked_add(16) else {
+        return false;
+    };
+    let Some(bytes) = packet.get(checksum_at..checksum_at + 2) else {
+        return false;
+    };
+    let mut checksum = u16::from_be_bytes([bytes[0], bytes[1]]);
     match (view.source, view.destination, source, destination) {
         (
             IpAddr::V4(old_source),
@@ -364,15 +371,22 @@ fn rewrite_tcp(
             let Some(bytes) = packet.get(10..12) else {
                 return false;
             };
-            let mut checksum = u16::from_be_bytes([bytes[0], bytes[1]]);
-            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
-            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
+            let mut header = u16::from_be_bytes([bytes[0], bytes[1]]);
+            header = checksum_update(header, &old_source.octets(), &source.octets());
+            header = checksum_update(header, &old_destination.octets(), &destination.octets());
             let Some(bytes) = packet.get_mut(10..12) else {
                 return false;
             };
-            bytes.copy_from_slice(&checksum.to_be_bytes());
+            bytes.copy_from_slice(&header.to_be_bytes());
+            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
+            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
         }
-        (IpAddr::V6(_), IpAddr::V6(_), IpAddr::V6(source), IpAddr::V6(destination)) => {
+        (
+            IpAddr::V6(old_source),
+            IpAddr::V6(old_destination),
+            IpAddr::V6(source),
+            IpAddr::V6(destination),
+        ) => {
             let Some(bytes) = packet.get_mut(8..24) else {
                 return false;
             };
@@ -381,6 +395,8 @@ fn rewrite_tcp(
                 return false;
             };
             bytes.copy_from_slice(&destination.octets());
+            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
+            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
         }
         _ => return false,
     }
@@ -392,34 +408,6 @@ fn rewrite_tcp(
         return false;
     };
     bytes.copy_from_slice(&destination_port.to_be_bytes());
-    let Some(checksum_at) = view.l4.checked_add(16) else {
-        return false;
-    };
-    let Some(bytes) = packet.get(checksum_at..checksum_at + 2) else {
-        return false;
-    };
-    let mut checksum = u16::from_be_bytes([bytes[0], bytes[1]]);
-    match (view.source, view.destination, source, destination) {
-        (
-            IpAddr::V4(old_source),
-            IpAddr::V4(old_destination),
-            IpAddr::V4(source),
-            IpAddr::V4(destination),
-        ) => {
-            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
-            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
-        }
-        (
-            IpAddr::V6(old_source),
-            IpAddr::V6(old_destination),
-            IpAddr::V6(source),
-            IpAddr::V6(destination),
-        ) => {
-            checksum = checksum_update(checksum, &old_source.octets(), &source.octets());
-            checksum = checksum_update(checksum, &old_destination.octets(), &destination.octets());
-        }
-        _ => return false,
-    }
     checksum = checksum_update(
         checksum,
         &view.source_port.to_be_bytes(),
