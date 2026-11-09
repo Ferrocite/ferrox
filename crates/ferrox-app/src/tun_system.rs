@@ -353,6 +353,14 @@ fn rewrite_tcp(
             IpAddr::V4(source),
             IpAddr::V4(destination),
         ) => {
+            let Some(bytes) = packet.get_mut(12..16) else {
+                return false;
+            };
+            bytes.copy_from_slice(&source.octets());
+            let Some(bytes) = packet.get_mut(16..20) else {
+                return false;
+            };
+            bytes.copy_from_slice(&destination.octets());
             let Some(bytes) = packet.get(10..12) else {
                 return false;
             };
@@ -363,14 +371,6 @@ fn rewrite_tcp(
                 return false;
             };
             bytes.copy_from_slice(&checksum.to_be_bytes());
-            let Some(bytes) = packet.get_mut(12..16) else {
-                return false;
-            };
-            bytes.copy_from_slice(&source.octets());
-            let Some(bytes) = packet.get_mut(16..20) else {
-                return false;
-            };
-            bytes.copy_from_slice(&destination.octets());
         }
         (IpAddr::V6(_), IpAddr::V6(_), IpAddr::V6(source), IpAddr::V6(destination)) => {
             let Some(bytes) = packet.get_mut(8..24) else {

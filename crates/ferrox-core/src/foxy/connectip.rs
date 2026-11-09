@@ -733,7 +733,7 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !fold(word_sum(header))
 }
 
-/// The checksum a stored value becomes when the words it covered change from `old` to `new`: RFC 1624's incremental update, reading only the replaced words instead of the whole run. The checksum's covered run must hold a non-zero word, as every IP or TCP header does, so its folded residue is `0xffff` rather than `0x0000` at the zero boundary.
+/// The checksum a stored value becomes when the words it covered change from `old` to `new`: RFC 1624's incremental update, reading only the replaced words instead of the whole run. `old` and `new` are the same word-aligned run within the covered bytes. The checksum's covered run must hold a non-zero word, as every IP or TCP header does, so its folded residue is `0xffff` rather than `0x0000` at the zero boundary.
 pub fn checksum_update(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
     debug_assert_eq!(old.len(), new.len());
     let delta = i64::from(word_sum(new)) - i64::from(word_sum(old));
