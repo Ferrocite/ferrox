@@ -813,6 +813,7 @@ carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carri
 # --- blackhole sink outbound --------------------------------------------------
 blackhole ops-retired-instructions UNBLESSED scripts/count-ops.sh
 blackhole answer-bytes-the-reference-writes 101 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
+blackhole inbound-answer-bytes-the-reference-writes 101 ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers
 blackhole answer-writes-per-flow 1 ferrox-core-blackhole::tests::the_answer_is_one_write
 blackhole answer-copies-per-byte-written 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
 blackhole answer-allocations-per-flow 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
