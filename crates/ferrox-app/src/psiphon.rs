@@ -5902,7 +5902,8 @@ fn push_fronted_variant(
         let host = meek.host.clone();
         meek.hosts = vec![host];
     }
-    if !alpn.is_empty() {
+    // The reference applies an override's ALPN to a TLS front; QUIC keeps its own h3 ALPN.
+    if !alpn.is_empty() && !meek.quic {
         meek.alpn = alpn.to_vec();
     }
     meek.verify_server_names = if skip_cert_verify || meek.quic || !meek.https {
@@ -8413,6 +8414,55 @@ mod tests {
             let meek = server.meek.as_ref().expect("fronted");
             meek.dial == "198.51.100.7" && meek.sni == "scan.example"
         }));
+    }
+
+    #[test]
+    fn a_quic_front_keeps_its_h3_alpn_over_an_override() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekDialOverrides": [{
+                        "DialAddresses": ["pypi.org"],
+                        "SNIServerName": "pypi.org",
+                        "ALPNProtocols": ["http/1.1"]
+                    }]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: vec![b"h3".to_vec()],
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: true,
+            fronted: true,
+            protocol: "FRONTED-MEEK-QUIC-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            verify_server_names: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        let front = servers
+            .iter()
+            .find(|server| server.meek.as_ref().is_some_and(|meek| meek.dial == "pypi.org"))
+            .expect("pypi front");
+        assert_eq!(
+            front.meek.as_ref().expect("fronted").alpn,
+            vec![b"h3".to_vec()]
+        );
     }
 
     #[test]
