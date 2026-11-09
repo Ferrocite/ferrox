@@ -14163,6 +14163,80 @@ fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
     }
 }
 
+/// A REALITY session held over one borrowed QUIC stream: the handshake rides the pooled connection's stream, and the relay that follows it is the pooled relay's own.
+fn dial_vless_quic_reality(
+    client: &Connection,
+    vless: &VlessOut,
+    target: Option<&Destination>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) {
+    let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
+    else {
+        return;
+    };
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let handshake = SealHandshake::new(pooled.stream_handle(), budgets::handshake());
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(handshake);
+    let mut session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("vless: reality quic handshake failed: {error}");
+            pooled.cancel();
+            return;
+        }
+    };
+    let Some(header) = vless_request_header(vless, target) else {
+        pooled.cancel();
+        return;
+    };
+    if session.write_all(header.as_ref()).is_err() {
+        pooled.cancel();
+        return;
+    }
+    if read_vless_response(&mut session).is_none() {
+        pooled.cancel();
+        return;
+    }
+    let stream_handle = session.get_ref().get_ref().stream.clone();
+    let reader = stream_handle.clone();
+    let pooled = Mutex::new(Some(pooled));
+    let close_handle = stream_handle.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        close_handle.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    relay_split(reader, stream_handle, client, &close);
+}
+
+/// A REALITY session held over one Hysteria flow: the handshake rides the same flow vmess opens.
+fn dial_vless_hysteria_reality(
+    client: &Connection,
+    vless: &VlessOut,
+    target: Option<&Destination>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) {
+    let Some(dial) = hysteria_dial_session(vless) else {
+        return;
+    };
+    let Some(header) = vless_request_header(vless, target) else {
+        return;
+    };
+    let Some(flow) = crate::hysteria::open(&dial, &header, 0) else {
+        return;
+    };
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(flow);
+    let Ok(mut session) = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) else {
+        eprintln!("vless: reality hysteria handshake failed");
+        return;
+    };
+    if read_vless_response(&mut session).is_none() {
+        return;
+    }
+    let closer = session.get_ref().get_ref().clone();
+    crate::hysteria::relay(client, &closer);
+}
+
 fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: &Destination) {
     let Some(encryption) = &vless.encryption else {
         return;
@@ -18860,6 +18934,13 @@ fn dial_vless_reality(
     let Some(header) = vless_request_header(vless, target) else {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     };
+    // A QUIC or Hysteria lease carries a client-initiated stream; the REALITY handshake rides it the same way it does a TCP one.
+    if matches!(vless.carrier, Carrier::Quic) {
+        return dial_vless_quic_reality(client, vless, target, cfg);
+    }
+    if matches!(vless.carrier, Carrier::Hysteria(_)) {
+        return dial_vless_hysteria_reality(client, vless, target, cfg);
+    }
     // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82), so this dial can take a pool entry without a handshake.
     if let Carrier::Xhttp { settings } = &vless.carrier {
         let pool = reality_xmux(server, vless, reality, settings);
@@ -35954,7 +36035,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         let out = tls_carried_vless(outbound, address, port, id, &flow, mux, encryption)?;
         return Some(out);
     }
-    // REALITY dials raw TCP and every carried carrier the client reaches; QUIC and Hysteria stay refused.
+    // REALITY dials raw TCP and every carried carrier the client reaches, both UDP dialers included.
     if security == "reality" {
         let (carrier, host) = outbound_carrier(outbound, &address);
         if !matches!(
@@ -35966,6 +36047,8 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
                 | Carrier::Xhttp { .. }
                 | Carrier::HttpHeader { .. }
                 | Carrier::Kcp(_)
+                | Carrier::Quic
+                | Carrier::Hysteria(_)
         ) {
             return None;
         }
@@ -35974,6 +36057,24 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             eprintln!("vless: {error}; outbound refused");
             return None;
         }
+        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+            Carrier::Quic => {
+                let ech = if security == "tls" {
+                    match crate::config::quic_ech_config(outbound, &address) {
+                        Ok(ech) => ech,
+                        Err(why) => {
+                            eprintln!("vless: {why}; the quic dial will fail");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
+        };
         return Some(VlessOut {
             address,
             port,
@@ -35981,9 +36082,9 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             carrier,
             host,
             mux,
-            quic_roots: None,
-            quic_ech: None,
-            hysteria_roots: None,
+            quic_roots,
+            quic_ech,
+            hysteria_roots,
             tls: None,
             flow,
             reality: Some(reality),
@@ -41688,12 +41789,16 @@ mod tests {
             "http-header REALITY dials"
         );
         assert!(
-            !dials(r#""network": "quic""#),
-            "quic REALITY stays refused, no UDP leg"
+            dials(r#""network": "quic""#),
+            "quic REALITY dials the carried tunnel"
         );
         assert!(
             dials(r#""network": "kcp""#),
             "kcp REALITY dials the carried tunnel"
+        );
+        assert!(
+            dials(r#""network": "hysteria""#),
+            "hysteria REALITY dials the carried tunnel"
         );
         let bare = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
