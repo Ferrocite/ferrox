@@ -661,6 +661,19 @@ fn serve_inbounds_counted(
                             inbounds += 1;
                         }
                     }
+                    "blackhole" => {
+                        if serve_blackhole_inbound(
+                            address,
+                            inbound,
+                            label,
+                            handler_stop.as_ref().map(Arc::clone),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
                     "tun" => {
                         // A tun flow has no source or local address, so a reaching rule that names one is refused here.
                         if refuse_source(route, inbound, label, "tun", prove) {
@@ -811,7 +824,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 13] = [
+const SERVED_INBOUNDS: [&str; 14] = [
     "vless",
     "trojan",
     "vmess",
@@ -825,6 +838,7 @@ const SERVED_INBOUNDS: [&str; 13] = [
     "masque",
     "dokodemo-door",
     "hc",
+    "blackhole",
 ];
 
 /// Whether this protocol is an inbound this binary serves.
@@ -12521,6 +12535,57 @@ fn kcp_parts_metered(
     let closer = KcpIo::new(Arc::clone(conn));
     let close: KcpClose = Arc::new(move || closer.close());
     (reader, writer, close)
+}
+
+/// The sink as a listener: each accepted flow gets the same answer the outbound writes and the
+/// same drain, so the wire is the one the oracle proved.
+fn serve_blackhole_inbound(
+    address: &str,
+    inbound: &Json,
+    label: &str,
+    stop: Option<Arc<Stop>>,
+) -> bool {
+    let answer = match crate::blackhole::answer(inbound.get("settings")) {
+        Ok(answer) => Arc::new(answer),
+        Err(reason) => exit(&format!(
+            "bad config {label}: inbound {} {reason}",
+            inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
+        )),
+    };
+    let address = address.to_owned();
+    thread::spawn(move || {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
+            return;
+        }
+        let target = parse_target(&address)
+            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
+        let listener = Listener::bind(&target)
+            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            drop(listener);
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
+            return;
+        }
+        for stream in listener.incoming() {
+            if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+                break;
+            }
+            let Ok(stream) = stream else { continue };
+            no_delay(&stream);
+            let answer = Arc::clone(&answer);
+            thread::spawn(move || crate::blackhole::serve(stream, &answer));
+        }
+        drop(listener);
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
+    });
+    true
 }
 
 /// Leaf's healthcheck door: one exact request line and, for `POST`, one exact body answer a
@@ -67180,6 +67245,68 @@ end
         assert!(
             listener.accept().is_err(),
             "the sink dialled the destination it was asked for"
+        );
+    }
+
+    fn blackhole_inbound(protocol: &str, settings: &str) -> u16 {
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"{protocol}","listen":"127.0.0.1","port":{port}{settings}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let opened = serve_inbounds(
+            "test",
+            &root,
+            None,
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+            None,
+            None,
+        );
+        assert_eq!(opened, 1, "the blackhole inbound opens");
+        port
+    }
+
+    /// The sink's inbound role answers with the reference's bytes and ends the flow, under either
+    /// name, and the silent answer writes nothing.
+    #[test]
+    fn a_blackhole_inbound_serves_all_three_answers() {
+        let port = blackhole_inbound("blackhole", r#","settings":{"response":{"type":"http"}}"#);
+        let mut client = connect_until(port);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n")
+            .expect("writes");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-closes");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("closes");
+        assert_eq!(got, ferrox_core::blackhole::HTTP_403);
+        assert_eq!(got.len(), 101, "the inbound writes the oracle's answer");
+
+        let port = blackhole_inbound(
+            "block",
+            r#","settings":{"response":{"type":"custom","customResponseData":"QllF"}}"#,
+        );
+        let mut client = connect_until(port);
+        client.write_all(b"x").expect("writes");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-closes");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("closes");
+        assert_eq!(got, b"BYE");
+
+        let port = blackhole_inbound("blackhole", "");
+        let mut client = connect_until(port);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).expect("closes"),
+            0,
+            "nothing was written"
         );
     }
 
