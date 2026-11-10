@@ -62,7 +62,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ inputs.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
+          key: matrix-engines-${{ inputs.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py', 'scripts/run-aether.py') }}
       - name: build every engine without moving traffic
         shell: bash
         env:
@@ -106,7 +106,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ inputs.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
+          key: matrix-engines-${{ inputs.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py', 'scripts/run-aether.py') }}
       - name: allow the kernel WireGuard client to open a link
         if: runner.os == 'Linux' && contains(inputs.cells, 'wireguard-kernel')
         shell: bash
