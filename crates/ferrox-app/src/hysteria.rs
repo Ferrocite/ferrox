@@ -1971,6 +1971,9 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
         let Some(max) = conn.dgram_max_writable_len() else {
             break;
         };
+        let Ok(mut flow) = lane.flow.lock() else {
+            break;
+        };
         if let Ok(mut slot) = lane.source.lock() {
             *slot = Some(src);
         }
@@ -1978,17 +1981,16 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
             let id = next_id;
             next_id += 1;
             let address = dest.to_string();
-            if let Ok(mut slot) = lane.flow.lock() {
-                *slot = Some(Association {
-                    session_id: id,
-                    destination: dest,
-                });
-            }
+            *flow = Some(Association {
+                session_id: id,
+                destination: dest,
+            });
             if let Ok(mut reassembly) = lane.defrag.lock() {
                 *reassembly = Defrag::new();
             }
             relayed = Some((id, dest, address));
         }
+        drop(flow);
         let Some((session_id, _, address)) = &relayed else {
             continue;
         };
@@ -2044,7 +2046,6 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
                 continue;
             }
             let destination = association.destination;
-            drop(held);
             let mut assembled = Vec::new();
             let Some(payload) = lane.defrag.lock().ok().and_then(|mut reassembly| {
                 reassembly
@@ -2058,6 +2059,7 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
                 continue;
             };
+            drop(held);
             let (front, tail) =
                 crate::proxy::socks_udp_parts(&mut reply_head, &destination, payload);
             let _ = crate::proxy::send_to_two(relay, front, tail, src);
