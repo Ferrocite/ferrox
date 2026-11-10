@@ -27,3 +27,10 @@ jobs:
             && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether 2>&1 | tail -2)
           mv upstream/aether/aether/target/release/aether /tmp/aether
           /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -40
+      - name: Our register, by the devices host and by the legacy host
+        run: |
+          set -x
+          cargo build --locked --release -p ferrox-app
+          bin=target/release/ferrox-app
+          "$bin" warp-register --out /tmp/identity-devices.json 2>&1 | tail -6
+          "$bin" warp-register --api https://api.cloudflareclient.com/v0a4471 --out /tmp/identity-legacy.json 2>&1 | tail -6
