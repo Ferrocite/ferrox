@@ -79,6 +79,7 @@ impl Wire {
 pub(crate) struct H3Reader {
     wire: Wire,
     buf: Vec<u8>,
+    room: Vec<u8>,
     payload: Vec<u8>,
     at: usize,
     head: Option<Vec<u8>>,
@@ -99,6 +100,7 @@ impl H3Reader {
         Self {
             wire,
             buf: Vec::new(),
+            room: Vec::new(),
             payload: Vec::new(),
             at: 0,
             head: None,
@@ -160,6 +162,13 @@ impl H3Reader {
         Ok(self.head.take())
     }
 
+    /// Reserve the one read buffer only when a stream first needs it, so an idle stream carries no scratch room.
+    fn reserve_room(&mut self) {
+        if self.room.is_empty() {
+            self.room.resize(READ_ROOM, 0);
+        }
+    }
+
     /// Parse the frames already buffered, then take one datagram's worth when nothing completes.
     fn step(&mut self) -> std::io::Result<()> {
         loop {
@@ -192,14 +201,14 @@ impl H3Reader {
             if self.ended || self.head.is_some() {
                 return Ok(());
             }
-            let mut room = [0u8; READ_ROOM];
-            match self.wire.read(&mut room) {
+            self.reserve_room();
+            match self.wire.read(&mut self.room) {
                 Ok(0) => {
                     self.ended = true;
                     return Ok(());
                 }
                 Ok(n) => {
-                    self.buf.extend_from_slice(&room[..n]);
+                    self.buf.extend_from_slice(&self.room[..n]);
                     self.idle_since = None;
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
@@ -309,8 +318,8 @@ impl H3Reader {
                 self.frame_left -= take;
                 return Ok(());
             }
-            let mut room = [0u8; READ_ROOM];
-            match self.wire.read(&mut room) {
+            self.reserve_room();
+            match self.wire.read(&mut self.room) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -319,9 +328,9 @@ impl H3Reader {
                 }
                 Ok(n) => {
                     let take = n.min(self.frame_left);
-                    self.payload.extend_from_slice(&room[..take]);
+                    self.payload.extend_from_slice(&self.room[..take]);
                     if n > take {
-                        self.buf.extend_from_slice(&room[take..n]);
+                        self.buf.extend_from_slice(&self.room[take..n]);
                     }
                     self.frame_left -= take;
                     self.idle_since = None;
@@ -1284,6 +1293,37 @@ mod tests {
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("the answer reads");
         assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn a_read_reuses_one_scratch_buffer() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = dual_settings(XhttpMode::StreamUp);
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let (mut reader, writer) = dial(port, &settings, roots);
+        assert!(
+            reader.room.is_empty(),
+            "a fresh stream reserves no scratch room"
+        );
+        let payload: Vec<u8> = (0..96 * 1024).map(|byte| (byte % 251) as u8).collect();
+        assert!(writer.send(&payload));
+        writer.finish();
+        let mut got = Vec::new();
+        let mut first = [0u8; 1];
+        let n = reader.read(&mut first).expect("the first read");
+        got.extend_from_slice(&first[..n]);
+        assert_eq!(
+            reader.room.len(),
+            READ_ROOM,
+            "the first wire read allocates the scratch room"
+        );
+        let base = reader.room.as_ptr();
+        let capacity = reader.room.capacity();
+        reader.read_to_end(&mut got).expect("the answer reads");
+        assert_eq!(got, payload);
+        assert_eq!(reader.room.as_ptr(), base, "the same room is reused");
+        assert_eq!(reader.room.capacity(), capacity, "no reallocation");
     }
 
     #[test]
