@@ -8786,8 +8786,7 @@ fn accept_tls_session(
     server: &ferrox_core::tls::TlsServerConfig,
 ) -> Option<impl ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + Drivable>
 {
-    // A shaped listener peeks the client hello before it builds the engine, so the accept waits on
-    // the handshake clock; the relay quantum would refuse a hello that is merely late.
+    // A shaped listener peeks the hello before it builds the engine, so accept waits on the handshake clock.
     if stream.set_read_timeout(Some(budgets::handshake())).is_err() {
         return None;
     }
@@ -52612,7 +52611,7 @@ mod tests {
                 None,
             );
         });
-        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
             .set_read_timeout(Some(budgets::handshake()))
             .expect("timeout");
