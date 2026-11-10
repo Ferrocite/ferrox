@@ -688,7 +688,7 @@ unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout
 unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
 
 # --- tun device inbound -----------------------------------------------------
-front-tun-smoltcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh
 front-tun-smoltcp syscalls-per-tun-packet UNBLESSED no syscall checker yet
 front-tun-smoltcp user-space-copies-per-tun-packet UNBLESSED no copy checker yet
 front-tun-smoltcp time-tcp-down-1 ferrox=9.883Gbit/s,zeptun=17.937Gbit/s,ratio=0.55 tun-bench.yml
@@ -839,7 +839,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions 51892694 scripts/count-ops.sh
+dns-outbound ops-retired-instructions 51892686 scripts/count-ops.sh
 dns-outbound answer-cases-replayed 21 ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes
 dns-outbound parse-refusals-replayed 8 ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses
 dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap

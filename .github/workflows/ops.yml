@@ -56,7 +56,6 @@ jobs:
     steps:
       - name: provision the counting userspace from a fixed archive
         id: provision
-        continue-on-error: true
         run: |
           apt-get update -qq --snapshot 20261027T000000Z
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
