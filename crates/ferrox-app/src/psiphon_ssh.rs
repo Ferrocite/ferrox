@@ -301,6 +301,9 @@ pub(crate) struct Server {
     pub(crate) region: Option<String>,
     pub(crate) provider_id: Option<String>,
     pub(crate) fronting_provider_id: Option<String>,
+    /// Whether the protocol limit that selected this entry lets it take CDN
+    /// scan candidates; a bare limit keeps the advertised fronting host.
+    pub(crate) scan_cdn: bool,
     pub(crate) direct: bool,
     pub(crate) tls: bool,
     pub(crate) tls_port: Option<u16>,
