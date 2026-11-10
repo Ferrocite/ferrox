@@ -507,10 +507,15 @@ pub(crate) fn serve_xhttp(
     password: &str,
     method: &str,
     identities: &[(String, u32)],
-    path: &str,
+    settings: &crate::xhttp::XhttpSettings,
     freedom: bool,
 ) {
-    let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let Some((mut reader, writer)) =
+        crate::xhttp::accept_split_with_settings(read, stream, settings, None)
+    else {
         return;
     };
     let Some((uplink, response, recv, meter)) =
