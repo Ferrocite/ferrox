@@ -4321,12 +4321,7 @@ fn serve_shadowsocks(
             }
             Carrier::Xhttp { settings, .. } => {
                 crate::shadowsocks2022::serve_xhttp(
-                    stream,
-                    password,
-                    method,
-                    identities,
-                    settings.path.as_str(),
-                    freedom,
+                    stream, password, method, identities, settings, freedom,
                 );
             }
             Carrier::HttpHeader { path } => {
