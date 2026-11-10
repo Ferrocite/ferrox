@@ -21569,6 +21569,28 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     key: &[[u8; 56]],
     freedom: bool,
 ) {
+    let settings = settings.clone();
+    let key = key.to_vec();
+    let mut read = Some(read);
+    let mut write = Some(write);
+    lane_pool::submit_setup(
+        Box::new(move || {
+            let read = read.take().expect("one xhttp preface");
+            let write = write.take().expect("one xhttp preface");
+            serve_trojan_xhttp_carrier_now(read, write, &settings, &key, freedom);
+            Next::Done
+        }),
+        Box::new(|| {}),
+    );
+}
+
+fn serve_trojan_xhttp_carrier_now<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
     let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
         return;
     };
@@ -52465,14 +52487,67 @@ mod tests {
         assert_eq!(got, BULK);
     }
 
+    /// The xHTTP preface is a setup read: a relay lane that waits for it starves the client's
+    /// own lane, which is what an eight-flow cell does when every lane is held there.
+    #[test]
+    fn an_xhttp_preface_read_does_not_hold_a_relay_lane() {
+        struct Stalled(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Read for Stalled {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let (lock, wake) = &*self.0;
+                let mut open = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*open {
+                    open = wake
+                        .wait(open)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                Ok(0)
+            }
+        }
+        struct Null;
+        impl Write for Null {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl FrameWrite for Null {
+            fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
+                true
+            }
+        }
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let settings = xhttp_settings("/setup-lane");
+        let key = trojan_key("xhttp-setup-lane");
+        let mut read_gate = Some(Arc::clone(&gate));
+        lane_pool::submit(
+            Box::new(move || {
+                let gate = read_gate.take().expect("one xhttp preface");
+                serve_trojan_xhttp_carrier(Stalled(gate), Null, &settings, &[key], true);
+                done.send(()).expect("done");
+                Next::Done
+            }),
+            Box::new(|| {}),
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the relay lane returns before the preface is read");
+        let (lock, wake) = &*gate;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+    }
+
     /// The benchmark's download opens eight connections at once, and every one must finish: one
     /// flow can hide lane starvation that eight expose. Crossing the window is the single-flow
     /// test's claim; this one only has to see all eight relays get a turn.
     #[test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "eight h2 packet-up flows stall in the timer-parked Windows reactor; the live lane covers Windows h2"
-    )]
     #[allow(clippy::too_many_lines)]
     fn eight_packet_up_trojan_h2_downloads_complete() {
         const BULK: usize = 256 * 1024;
