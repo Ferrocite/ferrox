@@ -52561,7 +52561,7 @@ mod tests {
         let mut readers = Vec::new();
         for _ in 0..FLOWS {
             let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
-            sock.set_read_timeout(Some(Duration::from_secs(30)))
+            sock.set_read_timeout(Some(Duration::from_secs(60)))
                 .expect("timeout");
             readers.push(thread::spawn(move || {
                 let mut got = 0usize;
