@@ -4117,6 +4117,40 @@ mod tests {
     }
 
     #[test]
+    fn an_h1_request_offering_both_upgrades_opens_connect_ip_on_an_ip_path() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpStream;
+
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (_, served) = serve_h1("127.0.0.1:1");
+        let tcp = TcpStream::connect(("127.0.0.1", served)).expect("tcp");
+        tcp.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let config = TlsConfig {
+            server_name: "localhost".to_owned(),
+            alpn: Arc::from([b"http/1.1".to_vec()]),
+            insecure: true,
+            ..TlsConfig::default()
+        };
+        let mut tls = ferrox_core::tls::connect(&config, tcp).expect("tls");
+        tls.handshake().expect("handshake");
+        let request = format!(
+            "GET https://localhost:{served}/.well-known/masque/ip/*/*/ HTTP/1.1\r\nHost: localhost:{served}\r\nConnection: Upgrade\r\nUpgrade: connect-udp, connect-ip\r\nCapsule-Protocol: ?1\r\nAuthorization: Basic dUBleGFtcGxlLmNvbTpw\r\n\r\n"
+        );
+        tls.write_all(request.as_bytes()).expect("request");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tls.read_exact(&mut byte).expect("head");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).expect("text");
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(head.contains("Upgrade: connect-ip"), "{head}");
+    }
+
+    #[test]
     fn an_h1_connect_udp_tunnel_refuses_a_wrong_bearer_with_a_proxy_challenge() {
         let (_, head) = connect_udp_h1("127.0.0.1", 9, "wrong");
         assert!(head.starts_with("HTTP/1.1 401"), "{head}");

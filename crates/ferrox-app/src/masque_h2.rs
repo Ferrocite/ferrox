@@ -1188,7 +1188,10 @@ impl Session {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
             }
             h2::T_HEADERS => {
-                if self.request.is_some() {
+                if let Some(active) = self.request {
+                    if id != active {
+                        wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
+                    }
                     return;
                 }
                 let block = strip_padding(flags, body, true);
@@ -2729,6 +2732,27 @@ mod tests {
         datagram(b"hello", &mut capsule);
         write_frame(&mut *stream, h2::T_DATA, 0, 1, &capsule);
         assert_eq!(read_udp_echo(&mut stream), b"hello");
+    }
+
+    #[test]
+    fn a_second_h2_connect_udp_stream_is_refused_rather_than_left_waiting() {
+        let address = echo_once();
+        let (mut stream, fields) = open_connect_udp("127.0.0.1", address.port(), "p", false);
+        assert_eq!(status(&fields), Some("200"));
+        write_frame(&mut *stream, h2::T_HEADERS, h2::F_END_HEADERS, 3, &[]);
+        loop {
+            let (kind, flags, id, body) = read_frame(&mut *stream);
+            if kind == h2::T_SETTINGS {
+                if flags & h2::F_ACK == 0 {
+                    write_frame(&mut *stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]);
+                }
+                continue;
+            }
+            if kind == h2::T_RST && id == 3 {
+                assert_eq!(body, 7u32.to_be_bytes(), "REFUSED_STREAM");
+                return;
+            }
+        }
     }
 
     #[test]

@@ -459,8 +459,10 @@ pub(crate) fn serve(
     let target = fields.next().unwrap_or_default();
     let version = fields.next().unwrap_or_default();
     let path = target_path(target);
-    let udp = header_has(text, "upgrade", "connect-udp");
-    let ip = header_has(text, "upgrade", "connect-ip");
+    let udp_path = masque::udp_target(path.as_bytes());
+    let udp = header_has(text, "upgrade", "connect-udp")
+        && (udp_path.is_some() || !header_has(text, "upgrade", "connect-ip"));
+    let ip = !udp && header_has(text, "upgrade", "connect-ip");
     if version != "HTTP/1.1" || method != "GET" {
         wire.send(&refusal(400));
         return;
@@ -474,7 +476,7 @@ pub(crate) fn serve(
         return;
     }
     let target = if udp {
-        let Some(target) = masque::udp_target(path.as_bytes()) else {
+        let Some(target) = udp_path else {
             wire.send(&refusal_proxy(400));
             return;
         };
