@@ -1172,6 +1172,43 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// The `warp-register` command: parse the flags, register once, print the outbound.
+pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage: fn() -> !) {
+    let mut identity = String::from("warp-identity.json");
+    let mut mode = String::from("auto");
+    let mut api = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-o" | "--out" | "--identity" => {
+                identity = match args.next() {
+                    Some(v) => v,
+                    None => usage(),
+                };
+            }
+            "--mode" => {
+                mode = match args.next() {
+                    Some(v) => v,
+                    None => usage(),
+                };
+            }
+            "--api" => {
+                api = Some(match args.next() {
+                    Some(v) => v,
+                    None => usage(),
+                });
+            }
+            _ => usage(),
+        }
+    }
+    match one_tap(&identity, &mode, api.as_deref()) {
+        Ok(text) => println!("{text}"),
+        Err(reason) => {
+            eprintln!("warp-register: {reason}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,42 +1471,5 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "the identity is owner-only");
         }
         std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
-/// The `warp-register` command: parse the flags, register once, print the outbound.
-pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage: fn() -> !) {
-    let mut identity = String::from("warp-identity.json");
-    let mut mode = String::from("auto");
-    let mut api = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-o" | "--out" | "--identity" => {
-                identity = match args.next() {
-                    Some(v) => v,
-                    None => usage(),
-                };
-            }
-            "--mode" => {
-                mode = match args.next() {
-                    Some(v) => v,
-                    None => usage(),
-                }
-            }
-            "--api" => {
-                api = Some(match args.next() {
-                    Some(v) => v,
-                    None => usage(),
-                })
-            }
-            _ => usage(),
-        }
-    }
-    match one_tap(&identity, &mode, api.as_deref()) {
-        Ok(text) => println!("{text}"),
-        Err(reason) => {
-            eprintln!("warp-register: {reason}");
-            std::process::exit(1);
-        }
     }
 }
