@@ -21555,7 +21555,10 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     relay_sink_ws(creader, &cwriter, &uplink);
 }
 
-fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_session_trojan_xhttp<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -21573,7 +21576,10 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
 
 /// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
 /// session every TLS xhttp client has always reached.
-fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_trojan_xhttp_carrier<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -21600,7 +21606,10 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     );
 }
 
-fn serve_trojan_xhttp_carrier_now<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_trojan_xhttp_carrier_now<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -52635,6 +52644,9 @@ mod tests {
                 }
                 Ok(0)
             }
+        }
+        impl RelayPoll for Stalled {
+            fn arm_relay_poll(&mut self) {}
         }
         struct Null;
         impl Write for Null {

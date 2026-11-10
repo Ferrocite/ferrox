@@ -2699,7 +2699,7 @@ fn check_request(head: &[u8], path: &str) -> Option<()> {
 
 // The same accept over halves that cannot peek: pipelined bytes arrive as a prefix. One connection serves requests until a session takes it or a request ends it, so a packet-up uplink does not pay a new connection per POST.
 pub(crate) fn accept_split_with_settings<
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 >(
     read: R,
@@ -2714,6 +2714,8 @@ pub(crate) fn accept_split_with_settings<
             crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
         // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
         let prefix = head.split_off(at);
+        // The session lands in a boxed window whose own arm is a no-op, so the socket gets its poll quantum here, once the head is in.
+        crate::proxy::RelayPoll::arm_relay_poll(&mut read);
         match accept_core(&head, prefix, Upload::Read(read), write, settings, None, fd) {
             Served::Session(reader, writer) => return Some((reader, writer)),
             Served::Again(next, next_write, carry) => {
@@ -5607,6 +5609,46 @@ mod tests {
         reader.read_exact(&mut buf).expect("reads the downlink");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// A plaintext session's upload lane must park on a poll quantum: the boxed window cannot arm the socket itself, and an unarmed read holds its worker for as long as the peer keeps the body open, which is the whole download.
+    #[test]
+    fn a_plaintext_session_upload_parks_instead_of_holding_its_worker() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one"}}}"#,
+        );
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let Ok(read) = stream.try_clone() else {
+                return;
+            };
+            let Some((mut reader, _writer)) =
+                accept_split_with_settings(read, stream, &settings, None)
+            else {
+                return;
+            };
+            let mut buf = [0u8; 16];
+            let _step = crate::proxy::RelayStep::enter();
+            let parked = match reader.read(&mut buf) {
+                Ok(_) => false,
+                Err(error) => crate::proxy::is_timeout(&error),
+            };
+            tx.send(parked).expect("sends");
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let head = format!(
+            "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        );
+        client.write_all(head.as_bytes()).expect("head");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the upload lane parked instead of blocking its worker"),
+            "the session's socket carries no poll quantum"
+        );
     }
 
     /// The relaxation is only for a mode nobody stated: a `packet-up` hub still refuses a session-less POST, so the knobs demonstrably reach the accept path.
