@@ -289,6 +289,10 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
             }
             pairs
         }
+        "xray.proxy.loopback.Config" => vec![
+            ("protocol", Json::Str("loopback".to_owned())),
+            ("settings", loopback_settings(value)?),
+        ],
         "xray.proxy.wireguard.DeviceConfig" => vec![
             ("protocol", Json::Str("wireguard".to_owned())),
             ("settings", wireguard_settings(value)?),
@@ -628,6 +632,27 @@ fn text(reader: &mut Reader<'_>, what: &str) -> Result<String, String> {
     std::str::from_utf8(reader.bytes()?)
         .map(str::to_owned)
         .map_err(|_| format!("wireguard {what} is not utf-8"))
+}
+
+/// `xray.proxy.loopback.Config`: the tag the second pass re-injects under, and the
+/// outbound's own sniffing. Both fields are optional and empty is the zero value; a
+/// routed second pass carries the empty tag.
+fn loopback_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.loopback.Config");
+    let mut inbound_tag = String::new();
+    let mut sniffing = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => inbound_tag = account_text(&mut reader)?,
+            (2, 2) => sniffing = Some(sniffing_settings(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![("inboundTag", Json::Str(inbound_tag))];
+    if let Some(sniffing) = sniffing {
+        pairs.push(("sniffing", sniffing));
+    }
+    Ok(object(pairs))
 }
 
 fn sniffing_settings(bytes: &[u8]) -> Result<Json, String> {
@@ -4480,6 +4505,17 @@ mod tests {
         )
     }
 
+    fn loopback_outbound(tag: &[u8], sniffing: Option<&[u8]>) -> Vec<u8> {
+        let mut settings = vec![bytes_field(1, tag)];
+        if let Some(sniffing) = sniffing {
+            settings.push(bytes_field(2, sniffing));
+        }
+        message(&[
+            bytes_field(1, b"again"),
+            bytes_field(3, &typed("xray.proxy.loopback.Config", &message(&settings))),
+        ])
+    }
+
     fn receiver_range(from: u64, to: u64, listen: Option<&[u8]>) -> Vec<u8> {
         let range = message(&[varint_field(1, from), varint_field(2, to)]);
         let mut fields = vec![bytes_field(1, &bytes_field(1, &range))];
@@ -4544,6 +4580,35 @@ mod tests {
         assert_eq!(
             outbounds[0].get("protocol").and_then(Json::as_str),
             Some("freedom")
+        );
+    }
+
+    #[test]
+    fn the_loopback_outbound_decodes_to_the_json_this_tree_serves() {
+        let sniffing = message(&[varint_field(1, 1), bytes_field(2, b"tls")]);
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, Some(&[127, 0, 0, 1])), &[]),
+            &loopback_outbound(b"target-in", Some(&sniffing)),
+        ))
+        .expect("the loopback shape decodes");
+        let outbounds = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds");
+        assert_eq!(
+            outbounds[0].get("protocol").and_then(Json::as_str),
+            Some("loopback")
+        );
+        let settings = outbounds[0].get("settings").expect("settings");
+        assert_eq!(
+            settings.get("inboundTag").and_then(Json::as_str),
+            Some("target-in")
+        );
+        let sniffing = settings.get("sniffing").expect("sniffing");
+        assert_eq!(sniffing.get("enabled"), Some(&Json::Bool(true)));
+        assert_eq!(
+            sniffing.get("destOverride"),
+            Some(&Json::Arr(vec![Json::Str("tls".to_owned())]))
         );
     }
 

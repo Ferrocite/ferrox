@@ -1355,6 +1355,11 @@ impl Routing {
         self.route_target_with(flow, &resolve_ips)
     }
 
+    /// The first matching rule with no name resolution, as a loopback's `SkipDNSResolve` reads it.
+    pub(crate) fn route_target_without_resolve(&self, flow: &Flow) -> Option<RuleHit<'_>> {
+        self.route_target_with(flow, &|_, _| Vec::new())
+    }
+
     /// The earliest rule any of a tested context's address choices reaches: xray reads each address
     /// list as any-of, where a live flow carries one address per role.
     pub(crate) fn probe_rule(&self, probe: &Probe<'_>) -> Option<RuleHit<'_>> {
@@ -4436,6 +4441,55 @@ mod tests {
         });
         assert_eq!(tag, Some("domain"));
         assert_eq!(lookups.get(), 0);
+    }
+
+    #[test]
+    fn a_skip_dns_route_does_not_resolve_a_name() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("domainStrategy", text("IPIfNonMatch")),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "address",
+                        vec![("ip", array(vec![text("192.0.2.0/24")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("echo.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(
+            routing
+                .route_target_without_resolve(&flow)
+                .map(|hit| hit.tag()),
+            None
+        );
+        let lookups = std::cell::Cell::new(0);
+        let tag = routing.route_with(&flow, &|_, _| {
+            lookups.set(lookups.get() + 1);
+            vec!["192.0.2.1".parse().expect("ip")]
+        });
+        assert_eq!(tag, Some("address"));
+        assert_eq!(lookups.get(), 1);
     }
 
     #[test]
