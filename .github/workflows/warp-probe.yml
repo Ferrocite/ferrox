@@ -25,5 +25,5 @@ jobs:
           tar -xzf upstream/aether/../aether.tgz --strip-components=1 -C upstream/aether
           (cd upstream/aether/aether \
             && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether 2>&1 | tail -2)
-          mv upstream/aether/target/release/aether /tmp/aether
+          mv upstream/aether/aether/target/release/aether /tmp/aether
           /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -40
