@@ -37141,6 +37141,10 @@ fn b64url(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The eight-flow cells each need the whole test pool; running two at once measures the
+    /// harness's parallelism, not the lane scheduler.
+    static EIGHT_FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_tun_field_with_the_wrong_type_is_refused() {
         for config in [
@@ -43640,6 +43644,9 @@ mod tests {
     /// flow stopped at the same frame. The payload is large enough to fill both send buffers.
     #[test]
     fn eight_downloads_finish_over_each_grpc_carrier() {
+        let _eight = EIGHT_FLOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let payload = vec![0x5au8; 4 * 1024 * 1024];
         for carry in [GrpcCarry::Plain, GrpcCarry::Tls, GrpcCarry::Reality] {
             grpc_multi_leg(carry, &payload, 8);
@@ -52450,9 +52457,13 @@ mod tests {
     /// flow can hide lane starvation that eight expose. Crossing the window is the single-flow
     /// test's claim; this one only has to see all eight relays get a turn.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn eight_packet_up_trojan_h2_downloads_complete() {
         const BULK: usize = 256 * 1024;
         const FLOWS: usize = 8;
+        let _eight = EIGHT_FLOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (server_config, mut client_config) = carried_tls_configs();
         let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
             alpn: vec![b"h2".to_vec()],
@@ -57334,6 +57345,9 @@ mod tests {
     #[test]
     fn eight_live_carried_sessions_share_one_pool() {
         const SESSIONS: usize = 8;
+        let _eight = EIGHT_FLOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
