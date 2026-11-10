@@ -244,11 +244,11 @@ impl Against {
         self.own_mib_s < self.other_mib_s
     }
 
-    /// The cell cannot price the comparison: this engine alone is already at the harness's own
-    /// generator bound of the one-hop ceiling, so the runner, not the engine, was the limit.
+    /// The cell cannot price the comparison: this engine alone already reaches the cell's one-hop
+    /// ceiling, so the runner's own generator, not the engine, was the limit.
     pub fn runner_bound(&self) -> bool {
         self.ceiling
-            .is_some_and(|ceiling| ceiling > 0.0 && self.own_mib_s >= HARNESS_BOUND * ceiling)
+            .is_some_and(|ceiling| ceiling > 0.0 && self.own_mib_s >= ceiling)
     }
 
     pub fn at_target(&self) -> bool {
@@ -309,10 +309,9 @@ impl Against {
             (
                 true,
                 format!(
-                    "{label}: below the comparator, {evidence}{ceiling}; this engine alone is at \
-                     the harness's {:.0}% generator bound of that ceiling, so the cell cannot \
-                     price the comparison",
-                    HARNESS_BOUND * 100.0
+                    "{label}: below the comparator, {evidence}{ceiling}; this engine alone \
+                     reaches that one-hop ceiling, so the runner was the limit and the cell \
+                     cannot price the comparison"
                 ),
             )
         } else if self.at_target() {
@@ -1126,11 +1125,11 @@ mod tests {
     }
 
     #[test]
-    fn a_never_below_row_at_the_generator_bound_reports_instead_of_failing() {
+    fn a_never_below_row_at_the_one_hop_ceiling_reports_instead_of_failing() {
         let gate = gate_rows(&[Row::never_below(
             "throughput (ferrox vs zeronet)",
-            Some(interval(0.80, 0.84, 0.88)),
-            1450.0,
+            Some(interval(0.90, 0.96, 0.99)),
+            1650.0,
             1707.0,
             Some(1650.0),
         )]);
@@ -1141,7 +1140,7 @@ mod tests {
             gate.lines
         );
         assert!(
-            gate.lines[0].contains("generator bound"),
+            gate.lines[0].contains("reaches that one-hop ceiling"),
             "{:?}",
             gate.lines
         );

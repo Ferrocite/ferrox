@@ -1028,8 +1028,8 @@ impl Comparison {
              never below that comparator's median, because beating the reference while \
              losing the cell to a peer is still losing the cell. A cell where its whole \
              interval is under that median fails, unless the engine alone already sits at the \
-             harness's {:.0}% generator bound of the cell's one-hop ceiling — then the runner \
-             was the limit and the row reports instead — one whose interval reaches 1.0x\n\
+             cell's one-hop ceiling — then the runner was the limit and the row reports \
+             instead — one whose interval reaches 1.0x\n\
              reports that this run cannot resolve it, and a median above the floor but under \
              the {:.1}x target is published as a warning.\n",
             stats::BOOTSTRAP_RESAMPLES,
@@ -1040,7 +1040,6 @@ impl Comparison {
             parity::cpu_resolution_floor_millis(),
             stats::TOLERANCE * 100.0,
             stats::min_pricable_cpu_millis(),
-            stats::HARNESS_BOUND * 100.0,
             stats::TARGET_RATIO,
         );
         for line in &gate.lines {
