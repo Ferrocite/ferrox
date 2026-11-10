@@ -193,6 +193,8 @@ carrier-httpupgrade user-space-copies-per-byte-relayed 1 ferrox-app-httpupgrade:
 carrier-httpupgrade writes-per-upgraded-dial-with-a-payload 2 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
 carrier-httpupgrade writes-per-upgraded-dial-without-a-payload 1 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
 carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tests::the_request_buffer_holds_its_capacity_over_a_dial_cycle
+carrier-httpupgrade host-check-allocations-per-served-connection 0 ferrox-app-httpupgrade::tests::the_host_check_allocates_nothing
+carrier-httpupgrade accept-answer-allocations-per-served-connection 0 ferrox-app-httpupgrade::tests::a_keyed_answer_is_written_without_an_allocation
 carrier-httpupgrade round-trips-per-upgraded-dial 1 ferrox-app-httpupgrade::tests::a_payload_waits_for_a_switch_that_dropped_what_rode_behind_it
 carrier-httpupgrade head-reads-per-window 1 ferrox-app-httpupgrade::tests::a_head_costs_one_read_per_window
 carrier-httpupgrade head-tail-allocations 0 ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled
