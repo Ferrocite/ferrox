@@ -4351,7 +4351,7 @@ fn serve_shadowsocks(
             crate::shadowsocks::serve_grpc_with(stream, users, settings, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::shadowsocks::serve_xhttp(stream, users, settings.path.as_str(), freedom);
+            crate::shadowsocks::serve_xhttp(stream, users, settings, freedom);
         }
         Carrier::HttpHeader { path } => {
             crate::shadowsocks::serve_httpheader(stream, users, path.as_str(), freedom);
@@ -53295,7 +53295,7 @@ mod tests {
             Carrier::Xhttp {
                 settings: xhttp_settings("/ss-xhttp"),
             },
-            ss_serve(crate::shadowsocks::serve_xhttp),
+            ss_serve(crate::shadowsocks::serve_xhttp_legacy),
             "/ss-xhttp",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -72821,7 +72821,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 crate::vmess::serve_ws(stream, path.as_str(), &users, freedom);
             }
             Carrier::Xhttp { settings, .. } => {
-                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &users, freedom);
+                crate::vmess::serve_xhttp_settings(stream, &settings, &users, freedom);
             }
             Carrier::HttpHeader { path } => {
                 crate::vmess::serve_httpheader(stream, path.as_str(), &users, freedom);
