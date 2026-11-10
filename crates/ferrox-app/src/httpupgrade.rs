@@ -154,7 +154,7 @@ pub(crate) fn accept(stream: Connection, path: &str, host: &str) -> Option<(UpRe
     if key.is_empty() {
         write.write_all(SWITCH).ok()?;
     } else {
-        write.write_all(&switch_answer(key)).ok()?;
+        write_switch_answer(&mut write, key)?;
     }
     Some((
         UpReader {
@@ -166,21 +166,28 @@ pub(crate) fn accept(stream: Connection, path: &str, host: &str) -> Option<(UpRe
     ))
 }
 
-/// The answer the reference derives: the key it was given, hashed with the WebSocket GUID, answers the accept header.
-fn switch_answer(key: &str) -> Vec<u8> {
+/// The answer the reference derives: the key it was given, hashed with the WebSocket GUID, answers the accept header. It is built in a fixed window, so a keyed accept enters no allocator.
+fn write_switch_answer<W: Write>(write: &mut W, key: &str) -> Option<()> {
     const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    const HEAD: &[u8] =
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-Websocket-Accept: ";
+    const TAIL: &[u8] = b"\r\nUpgrade: websocket\r\n\r\n";
+    const ACCEPT: usize = 28;
     use sha1::Digest as _;
     let mut hash = sha1::Sha1::new();
     hash.update(key.as_bytes());
     hash.update(GUID.as_bytes());
-    let accept = ferrox_core::b64::encode(&hash.finalize());
-    let mut answer = Vec::with_capacity(SWITCH.len() + accept.len() + 64);
-    answer.extend_from_slice(
-        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-Websocket-Accept: ",
-    );
-    answer.extend_from_slice(accept.as_bytes());
-    answer.extend_from_slice(b"\r\nUpgrade: websocket\r\n\r\n");
-    answer
+    let digest = hash.finalize();
+    let mut answer = [0u8; HEAD.len() + ACCEPT + TAIL.len()];
+    answer[..HEAD.len()].copy_from_slice(HEAD);
+    let written = ferrox_core::b64::encode_parts_into(
+        &[&digest],
+        &mut answer[HEAD.len()..HEAD.len() + ACCEPT],
+    )
+    .ok()?;
+    debug_assert_eq!(written, ACCEPT);
+    answer[HEAD.len() + ACCEPT..].copy_from_slice(TAIL);
+    write.write_all(&answer).ok()
 }
 
 /// The path the reference compares: the query is stripped and every percent escape is decoded.
@@ -265,12 +272,10 @@ fn check_request<'a>(head: &'a [u8], path: &str, host: &str) -> Option<&'a str> 
 
 /// `internet.IsValidHTTPHost`: the request's host, without a port, compared case-insensitively to the configured host.
 fn valid_http_host(request: &str, config: &str) -> bool {
-    let request = request.to_ascii_lowercase();
-    let config = config.to_ascii_lowercase();
     if request.contains(':') {
-        split_host_port(&request).is_some_and(|host| host == config)
+        split_host_port(request).is_some_and(|host| host.eq_ignore_ascii_case(config))
     } else {
-        request == config
+        request.eq_ignore_ascii_case(config)
     }
 }
 
@@ -299,7 +304,7 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     if key.is_empty() {
         write.write_all(SWITCH).ok()?;
     } else {
-        write.write_all(&switch_answer(key)).ok()?;
+        write_switch_answer(&mut write, key)?;
     }
     Some((
         UpReader {
@@ -765,6 +770,29 @@ mod tests {
             check_request(b"\xff\xfe", "/tunnel", "").is_none(),
             "invalid UTF-8"
         );
+    }
+
+    /// The reference lower-cases both hosts into fresh strings; this compares them in place, so a served connection enters no allocator to answer the host check.
+    #[test]
+    fn the_host_check_allocates_nothing() {
+        let head = b"GET /tunnel HTTP/1.1\r\nHost: ORACLE.Example:443\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let (key, counts) =
+            ferrox_core::alloc_count::measure(|| check_request(head, "/tunnel", "oracle.example"));
+        assert_eq!(key, Some(""), "the mixed-case host still matches");
+        assert_eq!(counts.allocs, 0, "the host compare copied a string");
+    }
+
+    /// A keyed accept is hashed in place, coded into the fixed window and written once: the `Vec` and the base64 `String` are gone.
+    #[test]
+    fn a_keyed_answer_is_written_without_an_allocation() {
+        let mut buffer = [0u8; 256];
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let mut window = &mut buffer[..];
+            write_switch_answer(&mut window, "dGhlIHNhbXBsZSBub25jZQ==").expect("answers");
+        });
+        assert_eq!(counts.allocs, 0, "the answer staged a buffer");
+        let answer = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-Websocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(&buffer[..answer.len()], answer);
     }
 
     /// Status and both upgrade headers fall out of one scan; the reason phrase is free text, the digits are not.
