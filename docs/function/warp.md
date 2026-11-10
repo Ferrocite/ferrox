@@ -57,3 +57,14 @@ graph TD
 
 No local duration is quoted: every contributor dials through a VPN, so a local race measures the tunnel.
 The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP-vs-Aether comparison is the benchmark matrix's WARP rows.
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The dial-side of the row is this page's own unit races, and the throughput comparison is the matrix's WARP rows (`warp-masque-*`): ferrox's warp outbound against Aether in the same cell, which runs only in CI because everything beyond loopback is.
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/warp.rs
+- symbols: find_warp_outbound
+- scenarios: warp-masque
+- engines: xray-core, aether
+<!-- scope:end -->

@@ -1219,7 +1219,7 @@ mod tests {
             (
                 "endpoint",
                 obj_pairs(vec![
-                    ("v4", string("162.159.192.1:0")),
+                    ("v4", string("192.0.2.1:0")),
                     (
                         "ports",
                         crate::json::Json::Arr(vec![
@@ -1305,7 +1305,7 @@ mod tests {
         assert_eq!(identity.wireguard.reserved, [9, 8, 7]);
         assert_eq!(
             identity.wireguard.endpoint,
-            "162.159.192.1:2408".parse().expect("an endpoint")
+            "192.0.2.1:2408".parse().expect("an endpoint")
         );
         assert_eq!(identity.wireguard.addresses.len(), 2);
         assert!(identity.masque.is_some());
@@ -1320,7 +1320,7 @@ mod tests {
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
                 peer: [8u8; 32],
-                endpoint: "162.159.192.1:2408".parse().expect("an endpoint"),
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
                 addresses: vec![
                     "172.16.0.2".parse().expect("a v4 address"),
                     "2606:4700:110:8a1b::2".parse().expect("a v6 address"),
@@ -1445,7 +1445,7 @@ mod tests {
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
                 peer: [8u8; 32],
-                endpoint: "162.159.192.1:2408".parse().expect("an endpoint"),
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
                 addresses: vec!["172.16.0.2".parse().expect("a v4 address")],
                 reserved: [1, 2, 3],
             },
