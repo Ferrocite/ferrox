@@ -17802,6 +17802,8 @@ fn xhttp_pair(
     if settings.h2c {
         // Prior-knowledge h2c: one cleartext listener answers both spellings, and this dial picks the framing.
         let read = uplink.try_clone().ok()?;
+        // The h2 reader pumps frames on a relay lane, so its transport yields on the same poll as the TLS one.
+        let _ = read.set_read_timeout(Some(RELAY_POLL));
         let raw = Arc::new(uplink.try_clone().ok()?);
         let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
             crate::xhttp_h2::connect_split(read, uplink, raw, host, settings, "http")
@@ -44407,6 +44409,36 @@ mod tests {
                 .any(|path| path == &witness),
             "an h2c dial must open with the H2 preface"
         );
+    }
+
+    /// An h2c downlink read parks on the transport's clock: a peer that sends no frame hands the
+    /// relay lane back instead of pinning it in a blocking socket read.
+    #[test]
+    fn an_h2c_downlink_read_yields_the_relay_lane() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            h2c: true,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        });
+        let uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (mut reader, _writer) = xhttp_pair(uplink, "127.0.0.1", &settings).expect("pair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _step = RelayStep::enter();
+            let _ = tx.send(reader.read_window().is_err());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("an idle h2c downlink must yield its lane"),
+            "an idle h2c downlink must time out, not block"
+        );
+        peer.join().ok();
     }
 
     fn xhttp_vless_header(echo_port: u16) -> Vec<u8> {
