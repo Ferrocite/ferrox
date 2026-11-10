@@ -439,8 +439,9 @@ struct Registered {
 fn parse_registration(reply: &Reply) -> Result<Registered, RegisterError> {
     if !(200..300).contains(&reply.status) {
         return Err(RegisterError::retryable(format!(
-            "the WARP service answered {}",
-            reply.status
+            "the WARP service answered {}: {}",
+            reply.status,
+            reply_snippet(&reply.body)
         )));
     }
     let root = crate::json::parse(&String::from_utf8_lossy(&reply.body))
@@ -540,8 +541,9 @@ fn reply_addresses(config: &crate::json::Json) -> Vec<IpAddr> {
 fn parse_masque_server(reply: &Reply) -> Result<Vec<u8>, RegisterError> {
     if !(200..300).contains(&reply.status) {
         return Err(RegisterError::fatal(format!(
-            "the WARP key enrollment answered {}",
-            reply.status
+            "the WARP key enrollment answered {}: {}",
+            reply.status,
+            reply_snippet(&reply.body)
         )));
     }
     let root = crate::json::parse(&String::from_utf8_lossy(&reply.body))
@@ -566,6 +568,18 @@ fn parse_masque_server(reply: &Reply) -> Result<Vec<u8>, RegisterError> {
         ));
     }
     Ok(der)
+}
+
+/// The reply's head, one line, for a runner's console: a WARP refusal that only
+/// names a status cannot be acted on.
+fn reply_snippet(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(&body[..body.len().min(160)]);
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        "empty".to_owned()
+    } else {
+        line
+    }
 }
 
 /// The P-256 algorithm identifier inside a `SubjectPublicKeyInfo`.
