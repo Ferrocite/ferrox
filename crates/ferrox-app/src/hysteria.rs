@@ -2024,9 +2024,34 @@ fn recv_one<T>(shared: &Mutex<T>, next: impl FnOnce(&mut T) -> Option<Vec<u8>>) 
     next(&mut guard)
 }
 
+/// Take the whole datagram `message` completes for the association it names, under the flow lock, so a rotation cannot move an old reply onto a new source; the caller sends after the lock is released.
+fn take_reply<'a>(
+    lane: &Lane,
+    message: &UdpMessage<'a>,
+    assembled: &'a mut Vec<u8>,
+) -> Option<(SocketAddr, SocketAddr, &'a [u8])> {
+    let held = lane.flow.lock().ok()?;
+    let association = held.as_ref()?;
+    if message.session != association.session_id {
+        return None;
+    }
+    let destination = association.destination;
+    let payload = lane
+        .defrag
+        .lock()
+        .ok()?
+        .feed(message, assembled)
+        .ok()
+        .flatten()
+        .map(|(_address, payload)| payload)?;
+    let src = lane.source.lock().ok().and_then(|slot| *slot)?;
+    Some((destination, src, payload))
+}
+
 /// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
     let mut reply_head = Vec::with_capacity(22);
+    let mut assembled = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
             break;
@@ -2036,30 +2061,10 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Ok(message) = hysteria::decode_udp(&data) else {
                 continue;
             };
-            let Ok(held) = lane.flow.lock() else {
-                break;
-            };
-            let Some(association) = held.as_ref() else {
+            let Some((destination, src, payload)) = take_reply(lane, &message, &mut assembled)
+            else {
                 continue;
             };
-            if message.session != association.session_id {
-                continue;
-            }
-            let destination = association.destination;
-            let mut assembled = Vec::new();
-            let Some(payload) = lane.defrag.lock().ok().and_then(|mut reassembly| {
-                reassembly
-                    .feed(&message, &mut assembled)
-                    .ok()
-                    .flatten()
-                    .map(|(_address, payload)| payload)
-            }) else {
-                continue;
-            };
-            let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
-                continue;
-            };
-            drop(held);
             let (front, tail) =
                 crate::proxy::socks_udp_parts(&mut reply_head, &destination, payload);
             let _ = crate::proxy::send_to_two(relay, front, tail, src);
@@ -3452,6 +3457,127 @@ mod tests {
             left += 1;
         }
         assert_eq!(left, 0, "a turn left {left} queued datagrams unread");
+    }
+
+    fn lane_with(association: Association, source: SocketAddr) -> Lane {
+        Lane {
+            flow: Mutex::new(Some(association)),
+            defrag: Mutex::new(Defrag::new()),
+            source: Mutex::new(Some(source)),
+        }
+    }
+
+    fn message<'a>(session: u32, packet: u16, frag: u8, payload: &'a [u8]) -> UdpMessage<'a> {
+        UdpMessage {
+            session,
+            packet,
+            frag,
+            frags: 2,
+            address: "a",
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_reply_keeps_the_association_it_selected() {
+        let old = Association {
+            session_id: 7,
+            destination: "127.0.0.1:7001".parse().expect("addr"),
+        };
+        let source = "127.0.0.1:5001".parse().expect("addr");
+        let lane = lane_with(
+            Association {
+                session_id: 7,
+                destination: old.destination,
+            },
+            source,
+        );
+        let mut assembled = Vec::new();
+        let first = UdpMessage {
+            session: 7,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            address: "a",
+            payload: b"one",
+        };
+        let (destination, src, payload) =
+            take_reply(&lane, &first, &mut assembled).expect("old reply");
+        assert_eq!(destination, old.destination);
+        assert_eq!(src, source);
+        assert_eq!(payload, b"one".as_slice());
+        {
+            let mut flow = lane.flow.lock().expect("flow");
+            *flow = Some(Association {
+                session_id: 8,
+                destination: "127.0.0.1:7002".parse().expect("addr"),
+            });
+            *lane.source.lock().expect("source") = Some("127.0.0.1:5002".parse().expect("addr"));
+            *lane.defrag.lock().expect("defrag") = Defrag::new();
+        }
+        assert!(
+            take_reply(&lane, &first, &mut assembled).is_none(),
+            "a retired session's reply is dropped"
+        );
+    }
+
+    #[test]
+    fn a_rotation_before_the_reply_drops_the_retired_session() {
+        let destination = "127.0.0.1:7002".parse().expect("addr");
+        let source = "127.0.0.1:5002".parse().expect("addr");
+        let lane = lane_with(
+            Association {
+                session_id: 8,
+                destination,
+            },
+            source,
+        );
+        let mut assembled = Vec::new();
+        let retired = UdpMessage {
+            session: 7,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            address: "a",
+            payload: b"old",
+        };
+        assert!(take_reply(&lane, &retired, &mut assembled).is_none());
+        let fresh = UdpMessage {
+            session: 8,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            address: "a",
+            payload: b"new",
+        };
+        let (seen, src, payload) = take_reply(&lane, &fresh, &mut assembled).expect("new reply");
+        assert_eq!(seen, destination);
+        assert_eq!(src, source);
+        assert_eq!(payload, b"new".as_slice());
+    }
+
+    #[test]
+    fn a_retired_session_cannot_feed_the_new_reassembly() {
+        let lane = lane_with(
+            Association {
+                session_id: 8,
+                destination: "127.0.0.1:7002".parse().expect("addr"),
+            },
+            "127.0.0.1:5002".parse().expect("addr"),
+        );
+        let mut assembled = Vec::new();
+        let old_head = message(7, 1, 0, b"old");
+        assert!(take_reply(&lane, &old_head, &mut assembled).is_none());
+        let old_tail = message(7, 1, 1, b"tail");
+        assert!(
+            take_reply(&lane, &old_tail, &mut assembled).is_none(),
+            "a retired fragment is refused"
+        );
+        let new_tail = message(8, 1, 1, b"tail");
+        assert!(take_reply(&lane, &new_tail, &mut assembled).is_none());
+        let new_head = message(8, 1, 0, b"head");
+        let (_, _, payload) = take_reply(&lane, &new_head, &mut assembled).expect("new whole");
+        assert_eq!(payload, b"headtail".as_slice(), "no retired bytes entered");
     }
 
     #[test]
