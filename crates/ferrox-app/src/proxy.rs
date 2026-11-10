@@ -8786,10 +8786,23 @@ fn accept_tls_session(
     server: &ferrox_core::tls::TlsServerConfig,
 ) -> Option<impl ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + Drivable>
 {
+    // A shaped listener peeks the client hello before it builds the engine, so the accept waits on
+    // the handshake clock; the relay quantum would refuse a hello that is merely late.
+    if stream.set_read_timeout(Some(budgets::handshake())).is_err() {
+        return None;
+    }
     let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
         echo_trace("tls-server accept refused");
         return None;
     };
+    if session
+        .get_ref()
+        .get_ref()
+        .set_read_timeout(Some(RELAY_POLL))
+        .is_err()
+    {
+        return None;
+    }
     // Silence is scheduling, not death: an idle handshake retries to the deadline; anything else refuses.
     if shake_tls(&mut session) {
         Some(session)
@@ -8812,18 +8825,12 @@ fn serve_vless_tls(
     fallbacks: Option<&[Fallback]>,
     decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
 ) {
-    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-        return;
-    }
     match carrier {
         Carrier::Raw(_) => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
+            let Some(tls) = accept_tls_session(stream, server) else {
                 return;
             };
-            if !shake_tls(&mut tls) {
-                return;
-            }
             if let Some(decryption) = decryption {
                 if raw.set_read_timeout(Some(budgets::handshake())).is_err() {
                     return;
@@ -21038,18 +21045,12 @@ fn serve_trojan_tls(
     server: &ferrox_core::tls::TlsServerConfig,
     fallbacks: Option<&[Fallback]>,
 ) {
-    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-        return;
-    }
     match carrier {
         Carrier::Raw(_) => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
+            let Some(tls) = accept_tls_session(stream, server) else {
                 return;
             };
-            if !shake_tls(&mut tls) {
-                return;
-            }
             let front = FrontNames::of(&tls);
             relay_trojan_with_fallbacks(tls, Some(raw), None, key, freedom, fallbacks, &front, &[]);
         }
@@ -52469,10 +52470,6 @@ mod tests {
     /// flow can hide lane starvation that eight expose. Crossing the window is the single-flow
     /// test's claim; this one only has to see all eight relays get a turn.
     #[test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "eight h2 packet-up flows stall in the timer-parked Windows reactor; the live lane covers Windows h2"
-    )]
     #[allow(clippy::too_many_lines)]
     fn eight_packet_up_trojan_h2_downloads_complete() {
         const BULK: usize = 256 * 1024;
@@ -52519,7 +52516,9 @@ mod tests {
         thread::spawn(move || {
             for _ in 0..FLOWS {
                 let (stream, _) = listener.accept().expect("accepts");
-                stream.set_read_timeout(Some(RELAY_POLL)).expect("poll");
+                stream
+                    .set_read_timeout(Some(budgets::handshake()))
+                    .expect("timeout");
                 let settings = server_settings.clone();
                 let keys = keys.clone();
                 let server_config = Arc::clone(&server_config);
@@ -52577,6 +52576,58 @@ mod tests {
         for reader in readers {
             assert_eq!(reader.join().expect("flow"), BULK);
         }
+    }
+
+    /// A shaped listener peeks the client hello before it builds the engine. The relay quantum is
+    /// one millisecond, so an accept that arms it refuses a hello that is merely late.
+    #[test]
+    fn a_tls_raw_accept_waits_for_a_late_shaped_hello() {
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            cipher_suites: vec![0xc02b, 0x003c],
+            ..(*server_config).clone()
+        });
+        client_config.fingerprint =
+            Some(ferrox_core::tls::Fingerprint::resolve("chrome").expect("chrome"));
+        let key = trojan_key("late-shaped-hello");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
+        let echo_addr: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).expect("reads");
+            stream.write_all(&buf).expect("echoes");
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let serving = Arc::clone(&server_config);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_tls(
+                stream,
+                &[key],
+                &Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+                true,
+                &serving,
+                None,
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(budgets::handshake()))
+            .expect("timeout");
+        thread::sleep(Duration::from_millis(50));
+        let mut session = ferrox_core::tls::connect(&client_config, client).expect("tls");
+        session
+            .handshake()
+            .expect("the server waits for the hello past the relay quantum");
+        let header = trojan_header(&key, 1, &Destination::from(echo_addr));
+        session.write_all(&header).expect("writes the header");
+        session.write_all(b"ping").expect("writes");
+        session.flush().expect("flushes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
     }
 
     #[test]
