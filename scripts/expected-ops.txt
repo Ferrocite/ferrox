@@ -156,9 +156,14 @@ append_pem 562
 # Re-blessed 51892694 by the sliced Vision seal: dns.rs is untouched; the same
 # ferrox-core lib test binary gained the sliced-record tests, and thin-LTO moved the
 # frame eight instructions forward; the five decisions and bytes are unchanged.
+# Re-blessed 51892686 by the ferrox-core landings after that blessing (masque,
+# the tun checksum walk, the quic/vision findings): dns.rs is untouched and the
+# probe still walks its five decisions 4096 times, so the eight instructions are
+# not a multiple of that walk -- the loop that decides is unchanged and the move
+# is in the frame's setup, measured in the pinned userspace below.
 # Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892694 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892686 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
