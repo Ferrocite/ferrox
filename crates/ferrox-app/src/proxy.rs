@@ -21571,10 +21571,15 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
 ) {
     let settings = settings.clone();
     let key = key.to_vec();
+    let sniffing = crate::sniff::current();
+    let mut access = Some(crate::accesslog::snapshot());
     let mut read = Some(read);
     let mut write = Some(write);
     lane_pool::submit_setup(
         Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let access = access.take().expect("one xhttp preface");
+            let _flow = crate::accesslog::install_snapshot(access);
             let read = read.take().expect("one xhttp preface");
             let write = write.take().expect("one xhttp preface");
             serve_trojan_xhttp_carrier_now(read, write, &settings, &key, freedom);
@@ -52534,14 +52539,13 @@ mod tests {
             }),
             Box::new(|| {}),
         );
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the relay lane returns before the preface is read");
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
         let (lock, wake) = &*gate;
         *lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         wake.notify_all();
+        outcome.expect("the relay lane returns before the preface is read");
     }
 
     /// The benchmark's download opens eight connections at once, and every one must finish: one
