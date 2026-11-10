@@ -12489,6 +12489,15 @@ fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
 }
 
 fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination) {
+    dial_vless_xdrive_until(client, vless, target, budgets::relay_stall());
+}
+
+fn dial_vless_xdrive_until(
+    client: &Connection,
+    vless: &VlessOut,
+    target: &Destination,
+    response_wait: Duration,
+) {
     let Some(mut session) = xdrive_dial_session(&vless.carrier, &vless.address, vless.port) else {
         return;
     };
@@ -12505,7 +12514,7 @@ fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination
     if !answered {
         return;
     }
-    xdrive_relay(client, session);
+    xdrive_relay_until(client, session, response_wait);
 }
 
 fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destination) {
@@ -50517,7 +50526,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let inbound = crate::json::parse(&format!(
@@ -50545,7 +50554,7 @@ mod tests {
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (socket, _) = downstream.accept().expect("accepts");
-            dial_trojan_xdrive(&socket, &trojan, &target);
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(5));
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
@@ -50588,7 +50597,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -50624,7 +50633,7 @@ mod tests {
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (socket, _) = downstream.accept().expect("accepts");
-            dial_vless_xdrive(&socket, &vless, &target);
+            dial_vless_xdrive_until(&socket, &vless, &target, Duration::from_secs(5));
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
@@ -50669,7 +50678,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let inbound = crate::json::parse(&format!(
@@ -50698,7 +50707,7 @@ mod tests {
         let relay = thread::spawn(move || {
             let (socket, _) = downstream.accept().expect("accepts");
             // The same grain this witness already arms its own read timeout and its join at: on a loaded runner the store's round trip is late, never wrong.
-            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(30));
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(5));
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
