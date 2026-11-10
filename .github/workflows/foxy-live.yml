@@ -139,7 +139,11 @@ jobs:
       # registers once into the lane's own identity file; no other test dials
       # Cloudflare.
       - name: Live lane, CLI --warp first
-        if: steps.secrets.outputs.present == 'true'
+        # A direct edge refusal is a fact about the runner's exit, not about
+        # the lane; the WARP hop dials from a different exit, and this step is
+        # the only check of the CLI lane, so it measures whether the edge
+        # answers the hop even when it answered the runner 502.
+        if: always() && steps.secrets.outputs.present == 'true'
         env:
           FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
           FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
