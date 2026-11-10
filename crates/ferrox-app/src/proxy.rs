@@ -34285,7 +34285,13 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
                     Some(other) => return Some(format!("version `{other}` is not carried")),
                 }
             }
-            if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
+            // The store's own lanes carry the handshake `security: tls` names, so no second one is added.
+            let xdrive = outbound
+                .get("streamSettings")
+                .and_then(|s| s.get("network"))
+                .and_then(Json::as_str)
+                == Some("xdrive");
+            if stream_security(outbound) == "tls" && !hysteria_transport(outbound) && !xdrive {
                 return Some(tls_reason(outbound, protocol));
             }
             None
