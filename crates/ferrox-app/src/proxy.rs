@@ -34188,20 +34188,51 @@ fn hysteria_outbound_refusal(outbound: &Json) -> Option<String> {
     None
 }
 
+/// The TLS block a lane's own dial builds, when that dial is `tls_parts` or `tls_carried_parts`:
+/// an error here is the config's own, so the reference refuses it before any dial rather than
+/// carrying the row plaintext.
+fn outbound_tls_refusal(outbound: &Json, protocol: &str) -> Option<String> {
+    if stream_security(outbound) != "tls" {
+        return None;
+    }
+    let settings = outbound.get("settings");
+    let server = match protocol {
+        "vless" | "vmess" => vnext_lane(settings?)?.0,
+        "trojan" | "http" | "socks" | "shadowsocks" => lane_server(settings, "servers")?,
+        _ => return None,
+    };
+    // A dial the lane cannot make is the refusal's own line, not this one.
+    if dial_fields(server).is_some() {
+        return None;
+    }
+    let address = server
+        .get("address")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    let (carrier, _) = outbound_carrier(outbound, address);
+    match carrier {
+        Carrier::Raw(_)
+        | Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc(_)
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. }
+        | Carrier::Kcp(_) => outbound_tls(outbound, address).err(),
+        _ => None,
+    }
+}
+
 // A lane the tree can carry when its fields are honest: the field it lacks is the refusal's word.
 fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
     let settings = outbound.get("settings");
-    let tls_reason = |outbound: &Json, address: &str| {
+    let tls_reason = |outbound: &Json, protocol: &str| {
         let network = outbound
             .get("streamSettings")
             .and_then(|s| s.get("network"))
             .and_then(Json::as_str)
             .unwrap_or("tcp");
-        if let Err(reason) = outbound_tls(outbound, address) {
-            reason
-        } else {
-            format!("security `tls` does not ride `{network}`")
-        }
+        outbound_tls_refusal(outbound, protocol)
+            .unwrap_or_else(|| format!("security `tls` does not ride `{network}`"))
     };
     match protocol {
         "vless" | "vmess" => {
@@ -34218,11 +34249,7 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
                 return Some("no user id that is a uuid in the account".to_owned());
             }
             if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
-                let address = server
-                    .get("address")
-                    .and_then(Json::as_str)
-                    .unwrap_or_default();
-                return Some(tls_reason(outbound, address));
+                return Some(tls_reason(outbound, protocol));
             }
             None
         }
@@ -34235,11 +34262,7 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
                 return Some("no password in the server entry".to_owned());
             }
             if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
-                let address = server
-                    .get("address")
-                    .and_then(Json::as_str)
-                    .unwrap_or_default();
-                return Some(tls_reason(outbound, address));
+                return Some(tls_reason(outbound, protocol));
             }
             None
         }
@@ -34261,6 +34284,9 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
                     None | Some("5" | "4" | "4a") => {}
                     Some(other) => return Some(format!("version `{other}` is not carried")),
                 }
+            }
+            if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
+                return Some(tls_reason(outbound, protocol));
             }
             None
         }
@@ -34420,6 +34446,11 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     }
     if let Some(dns) = find_dns_outbound(root)? {
         return Ok(Some(Outbound::Dns(dns)));
+    }
+    // A tls block the row cannot build is the config's own, so the reference refuses it before any dial.
+    let named = first.get("protocol").and_then(Json::as_str).unwrap_or("");
+    if let Some(reason) = outbound_tls_refusal(first, canonical_protocol(named)) {
+        return Err(reason);
     }
     Ok(None)
 }
@@ -37624,6 +37655,53 @@ mod tests {
             ["outbound `<untagged>` (quux) cannot be built: unknown outbound protocol: quux"]
         );
         assert_eq!(diagnose(r#"{"outbounds":[]}"#), [] as [String; 0]);
+    }
+
+    /// A front lane's `tlsSettings` is the config's own, so the fingerprint no table knows is the
+    /// reference's load-time refusal (`transport_security.go`), never a row silently left unbuilt.
+    #[test]
+    fn a_front_lanes_unknown_fingerprint_refuses_the_config() {
+        let lane = |protocol: &str, extra: &str, fingerprint: &str| {
+            crate::json::parse(&format!(
+                r#"{{"outbounds":[{{"protocol":"{protocol}","settings":{{"servers":[{{"address":"192.0.2.6","port":1080{extra}}}]}},"streamSettings":{{"security":"tls","tlsSettings":{{"allowInsecure":true,"fingerprint":"{fingerprint}"}}}}}}]}}"#
+            ))
+            .expect("parses")
+        };
+        for protocol in ["socks", "http", "shadowsocks"] {
+            let extra = if protocol == "shadowsocks" {
+                r#","method":"aes-128-gcm","password":"p""#
+            } else {
+                ""
+            };
+            assert_eq!(
+                find_outbound(&lane(protocol, extra, "Bogus")).err(),
+                Some(r#"unknown "fingerprint": bogus"#.to_owned()),
+                "{protocol} refused to name the field"
+            );
+            assert!(
+                matches!(
+                    find_outbound(&lane(protocol, extra, "chrome")),
+                    Ok(Some(
+                        Outbound::Socks(_) | Outbound::Http(_) | Outbound::Shadowsocks(_)
+                    ))
+                ),
+                "{protocol} did not build before the refusal"
+            );
+        }
+        // The same line reaches the operator when the row is diagnosed rather than built.
+        assert_eq!(
+            diagnose_outbounds(&lane("socks", "", "Bogus")),
+            [r#"outbound `<untagged>` (socks) cannot be built: unknown "fingerprint": bogus"#]
+        );
+        // A lane whose dial builds no tls block keeps its own fields, not this refusal.
+        let freedom = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","streamSettings":{"security":"tls","tlsSettings":{"fingerprint":"Bogus"}}}]}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            find_outbound(&freedom),
+            Ok(Some(Outbound::Freedom(_)))
+        ));
     }
 
     /// The census is a stall hunt's instrument: a release build's relay registers no wait
