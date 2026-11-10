@@ -1285,6 +1285,11 @@ impl H2Conn {
 
     /// A reset from the peer kills only its stream: the connection may still serve the others.
     fn fail_stream(&self, stream: u32) {
+        // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
+        let credit = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let state = self
             .streams
             .lock()
@@ -1296,6 +1301,7 @@ impl H2Conn {
             state.cv.notify_all();
         }
         self.wake.notify_all();
+        drop(credit);
     }
 
     fn end_stream(&self, stream: u32) {
@@ -1338,6 +1344,11 @@ impl H2Conn {
 
     fn reset_stream(&self, stream: u32) {
         self.forget_upload(stream);
+        // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
+        let credit = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         {
             let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(state) = streams.remove(&stream) {
@@ -1347,14 +1358,21 @@ impl H2Conn {
             }
         }
         self.wake.notify_all();
+        drop(credit);
         self.end_session_of(stream);
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
         let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
 
     fn kill(&self) {
+        // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
+        let credit = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.dead.store(true, Ordering::SeqCst);
         self.wake.notify_all();
+        drop(credit);
         let streams: Vec<_> = {
             self.streams
                 .lock()
@@ -6161,14 +6179,9 @@ mod tests {
         );
     }
 
-    /// A reset stream has no window left to grant, so its writer must be woken by the reset, not
-    /// left to discover the stream is gone when the relay stall expires.
-    #[test]
-    fn a_reset_stream_wakes_a_sender_waiting_on_its_window() {
-        crate::budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(Duration::from_secs(30)),
-            ..Default::default()
-        });
+    /// A stream or connection that dies must wake a writer parked on its window, not leave it to
+    /// discover the death when the relay stall expires.
+    fn assert_death_wakes_a_parked_sender(death: impl FnOnce(&H2Conn)) {
         let (conn, _written, _slices) = bare_conn();
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
@@ -6220,18 +6233,35 @@ mod tests {
             thread::yield_now();
         }
         let began = std::time::Instant::now();
-        conn.reset_stream(1);
+        death(&conn);
         let verdict = got.recv_timeout(Duration::from_secs(2));
         let took = began.elapsed();
         conn.dead.store(true, Ordering::SeqCst);
         conn.wake.notify_all();
         running.join().expect("sender thread");
-        crate::budgets::clear();
-        assert_eq!(verdict, Ok(false), "the reset sender returned");
+        assert_eq!(verdict, Ok(false), "the parked sender returned");
         assert!(
             took < Duration::from_secs(1),
-            "the reset stream kept its writer parked for {took:?}"
+            "the dead stream kept its writer parked for {took:?}"
         );
+    }
+
+    /// A reset stream has no window left to grant, so its writer must be woken by the reset.
+    #[test]
+    fn a_reset_stream_wakes_a_sender_waiting_on_its_window() {
+        assert_death_wakes_a_parked_sender(|conn| conn.reset_stream(1));
+    }
+
+    /// A peer reset kills only its stream, and the writer parked on that stream must wake now.
+    #[test]
+    fn a_failed_stream_wakes_a_sender_waiting_on_its_window() {
+        assert_death_wakes_a_parked_sender(|conn| conn.fail_stream(1));
+    }
+
+    /// A dead connection has no stream left to grant, so every parked writer must wake now.
+    #[test]
+    fn a_killed_connection_wakes_a_sender_waiting_on_its_window() {
+        assert_death_wakes_a_parked_sender(H2Conn::kill);
     }
 
     /// A POST that never sends its body leaves the stream's reader parked on a request no peer will finish; the relay stall ends it, and the stream is reset instead of holding its thread for the life of the connection.

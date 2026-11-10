@@ -17811,6 +17811,8 @@ fn xhttp_pair(
     if settings.h2c {
         // Prior-knowledge h2c: one cleartext listener answers both spellings, and this dial picks the framing.
         let read = uplink.try_clone().ok()?;
+        // The h2 reader pumps frames on a relay lane, so its transport yields on the same poll as the TLS one.
+        let _ = read.set_read_timeout(Some(RELAY_POLL));
         let raw = Arc::new(uplink.try_clone().ok()?);
         let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
             crate::xhttp_h2::connect_split(read, uplink, raw, host, settings, "http")
@@ -21572,6 +21574,33 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
 /// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
 /// session every TLS xhttp client has always reached.
 fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let settings = settings.clone();
+    let key = key.to_vec();
+    let sniffing = crate::sniff::current();
+    let mut access = Some(crate::accesslog::snapshot());
+    let mut read = Some(read);
+    let mut write = Some(write);
+    lane_pool::submit_setup(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let access = access.take().expect("one xhttp preface");
+            let _flow = crate::accesslog::install_snapshot(access);
+            let read = read.take().expect("one xhttp preface");
+            let write = write.take().expect("one xhttp preface");
+            serve_trojan_xhttp_carrier_now(read, write, &settings, &key, freedom);
+            Next::Done
+        }),
+        Box::new(|| {}),
+    );
+}
+
+fn serve_trojan_xhttp_carrier_now<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -44475,6 +44504,36 @@ mod tests {
         );
     }
 
+    /// An h2c downlink read parks on the transport's clock: a peer that sends no frame hands the
+    /// relay lane back instead of pinning it in a blocking socket read.
+    #[test]
+    fn an_h2c_downlink_read_yields_the_relay_lane() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            h2c: true,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        });
+        let uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (mut reader, _writer) = xhttp_pair(uplink, "127.0.0.1", &settings).expect("pair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _step = RelayStep::enter();
+            let _ = tx.send(reader.read_window().is_err());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("an idle h2c downlink must yield its lane"),
+            "an idle h2c downlink must time out, not block"
+        );
+        peer.join().ok();
+    }
+
     fn xhttp_vless_header(echo_port: u16) -> Vec<u8> {
         let link = ferrox_core::vless::VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
@@ -52558,14 +52617,66 @@ mod tests {
         assert_eq!(got, BULK);
     }
 
+    /// The xHTTP preface is a setup read: a relay lane that waits for it starves the client's
+    /// own lane, which is what an eight-flow cell does when every lane is held there.
+    #[test]
+    fn an_xhttp_preface_read_does_not_hold_a_relay_lane() {
+        struct Stalled(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Read for Stalled {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let (lock, wake) = &*self.0;
+                let mut open = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*open {
+                    open = wake
+                        .wait(open)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                Ok(0)
+            }
+        }
+        struct Null;
+        impl Write for Null {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl FrameWrite for Null {
+            fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
+                true
+            }
+        }
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let settings = xhttp_settings("/setup-lane");
+        let key = trojan_key("xhttp-setup-lane");
+        let mut read_gate = Some(Arc::clone(&gate));
+        lane_pool::submit(
+            Box::new(move || {
+                let gate = read_gate.take().expect("one xhttp preface");
+                serve_trojan_xhttp_carrier(Stalled(gate), Null, &settings, &[key], true);
+                done.send(()).expect("done");
+                Next::Done
+            }),
+            Box::new(|| {}),
+        );
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+        let (lock, wake) = &*gate;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+        outcome.expect("the relay lane returns before the preface is read");
+    }
+
     /// The benchmark's download opens eight connections at once, and every one must finish: one
     /// flow can hide lane starvation that eight expose. Crossing the window is the single-flow
     /// test's claim; this one only has to see all eight relays get a turn.
     #[test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "eight h2 packet-up flows stall in the timer-parked Windows reactor; the live lane covers Windows h2"
-    )]
     #[allow(clippy::too_many_lines)]
     fn eight_packet_up_trojan_h2_downloads_complete() {
         const BULK: usize = 256 * 1024;
