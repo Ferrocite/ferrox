@@ -20,10 +20,10 @@ jobs:
       - name: Aether registers anonymously from this runner
         run: |
           set -x
-          mkdir -p target/probe
-          curl -sSLo target/probe/aether.tgz https://github.com/CluvexStudio/Aether/archive/9ebdcc945af12ea532b32119884f846bdb9c4bfc.tar.gz
-          tar -xzf target/probe/aether.tgz -C target/probe
-          (cd target/probe/Aether-9ebdcc945af12ea532b32119884f846bdb9c4bfc/aether \
-            && cargo build --locked --release --bin aether 2>&1 | tail -2)
-          cp target/probe/Aether-9ebdcc945af12ea532b32119884f846bdb9c4bfc/aether/target/release/aether target/probe/aether
-          target/probe/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -40
+          mkdir -p upstream/aether target/release
+          curl -sSLo upstream/aether/../aether.tgz https://github.com/CluvexStudio/Aether/archive/9ebdcc945af12ea532b32119884f846bdb9c4bfc.tar.gz
+          tar -xzf upstream/aether/../aether.tgz --strip-components=1 -C upstream/aether
+          (cd upstream/aether/aether \
+            && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether 2>&1 | tail -2)
+          mv target/release/aether /tmp/aether
+          /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -40
