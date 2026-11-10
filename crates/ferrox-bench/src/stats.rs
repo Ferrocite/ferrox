@@ -255,6 +255,11 @@ impl Against {
         self.own_mib_s >= TARGET_RATIO * self.other_mib_s
     }
 
+    /// The floor, resolved: the whole interval is below the comparator's median.
+    pub fn deficit(&self, interval: Option<Interval>) -> bool {
+        interval.is_some_and(|i| self.below() && !self.runner_bound() && i.high < 1.0)
+    }
+
     fn line(&self, label: &str, interval: Option<Interval>) -> (bool, String) {
         let Some(interval) = interval else {
             return (
@@ -282,13 +287,22 @@ impl Against {
             ),
             _ => ", the cell measured no one-hop ceiling".to_owned(),
         };
-        if self.below() && !self.runner_bound() {
+        if self.deficit(Some(interval)) {
             (
                 false,
                 format!(
-                    "{label}: BELOW THE COMPARATOR, {evidence}{ceiling}. The ratio rule's floor \
-                     is 1.00x, so a comparator's median above this engine's is a defect to \
-                     root-cause, not a variance to note"
+                    "{label}: BELOW THE COMPARATOR, {evidence}{ceiling}. The whole interval is \
+                     under the ratio rule's 1.00x floor, so a comparator's median above this \
+                     engine's is a defect to root-cause, not a variance to note"
+                ),
+            )
+        } else if self.below() && !self.runner_bound() {
+            (
+                true,
+                format!(
+                    "{label}: under the comparator's median, {evidence}{ceiling}; the interval \
+                     includes 1.0x, so this run cannot resolve a loss and the row is reported, \
+                     not failed"
                 ),
             )
         } else if self.below() {
@@ -1092,6 +1106,23 @@ mod tests {
         )]);
         assert!(at.passed, "{:?}", at.lines);
         assert!(at.lines[0].contains("at the 1.2x target"), "{:?}", at.lines);
+    }
+
+    #[test]
+    fn a_never_below_row_whose_interval_reaches_parity_reports_instead_of_failing() {
+        let gate = gate_rows(&[Row::never_below(
+            "throughput (ferrox vs sing-box)",
+            Some(interval(0.95, 1.03, 1.05)),
+            980.0,
+            1000.0,
+            None,
+        )]);
+        assert!(gate.passed, "{:?}", gate.lines);
+        assert!(
+            gate.lines[0].contains("cannot resolve a loss"),
+            "{:?}",
+            gate.lines
+        );
     }
 
     #[test]

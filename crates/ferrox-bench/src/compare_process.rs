@@ -290,10 +290,7 @@ fn row_json(row: &stats::Row) -> Json {
         item.insert("comparator_mib_s", Json::Num(against.other_mib_s));
         item.insert("ratio", Json::Num(against.ratio()));
         item.insert("runner_bound", Json::Bool(against.runner_bound()));
-        item.insert(
-            "deficit",
-            Json::Bool(row.interval.is_some() && against.below() && !against.runner_bound()),
-        );
+        item.insert("deficit", Json::Bool(against.deficit(row.interval)));
         item.insert("below_target", Json::Bool(!against.at_target()));
     }
     item
@@ -1029,11 +1026,12 @@ impl Comparison {
              carries one `throughput (engine vs comparator)` row per peer, and those rows \
              gate on the ratio rule's floor rather than the reference: its own median is \
              never below that comparator's median, because beating the reference while \
-             losing the cell to a peer is still losing the cell. A cell where it is below \
-             fails, unless the engine alone already sits at the harness's {:.0}% generator \
-             bound of the cell's one-hop ceiling — then the runner was the limit and the row \
-             reports instead — and a median above the floor but under the {:.1}x target is \
-             published as a warning.\n",
+             losing the cell to a peer is still losing the cell. A cell where its whole \
+             interval is under that median fails, unless the engine alone already sits at the \
+             harness's {:.0}% generator bound of the cell's one-hop ceiling — then the runner \
+             was the limit and the row reports instead — one whose interval reaches 1.0x\n\
+             reports that this run cannot resolve it, and a median above the floor but under \
+             the {:.1}x target is published as a warning.\n",
             stats::BOOTSTRAP_RESAMPLES,
             stats::BOOTSTRAP_SEED,
             stats::TOLERANCE * 100.0,
