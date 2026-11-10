@@ -1375,11 +1375,11 @@ fn dial_through_proxy(
             "dialerProxy loops through `{tag}`"
         )));
     }
-    let Some(out) = shared.outbound_for(tag) else {
+    if shared.outbound_ref(tag).is_none() {
         return Err(std::io::Error::other(
             "there is no outbound handler for dialerProxy",
         ));
-    };
+    }
     let (source, sockopts, strategy) = if shared.default_tag.as_deref() == Some(tag) {
         (
             shared.default_source,
@@ -1399,12 +1399,15 @@ fn dial_through_proxy(
     thread::Builder::new()
         .name("ferrox-dialer-proxy".to_owned())
         .spawn(move || {
+            let Some(out) = shared.outbound_ref(&name) else {
+                return;
+            };
             let _source = SendThroughGuard::enter(source);
             let _sockopts = DialSockoptsGuard::enter(sockopts);
             let _target = TargetStrategyGuard::enter(strategy);
             serve_connect(
                 server,
-                &out,
+                out,
                 &Destination::Address(target),
                 Front::Probe,
                 &[],
@@ -2286,13 +2289,18 @@ impl RouteShared {
         }
     }
 
+    /// The outbound a `geodata.outbound` tag names, borrowed from the registry rather than copied.
+    fn outbound_ref(&self, tag: &str) -> Option<&Outbound> {
+        if tag.is_empty() {
+            return Some(&self.default);
+        }
+        self.tagged.get(tag)
+    }
+
     /// The outbound a `geodata.outbound` tag names, or the default when the tag is empty, which is
     /// what the reference's forced-tag dispatch falls back to.
     pub(crate) fn outbound_for(&self, tag: &str) -> Option<Outbound> {
-        if tag.is_empty() {
-            return Some(self.default.clone());
-        }
-        self.tagged.get(tag).cloned()
+        self.outbound_ref(tag).cloned()
     }
 
     /// Remember a direct-dial server inbound the management API added, so a later rule that can
@@ -68891,6 +68899,38 @@ end
         assert!(
             fragment.tagged.contains_key("fragment"),
             "the named fragment is reachable at the dial seam"
+        );
+    }
+
+    /// The hop a `dialerProxy` names is borrowed from the registry, not cloned per connection: the
+    /// old lookup copied the whole outbound before handing it to the hop thread.
+    #[test]
+    fn a_dialer_proxy_hop_is_borrowed_from_the_registry() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":8080}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let (hop, borrowed) = ferrox_core::alloc_count::measure(|| shared.outbound_ref("hop"));
+        assert_eq!(
+            borrowed.allocs, 0,
+            "the hop borrows the registry: {borrowed:?}"
+        );
+        assert_eq!(
+            hop.map(std::ptr::from_ref),
+            shared.tagged.get("hop").map(std::ptr::from_ref),
+            "the hop is the registry's own outbound"
+        );
+        let (copied, cloned) = ferrox_core::alloc_count::measure(|| shared.outbound_for("hop"));
+        assert!(copied.is_some());
+        assert!(
+            cloned.allocs > 0,
+            "the old lookup copied the outbound: {cloned:?}"
         );
     }
 
