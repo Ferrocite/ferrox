@@ -190,6 +190,7 @@ jobs:
             --charts target/benchmark-matrix/charts \
             --bundle-readme target/benchmark-matrix/README.md
           python3 scripts/check-matrix-legs.py --cells target/benchmark-matrix/cells --baseline scripts/leg-gaps.txt
+          python3 scripts/check-comparator-rows.py --cells target/benchmark-matrix/cells --baseline scripts/comparator-gaps.txt
       - name: refuse a bundle that measured nothing
         shell: bash
         run: |

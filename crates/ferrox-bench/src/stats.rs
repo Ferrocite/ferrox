@@ -8,6 +8,10 @@ pub const MIN_RUNS: usize = 3;
 
 pub const HARNESS_BOUND: f64 = 0.85;
 
+/// The ratio rule's target against another comparator: faster than it, and 1.2x its median where the
+/// cell measures the same work. A ratio between 1.0 and this is reported as a warning, not a failure.
+pub const TARGET_RATIO: f64 = 1.2;
+
 pub const BOOTSTRAP_RESAMPLES: usize = 4000;
 pub const BOOTSTRAP_SEED: u64 = 20_260_902;
 
@@ -216,6 +220,104 @@ impl Gate {
     }
 }
 
+/// The engine under test priced against another comparator engine rather than the reference, by
+/// the absolute medians the row's ratio came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Against {
+    pub own_mib_s: f64,
+    pub other_mib_s: f64,
+    /// The cell's one-hop ceiling, when the harness measured one on this runner.
+    pub ceiling: Option<f64>,
+}
+
+impl Against {
+    pub fn ratio(&self) -> f64 {
+        if self.other_mib_s > 0.0 {
+            self.own_mib_s / self.other_mib_s
+        } else {
+            0.0
+        }
+    }
+
+    /// The ratio rule's floor: this engine's median is never below the comparator's.
+    pub fn below(&self) -> bool {
+        self.own_mib_s < self.other_mib_s
+    }
+
+    /// The cell cannot price the comparison: this engine alone is already at the harness's own
+    /// generator bound of the one-hop ceiling, so the runner, not the engine, was the limit.
+    pub fn runner_bound(&self) -> bool {
+        self.ceiling
+            .is_some_and(|ceiling| ceiling > 0.0 && self.own_mib_s >= HARNESS_BOUND * ceiling)
+    }
+
+    pub fn at_target(&self) -> bool {
+        self.own_mib_s >= TARGET_RATIO * self.other_mib_s
+    }
+
+    fn line(&self, label: &str, interval: Option<Interval>) -> (bool, String) {
+        let Some(interval) = interval else {
+            return (
+                false,
+                format!(
+                    "{label}: UNPROVEN, fewer than {MIN_PAIRS} usable pairs, so no interval \
+                     exists. An unproven row is not a passing row"
+                ),
+            );
+        };
+        let evidence = format!(
+            "median {:.1} MiB/s against {:.1} MiB/s ({:.2}x) over {} pairs, 95% interval \
+             [{:.3}x, {:.3}x]",
+            self.own_mib_s,
+            self.other_mib_s,
+            self.ratio(),
+            interval.pairs,
+            interval.low,
+            interval.high
+        );
+        let ceiling = match self.ceiling {
+            Some(ceiling) if ceiling > 0.0 => format!(
+                ", {:.0}% of the cell's one-hop ceiling {ceiling:.1} MiB/s",
+                100.0 * self.own_mib_s / ceiling
+            ),
+            _ => ", the cell measured no one-hop ceiling".to_owned(),
+        };
+        if self.below() && !self.runner_bound() {
+            (
+                false,
+                format!(
+                    "{label}: BELOW THE COMPARATOR, {evidence}{ceiling}. The ratio rule's floor \
+                     is 1.00x, so a comparator's median above this engine's is a defect to \
+                     root-cause, not a variance to note"
+                ),
+            )
+        } else if self.below() {
+            (
+                true,
+                format!(
+                    "{label}: below the comparator, {evidence}{ceiling}; this engine alone is at \
+                     the harness's {:.0}% generator bound of that ceiling, so the cell cannot \
+                     price the comparison",
+                    HARNESS_BOUND * 100.0
+                ),
+            )
+        } else if self.at_target() {
+            (
+                true,
+                format!("{label}: {evidence}{ceiling}; at the {TARGET_RATIO}x target"),
+            )
+        } else {
+            (
+                true,
+                format!(
+                    "{label}: {evidence}{ceiling}; above the 1.00x floor and under the \
+                     {TARGET_RATIO}x target, so this row is a warning"
+                ),
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub label: String,
@@ -225,6 +327,8 @@ pub struct Row {
     pub runner_blamed: bool,
     /// A per-GiB row the workload prices no rate for; it reports, and says why it is not gated.
     pub unpriced: bool,
+    /// Set on a row that prices the engine under test against another comparator engine.
+    pub against: Option<Against>,
 }
 
 impl Row {
@@ -240,6 +344,7 @@ impl Row {
             gates: true,
             runner_blamed: false,
             unpriced: false,
+            against: None,
         }
     }
 
@@ -255,6 +360,26 @@ impl Row {
             gates: false,
             runner_blamed: false,
             unpriced: false,
+            against: None,
+        }
+    }
+
+    /// A gated row against another comparator engine: never below its median, and [`TARGET_RATIO`]x
+    /// that median is the target.
+    pub fn never_below(
+        label: impl Into<String>,
+        interval: Option<Interval>,
+        own_mib_s: f64,
+        other_mib_s: f64,
+        ceiling_mib_s: Option<f64>,
+    ) -> Self {
+        Self {
+            against: Some(Against {
+                own_mib_s,
+                other_mib_s,
+                ceiling: ceiling_mib_s,
+            }),
+            ..Self::gating(label, Direction::Higher, interval)
         }
     }
 
@@ -275,6 +400,37 @@ impl Row {
     }
 }
 
+/// Why a reported row does not decide the job, and why an inconclusive one may not be the engines'
+/// doing, so a reader never has to guess which of the two a `within noise` line means.
+fn report_note(row: &Row, verdict: &Verdict) -> String {
+    let mut note = if row.gates {
+        String::new()
+    } else if row.unpriced {
+        format!(
+            " — reported, not gated: pricing a per-GiB rate takes {} ms of cpu, so that \
+             one {} ms tick of the sampler moves the ratio by less than the {:.0}% this row \
+             decides at, and these runs span less; the ratio is the sampler's, not the \
+             engine's",
+            min_pricable_cpu_millis(),
+            crate::parity::cpu_resolution_floor_millis(),
+            TOLERANCE * 100.0
+        )
+    } else {
+        " — reported, not gated: this row is a pinned comparator, so its \
+         verdict is published and does not decide the job"
+            .to_owned()
+    };
+    let inconclusive = matches!(verdict, Verdict::WithinNoise(_) | Verdict::Unproven);
+    if row.runner_blamed && inconclusive {
+        note.push_str(
+            " — the runner's own throughput moved further than the tolerance above \
+             between repeats of one unchanged build, so this row cannot tell \
+             because of the machine rather than because the engines are close",
+        );
+    }
+    note
+}
+
 pub fn gate_rows(rows: &[Row]) -> Gate {
     if rows.is_empty() {
         return Gate::no_comparison();
@@ -287,32 +443,14 @@ pub fn gate_rows(rows: &[Row]) -> Gate {
         return Gate::no_gated_row(rows.len());
     }
     for row in rows {
-        let v = verdict(row.interval, row.direction);
-        let mut note = if row.gates {
-            String::new()
-        } else if row.unpriced {
-            format!(
-                " — reported, not gated: pricing a per-GiB rate takes {} ms of cpu, so that \
-                 one {} ms tick of the sampler moves the ratio by less than the {:.0}% this row \
-                 decides at, and these runs span less; the ratio is the sampler's, not the \
-                 engine's",
-                min_pricable_cpu_millis(),
-                crate::parity::cpu_resolution_floor_millis(),
-                TOLERANCE * 100.0
-            )
-        } else {
-            " — reported, not gated: this row is a pinned comparator, so its \
-             verdict is published and does not decide the job"
-                .to_owned()
-        };
-        let inconclusive = matches!(v, Verdict::WithinNoise(_) | Verdict::Unproven);
-        if row.runner_blamed && inconclusive {
-            note.push_str(
-                " — the runner's own throughput moved further than the tolerance above \
-                 between repeats of one unchanged build, so this row cannot tell \
-                 because of the machine rather than because the engines are close",
-            );
+        if let Some(against) = row.against {
+            let (ok, line) = against.line(&row.label, row.interval);
+            passed &= ok;
+            lines.push(line);
+            continue;
         }
+        let v = verdict(row.interval, row.direction);
+        let note = report_note(row, &v);
         let counts = row.gates;
         match v {
             Verdict::Better(i) => {
@@ -853,6 +991,7 @@ mod tests {
         assert_eq!(BOOTSTRAP_SEED, 20_260_902);
         assert!((TOLERANCE - 0.05).abs() < f64::EPSILON);
         assert!((HARNESS_BOUND - 0.85).abs() < f64::EPSILON);
+        assert!((TARGET_RATIO - 1.2).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -905,6 +1044,89 @@ mod tests {
             !line.contains("pinned comparator"),
             "this row reports because of the workload, not because of the engine's role: {line}"
         );
+    }
+
+    fn interval(low: f64, mid: f64, high: f64) -> Interval {
+        Interval {
+            low,
+            mid,
+            high,
+            pairs: 3,
+        }
+    }
+
+    #[test]
+    fn the_never_below_rule_fails_a_comparator_above_and_warns_under_the_target() {
+        let below = gate_rows(&[Row::never_below(
+            "throughput (ferrox vs zeronet)",
+            Some(interval(0.20, 0.24, 0.30)),
+            415.0,
+            1707.0,
+            Some(1650.0),
+        )]);
+        assert!(!below.passed, "{:?}", below.lines);
+        let line = &below.lines[0];
+        assert!(line.contains("BELOW THE COMPARATOR"), "{line}");
+        assert!(line.contains("0.24x"), "{line}");
+        assert!(line.contains("25% of the cell's one-hop ceiling"), "{line}");
+
+        let under = gate_rows(&[Row::never_below(
+            "throughput (ferrox vs aether)",
+            Some(interval(1.02, 1.08, 1.14)),
+            1080.0,
+            1000.0,
+            None,
+        )]);
+        assert!(under.passed, "{:?}", under.lines);
+        let line = &under.lines[0];
+        assert!(line.contains("above the 1.00x floor"), "{line}");
+        assert!(line.contains("1.08x"), "{line}");
+        assert!(line.contains("no one-hop ceiling"), "{line}");
+
+        let at = gate_rows(&[Row::never_below(
+            "throughput (ferrox vs aether)",
+            Some(interval(1.18, 1.25, 1.32)),
+            1250.0,
+            1000.0,
+            None,
+        )]);
+        assert!(at.passed, "{:?}", at.lines);
+        assert!(at.lines[0].contains("at the 1.2x target"), "{:?}", at.lines);
+    }
+
+    #[test]
+    fn a_never_below_row_at_the_generator_bound_reports_instead_of_failing() {
+        let gate = gate_rows(&[Row::never_below(
+            "throughput (ferrox vs zeronet)",
+            Some(interval(0.80, 0.84, 0.88)),
+            1450.0,
+            1707.0,
+            Some(1650.0),
+        )]);
+        assert!(gate.passed, "{:?}", gate.lines);
+        assert!(
+            gate.lines[0].contains("below the comparator"),
+            "{:?}",
+            gate.lines
+        );
+        assert!(
+            gate.lines[0].contains("generator bound"),
+            "{:?}",
+            gate.lines
+        );
+    }
+
+    #[test]
+    fn a_never_below_row_that_never_paired_is_unproven_and_fails() {
+        let gate = gate_rows(&[Row::never_below(
+            "throughput (ferrox vs zeronet)",
+            None,
+            415.0,
+            1707.0,
+            None,
+        )]);
+        assert!(!gate.passed);
+        assert!(gate.lines[0].contains("UNPROVEN"), "{:?}", gate.lines);
     }
 
     #[test]

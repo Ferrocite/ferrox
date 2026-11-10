@@ -1,0 +1,4 @@
+# Measured cells where the engine under test is below another comparator's
+# median and the runner was not the limit. A new one, or one worse than its
+# last filed ratio by more than 0.10, still fails the matrix.
+# scenario|comparator|ratio|issue, where scenario is the cell id in cell.json.
