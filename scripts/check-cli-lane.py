@@ -795,6 +795,37 @@ while True:
     return binary
 
 
+def warp_ladder_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-warp-ladder"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json, os, socket, sys
+config = sys.argv[sys.argv.index("-c") + 1]
+with open(config, encoding="utf-8") as handle:
+    document = json.load(handle)
+state = os.environ["FERROX_CONF_DIR"]
+with open(os.path.join(state, "fake-ladder-configs.json"), "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(document) + "\\n")
+outbound = document["outbounds"][0]
+chained = outbound.get("settings", {}).get("upstreamProxy")
+if outbound["protocol"] != "warp" and not chained:
+    print("foxy: the account plane answered 451", file=sys.stderr)
+    sys.exit(1)
+port = document["inbounds"][0]["port"]
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(16)
+while True:
+    conn, _ = server.accept()
+    conn.close()
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
 def check_failed_lane_is_closed(state: pathlib.Path) -> int:
     for stale in (
         "lane.json",
@@ -2884,6 +2915,137 @@ def check_stale_proxy_reconciled(state: pathlib.Path) -> int:
     return 0
 
 
+def check_warp_ladder(state: pathlib.Path) -> int:
+    for stale in (
+        "lane.json",
+        "lane.pid",
+        "system-proxy.ports",
+        "networksetup.calls",
+        "fake-ladder-configs.json",
+        "lane-snapshot.json",
+    ):
+        (state / stale).unlink(missing_ok=True)
+    for leftover in state.glob("warp-hop*"):
+        leftover.unlink(missing_ok=True)
+    port = free_port()
+    env = env_for(state, curl=True)
+    env["FERROX_BIN"] = str(warp_ladder_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    run = subprocess.run(
+        [*up_argv(port), "--country", "US"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH * 2,
+        env=env,
+    )
+    output = run.stdout + run.stderr
+    try:
+        subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: a 451 ladder exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if "the account plane answered 451 from this region" not in output:
+        print(
+            f"check-cli-lane: a 451 ladder did not name the refusal and its retry:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if "warp hop up (pid" not in output:
+        print(
+            f"check-cli-lane: a 451 ladder never said the warp hop started:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if "exit through socks" not in output:
+        print(
+            f"check-cli-lane: a 451 ladder did not end carried:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    recorded = state / "fake-ladder-configs.json"
+    if not recorded.exists():
+        print(
+            "check-cli-lane: the ladder never handed a config to the lane binary",
+            file=sys.stderr,
+        )
+        return 1
+    handovers = [
+        json.loads(line)
+        for line in recorded.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(handovers) != 3:
+        print(
+            f"check-cli-lane: the ladder handed {len(handovers)} configs, not three:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    first, hop, second = handovers
+    if first["outbounds"][0]["protocol"] != "foxy" or first["outbounds"][0][
+        "settings"
+    ].get("upstreamProxy"):
+        print(
+            "check-cli-lane: the first attempt was already chained through a hop",
+            file=sys.stderr,
+        )
+        return 1
+    warp = hop["outbounds"][0]
+    if (
+        warp["protocol"] != "warp"
+        or not warp["settings"].get("register")
+        or not warp["settings"].get("identityFile")
+    ):
+        print(
+            "check-cli-lane: the hop config is not a registering warp outbound",
+            file=sys.stderr,
+        )
+        return 1
+    if not hop["inbounds"] or hop["inbounds"][0].get("protocol") != "socks":
+        print(
+            "check-cli-lane: the hop config does not front a socks port",
+            file=sys.stderr,
+        )
+        return 1
+    chained_to = second["outbounds"][0]["settings"].get("upstreamProxy")
+    if chained_to != f"socks5://127.0.0.1:{hop['inbounds'][0]['port']}":
+        print(
+            "check-cli-lane: the retried lane does not chain to the hop's socks port"
+            f" (got {chained_to!r})",
+            file=sys.stderr,
+        )
+        return 1
+    pid_file = state / "lane.pid"
+    if pid_file.exists():
+        try:
+            os.kill(int(pid_file.read_text(encoding="utf-8").strip()), 0)
+        except (ProcessLookupError, ValueError):
+            pid_file = None
+        else:
+            print(
+                "check-cli-lane: a 451 ladder left a lane running after down",
+                file=sys.stderr,
+            )
+            return 1
+    print(
+        "check-cli-lane: a 451 from the plane moves the lane onto a warp hop, and"
+        " the retried lane carries the flow through it"
+    )
+    return 0
+
+
 # The gates job allows ten minutes and check-cli-args runs first: stop a wedged
 # suite early enough that CI kills the job after the failure is already named.
 SUITE = 240
@@ -2895,6 +3057,7 @@ CHECKS = (
     ("splits", check_splits),
     ("failed lane", check_failed_lane_is_closed),
     ("interrupted attempt", check_interrupted_attempt_leaves_nothing),
+    ("warp ladder", check_warp_ladder),
     ("config survives", check_config_survives),
     ("instance ports", check_instance_ports),
     ("vpn fronts", check_vpn_fronts),

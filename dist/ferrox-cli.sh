@@ -117,6 +117,11 @@ LOC_PING=0
 EXCLUDE_DOMAINS=""
 EXCLUDE_PORTS=""
 UPSTREAM=""
+WANT_WARP=0
+WARP_CFG=""
+WARP_PID_FILE=""
+WARP_LOG=""
+WARP_PORT_FILE=""
 # VeePN has no account and no server: an empty region lets the plane pick, and
 # the device id is kept under $CONF_DIR so a restart is the same device.
 REGION=""
@@ -290,6 +295,9 @@ foxy options (email + password is the whole setup; there is no server to name)
                          h2 and h1 when the path drops QUIC
   --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
+  --warp                 chain through WARP first: register once, race WireGuard
+                         against MASQUE, and egress the account plane and the
+                         carrier through it (a region block sees a WARP exit)
   --exclude-domains LIST domain suffixes that leave the tunnel and dial directly
                          (comma-separated; example.com also covers its subdomains)
   --exclude-ports LIST   destination ports that leave the tunnel and dial directly
@@ -1901,6 +1909,10 @@ apply_instance() {
   CFG="$CONF_DIR/lane$suffix.json"
   PID_FILE="$CONF_DIR/lane$suffix.pid"
   LOG="$CONF_DIR/lane$suffix.log"
+  WARP_CFG="$CONF_DIR/warp-hop$suffix.json"
+  WARP_PID_FILE="$CONF_DIR/warp-hop$suffix.pid"
+  WARP_LOG="$CONF_DIR/warp-hop$suffix.log"
+  WARP_PORT_FILE="$CONF_DIR/warp-hop$suffix.port"
   PROXY_PORTS="$STATE_DIR/system-proxy$suffix.ports"
   PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
   SUPERVISOR_FILE="$STATE_DIR/system-proxy$suffix.supervisor"
@@ -2012,6 +2024,13 @@ build_config() {
         LOGIN_QUIET=1 action_login
         say "account saved to $CREDS (owner-only); connecting."
         read_credentials
+      fi
+      # WARP first: the hop egresses the account plane and the carrier, so a
+      # region block on FxA or the catalogue sees a WARP exit. An explicit
+      # --upstream is the user's own hop and wins.
+      if [ "$WANT_WARP" = 1 ] && [ -z "$UPSTREAM" ]; then
+        require_bin
+        start_warp_hop || die "the warp hop did not start; nothing was chained."
       fi
       outbound="$(build_outbound foxy)" || exit 1
       save_lane_location
@@ -2135,7 +2154,10 @@ stop_lane() {
   fi
   rm -f "$PID_FILE"
   local rc=0
-  if [ "$clear" = 1 ]; then system_proxy_off || rc=$?; fi
+  if [ "$clear" = 1 ]; then
+    stop_warp_hop
+    system_proxy_off || rc=$?
+  fi
   return "$rc"
 }
 
@@ -2143,6 +2165,69 @@ stop_lane() {
 stop_and_forget() {
   stop_lane 1
   [ "$OUTBOUND" = config ] || rm -f "$CFG"
+}
+
+# A WARP hop is a lane of its own: a loopback socks front over a warp outbound
+# that registers once and keeps the identity, so the foxy plane egresses through
+# WARP and a region block sees a WARP exit instead of this machine.
+warp_hop_running() {
+  local pid port
+  pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
+  port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null && port_open "$port"
+}
+
+start_warp_hop() {
+  if warp_hop_running; then
+    UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
+    say "warp hop already up (pid $(cat "$WARP_PID_FILE")); the lane chains through it."
+    return 0
+  fi
+  stop_warp_hop
+  local port pid
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
+  [ -n "$port" ] || return 1
+  python3 - "$WARP_CFG" "$port" "$CONF_DIR/warp-identity.json" <<'PY'
+import json, sys
+cfg, port, identity = sys.argv[1:4]
+doc = {
+    "inbounds": [{"protocol": "socks", "listen": "127.0.0.1", "port": int(port)}],
+    "outbounds": [{"protocol": "warp", "settings": {
+        "identityFile": identity, "register": True, "mode": "auto"}}],
+}
+with open(cfg, "w") as handle:
+    json.dump(doc, handle, indent=2)
+PY
+  chmod 600 "$WARP_CFG"
+  say "warp hop: registering once and racing WireGuard against MASQUE..."
+  "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
+  pid=$!
+  echo "$pid" > "$WARP_PID_FILE"
+  echo "$port" > "$WARP_PORT_FILE"
+  for _ in $(seq 1 120); do
+    port_open "$port" && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if ! port_open "$port"; then
+    say "the warp hop did not open; last lines of $WARP_LOG:"
+    tail -n 20 "$WARP_LOG" 2>/dev/null || true
+    stop_warp_hop
+    return 1
+  fi
+  UPSTREAM="socks5://127.0.0.1:$port"
+  say "warp hop up (pid $pid) on 127.0.0.1:$port; the account plane and the carrier egress through it."
+}
+
+stop_warp_hop() {
+  local pid
+  pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
 }
 
 forget_lane_config() {
@@ -2169,6 +2254,13 @@ stop_all_lanes() {
         stop_lane 0 || rc=1
         forget_lane_config
       done
+      for pidfile in "$CONF_DIR"/warp-hop*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#warp-hop}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        stop_warp_hop
+      done
     done < "$LANES_FILE"
   fi
   CONF_DIR="$saved_conf"
@@ -2181,6 +2273,13 @@ stop_all_lanes() {
     apply_instance
     stop_lane 0 || rc=1
     forget_lane_config
+  done
+  for pidfile in "$CONF_DIR"/warp-hop*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#warp-hop}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    stop_warp_hop
   done
   INSTANCE=""
   apply_instance
@@ -2372,35 +2471,53 @@ verify_flow() {
   return 0
 }
 
+# A region block names itself 451 in the lane's log; WARP is the hop that moves
+# the exit, and the ladder takes it once before anything is reported refused.
+warp_ladder() {
+  [ "$OUTBOUND" = foxy ] || return 1
+  [ "$WANT_WARP" = 0 ] || return 1
+  grep -q "the account plane answered 451" "$LOG" 2>/dev/null || return 1
+  stop_and_forget
+  say "the account plane answered 451 from this region: the lane retries once through"
+  say "a WARP hop (register an identity, race WireGuard against MASQUE, sign in through"
+  say "it). Pass '--warp' to make that the first move next time."
+  WANT_WARP=1
+}
+
 action_up() {
   reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
-  start_lane
-  # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
-  trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
-  if [ -n "$FRONTS" ] && ! wait_fronts; then
-    say "the lane did not open its fronts; last lines of $LOG:"
-    tail -n 20 "$LOG" 2>/dev/null || true
-    stop_and_forget
-    say "the lane was stopped and its config removed; the log stays at $LOG."
-    exit 1
-  fi
-  say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
-  if [ "$OUTBOUND" = config ]; then
-    say "  the ones $CONFIG_FILE names (served verbatim)"
-  fi
-  port_map
-  [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
-  local ok=0
-  if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
-  if [ "$ok" = 1 ]; then
-    # A lane that carries no flow is a leftover, not a result: end it here.
-    stop_and_forget
-    say "the lane was stopped and its config removed; nothing is routed, and the"
-    say "log stays at $LOG."
-    exit 3
-  fi
+  for _ in 1 2; do
+    start_lane
+    # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
+    trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
+    if [ -n "$FRONTS" ] && ! wait_fronts; then
+      if warp_ladder; then continue; fi
+      say "the lane did not open its fronts; last lines of $LOG:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      stop_and_forget
+      say "the lane was stopped and its config removed; the log stays at $LOG."
+      exit 1
+    fi
+    say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
+    if [ "$OUTBOUND" = config ]; then
+      say "  the ones $CONFIG_FILE names (served verbatim)"
+    fi
+    port_map
+    [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
+    local ok=0
+    if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
+    if [ "$ok" = 1 ]; then
+      # A lane that carries no flow is a leftover, not a result: end it here.
+      if warp_ladder; then continue; fi
+      stop_and_forget
+      say "the lane was stopped and its config removed; nothing is routed, and the"
+      say "log stays at $LOG."
+      exit 3
+    fi
+    break
+  done
   # Route the machine only at a lane that proved it carries a flow: an armed
   # system proxy over a dead lane takes the network down with it.
   if [ "$WANT_VPN" = 1 ]; then
@@ -2418,30 +2535,35 @@ action_up() {
 action_serve() {
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
-  start_lane
-  # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
-  trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
-  if [ -n "$FRONTS" ] && ! wait_fronts; then
-    say "the lane did not open its fronts; last lines of $LOG:"
-    tail -n 20 "$LOG" 2>/dev/null || true
-    stop_and_forget
-    say "the lane was stopped and its config removed; the log stays at $LOG."
-    exit 1
-  fi
-  say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
-  if [ "$OUTBOUND" = config ]; then
-    say "  the ones $CONFIG_FILE names (served verbatim)"
-  fi
-  port_map
-  [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
-  local ok=0
-  if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
-  if [ "$ok" = 1 ]; then
-    stop_and_forget
-    say "the lane was stopped and its config removed; nothing is routed, and the"
-    say "log stays at $LOG."
-    exit 3
-  fi
+  for _ in 1 2; do
+    start_lane
+    # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
+    trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
+    if [ -n "$FRONTS" ] && ! wait_fronts; then
+      if warp_ladder; then continue; fi
+      say "the lane did not open its fronts; last lines of $LOG:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      stop_and_forget
+      say "the lane was stopped and its config removed; the log stays at $LOG."
+      exit 1
+    fi
+    say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
+    if [ "$OUTBOUND" = config ]; then
+      say "  the ones $CONFIG_FILE names (served verbatim)"
+    fi
+    port_map
+    [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
+    local ok=0
+    if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
+    if [ "$ok" = 1 ]; then
+      if warp_ladder; then continue; fi
+      stop_and_forget
+      say "the lane was stopped and its config removed; nothing is routed, and the"
+      say "log stays at $LOG."
+      exit 3
+    fi
+    break
+  done
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_on; then
     stop_and_forget
     say "the system proxy was not armed; the lane was stopped and its config removed."
@@ -2682,6 +2804,7 @@ while [ $# -gt 0 ]; do
       printable_ascii "$2" || die "--fxa-user-agent wants printable ASCII only; nothing was started."
       FXA_USER_AGENT="$2"; shift 2 ;;
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
+    --warp) WANT_WARP=1; shift ;;
     --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
     --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
     --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; FRONTS_SET=1; shift 2 ;;
@@ -2727,6 +2850,9 @@ if [ -n "$EXCLUDE_DOMAINS$EXCLUDE_PORTS" ] && [ "$OUTBOUND" != foxy ]; then
 fi
 if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
   die "--fxa-user-agent belongs to the foxy lane; nothing was started."
+fi
+if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ]; then
+  die "--warp chains the foxy lane through WARP (up --foxy --warp); nothing was started."
 fi
 
 if [ "$ALL" = 1 ]; then

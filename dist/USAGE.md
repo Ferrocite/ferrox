@@ -68,6 +68,7 @@ The foxy list prints one line per country and one per city with the number of pu
 ```bash
 ./dist/ferrox-cli.sh up --foxy                 # lane up, three local fronts (asks for the account first time)
 ./dist/ferrox-cli.sh up --foxy --vpn           # plus the macOS system proxy
+./dist/ferrox-cli.sh up --foxy --warp          # sign in and egress through a WARP hop
 ./dist/ferrox-cli.sh up --foxy --country DE --carrier h2
 ./dist/ferrox-cli.sh up --foxy --exclude-domains printer.lan --exclude-ports 22,53
 ./dist/ferrox-cli.sh up --foxy --socks 1080 --http 8081 --mixed 1082
@@ -79,6 +80,8 @@ The foxy list prints one line per country and one per city with the number of pu
 ```
 
 `up` prints the port map, then proves one flow through the first front. With `--vpn` it arms the macOS system proxy only after that flow answers, so a lane that carries nothing never takes the machine's traffic with it. If the fronts are open but no flow gets through, it says so, shows the lane log, and stops the lane itself: the pid file and config are removed and the proxy cleared, so nothing needs a `down` and nothing is left behind except the log.
+
+`--warp` starts a second lane — the WARP hop — that registers one identity, races WireGuard against MASQUE for the faster half, and listens on a loopback SOCKS port; the foxy lane then signs in and carries its flows through that hop, so FxA, the catalogue and the edge all egress from a WARP exit. A region that answers the sign-in with HTTP 451 is refused by name in the lane log, and the first failure of that shape moves the lane onto the hop by itself, once: `--warp` makes it the first move without the refusal.
 
 On a terminal `up --foxy` also asks which carrier to use — `auto` (h2, then h1, then h3), `h2`, `h1` or `h3` — and an empty answer or a pipe takes `auto`, so nothing needs typing. `--carrier` skips the question. `h2` is the rung `auto` opens on because it outran `h3` on every CI runner, and `h3` is the only carrier that also carries UDP. A named `h3` is a preference rather than a pin: it leads, and `h2` and `h1` follow when the path drops QUIC, which is silence rather than a refusal. `status` reads back how long the lane has been up, the carrier it was given, the allowance the plane last named (bytes left of the plan, and when they reset), and the exit IP and country. An allowance that is not there is named, not skipped: either the plane sent no quota header for the pass this lane carries, which is silence rather than zero, or the running lane was started by a binary that names neither the carrier nor the allowance, and `down` then `up` restarts it on the binary this script runs.
 
@@ -183,6 +186,7 @@ Drag `dist/Ferrox.app` to `/Applications` to keep it. It is ad-hoc signed, so th
 | symptom | cause |
 | --- | --- |
 | `lane up`, then "no flow got through" with `429` in the log | the account plane is rate-limiting sign-ins; wait it out, a second login does not buy bytes back |
+| same, with `the account plane answered 451` | this region refuses the sign-in before an account exists: the lane retries once through a WARP hop on its own; `up --foxy --warp` makes that the first move |
 | same, with `did not sign in` | the account or password is refused, or the account wants a two-factor code: `up --foxy --code 123456` |
 | same, with `the stored session was refused` | the saved grant was revoked or expired and the password fallback is not there: `ferrox-cli login --email you@example.com`, or delete `~/.config/ferrox/foxy-token.json` |
 | same, with `401`/`403` after a sign-in that worked | the edge refuses this account's pass at this exit: the subscription or its devices say otherwise; try `--country`, and check the account on vpn.mozilla.org |
