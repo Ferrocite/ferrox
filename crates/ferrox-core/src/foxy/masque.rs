@@ -113,6 +113,27 @@ pub fn connect_udp(
     field(out, b"capsule-protocol", b"?1");
 }
 
+/// The same request over HTTP/1.1, as RFC 9298 §4's upgrade: a `GET` on the default template, the upgrade token, the capsule protocol, and the pass.
+pub fn connect_udp_h1(
+    edge_authority: &str,
+    target_host: &str,
+    target_port: u16,
+    bearer: &str,
+    out: &mut Vec<u8>,
+) {
+    out.extend_from_slice(b"GET https://");
+    out.extend_from_slice(edge_authority.as_bytes());
+    udp_path(target_host, target_port, out);
+    out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    out.extend_from_slice(edge_authority.as_bytes());
+    out.extend_from_slice(
+        b"\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\nProxy-Authorization: ",
+    );
+    out.extend_from_slice(BEARER);
+    out.extend_from_slice(bearer.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+}
+
 /// The same seven fields as a QPACK block for HTTP/3: literal field lines, two zero prefix bytes naming no dynamic state, and no Huffman to compute on either side.
 pub fn connect_udp_qpack(
     edge_authority: &str,
@@ -243,6 +264,23 @@ mod tests {
             assert!(text.contains(field), "missing {field}");
         }
         assert_eq!(super::super::hpack::hpack_status(&block), None);
+    }
+
+    /// RFC 9298 §4's HTTP/1.1 upgrade asks for the same template the capsule carriers name, with the pass on the hop's own field.
+    #[test]
+    fn the_h1_upgrade_names_the_template_the_upgrade_and_the_pass() {
+        let mut request = Vec::new();
+        connect_udp_h1(
+            "edge.example:2499",
+            "example.com",
+            443,
+            "the-pass",
+            &mut request,
+        );
+        assert_eq!(
+            request,
+            b"GET https://edge.example:2499/.well-known/masque/udp/example.com/443/ HTTP/1.1\r\nHost: edge.example:2499\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\nProxy-Authorization: Bearer the-pass\r\n\r\n"
+        );
     }
 
     /// The two carriers write the same seven fields, one as a HPACK block and one as QPACK, so a reader walking literals either way is what compares them.
