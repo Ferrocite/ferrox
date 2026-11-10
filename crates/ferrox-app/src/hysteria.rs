@@ -1995,7 +1995,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
                 break;
             };
             rotate(
-                lane,
+                &lane,
                 &mut flow,
                 Association {
                     session_id: id,
@@ -3607,7 +3607,7 @@ mod tests {
             address: "a",
             payload: b"old",
         };
-        let flow = lane.flow.lock().expect("flow");
+        let mut flow = lane.flow.lock().expect("flow");
         let reader = {
             let lane = Arc::clone(&lane);
             std::thread::spawn(move || {
