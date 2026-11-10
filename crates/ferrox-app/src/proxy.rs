@@ -25434,7 +25434,7 @@ fn open_foxy_ip_tunnel(
             .account
             .as_ref()
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
-        for carrier in crate::foxy::Carrier::udp_order() {
+        for carrier in crate::foxy::Carrier::ip_order() {
             // As on TCP and CONNECT-UDP: a silent carrier is left alone for the window, not probed per packet.
             if foxy.carrier_unanswered(edge, carrier) {
                 continue;
@@ -25558,6 +25558,18 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(edge, carrier);
                             return Some(crate::foxy::Datagram::H3(Box::new(lane)));
+                        }
+                        Err(failure) => failure,
+                    }
+                }
+                crate::foxy::Carrier::H1 => {
+                    match crate::foxy::open_udp_h1(&dial, &host, dest.port()) {
+                        Ok(lane) => {
+                            let _ = lane.set_read_quantum(UDP_POLL);
+                            debug_lane(edge, carrier, || format!("udp opened for {dest}"));
+                            clear_limited(&foxy.limited_strikes, &foxy.limited_until);
+                            foxy.carrier_answered(edge, carrier);
+                            return Some(crate::foxy::Datagram::H1(Box::new(lane)));
                         }
                         Err(failure) => failure,
                     }
@@ -67055,7 +67067,7 @@ mod tests {
             exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
         };
         // Both capsule carriers are known silent, and neither is to be knocked on again inside its window.
-        for carrier in crate::foxy::Carrier::udp_order() {
+        for carrier in crate::foxy::Carrier::ip_order() {
             if let Ok(mut cache) = foxy.carrier_dead.lock() {
                 cache.remember(
                     carrier.key(),

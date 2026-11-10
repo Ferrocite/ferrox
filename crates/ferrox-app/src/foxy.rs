@@ -95,9 +95,15 @@ impl Carrier {
         }
     }
 
-    /// The carriers a UDP flow rides: HTTP/1.1 has no extended CONNECT for datagrams, and the configured carrier does not apply.
+    /// The carriers a CONNECT-UDP flow rides: HTTP/3 carries a capsule natively, HTTP/2 as a stream, and HTTP/1.1 through RFC 9298 §4's upgrade.
     #[must_use]
-    pub(crate) const fn udp_order() -> [Self; 2] {
+    pub(crate) const fn udp_order() -> [Self; 3] {
+        [Self::H3, Self::H2, Self::H1]
+    }
+
+    /// The carriers a CONNECT-IP flow rides: HTTP/1.1 has no mapping for the address request, so the datagram orders diverge here.
+    #[must_use]
+    pub(crate) const fn ip_order() -> [Self; 2] {
         [Self::H3, Self::H2]
     }
 }
@@ -770,6 +776,39 @@ pub(crate) fn open_udp(
         &mut block,
     );
     open_stream(dial, &block)
+}
+
+/// One UDP target as its own HTTP/1.1 upgrade carrying CONNECT-UDP: RFC 9298 §4's fallback for an edge whose TLS answers no HTTP/2 or HTTP/3.
+pub(crate) fn open_udp_h1(
+    dial: &FoxyDial,
+    target_host: &str,
+    target_port: u16,
+) -> Result<H1Datagram, Failure> {
+    let edge = edge_authority(&dial.host, dial.port);
+    let mut tls = tls_to_edge(dial)?;
+    let mut request = Vec::with_capacity(192 + dial.pass.token.len() + target_host.len());
+    masque::connect_udp_h1(
+        &edge,
+        target_host,
+        target_port,
+        &dial.pass.token,
+        &mut request,
+    );
+    tls.write_all(&request).map_err(|_| Failure::Io)?;
+    let (status, carried) = head(&mut tls, None)?;
+    if status != 101 {
+        return Err(Failure::Rejected(status));
+    }
+    Ok(H1Datagram {
+        tls: Tls1 {
+            tls,
+            carried,
+            at: 0,
+            park: None,
+        },
+        capsule_buf: Vec::new(),
+        handed: 0,
+    })
 }
 
 /// One HTTP/2 session to the edge: the preface, the settings, and a socket with no stream on it yet.
@@ -3240,8 +3279,70 @@ fn build_packet(
     )
 }
 
+/// One CONNECT-UDP lane over an HTTP/1.1 upgrade: the byte stream after `101` is the capsule stream, so the lane frames each datagram where the other carriers' frame does.
+pub(crate) struct H1Datagram {
+    tls: Tls1,
+    /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span TLS records, so records accumulate only here.
+    capsule_buf: Vec<u8>,
+    /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length.
+    handed: usize,
+}
+
+impl H1Datagram {
+    pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
+        self.tls.set_read_quantum(quantum)
+    }
+
+    pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let mut prefix = [0u8; 10];
+        let plen = masque::datagram_prefix_into(&mut prefix, payload.len());
+        self.tls.tls.write_all_slices(&[&prefix[..plen], payload])
+    }
+
+    pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let capsule = match masque::datagram_split(&self.capsule_buf) {
+                Some((used, payload)) => {
+                    let len = payload.len();
+                    let at = self.handed;
+                    let take = buf.len().min(len - at);
+                    buf[..take].copy_from_slice(&payload[at..at + take]);
+                    if at + take == len {
+                        self.capsule_buf.drain(..used);
+                        self.handed = 0;
+                    } else {
+                        self.handed = at + take;
+                    }
+                    Some((len, take))
+                }
+                None => None,
+            };
+            if let Some((len, take)) = capsule {
+                if len == 0 {
+                    continue;
+                }
+                return Ok(take);
+            }
+            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+                self.capsule_buf.clear();
+                self.handed = 0;
+                return Err(std::io::Error::other(
+                    "foxy: a capsule stream that never parses",
+                ));
+            }
+            let mut window = [0u8; 8192];
+            let read = self.tls.read(&mut window)?;
+            if read == 0 {
+                return Ok(0);
+            }
+            self.capsule_buf.extend_from_slice(&window[..read]);
+        }
+    }
+}
+
 /// One CONNECT-UDP lane on whichever carrier the edge answers: a UDP flow is a capsule stream either way, and which carrier carries it is the dial's question.
 pub(crate) enum Datagram {
+    H1(Box<H1Datagram>),
     H2(Box<Tls2>),
     H3(Box<H3>),
 }
@@ -3687,6 +3788,7 @@ impl Drop for Tunnel {
 impl std::io::Write for Datagram {
     fn write(&mut self, payload: &[u8]) -> std::io::Result<usize> {
         match self {
+            Self::H1(lane) => lane.write_datagram(payload),
             Self::H2(lane) => lane.write_datagram(payload),
             Self::H3(lane) => lane.write_datagram(payload),
         }
@@ -3701,6 +3803,7 @@ impl std::io::Write for Datagram {
 impl std::io::Read for Datagram {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
+            Self::H1(lane) => lane.read_datagram(buf),
             Self::H2(lane) => lane.read_datagram(buf),
             Self::H3(lane) => lane.read_datagram(buf),
         }
@@ -3976,11 +4079,11 @@ mod tests {
         );
         assert_eq!(Carrier::H2.order(), [Carrier::H2, Carrier::H2, Carrier::H2]);
         assert_eq!(Carrier::H3.order(), [Carrier::H3, Carrier::H2, Carrier::H1]);
-        assert_eq!(Carrier::udp_order(), [Carrier::H3, Carrier::H2]);
-        assert!(
-            !Carrier::udp_order().contains(&Carrier::H1),
-            "HTTP/1.1 has no extended CONNECT to carry a capsule"
+        assert_eq!(
+            Carrier::udp_order(),
+            [Carrier::H3, Carrier::H2, Carrier::H1]
         );
+        assert_eq!(Carrier::ip_order(), [Carrier::H3, Carrier::H2]);
     }
 
     /// The pause between attempts bounds the budget the whole dial spends: a peer that would have answered is not waited on for long.
@@ -6594,6 +6697,123 @@ pub(crate) mod loopback {
             0,
             "the read cursor is where it started"
         );
+    }
+
+    /// A loopback HTTP/1.1 edge that answers the RFC 9298 upgrade and echoes the first datagram back in one capsule.
+    fn masque_h1_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let request = read_head(&mut tls);
+            seen.send(request.into_bytes()).expect("reports the head");
+            tls.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n",
+            )
+            .expect("answers the upgrade");
+            tls.flush().expect("flushes the answer");
+            let mut stream = Vec::new();
+            let mut window = [0u8; 1024];
+            loop {
+                let read = match tls.read(&mut window) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                stream.extend_from_slice(&window[..read]);
+                if let Some((_, datagram)) = masque::datagram_split(&stream) {
+                    let mut echo = Vec::new();
+                    masque::datagram_encode(datagram, &mut echo);
+                    tls.write_all(&echo).expect("echoes");
+                    tls.flush().expect("flushes the echo");
+                    // The echo is not the end of the edge: the lane must find it still there after the capsule.
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn the_h1_carrier_opens_connect_udp_and_echoes_a_datagram() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = masque_h1_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        let mut lane = open_udp_h1(&dial, "example.com", 443).expect("opens");
+        let request = seen_rx.recv_timeout(Duration::from_secs(20)).expect("head");
+        let text = String::from_utf8_lossy(&request);
+        for field in [
+            "GET https://localhost:",
+            "/.well-known/masque/udp/example.com/443/",
+            "Upgrade: connect-udp",
+            "Capsule-Protocol: ?1",
+            "Proxy-Authorization: Bearer the-pass",
+        ] {
+            assert!(text.contains(field), "missing {field}");
+        }
+        lane.write_datagram(b"hello udp").expect("writes");
+        lane.set_read_quantum(Duration::from_secs(5))
+            .expect("bounds a read");
+        let mut back = [0u8; 64];
+        let mut at = 0usize;
+        while at < b"hello udp".len() {
+            match lane.read_datagram(&mut back[at..]) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => at += read,
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        assert_eq!(&back[..at], b"hello udp");
+        edge.join().expect("joins");
+    }
+
+    /// A capsule wider than the caller's buffer keeps its tail on the h1 lane, and the next read resumes at the cursor rather than dropping the rest.
+    #[test]
+    fn a_h1_datagram_wider_than_the_caller_s_buffer_keeps_its_tail() {
+        const BODY: usize = 1_350;
+        let (roots, server) = minted(b"http/1.1");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let edge = masque_h1_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        let mut lane = open_udp_h1(&dial, "example.com", 443).expect("opens");
+        let wide: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+        lane.write_datagram(&wide).expect("writes");
+        lane.set_read_quantum(Duration::from_secs(5))
+            .expect("bounds a read");
+        let mut piece = [0u8; 64];
+        let mut got = Vec::new();
+        while got.len() < BODY {
+            match lane.read_datagram(&mut piece) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => {
+                    assert!(
+                        read > 0 && read <= piece.len(),
+                        "a read reports what its buffer got"
+                    );
+                    got.extend_from_slice(&piece[..read]);
+                }
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        assert_eq!(got, wide, "every octet once, in the order it was sent");
+        assert!(
+            lane.capsule_buf.is_empty(),
+            "the spent capsule left nothing staged"
+        );
+        assert_eq!(lane.handed, 0, "and no cursor either");
+        edge.join().expect("joins");
     }
 
     /// A frame read a hundred bytes at a time leaves nothing staged in the lane: every byte the caller took went from the wire into its own buffer, and between those visits the lane holds only the cursor.
