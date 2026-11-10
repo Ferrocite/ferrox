@@ -3467,7 +3467,7 @@ mod tests {
         }
     }
 
-    fn message<'a>(session: u32, packet: u16, frag: u8, payload: &'a [u8]) -> UdpMessage<'a> {
+    fn message(session: u32, packet: u16, frag: u8, payload: &[u8]) -> UdpMessage<'_> {
         UdpMessage {
             session,
             packet,
