@@ -156,9 +156,14 @@ append_pem 562
 # Re-blessed 51892694 by the sliced Vision seal: dns.rs is untouched; the same
 # ferrox-core lib test binary gained the sliced-record tests, and thin-LTO moved the
 # frame eight instructions forward; the five decisions and bytes are unchanged.
+# Re-blessed 51892686 by the ferrox-core landings after that blessing (masque,
+# the tun checksum walk, the quic/vision findings): dns.rs is untouched and the
+# probe still walks its five decisions 4096 times, so the eight instructions are
+# not a multiple of that walk -- the loop that decides is unchanged and the move
+# is in the frame's setup, measured in the pinned userspace below.
 # Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892694 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892686 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -216,10 +221,12 @@ ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_
 ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
 # The four-slice SSH packet sealed 4096 times through the direct write reports
 # 47483770; flattening the same slices into one and sealing that reports
-# 47621526 on the current base. The direct probe is 137756 (0.29%) lower, a net
+# 47621538 on the current base. The direct probe is 137756 (0.29%) lower, a net
 # that includes the flatten copy and the four-slices-versus-one effect, not the
 # previous writer's framing loop. The bytes and their order are unchanged; the
-# 12-instruction difference from the 47621538 this row carried is codegen moved
-# by the later psiphon landings, not the test's bytes or order.
+# row's 12 instructions move with the ferrox-app test binary's thin-LTO layout
+# (the shaped-hello clock arm of b979a9ba moved it back from 47621526), and 12
+# is not a multiple of the probe's 4096 writes, so the loop is unchanged and the
+# move is in its setup.
 ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
