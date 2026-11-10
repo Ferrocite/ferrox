@@ -1285,6 +1285,11 @@ impl H2Conn {
 
     /// A reset from the peer kills only its stream: the connection may still serve the others.
     fn fail_stream(&self, stream: u32) {
+        // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
+        let credit = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let state = self
             .streams
             .lock()
@@ -1296,6 +1301,7 @@ impl H2Conn {
             state.cv.notify_all();
         }
         self.wake.notify_all();
+        drop(credit);
     }
 
     fn end_stream(&self, stream: u32) {
@@ -1338,6 +1344,11 @@ impl H2Conn {
 
     fn reset_stream(&self, stream: u32) {
         self.forget_upload(stream);
+        // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
+        let credit = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         {
             let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(state) = streams.remove(&stream) {
@@ -1347,14 +1358,21 @@ impl H2Conn {
             }
         }
         self.wake.notify_all();
+        drop(credit);
         self.end_session_of(stream);
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
         let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
 
     fn kill(&self) {
+        // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
+        let credit = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.dead.store(true, Ordering::SeqCst);
         self.wake.notify_all();
+        drop(credit);
         let streams: Vec<_> = {
             self.streams
                 .lock()
