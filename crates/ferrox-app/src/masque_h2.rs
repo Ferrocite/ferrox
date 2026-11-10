@@ -1065,6 +1065,7 @@ struct Session {
     peer_window: i64,
     granted: Option<Granted>,
     addrs: Vec<IpAddr>,
+    udp: Option<masque::UdpLane>,
     warp: bool,
     end: bool,
 }
@@ -1086,6 +1087,7 @@ impl Session {
             peer_window: DEFAULT_WINDOW,
             granted: None,
             addrs: Vec::new(),
+            udp: None,
             warp: false,
             end: false,
         }
@@ -1186,7 +1188,10 @@ impl Session {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
             }
             h2::T_HEADERS => {
-                if self.request.is_some() {
+                if let Some(active) = self.request {
+                    if id != active {
+                        wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
+                    }
                     return;
                 }
                 let block = strip_padding(flags, body, true);
@@ -1253,42 +1258,59 @@ impl Session {
         } else {
             field(b":protocol").unwrap_or_default()
         };
-        let path_ok = field(b":path").is_some_and(|path| self.spec.path_matches(path, protocol));
+        let udp = protocol == b"connect-udp";
+        let target = udp
+            .then(|| field(b":path"))
+            .flatten()
+            .and_then(masque::udp_target);
+        let path_ok = if udp {
+            target.is_some()
+        } else {
+            field(b":path").is_some_and(|path| self.spec.path_matches(path, protocol))
+        };
         let method_ok = field(b":method") == Some(b"CONNECT");
-        let protocol_ok = self.spec.accepts_protocol(protocol);
+        let protocol_ok = udp || self.spec.accepts_protocol(protocol);
         let capsules_ok = warp
             || field(b"capsule-protocol")
                 .and_then(|value| value.strip_prefix(b"?"))
                 .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
         if !decoded {
-            self.reply(wire, id, 400);
+            self.reply(wire, id, 400, udp);
             return;
         }
         if !path_ok {
-            self.reply(wire, id, 404);
+            self.reply(wire, id, if udp { 400 } else { 404 }, udp);
             return;
         }
         if !method_ok || !protocol_ok || !capsules_ok {
-            self.reply(wire, id, 400);
+            self.reply(wire, id, 400, udp);
             return;
         }
-        if !self
-            .spec
-            .request_authenticated(protocol, field(b"authorization"))
-        {
-            self.reply(wire, id, 401);
+        let authenticated = if udp {
+            self.spec
+                .udp_authenticated(field(b"proxy-authorization"), field(b"authorization"))
+        } else {
+            self.spec
+                .request_authenticated(protocol, field(b"authorization"))
+        };
+        if !authenticated {
+            self.reply(wire, id, 401, udp);
+            return;
+        }
+        if udp {
+            self.accept_udp(wire, id, target);
             return;
         }
         self.warp = warp;
         let Some(addrs) = masque::assign(&self.shared) else {
-            self.reply(wire, id, 503);
+            self.reply(wire, id, 503, false);
             return;
         };
         let (sender, outgoing) = mpsc::sync_channel::<Vec<u8>>(masque::QUEUE);
         let queue = masque::TunnelQueue::new(sender, None);
         let Some(granted) = masque::register(&self.shared, &addrs, &queue) else {
             masque::release(&self.shared, &addrs);
-            self.reply(wire, id, 503);
+            self.reply(wire, id, 503, false);
             return;
         };
         self.addrs = addrs;
@@ -1308,11 +1330,36 @@ impl Session {
         }
     }
 
-    fn reply(&mut self, wire: &mut Wire, id: u32, status: u16) {
+    fn accept_udp(&mut self, wire: &mut Wire, id: u32, target: Option<(String, u16)>) {
+        let Some((host, port)) = target else {
+            self.reply(wire, id, 400, true);
+            return;
+        };
+        let Ok(lane) = masque::UdpLane::open(&host, port) else {
+            self.reply(wire, id, 503, true);
+            return;
+        };
+        self.udp = Some(lane);
+        self.request = Some(id);
+        let block = h2::block_encode(&[(":status", "200"), ("capsule-protocol", "?1")]);
+        wire.send(h2::T_HEADERS, h2::F_END_HEADERS, id, &block);
+        if !wire.closed {
+            wire.deadline.clear();
+        }
+    }
+
+    fn reply(&mut self, wire: &mut Wire, id: u32, status: u16, proxy: bool) {
         let status = status.to_string();
         let mut fields = vec![(":status", status.as_str())];
         if status == "401" {
-            fields.push(("www-authenticate", AUTH_REALM));
+            fields.push((
+                if proxy {
+                    "proxy-authenticate"
+                } else {
+                    "www-authenticate"
+                },
+                AUTH_REALM,
+            ));
         }
         let block = h2::block_encode(&fields);
         wire.send(h2::T_HEADERS, h2::F_END_HEADERS | h2::F_END, id, &block);
@@ -1343,9 +1390,13 @@ impl Session {
             self.capsule_at += used;
             match capsule {
                 connectip::Capsule::Datagram(packet) => {
-                    masque::forward(&self.shared, &self.spec, &self.addrs, packet);
+                    if let Some(udp) = &self.udp {
+                        udp.send(packet);
+                    } else {
+                        masque::forward(&self.shared, &self.spec, &self.addrs, packet);
+                    }
                 }
-                connectip::Capsule::AddressRequest(body) => {
+                connectip::Capsule::AddressRequest(body) if self.udp.is_none() => {
                     let granted = masque::respond(body, &self.addrs);
                     if !granted.is_empty() {
                         let mut out = Vec::new();
@@ -1421,11 +1472,13 @@ impl Session {
             if wire.closed || self.end {
                 break;
             }
-            let Some(packet) = self
-                .outgoing
-                .as_ref()
-                .and_then(|outgoing| outgoing.try_recv().ok())
-            else {
+            let Some(packet) = (if let Some(udp) = &self.udp {
+                udp.try_recv()
+            } else {
+                self.outgoing
+                    .as_ref()
+                    .and_then(|outgoing| outgoing.try_recv().ok())
+            }) else {
                 break;
             };
             let mut capsule = Vec::with_capacity(packet.len() + 8);
@@ -2418,7 +2471,7 @@ mod tests {
         block.extend_from_slice(value);
     }
 
-    fn read_frame(stream: &mut dyn Read) -> (u8, u8, u32, Vec<u8>) {
+    fn read_frame<S: Read + ?Sized>(stream: &mut S) -> (u8, u8, u32, Vec<u8>) {
         let mut head = [0u8; 9];
         stream.read_exact(&mut head).expect("a frame head");
         let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
@@ -2432,7 +2485,7 @@ mod tests {
         )
     }
 
-    fn write_frame(stream: &mut dyn Write, kind: u8, flags: u8, id: u32, body: &[u8]) {
+    fn write_frame<S: Write + ?Sized>(stream: &mut S, kind: u8, flags: u8, id: u32, body: &[u8]) {
         let head = h2::frame_head(body.len(), kind, flags, id);
         stream.write_all(&head).expect("a frame head");
         stream.write_all(body).expect("a frame body");
@@ -2542,6 +2595,182 @@ mod tests {
             })
             .expect("a v4 address");
         (tls, client)
+    }
+
+    fn inbound_cleartext(settings: &str) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{settings},"streamSettings":{{"network":"masque","security":"none"}}}}"#
+        ))
+        .expect("a cleartext masque inbound")
+    }
+
+    trait ReadWrite: Read + Write {}
+    impl<T: Read + Write> ReadWrite for T {}
+
+    type TestStream = Box<dyn ReadWrite>;
+
+    fn open_connect_udp(
+        target: &str,
+        port: u16,
+        bearer: &str,
+        cleartext: bool,
+    ) -> (TestStream, Vec<(String, String)>) {
+        let settings =
+            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24"]}"#;
+        let config = if cleartext {
+            inbound_cleartext(settings)
+        } else {
+            inbound(settings)
+        };
+        let served = crate::masque::serve_inbound(&config, &freedom("127.0.0.1:1"), "127.0.0.1:0")
+            .expect("serve");
+        let tcp = TcpStream::connect(("127.0.0.1", served)).expect("tcp");
+        tcp.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let mut stream: TestStream = if cleartext {
+            Box::new(tcp)
+        } else {
+            let config = TlsConfig {
+                server_name: "localhost".to_owned(),
+                alpn: Arc::from([b"h2".to_vec()]),
+                insecure: true,
+                ..TlsConfig::default()
+            };
+            let mut tls = ferrox_core::tls::connect(&config, tcp).expect("tls");
+            tls.handshake().expect("handshake");
+            assert_eq!(tls.alpn(), Some(b"h2".as_slice()));
+            Box::new(tls)
+        };
+        stream.write_all(h2::MAGIC).expect("preface");
+        write_frame(&mut *stream, h2::T_SETTINGS, 0, 0, &[]);
+        let mut block = Vec::new();
+        field(&mut block, ":method", b"CONNECT");
+        field(&mut block, ":protocol", b"connect-udp");
+        field(&mut block, ":scheme", b"https");
+        field(
+            &mut block,
+            ":authority",
+            format!("localhost:{served}").as_bytes(),
+        );
+        let path = format!("/.well-known/masque/udp/{target}/{port}/");
+        field(&mut block, ":path", path.as_bytes());
+        field(&mut block, "capsule-protocol", b"?1");
+        let pass = format!("Bearer {bearer}");
+        field(&mut block, "proxy-authorization", pass.as_bytes());
+        write_frame(&mut *stream, h2::T_HEADERS, h2::F_END_HEADERS, 1, &block);
+
+        let mut fields = Vec::new();
+        while fields.is_empty() {
+            let (kind, flags, id, body) = read_frame(&mut *stream);
+            if kind == h2::T_SETTINGS {
+                if flags & h2::F_ACK == 0 {
+                    write_frame(&mut *stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]);
+                }
+            } else if kind == h2::T_HEADERS && id == 1 {
+                Decoder::default()
+                    .decode(&body, &mut |name, value| {
+                        fields.push((
+                            String::from_utf8_lossy(name).into_owned(),
+                            String::from_utf8_lossy(value).into_owned(),
+                        ));
+                    })
+                    .expect("a header block");
+            }
+        }
+        (stream, fields)
+    }
+
+    fn status(fields: &[(String, String)]) -> Option<&str> {
+        fields
+            .iter()
+            .find(|(name, _)| name == ":status")
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn echo_once() -> SocketAddr {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let address = echo.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        address
+    }
+
+    fn read_udp_echo(stream: &mut TestStream) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let (kind, flags, id, body) = read_frame(&mut *stream);
+            if kind == h2::T_SETTINGS {
+                if flags & h2::F_ACK == 0 {
+                    write_frame(&mut *stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]);
+                }
+                continue;
+            }
+            if kind != h2::T_DATA || id != 1 {
+                continue;
+            }
+            let mut at = 0;
+            while let Some((used, capsule)) = connectip::capsule_split(&body[at..]) {
+                at += used;
+                if let connectip::Capsule::Datagram(payload) = capsule {
+                    return payload.to_vec();
+                }
+            }
+        }
+        panic!("no datagram came back");
+    }
+
+    #[test]
+    fn an_h2_connect_udp_tunnel_carries_a_datagram_to_its_target() {
+        let address = echo_once();
+        let (mut stream, fields) = open_connect_udp("127.0.0.1", address.port(), "p", false);
+        assert_eq!(status(&fields), Some("200"));
+        let mut capsule = Vec::new();
+        datagram(b"hello", &mut capsule);
+        write_frame(&mut *stream, h2::T_DATA, 0, 1, &capsule);
+        assert_eq!(read_udp_echo(&mut stream), b"hello");
+    }
+
+    #[test]
+    fn a_second_h2_connect_udp_stream_is_refused_rather_than_left_waiting() {
+        let address = echo_once();
+        let (mut stream, fields) = open_connect_udp("127.0.0.1", address.port(), "p", false);
+        assert_eq!(status(&fields), Some("200"));
+        write_frame(&mut *stream, h2::T_HEADERS, h2::F_END_HEADERS, 3, &[]);
+        loop {
+            let (kind, flags, id, body) = read_frame(&mut *stream);
+            if kind == h2::T_SETTINGS {
+                if flags & h2::F_ACK == 0 {
+                    write_frame(&mut *stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]);
+                }
+                continue;
+            }
+            if kind == h2::T_RST && id == 3 {
+                assert_eq!(body, 7u32.to_be_bytes(), "REFUSED_STREAM");
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn an_h2c_connect_udp_tunnel_carries_a_datagram_to_its_target() {
+        let address = echo_once();
+        let (mut stream, fields) = open_connect_udp("127.0.0.1", address.port(), "p", true);
+        assert_eq!(status(&fields), Some("200"));
+        let mut capsule = Vec::new();
+        datagram(b"h2c", &mut capsule);
+        write_frame(&mut *stream, h2::T_DATA, 0, 1, &capsule);
+        assert_eq!(read_udp_echo(&mut stream), b"h2c");
+    }
+
+    #[test]
+    fn a_connect_udp_tunnel_refuses_a_wrong_bearer_with_a_proxy_challenge() {
+        let (_, fields) = open_connect_udp("127.0.0.1", 9, "wrong", false);
+        assert_eq!(status(&fields), Some("401"));
+        assert!(fields.iter().any(|(name, _)| name == "proxy-authenticate"));
     }
 
     #[test]

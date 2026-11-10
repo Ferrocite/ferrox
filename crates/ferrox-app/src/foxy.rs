@@ -775,7 +775,8 @@ pub(crate) fn open_udp(
         &dial.pass.token,
         &mut block,
     );
-    open_stream(dial, &block)
+    let session = open_session(dial)?;
+    attach(&session, &block)
 }
 
 /// One UDP target as its own HTTP/1.1 upgrade carrying CONNECT-UDP: RFC 9298 §4's fallback for an edge whose TLS answers no HTTP/2 or HTTP/3.

@@ -120,9 +120,18 @@ pub(crate) fn request(authority: &str, path: &str, headers: &[(String, String)])
 }
 
 pub(crate) const SWITCH: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n";
+pub(crate) const SWITCH_UDP: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n";
 
 /// A minimal error answer; a 401 also carries the Basic challenge.
 fn refusal(status: u16) -> Vec<u8> {
+    refusal_with(status, false)
+}
+
+fn refusal_proxy(status: u16) -> Vec<u8> {
+    refusal_with(status, true)
+}
+
+fn refusal_with(status: u16, proxy: bool) -> Vec<u8> {
     let reason = match status {
         401 => "Unauthorized",
         404 => "Not Found",
@@ -132,7 +141,11 @@ fn refusal(status: u16) -> Vec<u8> {
     let mut out =
         format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n");
     if status == 401 {
-        out.push_str("WWW-Authenticate: ");
+        out.push_str(if proxy {
+            "Proxy-Authenticate: "
+        } else {
+            "WWW-Authenticate: "
+        });
         out.push_str(AUTH_REALM);
         out.push_str("\r\n");
     }
@@ -446,27 +459,80 @@ pub(crate) fn serve(
     let target = fields.next().unwrap_or_default();
     let version = fields.next().unwrap_or_default();
     let path = target_path(target);
+    let udp_path = masque::udp_target(path.as_bytes());
+    let udp = header_has(text, "upgrade", "connect-udp")
+        && (udp_path.is_some() || !header_has(text, "upgrade", "connect-ip"));
+    let ip = !udp && header_has(text, "upgrade", "connect-ip");
     if version != "HTTP/1.1" || method != "GET" {
         wire.send(&refusal(400));
         return;
     }
-    if !masque::path_matches(path.as_bytes(), &spec.path) {
-        wire.send(&refusal(404));
-        return;
-    }
     if !header_has(text, "connection", "upgrade")
-        || !header_has(text, "upgrade", "connect-ip")
+        || (!udp && !ip)
         || !capsules_ok(text)
         || crate::proxy::header_value_in(text, "host").is_none()
     {
         wire.send(&refusal(400));
         return;
     }
-    if !spec.authenticates(crate::proxy::header_value_in(text, "authorization").map(str::as_bytes))
-    {
-        wire.send(&refusal(401));
+    let target = if udp {
+        let Some(target) = udp_path else {
+            wire.send(&refusal_proxy(400));
+            return;
+        };
+        Some(target)
+    } else {
+        if !masque::path_matches(path.as_bytes(), &spec.path) {
+            wire.send(&refusal(404));
+            return;
+        }
+        None
+    };
+    let authorized = if udp {
+        spec.udp_authenticated(
+            crate::proxy::header_value_in(text, "proxy-authorization").map(str::as_bytes),
+            crate::proxy::header_value_in(text, "authorization").map(str::as_bytes),
+        )
+    } else {
+        spec.authenticates(crate::proxy::header_value_in(text, "authorization").map(str::as_bytes))
+    };
+    if !authorized {
+        let answer = if udp {
+            refusal_proxy(401)
+        } else {
+            refusal(401)
+        };
+        wire.send(&answer);
         return;
     }
+    match target {
+        Some((host, port)) => serve_udp(&mut wire, shared, spec, &host, port),
+        None => serve_ip(&mut wire, shared, spec),
+    }
+}
+
+fn serve_udp(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>, host: &str, port: u16) {
+    let Ok(lane) = masque::UdpLane::open(host, port) else {
+        wire.send(&refusal_proxy(503));
+        return;
+    };
+    if !wire.send(SWITCH_UDP) {
+        return;
+    }
+    let mut session = Session {
+        shared,
+        spec,
+        addrs: Vec::new(),
+        outgoing: None,
+        udp: Some(lane),
+        capsules: Vec::new(),
+        capsule_at: 0,
+        end: false,
+    };
+    session.run(wire);
+}
+
+fn serve_ip(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
     let Some(addrs) = masque::assign(&shared) else {
         wire.send(&refusal(503));
         return;
@@ -496,11 +562,12 @@ pub(crate) fn serve(
         spec,
         addrs,
         outgoing: Some(outgoing),
+        udp: None,
         capsules: Vec::new(),
         capsule_at: 0,
         end: false,
     };
-    session.run(&mut wire);
+    session.run(wire);
 }
 
 struct Session {
@@ -508,6 +575,7 @@ struct Session {
     spec: Arc<ServerSpec>,
     addrs: Vec<IpAddr>,
     outgoing: Option<Receiver<Vec<u8>>>,
+    udp: Option<masque::UdpLane>,
     capsules: Vec<u8>,
     capsule_at: usize,
     end: bool,
@@ -526,11 +594,13 @@ impl Session {
                 if self.end || wire.closed {
                     break;
                 }
-                let Some(packet) = self
-                    .outgoing
-                    .as_ref()
-                    .and_then(|outgoing| outgoing.try_recv().ok())
-                else {
+                let Some(packet) = (if let Some(udp) = &self.udp {
+                    udp.try_recv()
+                } else {
+                    self.outgoing
+                        .as_ref()
+                        .and_then(|outgoing| outgoing.try_recv().ok())
+                }) else {
                     break;
                 };
                 capsule.clear();
@@ -554,9 +624,13 @@ impl Session {
             self.capsule_at += used;
             match capsule {
                 connectip::Capsule::Datagram(packet) => {
-                    masque::forward(&self.shared, &self.spec, &self.addrs, packet);
+                    if let Some(udp) = &self.udp {
+                        udp.send(packet);
+                    } else {
+                        masque::forward(&self.shared, &self.spec, &self.addrs, packet);
+                    }
                 }
-                connectip::Capsule::AddressRequest(body) => {
+                connectip::Capsule::AddressRequest(body) if self.udp.is_none() => {
                     let granted = masque::respond(body, &self.addrs);
                     if !granted.is_empty() {
                         let mut out = Vec::new();
