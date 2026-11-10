@@ -161,7 +161,6 @@ def main():
         fail("the config has no MASQUE, WireGuard or WARP outbound")
     settings = outbound.get("settings") or {}
     stream = outbound.get("streamSettings") or {}
-    peer = endpoint(settings)
     real = pathlib.Path(__file__).resolve().with_name("aether-bin")
     if not real.exists():
         fail(f"the pinned Aether binary is missing at {real}")
@@ -191,6 +190,7 @@ def main():
     elif outbound.get("protocol") == "masque":
         tls = stream.get("tlsSettings") or {}
         sni = tls.get("serverName") or "carrier.test"
+        peer = endpoint(settings)
         config = masque_identity(cfg_path, stream)
         command = [
             str(real), "--protocol", "masque", "--peer", peer,
@@ -199,6 +199,7 @@ def main():
             "--no-quic-v2", "--log-level", "warn",
         ]
     else:
+        peer = endpoint(settings)
         config = wireguard_identity(cfg_path, settings)
         command = [
             str(real), "--protocol", "wg", "--wg-peer", peer,
