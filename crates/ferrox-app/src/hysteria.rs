@@ -1922,6 +1922,22 @@ struct Lane {
     source: Mutex<Option<SocketAddr>>,
 }
 
+/// Rotate the lane under the writer's flow guard: the source moves with the association, so a reply cannot pair a retired flow with a new source, and the retired reassembly is dropped.
+fn rotate(
+    lane: &Lane,
+    flow: &mut Option<Association>,
+    association: Association,
+    source: SocketAddr,
+) {
+    *flow = Some(association);
+    if let Ok(mut slot) = lane.source.lock() {
+        *slot = Some(source);
+    }
+    if let Ok(mut reassembly) = lane.defrag.lock() {
+        *reassembly = Defrag::new();
+    }
+}
+
 /// The client's UDP uplink over the hysteria carrier: read the relay socket, put every datagram on the connection's datagram lane, and let a companion thread drive the connection and carry replies back. One destination at a time — a change rotates the association, stamping a fresh session id that the connection has never used, over a connection of its own: the pool is a TCP instrument, its staleness caught by a flow's reply deadline a datagram send has no answer to, so a lane dials fresh and is live from the first packet. The relay's read timeout, `budgets::udp_idle()`, is already armed where the front was raised, so silence ends the loop and retires the association with its reader; a server that refused the lane in auth is answered in silence, as the references do. Salamander obfuscation, when the outbound names it, is already wrapped at the `quic::Datagram` seam by `connect`, so no byte of this path changes when the password is set.
 pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let Some(session) = connect(dial) else {
@@ -1971,26 +1987,27 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
         let Some(max) = conn.dgram_max_writable_len() else {
             break;
         };
-        let Ok(mut flow) = lane.flow.lock() else {
-            break;
-        };
-        if let Ok(mut slot) = lane.source.lock() {
-            *slot = Some(src);
-        }
         if relayed.as_ref().is_none_or(|(_, held, _)| *held != dest) {
             let id = next_id;
             next_id += 1;
             let address = dest.to_string();
-            *flow = Some(Association {
-                session_id: id,
-                destination: dest,
-            });
-            if let Ok(mut reassembly) = lane.defrag.lock() {
-                *reassembly = Defrag::new();
-            }
+            let Ok(mut flow) = lane.flow.lock() else {
+                break;
+            };
+            rotate(
+                lane,
+                &mut flow,
+                Association {
+                    session_id: id,
+                    destination: dest,
+                },
+                src,
+            );
+            drop(flow);
             relayed = Some((id, dest, address));
+        } else if let Ok(mut slot) = lane.source.lock() {
+            *slot = Some(src);
         }
-        drop(flow);
         let Some((session_id, _, address)) = &relayed else {
             continue;
         };
@@ -3522,17 +3539,66 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_before_the_reply_drops_the_retired_session() {
-        let destination = "127.0.0.1:7002".parse().expect("addr");
-        let source = "127.0.0.1:5002".parse().expect("addr");
-        let lane = lane_with(
+    fn a_reader_holds_the_flow_until_it_has_the_source() {
+        let old = Association {
+            session_id: 7,
+            destination: "127.0.0.1:7001".parse().expect("addr"),
+        };
+        let source = "127.0.0.1:5001".parse().expect("addr");
+        let lane = Arc::new(lane_with(
             Association {
-                session_id: 8,
-                destination,
+                session_id: 7,
+                destination: old.destination,
             },
             source,
+        ));
+        let first = UdpMessage {
+            session: 7,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            address: "a",
+            payload: b"one",
+        };
+        let held = lane.source.lock().expect("source");
+        let reader = {
+            let lane = Arc::clone(&lane);
+            std::thread::spawn(move || {
+                let mut assembled = Vec::new();
+                take_reply(&lane, &first, &mut assembled)
+                    .map(|(destination, src, payload)| (destination, src, payload.to_vec()))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lane.flow.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the reader did not take the flow"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            lane.flow.try_lock().is_err(),
+            "the reader holds the flow while it waits for the source"
         );
-        let mut assembled = Vec::new();
+        drop(held);
+        let (destination, src, payload) = reader.join().expect("reader").expect("reply");
+        assert_eq!(destination, old.destination);
+        assert_eq!(src, source);
+        assert_eq!(payload.as_slice(), b"one");
+    }
+
+    #[test]
+    fn a_writer_that_rotates_first_retires_the_session() {
+        let destination = "127.0.0.1:7002".parse().expect("addr");
+        let source = "127.0.0.1:5002".parse().expect("addr");
+        let lane = Arc::new(lane_with(
+            Association {
+                session_id: 7,
+                destination: "127.0.0.1:7001".parse().expect("addr"),
+            },
+            "127.0.0.1:5001".parse().expect("addr"),
+        ));
         let retired = UdpMessage {
             session: 7,
             packet: 0,
@@ -3541,7 +3607,29 @@ mod tests {
             address: "a",
             payload: b"old",
         };
-        assert!(take_reply(&lane, &retired, &mut assembled).is_none());
+        let flow = lane.flow.lock().expect("flow");
+        let reader = {
+            let lane = Arc::clone(&lane);
+            std::thread::spawn(move || {
+                let mut assembled = Vec::new();
+                take_reply(&lane, &retired, &mut assembled)
+                    .map(|(destination, src, payload)| (destination, src, payload.to_vec()))
+            })
+        };
+        rotate(
+            &lane,
+            &mut flow,
+            Association {
+                session_id: 8,
+                destination,
+            },
+            source,
+        );
+        drop(flow);
+        assert!(
+            reader.join().expect("reader").is_none(),
+            "the retired session is dropped"
+        );
         let fresh = UdpMessage {
             session: 8,
             packet: 0,
@@ -3550,6 +3638,7 @@ mod tests {
             address: "a",
             payload: b"new",
         };
+        let mut assembled = Vec::new();
         let (seen, src, payload) = take_reply(&lane, &fresh, &mut assembled).expect("new reply");
         assert_eq!(seen, destination);
         assert_eq!(src, source);
@@ -3560,14 +3649,29 @@ mod tests {
     fn a_retired_session_cannot_feed_the_new_reassembly() {
         let lane = lane_with(
             Association {
-                session_id: 8,
-                destination: "127.0.0.1:7002".parse().expect("addr"),
+                session_id: 7,
+                destination: "127.0.0.1:7001".parse().expect("addr"),
             },
-            "127.0.0.1:5002".parse().expect("addr"),
+            "127.0.0.1:5001".parse().expect("addr"),
         );
         let mut assembled = Vec::new();
         let old_head = message(7, 1, 0, b"old");
-        assert!(take_reply(&lane, &old_head, &mut assembled).is_none());
+        assert!(
+            take_reply(&lane, &old_head, &mut assembled).is_none(),
+            "the old partial stays pending"
+        );
+        {
+            let mut flow = lane.flow.lock().expect("flow");
+            rotate(
+                &lane,
+                &mut flow,
+                Association {
+                    session_id: 8,
+                    destination: "127.0.0.1:7002".parse().expect("addr"),
+                },
+                "127.0.0.1:5002".parse().expect("addr"),
+            );
+        }
         let old_tail = message(7, 1, 1, b"tail");
         assert!(
             take_reply(&lane, &old_tail, &mut assembled).is_none(),
