@@ -798,11 +798,21 @@ fn wrap_sec1(sec1: &[u8]) -> Vec<u8> {
 /// The certificate xray mints for a WARP dial: a P-256 self-signed identity
 /// with a fresh serial and a long validity, carrying the config's key.
 fn warp_identity(private: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let key = rcgen::KeyPair::try_from(private)
+    let checked = rcgen::KeyPair::try_from(private)
         .map_err(|error| format!("masque warp private key: {error}"))?;
-    if key.algorithm() != &rcgen::PKCS_ECDSA_P256_SHA256 {
+    if checked.algorithm() != &rcgen::PKCS_ECDSA_P256_SHA256 {
         return Err("masque warp private key is not a P-256 key".to_owned());
     }
+    let scalar = warp_scalar(private).ok_or("masque warp private key carries no key")?;
+    let point = checked.public_key_raw();
+    if point.len() != 65 {
+        return Err("masque warp private key is short of its public key".to_owned());
+    }
+    let canonical = warp_canonical_pkcs8(scalar, point);
+    // the backend's loader wants the public key inside the SEC 1 envelope: a
+    // minimal key is refused as a TLS identity even though xray accepts it
+    let key = rcgen::KeyPair::try_from(canonical.as_slice())
+        .map_err(|error| format!("masque warp canonical key: {error}"))?;
     let mut serial = [0u8; 16];
     getrandom::fill(&mut serial).map_err(|error| format!("masque warp serial: {error}"))?;
     let mut params = rcgen::CertificateParams::default();
@@ -812,7 +822,75 @@ fn warp_identity(private: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     let certificate = params
         .self_signed(&key)
         .map_err(|error| format!("masque warp certificate: {error}"))?;
-    Ok((certificate.der().to_vec(), key.serialize_der()))
+    Ok((certificate.der().to_vec(), canonical))
+}
+
+/// The private scalar of an already-PKCS #8 key: a bare octet or the octet of
+/// a SEC 1 envelope whose scalar element is found.
+fn warp_scalar(pkcs8: &[u8]) -> Option<&[u8]> {
+    let mut at = 0;
+    let Some((0x30, body, _)) = der_next(pkcs8, &mut at) else {
+        return None;
+    };
+    let mut inner = 0;
+    let Some((0x02, _, _)) = der_next(body, &mut inner) else {
+        return None;
+    };
+    let mut at_element = inner;
+    for _ in 0..2 {
+        let (tag, value, _) = der_next(body, &mut at_element)?;
+        if tag == 0x04 {
+            return warp_scalar_element(value);
+        }
+    }
+    None
+}
+
+fn warp_scalar_element(field: &[u8]) -> Option<&[u8]> {
+    if field.len() == 32 {
+        return Some(field);
+    }
+    let mut at = 0;
+    let Some((0x30, body, _)) = der_next(field, &mut at) else {
+        return None;
+    };
+    let mut inner = 0;
+    while inner < body.len() {
+        let Some((tag, value, _)) = der_next(body, &mut inner) else {
+            break;
+        };
+        if tag == 0x04 && value.len() == 32 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// PKCS #8 in the socket-loadable shape: the SEC 1 envelope carries the public
+/// key, without which the backend refuses the same key xray accepts.
+fn warp_canonical_pkcs8(scalar: &[u8], point: &[u8]) -> Vec<u8> {
+    let mut sec1 = vec![0x02, 0x01, 0x01, 0x04, 0x20];
+    sec1.extend_from_slice(scalar);
+    let mut bit = vec![0x03, 0x42, 0x00];
+    bit.extend_from_slice(point);
+    let mut element = vec![0xa1, bit.len() as u8];
+    element.extend_from_slice(&bit);
+    sec1.extend_from_slice(&element);
+    let mut sec1_element = vec![0x30];
+    der_length(sec1.len(), &mut sec1_element);
+    sec1_element.extend_from_slice(&sec1);
+    let mut body = vec![0x02, 0x01, 0x00];
+    body.extend_from_slice(&[
+        0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+    ]);
+    body.push(0x04);
+    der_length(sec1_element.len(), &mut body);
+    body.extend_from_slice(&sec1_element);
+    let mut pkcs8 = vec![0x30];
+    der_length(body.len(), &mut pkcs8);
+    pkcs8.extend_from_slice(&body);
+    pkcs8
 }
 
 /// At most one IPv4 and one IPv6 prefix, the bind xray enforces; the address is
@@ -5202,7 +5280,12 @@ mod tests {
         let public = warp_key(&key.public_key_pem()).expect("the public key");
         let (certificate, minted) = warp_identity(&private).expect("an identity");
         assert_eq!(warp_spki(&certificate), Some(public.as_slice()));
-        assert_eq!(minted, private, "the minted key is the configured key");
+        // whatever the config carried, the minted key names the same pair
+        assert_eq!(
+            warp_identity(&minted).expect("re-minted").1,
+            minted,
+            "the minted key is canonical"
+        );
     }
 
     #[test]
@@ -5296,6 +5379,25 @@ mod tests {
             certificate,
             key: minted,
             addresses: vec!["172.16.0.2".parse().expect("v4")],
+        };
+        assert!(warp_config(&warp).is_ok());
+    }
+
+    /// A minimal key is accepted by xray yet not by the backend's socket loader,
+    /// so the minter rephrases every accepted key into the envelope that loads.
+    #[test]
+    fn a_minimal_warp_key_is_minted_in_a_form_the_socket_loads() {
+        let private = warp_pkcs8(
+            &warp_key("MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==")
+                .expect("a key"),
+        )
+        .expect("an envelope");
+        let (certificate, minted) = warp_identity(&private).expect("an identity");
+        let warp = Warp {
+            public_key: Vec::new(),
+            certificate,
+            key: minted,
+            addresses: vec!["10.13.0.2".parse().expect("v4")],
         };
         assert!(warp_config(&warp).is_ok());
     }
