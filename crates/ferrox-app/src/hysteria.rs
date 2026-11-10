@@ -2046,6 +2046,7 @@ fn take_reply<'a>(
     lane: &Lane,
     message: &UdpMessage<'a>,
     assembled: &'a mut Vec<u8>,
+    before_source: impl FnOnce(),
 ) -> Option<(SocketAddr, SocketAddr, &'a [u8])> {
     let held = lane.flow.lock().ok()?;
     let association = held.as_ref()?;
@@ -2061,6 +2062,7 @@ fn take_reply<'a>(
         .ok()
         .flatten()
         .map(|(_address, payload)| payload)?;
+    before_source();
     let src = lane.source.lock().ok().and_then(|slot| *slot)?;
     Some((destination, src, payload))
 }
@@ -2078,7 +2080,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Ok(message) = hysteria::decode_udp(&data) else {
                 continue;
             };
-            let Some((destination, src, payload)) = take_reply(lane, &message, &mut assembled)
+            let Some((destination, src, payload)) =
+                take_reply(lane, &message, &mut assembled, || {})
             else {
                 continue;
             };
@@ -3519,7 +3522,7 @@ mod tests {
             payload: b"one",
         };
         let (destination, src, payload) =
-            take_reply(&lane, &first, &mut assembled).expect("old reply");
+            take_reply(&lane, &first, &mut assembled, || {}).expect("old reply");
         assert_eq!(destination, old.destination);
         assert_eq!(src, source);
         assert_eq!(payload, b"one".as_slice());
@@ -3533,7 +3536,7 @@ mod tests {
             *lane.defrag.lock().expect("defrag") = Defrag::new();
         }
         assert!(
-            take_reply(&lane, &first, &mut assembled).is_none(),
+            take_reply(&lane, &first, &mut assembled, || {}).is_none(),
             "a retired session's reply is dropped"
         );
     }
@@ -3560,28 +3563,27 @@ mod tests {
             address: "a",
             payload: b"one",
         };
-        let held = lane.source.lock().expect("source");
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
         let reader = {
             let lane = Arc::clone(&lane);
             std::thread::spawn(move || {
                 let mut assembled = Vec::new();
-                take_reply(&lane, &first, &mut assembled)
-                    .map(|(destination, src, payload)| (destination, src, payload.to_vec()))
+                take_reply(&lane, &first, &mut assembled, || {
+                    reached.send(()).expect("reached");
+                    release_rx.recv().expect("release");
+                })
+                .map(|(destination, src, payload)| (destination, src, payload.to_vec()))
             })
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while lane.flow.try_lock().is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "the reader did not take the flow"
-            );
-            std::thread::yield_now();
-        }
+        reached_rx
+            .recv()
+            .expect("the reader reached the source read");
         assert!(
             lane.flow.try_lock().is_err(),
-            "the reader holds the flow while it waits for the source"
+            "the reader holds the flow at the source read, so no rotation can start"
         );
-        drop(held);
+        release.send(()).expect("release");
         let (destination, src, payload) = reader.join().expect("reader").expect("reply");
         assert_eq!(destination, old.destination);
         assert_eq!(src, source);
@@ -3612,7 +3614,7 @@ mod tests {
             let lane = Arc::clone(&lane);
             std::thread::spawn(move || {
                 let mut assembled = Vec::new();
-                take_reply(&lane, &retired, &mut assembled)
+                take_reply(&lane, &retired, &mut assembled, || {})
                     .map(|(destination, src, payload)| (destination, src, payload.to_vec()))
             })
         };
@@ -3639,7 +3641,8 @@ mod tests {
             payload: b"new",
         };
         let mut assembled = Vec::new();
-        let (seen, src, payload) = take_reply(&lane, &fresh, &mut assembled).expect("new reply");
+        let (seen, src, payload) =
+            take_reply(&lane, &fresh, &mut assembled, || {}).expect("new reply");
         assert_eq!(seen, destination);
         assert_eq!(src, source);
         assert_eq!(payload, b"new".as_slice());
@@ -3657,7 +3660,7 @@ mod tests {
         let mut assembled = Vec::new();
         let old_head = message(7, 1, 0, b"old");
         assert!(
-            take_reply(&lane, &old_head, &mut assembled).is_none(),
+            take_reply(&lane, &old_head, &mut assembled, || {}).is_none(),
             "the old partial stays pending"
         );
         {
@@ -3674,13 +3677,14 @@ mod tests {
         }
         let old_tail = message(7, 1, 1, b"tail");
         assert!(
-            take_reply(&lane, &old_tail, &mut assembled).is_none(),
+            take_reply(&lane, &old_tail, &mut assembled, || {}).is_none(),
             "a retired fragment is refused"
         );
         let new_tail = message(8, 1, 1, b"tail");
-        assert!(take_reply(&lane, &new_tail, &mut assembled).is_none());
+        assert!(take_reply(&lane, &new_tail, &mut assembled, || {}).is_none());
         let new_head = message(8, 1, 0, b"head");
-        let (_, _, payload) = take_reply(&lane, &new_head, &mut assembled).expect("new whole");
+        let (_, _, payload) =
+            take_reply(&lane, &new_head, &mut assembled, || {}).expect("new whole");
         assert_eq!(payload, b"headtail".as_slice(), "no retired bytes entered");
     }
 
