@@ -39,10 +39,6 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     /// wide while the framing lives. Nothing stages the content again on the way out.
     have: Vec<u8>,
     dot: usize,
-    /// Plaintext a parked read already drained, served before the session: the body addons
-    /// follow the request header, so they must be the walk's first bytes.
-    source: Vec<u8>,
-    source_at: usize,
     walk: Walk,
     #[cfg(test)]
     staged: usize,
@@ -307,10 +303,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             raw,
             direct: None,
             uuid: *uuid,
-            have: Vec::with_capacity(WINDOW),
+            have: Vec::new(),
             dot: 0,
-            source: Vec::new(),
-            source_at: 0,
             walk: Walk {
                 framed: false,
                 want_header: 0,
@@ -342,10 +336,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    /// Hands the link plaintext a parked read already drained, ahead of the session.
+    /// Hands the link a parked read's framed prefix as the walk's window, before the session.
     pub(crate) fn preload(&mut self, prefix: Vec<u8>) {
-        self.source = prefix;
-        self.source_at = 0;
+        debug_assert!(self.have.is_empty() && self.dot == 0);
+        self.have = prefix;
     }
 
     /// The reader strips the VLESS answer before its first frame, on the read that first
@@ -386,10 +380,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             raw,
             direct: None,
             uuid: *uuid,
-            have: Vec::with_capacity(WINDOW),
+            have: Vec::new(),
             dot: 0,
-            source: Vec::new(),
-            source_at: 0,
             walk: Walk {
                 framed: false,
                 want_header: 0,
@@ -883,24 +875,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         loop {
             self.compact();
             let base = self.have.len();
-            if self.source_at < self.source.len() {
-                let room = WINDOW - base;
-                if room > 0 {
-                    let n = room.min(self.source.len() - self.source_at);
-                    self.have
-                        .extend_from_slice(&self.source[self.source_at..self.source_at + n]);
-                    self.source_at += n;
-                    if self.source_at == self.source.len() {
-                        self.source = Vec::new();
-                        self.source_at = 0;
-                    }
-                    self.stage(n);
-                    if !self.read.padding || self.dot < self.have.len() {
-                        return Ok(true);
-                    }
-                    continue;
-                }
-            }
             self.have.reserve_exact(WINDOW - base);
             // The read lands in spare capacity held steady at the window; nothing here copies a framed byte into a staging buffer any more.
             let read = unsafe {
@@ -1304,6 +1278,31 @@ mod tests {
         let mut out = Vec::new();
         link.read_to_end(&mut out).expect("reads");
         assert_eq!(out, b"no framing here at all");
+    }
+
+    /// The parked prefix becomes the walk's window in place: no copy, and its bytes
+    /// still cross the frame walk before the session's remainder.
+    #[test]
+    fn a_preloaded_prefix_is_the_walk_window_without_a_copy() {
+        let prefix = frame(true, VisionCommand::Continue.byte(), b"lead", 2);
+        let base = prefix.as_ptr();
+        let capacity = prefix.capacity();
+        let rest = frame(false, VisionCommand::End.byte(), b"tail", 0);
+        let mut link = link(&rest);
+        link.preload(prefix);
+        assert_eq!(
+            link.have.as_ptr(),
+            base,
+            "the prefix moved, it was not copied"
+        );
+        assert_eq!(
+            link.have.capacity(),
+            capacity,
+            "the prefix kept its allocation"
+        );
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"leadtail");
     }
 
     /// Past the switch the tail is delivered with zero copies, where the framed path copied it twice.
