@@ -78,6 +78,50 @@ fn test_refuses_a_config_whose_cert_is_missing() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A fingerprint no table knows is the reference's load-time refusal, and a servable inbound must
+/// not soften it into `Configuration OK.` — the lane's own `tlsSettings` is the config's error.
+#[test]
+fn test_refuses_an_unknown_fingerprint_on_a_front_lane() {
+    let lane = |fingerprint: &str| {
+        format!(
+            r#"{{"inbounds":[{{"listen":"127.0.0.1","port":18096,"protocol":"blackhole"}}],
+            "outbounds":[{{"protocol":"socks","settings":{{"servers":[{{"address":"127.0.0.1","port":1080}}]}},
+            "streamSettings":{{"security":"tls","tlsSettings":{{"allowInsecure":true,"fingerprint":"{fingerprint}"}}}}}}]}}"#
+        )
+    };
+    let path = config_path("fingerprint", &lane("Bogus"));
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "`-test` reported OK for a fingerprint the reference refuses: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(r#"unknown "fingerprint": bogus"#),
+        "the refusal does not name the field: {stdout}"
+    );
+    // Serve mode refuses on the same line: the config never reaches a listener.
+    let served = run(&["-c", &named]);
+    let said = String::from_utf8_lossy(&served.stderr);
+    assert_eq!(served.status.code(), Some(1), "{said}");
+    assert!(
+        said.contains(r#"unknown "fingerprint": bogus"#),
+        "startup did not name the field: {said}"
+    );
+    // A fingerprint the table knows still builds, so the refusal is the unknown name alone.
+    let good = config_path("fingerprint-good", &lane("chrome"));
+    let named = good.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("Configuration OK."), "{stdout}");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&good);
+}
+
 #[test]
 fn test_refuses_json_it_cannot_parse() {
     let path = config_path("broken", r#"{"inbounds": ]"#);
