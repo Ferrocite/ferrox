@@ -809,8 +809,7 @@ fn warp_identity(private: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         return Err("masque warp private key is short of its public key".to_owned());
     }
     let canonical = warp_canonical_pkcs8(scalar, point);
-    // the backend's loader wants the public key inside the SEC 1 envelope: a
-    // minimal key is refused as a TLS identity even though xray accepts it
+    // the backend's loader wants the public key inside the SEC 1 envelope, where the reference's accepts the bare form
     let key = rcgen::KeyPair::try_from(canonical.as_slice())
         .map_err(|error| format!("masque warp canonical key: {error}"))?;
     let mut serial = [0u8; 16];
