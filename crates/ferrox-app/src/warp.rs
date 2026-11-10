@@ -341,7 +341,8 @@ impl RegisterError {
     }
 }
 
-/// Register against the first host that answers, then enroll and enable.
+/// Register against the first host that answers, then enroll and enable; a
+/// refusal names the host that refused so a runner's console can act on it.
 fn register(spec: &WarpSpec) -> Result<Identity, String> {
     let mut last = String::new();
     for base in spec.api_url() {
@@ -354,7 +355,11 @@ fn register(spec: &WarpSpec) -> Result<Identity, String> {
                 .map_err(RegisterError::retryable)
         }) {
             Ok(identity) => return Ok(identity),
-            Err(error) if error.fatal => return Err(error.reason),
+            Err(error) if error.fatal => {
+                return Err(format!("{} (earlier: {last})", error.reason)
+                    .trim_end()
+                    .to_owned());
+            }
             Err(error) => last = error.reason,
         }
     }
