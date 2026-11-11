@@ -55,6 +55,7 @@ graph TD
 | time-udp-100k | ferrox=99920pps,zeptun=99962pps,ratio=1.00 | tun-bench.yml |
 | cpu-cores-at-tcp-down-10 | ferrox=2.9cores,zeptun=1.7cores | tun-bench.yml |
 | rss-mb-at-ten-flows | ferrox=60-75MB,zeptun=2-8MB | tun-bench.yml |
+| writes-after-a-refused-packet | 2 | ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out |
 <!-- counts:end -->
 
 `scripts/count-ops.sh` measures `Nat::rewrite` over the payload lengths in `a_rewrite_keeps_the_checksum_of_every_payload_length`; no pointer-identity or copy-count checker yet covers this path, so the syscall and copy rows stay open. The writer copies each smoltcp segment into an aggregate buffer, and the reader copies each device packet into a stack slot. The `time-*` rows measure the userspace stack; no `system` or `hybrid` row has been measured, so this page makes no speed claim for either.
@@ -66,6 +67,8 @@ The `time-*` rows above are the same-run `tun-bench.yml` cells; a later single-e
 ## What we removed
 
 Against the native handler the userspace path removes the hand-written TCP reassembly and the single-queue limit: `smoltcp` supplies retransmit, receive windows and congestion control, and `tun-rs` supplies multi-queue and GSO/GRO. The writer batches a queue's segments so GRO can coalesce same-flow packets into one aggregate, and the reader asks for a batch instead of one packet per syscall. The `tun` config keeps one stack knob (`smoltcp`, `userspace`, `system`, `hybrid`, `loopback`) instead of growing a second inbound protocol. The system path removes smoltcp's TCP state machine from the handled flow: the kernel owns the handshake and retransmits, and the userspace stack keeps only UDP, ICMP and (under hybrid) the flows the kernel cannot take. That is one packet rewrite and an incremental checksum update over the changed addresses and ports, not a second userspace TCP implementation. The changed words are folded into one delta, so the IPv4 header and TCP checksum each take one `checksum_update` call instead of one per field.
+
+The kernel can refuse a whole packet — `EMSGSIZE` when the MTU moved under the stack, `EINVAL` when the packet no longer matches the device's format — and one refusal used to end the queue's writer, taking every uploading flow with it. Both writers now classify the error: a refusal drops that packet and the loop keeps reading, while any other error still marks the device failed. The Linux batch path already attempts every buffer inside `send_multiple` and reports the last error, so a refused batch leaves the other packets written and the loop running. `a_refused_packet_is_dropped_and_the_next_still_goes_out` holds the first half (two writes, the second packet delivered) and `a_dead_descriptor_still_stops_the_send_loop` the second (one write, the device marked failed).
 
 Against the pinned references, xray-core and sing-box open the platform device and hand packets to their configured stack, ZeroNet's zero-tun is its own device wrapper, and this tree's native handler remains the `loopback` fallback. None of those references carries this per-queue smoltcp server, so the comparison is the same-run Time rows rather than a removed pass; this page does not claim their code was removed. What is not removed is the userspace stack's per-byte copying, priced in the rows above.
 

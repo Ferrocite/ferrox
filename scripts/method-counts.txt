@@ -704,6 +704,7 @@ front-tun-smoltcp time-rr-8x1k ferrox=38261tps,zeptun=64001tps,ratio=0.60 tun-be
 front-tun-smoltcp time-udp-100k ferrox=99920pps,zeptun=99962pps,ratio=1.00 tun-bench.yml
 front-tun-smoltcp cpu-cores-at-tcp-down-10 ferrox=2.9cores,zeptun=1.7cores tun-bench.yml
 front-tun-smoltcp rss-mb-at-ten-flows ferrox=60-75MB,zeptun=2-8MB tun-bench.yml
+front-tun-smoltcp writes-after-a-refused-packet 2 ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out
 front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream
 front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets
