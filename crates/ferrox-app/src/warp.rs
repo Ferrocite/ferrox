@@ -409,16 +409,15 @@ where
         .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
-    let reply = call("PATCH", &path, &headers, &enrollment_body(&spki)).map_err(|error| {
+    let reply = call("PATCH", &path, &headers, &enrollment_body(&spki))
+        .map_err(|error| RegisterError::fatal(error.reason))?;
+    let server = parse_masque_server(&reply).map_err(|error| {
         // A refusal that may be about the token is told apart from one about the enrollment: the token's own GET answers where the PATCH cannot.
-        let token_speaks = || {
-            call("GET", &path, &headers, b"")
-                .map(|reply| format!("the token answers GET {}", reply.status))
-        };
-        let why = token_speaks().unwrap_or_else(|error| format!("its GET too: {}", error.reason));
+        let why = call("GET", &path, &headers, b"")
+            .map(|get| format!("the token answers GET {}", get.status))
+            .unwrap_or_else(|get_error| format!("its GET too: {}", get_error.reason));
         RegisterError::fatal(format!("{} ({})", error.reason, why))
     })?;
-    let server = parse_masque_server(&reply)?;
 
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
