@@ -322,6 +322,9 @@ fn send_loop(
             pool.push(buffer);
         }
         if let Err(error) = written {
+            if refused(&error) {
+                continue;
+            }
             eprintln!("tun write: {error}");
             failed.store(true, Ordering::Relaxed);
             return;
@@ -361,14 +364,102 @@ pub(crate) fn send_plain(
     failed: &AtomicBool,
     recycle: Option<SyncSender<Vec<u8>>>,
 ) {
+    send_packets(packets, failed, recycle.as_ref(), |packet| {
+        device.send(packet).map(|_| ())
+    });
+}
+
+/// One packet the kernel refuses is the packet that is lost, not the device: `EINVAL` and
+/// `EMSGSIZE` mean this send was bad, while every other error means the descriptor is gone.
+#[cfg(unix)]
+const REFUSED_WRITES: [i32; 2] = [libc::EINVAL, libc::EMSGSIZE];
+#[cfg(windows)]
+const REFUSED_WRITES: [i32; 2] = [10022, 10040];
+#[cfg(not(any(unix, windows)))]
+const REFUSED_WRITES: [i32; 0] = [];
+
+fn refused(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| REFUSED_WRITES.contains(&code))
+}
+
+fn send_packets<W>(
+    packets: Receiver<Vec<u8>>,
+    failed: &AtomicBool,
+    recycle: Option<&SyncSender<Vec<u8>>>,
+    mut write: W,
+) where
+    W: FnMut(&[u8]) -> io::Result<()>,
+{
     while let Ok(packet) = packets.recv() {
-        if let Err(error) = device.send(&packet) {
+        let written = write(&packet);
+        if let Some(recycle) = recycle {
+            let _ = recycle.try_send(packet);
+        }
+        if let Err(error) = written {
+            if refused(&error) {
+                continue;
+            }
             eprintln!("tun write: {error}");
             failed.store(true, Ordering::Relaxed);
             return;
         }
-        if let Some(recycle) = &recycle {
-            let _ = recycle.try_send(packet);
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    const REFUSED: i32 = libc::EINVAL;
+    #[cfg(windows)]
+    const REFUSED: i32 = 10022;
+    #[cfg(unix)]
+    const DEAD: i32 = libc::EBADF;
+    #[cfg(windows)]
+    const DEAD: i32 = 10009;
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn a_refused_packet_is_dropped_and_the_next_still_goes_out() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(b"first".to_vec()).expect("queues");
+        tx.send(b"second".to_vec()).expect("queues");
+        drop(tx);
+        let failed = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let mut first = true;
+        let mut writes = 0;
+        send_packets(rx, &failed, None, |packet| {
+            writes += 1;
+            if first {
+                first = false;
+                return Err(io::Error::from_raw_os_error(REFUSED));
+            }
+            seen.push(packet.to_vec());
+            Ok(())
+        });
+        assert_eq!(writes, 2, "the loop kept writing after the refusal");
+        assert_eq!(seen, vec![b"second".to_vec()]);
+        assert!(!failed.load(Ordering::Relaxed), "a refusal is not fatal");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn a_dead_descriptor_still_stops_the_send_loop() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(b"first".to_vec()).expect("queues");
+        tx.send(b"second".to_vec()).expect("queues");
+        drop(tx);
+        let failed = AtomicBool::new(false);
+        let mut writes = 0;
+        send_packets(rx, &failed, None, |_| {
+            writes += 1;
+            Err(io::Error::from_raw_os_error(DEAD))
+        });
+        assert_eq!(writes, 1, "a dead descriptor stops before the next packet");
+        assert!(failed.load(Ordering::Relaxed));
     }
 }
