@@ -1,6 +1,6 @@
 [sources.xray-core]
 repo          = "https://github.com/XTLS/Xray-core"
-rev           = "676eaf66f8f05d4d558ee7a74b4736623d3feeb9"
+rev           = "c456141815359e1d2c00dfc673f5f26adf22fae2"
 always        = true
 default_branch = "main"
 path          = "common/crypto"
@@ -13,7 +13,7 @@ note          = "Xray-core at this pin. The unit tests are in-process with no se
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
-rev           = "8295e4910f14d3041c948d2ad74bf3af384a064d"
+rev           = "a13dbe1f785f66c86acbf3985c33fdafea0cbfd6"
 always        = true
 default_branch = "testing"
 path          = "protocol/shadowsocks"
@@ -33,7 +33,7 @@ note          = "hand-rolled ChaCha20 in the WireGuard data path"
 
 [sources.amnezia-client]
 repo          = "https://github.com/amnezia-vpn/amnezia-client"
-rev           = "ac175c8a8147cfe56f98c8372ec17ea2ba00bb02"
+rev           = "3a6bf7376cd49cb30caa27592e46321f014611e8"
 topics        = "amnezia, junk packet, header protection"
 default_branch = "dev"
 path          = "common/crypto"
@@ -43,7 +43,7 @@ note          = "the C++ Amnezia core; the second implementation of the same wir
 
 [sources.xray-rust]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "d8cee9f16b25b243ba6f0b0dc1c23e044c32eddc"
+rev           = "20b86c9603d1ba83b0d5a5f8fc1be1ea9287700a"
 topics        = "interop, balancer, round robin, proxy chain"
 default_branch = "main"
 path          = "crates"
@@ -55,7 +55,7 @@ note          = "Rust VLESS core; 24 of local_xray_interop_tests.rs's 29 interop
 
 [sources.xray-rust-hysteria]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "d8cee9f16b25b243ba6f0b0dc1c23e044c32eddc"
+rev           = "20b86c9603d1ba83b0d5a5f8fc1be1ea9287700a"
 topics        = "hysteria"
 default_branch = "main"
 path          = "crates"
@@ -78,7 +78,7 @@ note          = "a Rust rewrite of xray-core, read as a third same-language impl
 
 [sources.pattng]
 repo          = "https://github.com/patterniha/PattNG"
-rev           = "e7a52cfc94389ca4ef1cb10e9595a9dba5cb0564"
+rev           = "5e63fd4c5af12d6eb537ceb6832691e6f469e442"
 topics        = "ciphersuites, unsafe fingerprint, plaintext to public"
 default_branch = "my-releases"
 path          = "V2rayNG"
@@ -161,7 +161,7 @@ note          = "DNS covert channel over QUIC multipath (picoquic); TCP-over-DNS
 
 [sources.quiche]
 repo          = "https://github.com/cloudflare/quiche"
-rev           = "fa0e48072e945ff2da5bb9a21684f86a91f35877"
+rev           = "7055f78a110c6e5697d9c7236e03a342bec7942c"
 topics        = "quic, http/3, h3, masque, hysteria, tuic, multipath, 0-rtt"
 default_branch = "master"
 path          = "quiche"
