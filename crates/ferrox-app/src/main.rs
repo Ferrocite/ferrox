@@ -45,6 +45,7 @@ mod masque;
 mod masque_h1;
 mod masque_h2;
 mod metrics;
+mod muxpool;
 mod observatory;
 mod policy;
 mod process;

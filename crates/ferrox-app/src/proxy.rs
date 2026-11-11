@@ -3711,7 +3711,8 @@ pub(crate) struct VlessOut {
     host: String,
     headers: Vec<(String, String)>,
     heartbeat: u32,
-    mux: bool,
+    mux: Mux,
+    pool: Pools,
     quic_roots: Option<ferrox_core::tls::Anchors>,
     quic_ech: Option<Arc<[u8]>>,
     hysteria_roots: Option<ferrox_core::tls::Anchors>,
@@ -3728,6 +3729,34 @@ impl VlessOut {
 
     fn allows_udp443(&self) -> bool {
         self.flow == ferrox_core::vless::VISION_UDP443_FLOW
+    }
+
+    /// The spec a carrier opener dials: a clone whose pools are fresh, so the manager the closure
+    /// is stored in is not itself reachable from the spec it holds.
+    fn carrier_spec(&self) -> Self {
+        Self {
+            pool: Pools::default(),
+            ..self.clone()
+        }
+    }
+
+    fn tcp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.tcp?;
+        Some(self.pool.tcp(cap, {
+            let spec = self.carrier_spec();
+            move || open_vless_mux(&spec).map(Into::into)
+        }))
+    }
+
+    fn udp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.udp_manager()?;
+        Some(match self.mux.xudp {
+            Xudp::Shared => self.tcp_pool()?,
+            _ => self.pool.udp(cap, {
+                let spec = self.carrier_spec();
+                move || open_vless_mux(&spec).map(Into::into)
+            }),
+        })
     }
 }
 
@@ -4105,6 +4134,8 @@ pub(crate) struct VmessOut {
     quic_roots: Option<ferrox_core::tls::Anchors>,
     quic_ech: Option<Arc<[u8]>>,
     hysteria_roots: Option<ferrox_core::tls::Anchors>,
+    mux: Mux,
+    pool: Pools,
 }
 
 #[derive(Debug, Clone)]
@@ -4121,6 +4152,7 @@ pub(crate) struct TrojanOut {
     quic_ech: Option<Arc<[u8]>>,
     hysteria_roots: Option<ferrox_core::tls::Anchors>,
     mux: Mux,
+    pool: Pools,
     reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
 }
 
@@ -4135,16 +4167,184 @@ pub(crate) struct ShadowsocksOut {
     headers: Vec<(String, String)>,
     heartbeat: u32,
     mux: Mux,
+    pool: Pools,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
 }
 
-/// The session's two lanes and xray's `xudpProxyUDP443` for the datagram one, read only while a mux session is enabled.
-#[derive(Debug, Clone, Copy, Default)]
+impl VmessOut {
+    /// A spec whose pools are fresh, as for every carrier opener, so no manager holds itself.
+    fn carrier_spec(&self) -> Self {
+        Self {
+            pool: Pools::default(),
+            ..self.clone()
+        }
+    }
+
+    fn tcp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.tcp?;
+        Some(self.pool.tcp(cap, {
+            let spec = self.carrier_spec();
+            move || open_vmess_mux(&spec).map(Into::into)
+        }))
+    }
+
+    fn udp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.udp_manager()?;
+        Some(match self.mux.xudp {
+            Xudp::Shared => self.tcp_pool()?,
+            _ => self.pool.udp(cap, {
+                let spec = self.carrier_spec();
+                move || open_vmess_mux(&spec).map(Into::into)
+            }),
+        })
+    }
+}
+
+impl TrojanOut {
+    fn carrier_spec(&self) -> Self {
+        Self {
+            pool: Pools::default(),
+            ..self.clone()
+        }
+    }
+
+    fn tcp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.tcp?;
+        Some(self.pool.tcp(cap, {
+            let spec = self.carrier_spec();
+            move || open_trojan_mux(&spec).map(Into::into)
+        }))
+    }
+
+    fn udp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.udp_manager()?;
+        Some(match self.mux.xudp {
+            Xudp::Shared => self.tcp_pool()?,
+            _ => self.pool.udp(cap, {
+                let spec = self.carrier_spec();
+                move || open_trojan_mux(&spec).map(Into::into)
+            }),
+        })
+    }
+}
+
+impl ShadowsocksOut {
+    fn carrier_spec(&self) -> Self {
+        Self {
+            pool: Pools::default(),
+            ..self.clone()
+        }
+    }
+
+    fn tcp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.tcp?;
+        Some(self.pool.tcp(cap, {
+            let spec = self.carrier_spec();
+            move || open_ss_mux(&spec).map(Into::into)
+        }))
+    }
+
+    fn udp_pool(&self) -> Option<Arc<crate::muxpool::Manager>> {
+        let cap = self.mux.udp_manager()?;
+        Some(match self.mux.xudp {
+            Xudp::Shared => self.tcp_pool()?,
+            _ => self.pool.udp(cap, {
+                let spec = self.carrier_spec();
+                move || open_ss_mux(&spec).map(Into::into)
+            }),
+        })
+    }
+}
+
+/// xray's `MultiplexSettings`: the TCP carrier's cap, the datagram manager's own cap, and `xudpProxyUDP443`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mux {
-    tcp: bool,
-    udp: bool,
+    /// `enabled`: the object turns the whole mux on, the 443 policy included.
+    enabled: bool,
+    /// Flows a carrier takes before a second is dialed, at the reference's 128 floor; `None` is `concurrency < 0`.
+    tcp: Option<usize>,
+    /// `xudpConcurrency`: `Off` is negative, `Shared` is zero (the TCP carrier carries datagrams too), `Own` is the datagram manager's cap.
+    xudp: Xudp,
+    /// What a datagram to port 443 does while the mux is on.
     udp443: Udp443,
+}
+
+impl Default for Mux {
+    fn default() -> Self {
+        Mux {
+            enabled: false,
+            tcp: None,
+            xudp: Xudp::Off,
+            udp443: Udp443::Reject,
+        }
+    }
+}
+
+impl Mux {
+    /// The datagram carrier's cap: `Shared` rides the TCP carrier, `Own` gets its own, and `Off` dials directly.
+    fn udp_manager(&self) -> Option<usize> {
+        match self.xudp {
+            _ if !self.enabled => None,
+            Xudp::Off => None,
+            Xudp::Shared => self.tcp,
+            Xudp::Own(cap) => Some(cap),
+        }
+    }
+
+    /// xray's `xudpProxyUDP443`, read only while the session is on; every other datagram is allowed.
+    fn udp_443(&self, dest: SocketAddr) -> Udp443 {
+        if self.enabled && dest.port() == 443 {
+            self.udp443
+        } else {
+            Udp443::Allow
+        }
+    }
+}
+
+/// xray's `xudpConcurrency` fold: a negative count dials datagrams directly, zero keeps the TCP carrier, a positive count gets its own manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Xudp {
+    Off,
+    Shared,
+    Own(usize),
+}
+
+/// The carrier pools an outbound's mux settings build, one for TCP and one for its own datagram
+/// manager; `Shared` datagrams ride the TCP carrier, so both lanes name the same pool then.
+#[derive(Debug, Clone, Default)]
+struct Pools(Arc<PoolsInner>);
+
+impl Pools {
+    fn tcp(
+        &self,
+        cap: usize,
+        open: impl Fn() -> Option<crate::muxpool::Uplink> + Send + Sync + 'static,
+    ) -> Arc<crate::muxpool::Manager> {
+        Arc::clone(
+            self.0
+                .tcp
+                .get_or_init(|| crate::muxpool::Manager::new(cap, open)),
+        )
+    }
+
+    fn udp(
+        &self,
+        cap: usize,
+        open: impl Fn() -> Option<crate::muxpool::Uplink> + Send + Sync + 'static,
+    ) -> Arc<crate::muxpool::Manager> {
+        Arc::clone(
+            self.0
+                .udp
+                .get_or_init(|| crate::muxpool::Manager::new(cap, open)),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct PoolsInner {
+    tcp: std::sync::OnceLock<Arc<crate::muxpool::Manager>>,
+    udp: std::sync::OnceLock<Arc<crate::muxpool::Manager>>,
 }
 
 /// What a UDP datagram to port 443 does under a mux: it is refused, rides the mux, or skips it for the direct dial.
@@ -15476,23 +15676,23 @@ struct TrojanUdpUplink {
 }
 
 /// The outbound's direct UDP lane for a mux's skipped datagrams: one association, opened on the first.
-struct TrojanUdpLane<'a> {
-    trojan: &'a TrojanOut,
-    relay: &'a UdpSocket,
+struct TrojanUdpLane {
+    trojan: TrojanOut,
+    relay: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
     uplink: Option<TrojanUdpUplink>,
     head: Vec<u8>,
 }
 
-impl<'a> TrojanUdpLane<'a> {
-    fn new(trojan: &'a TrojanOut, relay: &'a UdpSocket) -> Self {
-        Self {
-            trojan,
-            relay,
+impl TrojanUdpLane {
+    fn new(trojan: &TrojanOut, relay: &UdpSocket) -> Option<Self> {
+        Some(Self {
+            trojan: trojan.clone(),
+            relay: relay.try_clone().ok()?,
             source: Arc::new(Mutex::new(None)),
             uplink: None,
             head: Vec::with_capacity(32),
-        }
+        })
     }
 
     fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
@@ -15501,7 +15701,7 @@ impl<'a> TrojanUdpLane<'a> {
         }
         if self.uplink.is_none() {
             self.uplink =
-                dial_trojan_udp_uplink(self.trojan, &dest, self.relay, Arc::clone(&self.source));
+                dial_trojan_udp_uplink(&self.trojan, &dest, &self.relay, Arc::clone(&self.source));
         }
         if let Some(up) = &mut self.uplink {
             if !write_trojan_datagram(&mut *up.write, &dest, payload, &mut self.head) {
@@ -15516,6 +15716,65 @@ impl<'a> TrojanUdpLane<'a> {
 
     fn close(self) {
         if let Some(old) = self.uplink {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
+/// The direct lane a mux's `skip` policy uses for VMess: one plain UDP session per destination,
+/// framed through the same writer the non-mux path uses.
+struct VmessUdpLane {
+    vmess: VmessOut,
+    relay: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplinks: HashMap<SocketAddr, VmessUdpUplink>,
+    staging: Vec<u8>,
+}
+
+impl VmessUdpLane {
+    fn new(vmess: &VmessOut, relay: &UdpSocket) -> Option<Self> {
+        Some(Self {
+            vmess: vmess.clone(),
+            relay: relay.try_clone().ok()?,
+            source: Arc::new(Mutex::new(None)),
+            uplinks: HashMap::new(),
+            staging: Vec::with_capacity(UDP_BUF),
+        })
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        if !self.uplinks.contains_key(&dest) {
+            let Some(up) =
+                dial_vmess_udp_uplink(&self.vmess, &dest, &self.relay, Arc::clone(&self.source))
+            else {
+                return true;
+            };
+            self.uplinks.insert(dest, up);
+        }
+        let Some(up) = self.uplinks.get_mut(&dest) else {
+            return true;
+        };
+        if crate::vmess::write_frame(
+            &mut up.write,
+            &mut up.send,
+            payload,
+            &mut self.staging,
+            &mut up.pad,
+        ) {
+            return true;
+        }
+        if let Some(old) = self.uplinks.remove(&dest) {
+            (old.close)();
+        }
+        false
+    }
+
+    fn close(self) {
+        for (_, old) in self.uplinks {
             (old.close)();
             join(&old.done);
         }
@@ -15954,128 +16213,6 @@ where
     })
 }
 
-/// Frames one downlink hands the socket per vectored write: a read rarely holds more, and the
-/// run table lives on the stack.
-const MUX_RUNS: usize = 32;
-
-fn mux_dial_downlink_stream(down: &mut dyn Read, up: &mut dyn Write, id: u16) -> bool {
-    let ended = mux_downlink(down, up, id);
-    let _ = up.flush();
-    ended
-}
-
-/// One mux session's downlink: every Keep payload of `id` reaches `write` in the order it arrived,
-/// a batch of them in one vectored call whose segments are the read buffer's own payload subranges,
-/// and `true` reports an End frame so the caller can close its half.
-fn mux_downlink(read: &mut (impl Read + ?Sized), write: &mut dyn Write, id: u16) -> bool {
-    let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
-    let mut at = 0;
-    let mut runs = [(0usize, 0usize); MUX_RUNS];
-    let mut batched = 0;
-    'session: loop {
-        if at >= buf.len() {
-            buf.clear();
-            at = 0;
-        } else if at > 0 {
-            buf.drain(..at);
-            at = 0;
-        }
-        let mut progressed = false;
-        let mut ended = false;
-        loop {
-            match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
-                Err(ferrox_core::mux::Error::Short { .. }) => break,
-                Err(_) => break 'session,
-                Ok((frame, used)) => {
-                    at += used;
-                    progressed = true;
-                    if frame.id != id {
-                        continue;
-                    }
-                    match frame.status {
-                        ferrox_core::mux::Status::Keep => {
-                            let Some(data) = frame.data else {
-                                continue;
-                            };
-                            if batched == runs.len() {
-                                if !write_mux_runs(write, &buf, &runs[..batched]) {
-                                    return false;
-                                }
-                                batched = 0;
-                            }
-                            let start = data.as_ptr() as usize - buf.as_ptr() as usize;
-                            runs[batched] = (start, data.len());
-                            batched += 1;
-                        }
-                        ferrox_core::mux::Status::End => {
-                            ended = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if batched > 0 {
-            if !write_mux_runs(write, &buf, &runs[..batched]) {
-                return false;
-            }
-            batched = 0;
-        }
-        if ended {
-            return true;
-        }
-        if !progressed {
-            match read_into_tail(read, &mut buf) {
-                Ok(0) => return false,
-                Ok(_) => {}
-                Err(error) if is_timeout(&error) => {}
-                Err(_) => return false,
-            }
-        }
-    }
-    // A session that ends on a bad frame still delivers the frames decoded before it, as it did when each was written on its own.
-    if batched > 0 {
-        let _ = write_mux_runs(write, &buf, &runs[..batched]);
-    }
-    false
-}
-
-fn write_mux_runs(write: &mut dyn Write, buf: &[u8], runs: &[(usize, usize)]) -> bool {
-    write_all_runs::<MUX_RUNS>(write, buf, runs).is_ok()
-}
-
-fn mux_dial_uplink(client: &Connection, uplink: &mut dyn Write, id: u16) {
-    let mut chunk = [0u8; 8192];
-    let Ok(mut plain) = client.try_clone() else {
-        return;
-    };
-    let keep = ferrox_core::mux::Outgoing {
-        id,
-        status: ferrox_core::mux::Status::Keep,
-        options: ferrox_core::mux::DATA,
-        target: None,
-        global_id: None,
-    };
-    // One header per uplink with only its payload length rewritten; a framed payload goes to the socket uncopied.
-    let mut header = Vec::with_capacity(64);
-    let at = keep.encode_header_into(&mut header);
-    loop {
-        match plain.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                keep.patch_payload_len(&mut header, at, n);
-                if write_all_parts::<2>(uplink, &[&header[..], &chunk[..n]]).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
-    let _ = end.encode_header_into(&mut header);
-    let _ = uplink.write_all(&header);
-}
-
 /// The two halves of a mux carrier and the close that tears its socket down.
 type MuxHalves = (
     Box<dyn Read + Send>,
@@ -16087,6 +16224,16 @@ struct MuxUplink {
     read: Box<dyn Read + Send>,
     write: Box<dyn Write + Send>,
     close: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl From<MuxUplink> for crate::muxpool::Uplink {
+    fn from(uplink: MuxUplink) -> Self {
+        Self {
+            read: uplink.read,
+            write: uplink.write,
+            close: uplink.close,
+        }
+    }
 }
 
 fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
@@ -16489,6 +16636,58 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     })
 }
 
+/// The VMess carrier as a mux underlayer: the dial names the mux command, so the existing dial
+/// ladder carries the frames and no second session type exists; a loopback pair hands them over.
+fn open_vmess_mux(vmess: &VmessOut) -> Option<MuxUplink> {
+    match &vmess.carrier {
+        Carrier::Kcp(_)
+        | Carrier::Xdrive { .. }
+        | Carrier::Masque
+        | Carrier::Http
+        | Carrier::Unknown { .. } => return vmess_mux_unserved(),
+        _ => {}
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    let address = listener.local_addr().ok()?;
+    let spec = vmess.carrier_spec();
+    thread::spawn(move || {
+        let Ok((server, _)) = listener.accept() else {
+            return;
+        };
+        drop(listener);
+        let Some(edge) = resolve_outbound(&spec.address, spec.port) else {
+            return;
+        };
+        let server = Connection::from(server);
+        dial_vmess(&server, &edge, &spec, &vmess_mux_target(), Ladder::global());
+    });
+    let client = crate::conn::connect(&crate::conn::Target::Ip(address), budgets::dial()).ok()?;
+    let read = client.try_clone().ok()?;
+    let write = client.try_clone().ok()?;
+    let closer = client.try_clone().ok()?;
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(write),
+        close,
+    })
+}
+
+fn vmess_mux_unserved() -> Option<MuxUplink> {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if SAID.set(()).is_ok() {
+        eprintln!("vmess: this carrier does not pair with mux; dialing directly");
+    }
+    None
+}
+
+/// The name a VMess mux request carries: the command byte is the mux, and no address follows it.
+fn vmess_mux_target() -> Destination {
+    Destination::Name("v1.mux.cool".to_owned(), TROJAN_MUX_PORT)
+}
+
 fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
     if matches!(trojan.carrier, Carrier::Kcp(_)) {
         return trojan_mux_kcp(trojan);
@@ -16743,11 +16942,10 @@ fn trojan_mux_unserved() -> Option<MuxUplink> {
 }
 
 fn dial_trojan_mux(client: &Connection, trojan: &TrojanOut, target: &Destination) -> bool {
-    let Some(mux) = open_trojan_mux(trojan) else {
+    let Some(pool) = trojan.tcp_pool() else {
         return false;
     };
-    dial_mux_stream(client, mux, target);
-    true
+    dial_pooled_mux(client, &pool, target)
 }
 
 fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
@@ -16806,25 +17004,94 @@ fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
 }
 
 fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) {
-    let Some(mux) = open_vless_mux(vless) else {
-        return;
+    if let Some(pool) = vless.tcp_pool() {
+        dial_pooled_mux(client, &pool, target);
+    }
+}
+
+fn dial_vmess_mux(client: &Connection, vmess: &VmessOut, target: &Destination) -> bool {
+    let Some(pool) = vmess.tcp_pool() else {
+        return false;
     };
-    dial_mux_stream(client, mux, target);
+    dial_pooled_mux(client, &pool, target)
 }
 
 fn dial_ss_mux(client: &Connection, ss: &ShadowsocksOut, target: &Destination) -> bool {
-    let Some(mux) = open_ss_mux(ss) else {
+    let Some(pool) = ss.tcp_pool() else {
         return false;
     };
-    dial_mux_stream(client, mux, target);
+    dial_pooled_mux(client, &pool, target)
+}
+
+fn dial_pooled_mux(
+    client: &Connection,
+    pool: &Arc<crate::muxpool::Manager>,
+    target: &Destination,
+) -> bool {
+    let Some(flow) = pool.dial(&mux_target(target)) else {
+        return false;
+    };
+    relay_pool_flow(client, flow);
     true
 }
 
-fn dial_mux_stream(client: &Connection, mut mux: MuxUplink, target: &Destination) {
-    let mut ids = ferrox_core::mux::Ids::new(1);
-    let Ok(id) = ids.take() else {
+fn relay_pool_flow(client: &Connection, mut flow: crate::muxpool::Flow) {
+    let Ok(up) = client.try_clone() else {
+        flow.close();
         return;
     };
+    let Ok(down) = client.try_clone() else {
+        flow.close();
+        return;
+    };
+    let Some(replies) = flow.take_replies() else {
+        flow.close();
+        return;
+    };
+    let done = RelayPool::global().run(move || {
+        let mut down = down;
+        if mux_pool_downlink(&replies, &mut down) {
+            let _ = down.shutdown(Shutdown::Write);
+        }
+    });
+    let mut chunk = [0u8; READ_SLICE];
+    let Ok(mut plain) = up.try_clone() else {
+        flow.close();
+        join(&done);
+        return;
+    };
+    loop {
+        match plain.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if !flow.send(&chunk[..n]) {
+                    break;
+                }
+            }
+        }
+    }
+    flow.close();
+    join(&done);
+}
+
+/// One session's replies as the client's downlink: every `Keep` payload is written in arrival order,
+/// and `true` reports an `End` so the caller can close its half.
+fn mux_pool_downlink(
+    replies: &std::sync::mpsc::Receiver<crate::muxpool::Msg>,
+    down: &mut Connection,
+) -> bool {
+    while let Ok(msg) = replies.recv() {
+        if msg.end {
+            return true;
+        }
+        if down.write_all(&msg.data).is_err() {
+            return false;
+        }
+    }
+    false
+}
+
+fn mux_target(target: &Destination) -> ferrox_core::mux::Target<'_> {
     let addr = match target {
         Destination::Address(address) => match address.ip() {
             std::net::IpAddr::V4(octets) => ferrox_core::addr::Addr::V4(octets.octets()),
@@ -16832,46 +17099,11 @@ fn dial_mux_stream(client: &Connection, mut mux: MuxUplink, target: &Destination
         },
         Destination::Name(host, _) => ferrox_core::addr::Addr::Name(host.as_bytes()),
     };
-    let dest = ferrox_core::mux::Target {
+    ferrox_core::mux::Target {
         network: ferrox_core::mux::Network::Tcp,
         port: target.port(),
         addr,
-    };
-    let new = ferrox_core::mux::Outgoing {
-        id,
-        status: ferrox_core::mux::Status::New,
-        options: 0,
-        target: Some(dest),
-        global_id: None,
-    };
-    let mut frame = unfilled(new.frame_len(0));
-    let written = new.encode_into(None, &mut frame);
-    if mux.write.write_all(&frame[..written]).is_err() {
-        (mux.close)();
-        return;
     }
-    let Ok(up) = client.try_clone() else {
-        (mux.close)();
-        return;
-    };
-    let Ok(down) = client.try_clone() else {
-        (mux.close)();
-        return;
-    };
-    let MuxUplink {
-        mut read,
-        mut write,
-        close,
-    } = mux;
-    let done = RelayPool::global().run(move || {
-        let mut down = down;
-        if mux_dial_downlink_stream(&mut *read, &mut down, id) {
-            let _ = down.shutdown(Shutdown::Write);
-        }
-    });
-    mux_dial_uplink(&up, &mut *write, id);
-    close();
-    join(&done);
 }
 
 fn dial_vmess_httpupgrade(
@@ -22794,7 +23026,7 @@ fn serve_connect_at(
     };
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
-            if vless.mux {
+            if vless.mux.tcp.is_some() {
                 dial_vless_mux(&client, vless, asked);
             } else if vless.encryption.is_some() {
                 dial_vless_quic_sealed(&client, vless, asked);
@@ -22803,20 +23035,20 @@ fn serve_connect_at(
             }
             return;
         }
-        if matches!(vless.carrier, Carrier::Kcp(_)) && !vless.mux {
+        if matches!(vless.carrier, Carrier::Kcp(_)) && vless.mux.tcp.is_none() {
             if let Some(session) = kcp_dial_session(&vless.carrier, &vless.address, vless.port) {
                 dial_vless_kcp(&client, &session, vless, asked);
             }
             return;
         }
-        if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux {
+        if matches!(vless.carrier, Carrier::Hysteria(_)) && vless.mux.tcp.is_none() {
             if let Some(dial) = hysteria_dial_session(vless) {
                 crate::hysteria::dial_vless(&client, &dial, &vless.id, asked);
             }
             return;
         }
         if let Carrier::Xdrive { .. } = &vless.carrier {
-            if !vless.mux {
+            if vless.mux.tcp.is_none() {
                 dial_vless_xdrive(&client, vless, asked);
             }
             return;
@@ -22883,20 +23115,24 @@ fn dial_socks_outbound(
     let ladder = Ladder::global();
     match out {
         Outbound::Vless(vless) => {
-            if vless.mux {
+            if vless.mux.tcp.is_some() {
                 dial_vless_mux(client, vless, target);
             } else {
                 dial_vless(client, server, vless, Some(target), ladder);
             }
         }
-        Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
+        Outbound::Vmess(vmess) => {
+            if vmess.mux.tcp.is_none() || !dial_vmess_mux(client, vmess, target) {
+                dial_vmess(client, server, vmess, target, ladder);
+            }
+        }
         Outbound::Trojan(trojan) => {
-            if !trojan.mux.tcp || !dial_trojan_mux(client, trojan, target) {
+            if trojan.mux.tcp.is_none() || !dial_trojan_mux(client, trojan, target) {
                 dial_trojan(client, server, trojan, target, ladder);
             }
         }
         Outbound::Shadowsocks(shadowsocks) => {
-            if !shadowsocks.mux.tcp || !dial_ss_mux(client, shadowsocks, target) {
+            if shadowsocks.mux.tcp.is_none() || !dial_ss_mux(client, shadowsocks, target) {
                 dial_shadowsocks(client, server, shadowsocks, target, ladder);
             }
         }
@@ -24446,10 +24682,14 @@ fn serve_udp_lane_with(
         {
             serve_socks_udp_vless(relay, vless);
         }
-        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Kcp(_)) && vless.mux => {
+        Outbound::Vless(vless)
+            if matches!(vless.carrier, Carrier::Kcp(_)) && vless.mux.tcp.is_some() =>
+        {
             serve_socks_udp_vless(relay, vless);
         }
-        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux => {
+        Outbound::Vless(vless)
+            if matches!(vless.carrier, Carrier::Hysteria(_)) && vless.mux.tcp.is_none() =>
+        {
             // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
             if let Some(dial) = hysteria_dial_session(vless) {
                 crate::hysteria::serve_udp(relay, &dial);
@@ -26011,8 +26251,41 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         serve_socks_udp_shadowsocks2022(relay, ss, method2022);
         return;
     }
-    if ss.mux.udp && serve_socks_udp_ss_mux(relay, ss) {
-        return;
+    if ss.mux.udp_manager().is_some() {
+        if let Some(pool) = ss.udp_pool() {
+            let mut lane: Option<SsUdpLane> = None;
+            let mut said = false;
+            serve_socks_udp_pool(
+                relay,
+                &pool,
+                &ss.mux,
+                "shadowsocks",
+                false,
+                |_| true,
+                |socket, src, dest, buf, at, len| {
+                    if lane.is_none() {
+                        match SsUdpLane::open(socket, ss) {
+                            Some(open) => lane = Some(open),
+                            None => {
+                                if !said {
+                                    said = true;
+                                    eprintln!(
+                                        "shadowsocks: udp/443 skip lane unavailable; dropped"
+                                    );
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    lane.as_ref()
+                        .is_some_and(|lane| lane.send(src, dest, buf, at, len))
+                },
+            );
+            if let Some(lane) = lane {
+                lane.close();
+            }
+            return;
+        }
     }
     let Some(lane) = SsUdpLane::open(relay, ss) else {
         return;
@@ -26228,6 +26501,40 @@ fn spawn_ss_udp_reader2022(
 }
 
 fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
+    if vmess.mux.udp_manager().is_some() {
+        if let Some(pool) = vmess.udp_pool() {
+            let mut lane: Option<VmessUdpLane> = None;
+            let mut said = false;
+            serve_socks_udp_pool(
+                relay,
+                &pool,
+                &vmess.mux,
+                "vmess",
+                false,
+                |_| true,
+                |socket, src, dest, buf, at, len| {
+                    if lane.is_none() {
+                        match VmessUdpLane::new(vmess, socket) {
+                            Some(open) => lane = Some(open),
+                            None => {
+                                if !said {
+                                    said = true;
+                                    eprintln!("vmess: udp/443 skip lane unavailable; dropped");
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    lane.as_mut()
+                        .is_some_and(|lane| lane.send(src, dest, &buf[at..at + len]))
+                },
+            );
+            if let Some(lane) = lane {
+                lane.close();
+            }
+            return;
+        }
+    }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<VmessUdpUplink> = None;
     let mut staging = Vec::with_capacity(UDP_BUF);
@@ -26286,7 +26593,7 @@ fn vless_udp_target_allowed(vless: &VlessOut, dest: &SocketAddr) -> bool {
 }
 
 fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
-    if vless.mux {
+    if vless.mux.udp_manager().is_some() {
         return serve_socks_udp_vless_xudp(relay, vless);
     }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -26349,22 +26656,6 @@ fn xudp_identity(source: SocketAddr) -> [u8; ferrox_core::mux::GLOBAL_ID] {
     hash.to_be_bytes()
 }
 
-/// One XUDP datagram as its two wire parts: the frame header just encoded, and the payload the relay
-/// read, which goes to the socket where it lies instead of through a staging copy.
-fn xudp_datagram<'a>(
-    frame: &ferrox_core::mux::Outgoing<'_>,
-    header: &'a mut Vec<u8>,
-    payload: &'a [u8],
-) -> (&'a [u8], &'a [u8]) {
-    assert!(
-        payload.len() <= ferrox_core::mux::CHUNK_MAX,
-        "mux chunk longer than a length field"
-    );
-    let at = frame.encode_header_into(&mut *header);
-    frame.patch_payload_len(&mut *header, at, payload.len());
-    (header.as_slice(), payload)
-}
-
 /// One SOCKS5 UDP frame as its two parts: the head this tree builds and the payload that arrived.
 /// The socket takes both by pointer, so a datagram is not gathered into a second buffer first.
 pub(crate) fn socks_udp_parts<'a>(
@@ -26376,258 +26667,134 @@ pub(crate) fn socks_udp_parts<'a>(
     (head.as_slice(), payload)
 }
 
-fn spawn_xudp_reader(
-    read: Box<dyn Read + Send>,
+/// One association's datagrams over the outbound's shared XUDP carrier: one flow per destination
+/// whose replies land on this association's own relay, and the 443 policy applied before the mux.
+fn serve_socks_udp_pool<F, G>(
     relay: &UdpSocket,
-    source: Arc<Mutex<Option<SocketAddr>>>,
-) -> Option<RelayEnd> {
-    let reply = relay.try_clone().ok()?;
-    Some(RelayPool::global().run(move || {
-        let mut read = read;
-        let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
-        let mut at = 0;
-        let mut head = Vec::with_capacity(HEAD);
-        loop {
-            if at >= buf.len() {
-                buf.clear();
-                at = 0;
-            } else if at > 0 {
-                buf.drain(..at);
-                at = 0;
-            }
-            let mut progressed = false;
-            loop {
-                match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
-                    Err(ferrox_core::mux::Error::Short { .. }) => break,
-                    Err(_) => return,
-                    Ok((frame, used)) => {
-                        at += used;
-                        progressed = true;
-                        let Some(data) = frame.data else { continue };
-                        let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
-                            continue;
-                        };
-                        let Some(dest) = source.lock().ok().and_then(|slot| *slot) else {
-                            continue;
-                        };
-                        let (front, tail) = socks_udp_parts(&mut head, &target, data);
-                        let _ = send_to_two(&reply, front, tail, dest);
-                    }
-                }
-            }
-            if !progressed {
-                match read_into_tail(&mut read, &mut buf) {
-                    Ok(0) => return,
-                    Ok(_) => {}
-                    // A quiet gap is not an end: the stream's own poll times out before the peer speaks again.
-                    Err(error) if is_timeout(&error) => {}
-                    Err(_) => return,
-                }
-            }
-        }
-    }))
-}
-
-fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
-    let Some(mux) = open_vless_mux(vless) else {
-        return;
-    };
-    serve_socks_udp_mux(
-        relay,
-        mux,
-        |dest| vless_udp_target_allowed(vless, dest),
-        |_, _, _| true,
-    );
-}
-
-fn serve_socks_udp_mux<F, G>(relay: &UdpSocket, mux: MuxUplink, allowed: F, mut skip: G)
-where
-    F: Fn(&SocketAddr) -> bool,
-    G: FnMut(SocketAddr, SocketAddr, &[u8]) -> bool,
+    pool: &Arc<crate::muxpool::Manager>,
+    settings: &Mux,
+    label: &str,
+    nat: bool,
+    mut allowed: F,
+    mut skip: G,
+) where
+    F: FnMut(&SocketAddr) -> bool,
+    G: FnMut(&UdpSocket, SocketAddr, SocketAddr, &mut [u8], usize, usize) -> bool,
 {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-    let Some(done) = spawn_xudp_reader(mux.read, relay, Arc::clone(&source)) else {
-        (mux.close)();
+    let Ok(reply) = relay.try_clone() else {
         return;
     };
-    let mut write = mux.write;
+    let reply = Arc::new(reply);
     let mut buf = udp_buffer();
-    let mut header = Vec::with_capacity(64);
+    let mut flows: HashMap<SocketAddr, crate::muxpool::UdpFlow> = HashMap::new();
     let mut identity: Option<[u8; ferrox_core::mux::GLOBAL_ID]> = None;
     let mut published: Option<SocketAddr> = None;
+    let mut said_reject = false;
+    let mut said_skip = false;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() {
+        let at = payload.as_ptr() as usize - buf.as_ptr() as usize;
+        let len = payload.len();
+        if len == 0 || !allowed(&dest) {
             continue;
         }
-        if !allowed(&dest) {
-            if !skip(src, dest, payload) {
-                break;
-            }
-            continue;
-        }
-        // The reply reader only needs the slot once: an association that keeps its socket writes it once.
-        if published != Some(src) {
-            if let Ok(mut slot) = source.lock() {
-                *slot = Some(src);
-                published = Some(src);
-            }
-        }
-        let first = identity.is_none();
-        let identity = identity.get_or_insert_with(|| xudp_identity(src));
-        let frame = ferrox_core::mux::Outgoing {
-            id: 0,
-            status: if first {
-                ferrox_core::mux::Status::New
-            } else {
-                ferrox_core::mux::Status::Keep
-            },
-            options: ferrox_core::mux::DATA,
-            target: Some(mux_target_of(dest)),
-            global_id: if first { Some(*identity) } else { None },
-        };
-        let (head, body) = xudp_datagram(&frame, &mut header, payload);
-        if write_all_parts::<2>(&mut *write, &[head, body]).is_err() {
-            break;
-        }
-    }
-    let end = ferrox_core::mux::Outgoing::bare(0, ferrox_core::mux::Status::End, 0);
-    resize_scratch(&mut header, end.frame_len(0));
-    let written = end.encode_into(None, &mut header);
-    let _ = write.write_all(&header[..written]);
-    (mux.close)();
-    join(&done);
-}
-
-/// The datagram's 443 policy: only a port-443 datagram is affected, and only by reject or skip.
-fn ss_mux_443(policy: Udp443, dest: SocketAddr) -> Udp443 {
-    if dest.port() == 443 {
-        policy
-    } else {
-        Udp443::Allow
-    }
-}
-
-fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
-    let Some(mux) = open_ss_mux(ss) else {
-        return false;
-    };
-    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-    let Some(done) = spawn_xudp_reader(mux.read, relay, Arc::clone(&source)) else {
-        (mux.close)();
-        return true;
-    };
-    let mut write = mux.write;
-    let mut buf = Vec::new();
-    resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
-    let room = crate::shadowsocks::SEAL_ROOM;
-    let mut header = Vec::with_capacity(64);
-    // One mux flow per destination, capped at 1024, found in one probe; `order` keeps insertion order for the teardown ends.
-    let mut ids = ferrox_core::mux::Ids::new(1_024);
-    let mut lanes: HashMap<SocketAddr, u16> = HashMap::new();
-    let mut order: Vec<u16> = Vec::new();
-    let mut skip: Option<SsUdpLane> = None;
-    let mut skip_tried = false;
-    let mut published: Option<SocketAddr> = None;
-    while let Ok((n, src)) = relay.recv_from(&mut buf[room..room + UDP_BUF]) {
-        let Some((dest, payload)) = parse_socks_udp(&buf[room..room + n]) else {
-            continue;
-        };
-        if payload.is_empty() {
-            continue;
-        }
-        if published != Some(src) {
-            if let Ok(mut slot) = source.lock() {
-                *slot = Some(src);
-                published = Some(src);
-            }
-        }
-        match ss_mux_443(ss.mux.udp443, dest) {
+        match settings.udp_443(dest) {
             Udp443::Reject => {
-                static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                if SAID.set(()).is_ok() {
-                    eprintln!("shadowsocks: mux rejects udp/443; the datagram is dropped");
+                if !said_reject {
+                    said_reject = true;
+                    eprintln!("{label}: mux rejects udp/443; the datagram is dropped");
                 }
                 continue;
             }
             Udp443::Skip => {
-                if !skip_tried {
-                    skip_tried = true;
-                    skip = SsUdpLane::open(relay, ss);
-                    if skip.is_none() {
-                        eprintln!("shadowsocks: udp/443 skip lane unavailable; dropped");
-                    }
-                }
-                if let Some(lane) = &skip {
-                    let (at, len) = (
-                        payload.as_ptr() as usize - buf.as_ptr() as usize,
-                        payload.len(),
-                    );
-                    if !lane.send(src, dest, &mut buf, at, len) {
-                        break;
-                    }
+                if !skip(relay, src, dest, &mut buf, at, len) && !said_skip {
+                    said_skip = true;
                 }
                 continue;
             }
             Udp443::Allow => {}
         }
-        let (id, first) = match lanes.entry(dest) {
-            std::collections::hash_map::Entry::Occupied(known) => (*known.get(), false),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let Ok(id) = ids.take() else { continue };
-                order.push(id);
-                (*slot.insert(id), true)
+        if published != Some(src) {
+            if let Ok(mut slot) = source.lock() {
+                *slot = Some(src);
+                published = Some(src);
             }
+        }
+        let id = if nat {
+            Some(*identity.get_or_insert_with(|| xudp_identity(src)))
+        } else {
+            None
         };
-        let frame = ferrox_core::mux::Outgoing {
-            id,
-            status: if first {
-                ferrox_core::mux::Status::New
-            } else {
-                ferrox_core::mux::Status::Keep
-            },
-            options: ferrox_core::mux::DATA,
-            target: Some(mux_target_of(dest)),
-            global_id: None,
-        };
-        let (head, body) = xudp_datagram(&frame, &mut header, payload);
-        if write_all_parts::<2>(&mut *write, &[head, body]).is_err() {
-            break;
+        let target = mux_target_of(dest);
+        if let Some(flow) = flows.get(&dest) {
+            if !flow.send(&target, &buf[at..at + len]) {
+                if let Some(old) = flows.remove(&dest) {
+                    old.close();
+                }
+            }
+            continue;
+        }
+        let sink_reply = Arc::clone(&reply);
+        let sink_source = Arc::clone(&source);
+        let deliver: crate::muxpool::Deliver = Arc::new(move |data, target| {
+            let Ok(slot) = sink_source.lock() else {
+                return;
+            };
+            let Some(peer) = *slot else {
+                return;
+            };
+            let mut head = Vec::with_capacity(HEAD);
+            let out = socks_udp_frame(&mut head, None, &target.unwrap_or(dest), data);
+            let _ = sink_reply.send_to(out, peer);
+        });
+        if let Some(flow) = pool.udp(&target, id.as_ref(), &buf[at..at + len], deliver) {
+            flows.insert(dest, flow);
         }
     }
-    for id in &order {
-        let end = ferrox_core::mux::Outgoing::bare(*id, ferrox_core::mux::Status::End, 0);
-        resize_scratch(&mut header, end.frame_len(0));
-        let written = end.encode_into(None, &mut header);
-        if write.write_all(&header[..written]).is_err() {
-            break;
-        }
+    for (_, flow) in flows {
+        flow.close();
     }
-    (mux.close)();
-    join(&done);
-    if let Some(lane) = skip {
-        lane.close();
-    }
-    true
+}
+
+fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
+    let Some(pool) = vless.udp_pool() else {
+        return;
+    };
+    serve_socks_udp_pool(
+        relay,
+        &pool,
+        &vless.mux,
+        "vless",
+        true,
+        |dest| vless_udp_target_allowed(vless, dest),
+        |_, _, _, _, _, _| true,
+    );
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
-    if trojan.mux.udp {
-        if let Some(mux) = open_trojan_mux(trojan) {
+    if trojan.mux.udp_manager().is_some() {
+        if let Some(pool) = trojan.udp_pool() {
             let mut lane: Option<TrojanUdpLane> = None;
-            serve_socks_udp_mux(
+            serve_socks_udp_pool(
                 relay,
-                mux,
-                |dest| matches!(ss_mux_443(trojan.mux.udp443, *dest), Udp443::Allow),
-                |src, dest, payload| {
-                    if matches!(ss_mux_443(trojan.mux.udp443, dest), Udp443::Skip) {
-                        return lane
-                            .get_or_insert_with(|| TrojanUdpLane::new(trojan, relay))
-                            .send(src, dest, payload);
+                &pool,
+                &trojan.mux,
+                "trojan",
+                true,
+                |_| true,
+                |socket, src, dest, buf, at, len| match &mut lane {
+                    Some(lane) => lane.send(src, dest, &buf[at..at + len]),
+                    None => {
+                        let Some(mut open) = TrojanUdpLane::new(trojan, socket) else {
+                            return true;
+                        };
+                        let sent = open.send(src, dest, &buf[at..at + len]);
+                        lane = Some(open);
+                        sent
                     }
-                    true
                 },
             );
             if let Some(lane) = lane {
@@ -26636,7 +26803,6 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
             return;
         }
     }
-    let policy = trojan.mux.udp.then_some(trojan.mux.udp443);
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<TrojanUdpUplink> = None;
     let mut buf = udp_buffer();
@@ -26648,7 +26814,7 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
         if payload.is_empty() {
             continue;
         }
-        if policy.is_some_and(|policy| matches!(ss_mux_443(policy, dest), Udp443::Reject)) {
+        if matches!(trojan.mux.udp_443(dest), Udp443::Reject) {
             continue;
         }
         if let Ok(mut slot) = source.lock() {
@@ -35651,7 +35817,8 @@ fn loopback_dial(
                 id: inbound_id(inbound),
                 carrier,
                 host,
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -35678,6 +35845,7 @@ fn loopback_dial(
                 quic_ech: None,
                 hysteria_roots: None,
                 mux: Mux::default(),
+                pool: Pools::default(),
                 reality: None,
             }))
         }
@@ -35701,6 +35869,8 @@ fn loopback_dial(
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
             }))
         }
         "shadowsocks" if matches!(stream_security(inbound), "" | "none") => {
@@ -35735,6 +35905,7 @@ fn loopback_shadowsocks(
         carrier,
         host,
         mux: Mux::default(),
+        pool: Pools::default(),
         tls: None,
         reality: None,
         headers,
@@ -36330,31 +36501,48 @@ pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
     std::process::exit(0);
 }
 
-/// The mux session an outbound's `mux` object enables: xray's negative pool size turns the manager off.
-fn outbound_mux(outbound: &Json) -> Mux {
-    let mux = outbound.get("mux");
-    let enabled = mux.and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
-    let concurrency = mux
-        .and_then(|mux| mux.get("concurrency"))
-        .and_then(Json::as_i64)
-        .unwrap_or(0);
-    let xudp = mux
-        .and_then(|mux| mux.get("xudpConcurrency"))
-        .and_then(Json::as_i64)
-        .unwrap_or(0);
-    let udp443 = match mux
-        .and_then(|mux| mux.get("xudpProxyUDP443"))
-        .and_then(Json::as_str)
-    {
-        Some("skip") => Udp443::Skip,
-        Some("allow") => Udp443::Allow,
-        _ => Udp443::Reject,
+/// The mux session an outbound's `mux` object enables: xray's `enabled`, its `concurrency` and
+/// `xudpConcurrency` folds, and the `xudpProxyUDP443` passthrough with its one refusal.
+fn outbound_mux(outbound: &Json) -> Result<Mux, String> {
+    let Some(mux) = outbound.get("mux") else {
+        return Ok(Mux::default());
     };
-    Mux {
-        tcp: enabled && concurrency >= 0,
-        udp: enabled && (xudp > 0 || (xudp == 0 && concurrency >= 0)),
-        udp443,
+    let udp443 = match mux.get("xudpProxyUDP443") {
+        None => Udp443::Reject,
+        Some(Json::Str(policy)) => match policy.as_str() {
+            "reject" => Udp443::Reject,
+            "allow" => Udp443::Allow,
+            "skip" => Udp443::Skip,
+            _ => return Err(format!("unknown \"xudpProxyUDP443\": {policy}")),
+        },
+        Some(_) => return Err("unknown \"xudpProxyUDP443\": not a string".to_owned()),
+    };
+    if mux.get("enabled").and_then(Json::as_bool) != Some(true) {
+        return Ok(Mux::default());
     }
+    let concurrency = mux.get("concurrency").and_then(Json::as_i64).unwrap_or(0);
+    let xudp = mux
+        .get("xudpConcurrency")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    Ok(Mux {
+        enabled: true,
+        tcp: (concurrency >= 0).then(|| {
+            if concurrency <= 128 {
+                128
+            } else {
+                usize::try_from(concurrency).unwrap_or(usize::MAX)
+            }
+        }),
+        xudp: if xudp < 0 {
+            Xudp::Off
+        } else if xudp == 0 {
+            Xudp::Shared
+        } else {
+            Xudp::Own(usize::try_from(xudp).unwrap_or(usize::MAX))
+        },
+        udp443,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -36379,7 +36567,13 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
         let security = stream_security(outbound);
-        let mux = outbound_mux(outbound);
+        let mux = match outbound_mux(outbound) {
+            Ok(mux) => mux,
+            Err(why) => {
+                eprintln!("trojan: {why}; outbound refused");
+                return None;
+            }
+        };
         let quic_tls = outbound
             .get("streamSettings")
             .and_then(|s| s.get("network"))
@@ -36419,6 +36613,7 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
                 quic_ech: None,
                 hysteria_roots: None,
                 mux,
+                pool: Pools::default(),
                 reality: Some(reality),
             });
         }
@@ -36437,6 +36632,7 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
                     quic_ech: None,
                     hysteria_roots: None,
                     mux,
+                    pool: Pools::default(),
                     reality: None,
                 });
             }
@@ -36477,6 +36673,7 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             quic_ech,
             hysteria_roots,
             mux,
+            pool: Pools::default(),
             reality: None,
         });
     }
@@ -36670,6 +36867,13 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let method = server.get("method").and_then(Json::as_str)?.to_owned();
         let password = server.get("password").and_then(Json::as_str)?.to_owned();
+        let mux = match outbound_mux(outbound) {
+            Ok(mux) => mux,
+            Err(why) => {
+                eprintln!("shadowsocks: {why}; outbound refused");
+                continue;
+            }
+        };
         // The store's own lanes speak the handshake, so a tls xdrive row adds no second one and keeps the row.
         if let Some((carrier, host)) = xdrive_carried(outbound, &address) {
             return Some(ShadowsocksOut {
@@ -36680,6 +36884,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 carrier,
                 host,
                 mux: Mux::default(),
+                pool: Pools::default(),
                 tls: None,
                 reality: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
@@ -36712,7 +36917,8 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 password,
                 carrier,
                 host,
-                mux: outbound_mux(outbound),
+                mux,
+                pool: Pools::default(),
                 tls: None,
                 reality: Some(reality),
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
@@ -36737,7 +36943,8 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             password,
             carrier,
             host,
-            mux: outbound_mux(outbound),
+            mux,
+            pool: Pools::default(),
             tls,
             reality: None,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
@@ -37233,13 +37440,17 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
     let transport_tls = quic_tls || hysteria_tls;
     let address = server.address.to_owned();
     let (port, id) = (server.port, server.id);
-    let requested =
-        outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
-    let rides = vless_mux_pairs(&outbound_carrier(outbound, &address).0);
-    if requested && !rides {
+    let mut mux = match outbound_mux(outbound) {
+        Ok(mux) => mux,
+        Err(why) => {
+            eprintln!("vless: {why}; outbound refused");
+            return None;
+        }
+    };
+    if mux.tcp.is_some() && !vless_mux_pairs(&outbound_carrier(outbound, &address).0) {
         eprintln!("vless: mux is not carried over this network; every flow dials directly");
+        mux.tcp = None;
     }
-    let mux = requested && rides;
     let stored = xdrive_carried(outbound, &address);
     if security == "tls" && !transport_tls && stored.is_none() {
         let out = tls_carried_vless(outbound, address, port, id, &flow, mux, encryption)?;
@@ -37292,6 +37503,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             carrier,
             host,
             mux,
+            pool: Pools::default(),
             quic_roots,
             quic_ech,
             hysteria_roots,
@@ -37303,7 +37515,10 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             encryption,
         });
     }
-    if !vless_security_supported(security) && !transport_tls && (mux || stored.is_none()) {
+    if !vless_security_supported(security)
+        && !transport_tls
+        && (mux.tcp.is_some() || stored.is_none())
+    {
         return None;
     }
     let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
@@ -37332,6 +37547,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         carrier,
         host,
         mux,
+        pool: Pools::default(),
         quic_roots,
         quic_ech,
         hysteria_roots,
@@ -37390,7 +37606,7 @@ fn tls_carried_vless(
     port: u16,
     id: [u8; 16],
     flow: &str,
-    mux: bool,
+    mux: Mux,
     encryption: Option<Arc<ferrox_core::vless_encryption::Client>>,
 ) -> Option<VlessOut> {
     let (carrier, host, tls) = tls_carried_parts(outbound, &address)?;
@@ -37401,6 +37617,7 @@ fn tls_carried_vless(
         carrier,
         host,
         mux,
+        pool: Pools::default(),
         quic_roots: None,
         quic_ech: None,
         hysteria_roots: None,
@@ -37448,6 +37665,13 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
         let cipher = vmess_cipher(user);
         let auth_len = authenticated_length(user);
         let no_termination = no_termination(user);
+        let mux = match outbound_mux(outbound) {
+            Ok(mux) => mux,
+            Err(why) => {
+                eprintln!("vmess: {why}; outbound refused");
+                return None;
+            }
+        };
         if stream_security(outbound) == "reality" {
             let (carrier, host) = outbound_carrier(outbound, &address);
             if !matches!(
@@ -37493,6 +37717,8 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux,
+                pool: Pools::default(),
             });
         }
         let security = stream_security(outbound);
@@ -37521,6 +37747,8 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                     quic_roots: None,
                     quic_ech: None,
                     hysteria_roots: None,
+                    mux,
+                    pool: Pools::default(),
                 });
             }
         }
@@ -37572,6 +37800,8 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             quic_roots,
             quic_ech,
             hysteria_roots,
+            mux,
+            pool: Pools::default(),
         });
     }
     None
@@ -37648,6 +37878,18 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Mux {
+        /// The mux a config with only `enabled: true` folds to: the 128 concurrency floor and the shared datagram carrier.
+        fn on() -> Mux {
+            Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443: Udp443::Reject,
+            }
+        }
+    }
 
     /// The eight-flow cells each need the whole test pool; running two at once measures the
     /// harness's parallelism, not the lane scheduler.
@@ -39238,7 +39480,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -39351,7 +39594,8 @@ mod tests {
             id,
             carrier,
             host: host.to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -39495,7 +39739,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -39588,7 +39833,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -43461,7 +43707,8 @@ mod tests {
             id: [0x11; 16],
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -44245,7 +44492,8 @@ mod tests {
                 id,
                 carrier: carrier.clone(),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -44984,7 +45232,8 @@ mod tests {
             id,
             carrier: Carrier::Xhttp { settings },
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -45418,7 +45667,8 @@ mod tests {
                 path: "/p".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -47138,7 +47388,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -47211,7 +47462,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -47283,7 +47535,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -47430,7 +47683,8 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -47506,7 +47760,8 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -47790,7 +48045,7 @@ mod tests {
         .expect("parses");
         let muxed = find_vless_outbound(&muxed).expect("tls carries the muxed outbound");
         assert!(muxed.tls.is_some(), "the session is still tls");
-        assert!(muxed.mux, "the mux rides the tls carrier");
+        assert!(muxed.mux.tcp.is_some(), "the mux rides the tls carrier");
         let kcp = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "mux": {"enabled": true},
                 "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
@@ -47799,7 +48054,7 @@ mod tests {
         )
         .expect("parses");
         let kcp = find_vless_outbound(&kcp).expect("kcp carries the mux");
-        assert!(kcp.mux, "the codec rides the kcp session");
+        assert!(kcp.mux.tcp.is_some(), "the codec rides the kcp session");
         let _ = std::fs::remove_file(&ca);
     }
 
@@ -48247,7 +48502,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -48386,7 +48642,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -48462,7 +48719,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -48576,7 +48834,8 @@ mod tests {
             id,
             carrier,
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -48780,7 +49039,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -48869,7 +49129,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -48956,7 +49217,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -49033,7 +49295,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -49102,7 +49365,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -49168,7 +49432,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -49228,7 +49493,8 @@ mod tests {
                 id,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -49353,6 +49619,7 @@ mod tests {
                 quic_ech: None,
                 hysteria_roots: None,
                 mux: Mux::default(),
+                pool: Pools::default(),
                 reality: None,
             };
             echo_trace(&format!("cli {port} dialing"));
@@ -49471,6 +49738,7 @@ mod tests {
                 quic_ech: None,
                 hysteria_roots: None,
                 mux: Mux::default(),
+                pool: Pools::default(),
                 reality: None,
             };
             let listener: SocketAddr = address.parse().expect("addr");
@@ -49781,6 +50049,8 @@ mod tests {
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
             };
             let listener: SocketAddr = address.parse().expect("addr");
             thread::spawn(move || {
@@ -49834,6 +50104,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         };
         assert_trojan_udp_echo_with(tag, &trojan, udp);
@@ -50425,7 +50696,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
-            mux: Mux::default(),
+            mux: Mux::on(),
+            pool: Pools::default(),
             reality: None,
         };
         for (tag, stream) in carriers {
@@ -50452,8 +50724,9 @@ mod tests {
         }
         for (tag, stream) in carriers {
             let inbound = trojan_reality_inbound(stream);
-            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, 0))
+            let mut trojan = find_trojan_outbound(&trojan_reality_outbound(stream, 0))
                 .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            trojan.mux = Mux::on();
             assert_trojan_mux_against_inbound(tag, &inbound, trojan, true);
         }
         let kcp = crate::json::parse(
@@ -50474,9 +50747,10 @@ mod tests {
         };
         assert_trojan_mux_against_inbound("kcp-tls", &kcp_tls, kcp_tls_out, false);
         let kcp_reality = trojan_reality_inbound(r#""network": "kcp""#);
-        let kcp_reality_out =
+        let mut kcp_reality_out =
             find_trojan_outbound(&trojan_reality_outbound(r#""network": "kcp""#, 0))
                 .expect("reality kcp outbound");
+        kcp_reality_out.mux = Mux::on();
         assert_trojan_mux_against_inbound("kcp-reality", &kcp_reality, kcp_reality_out, false);
     }
 
@@ -50503,8 +50777,10 @@ mod tests {
         let dport = downstream.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
-            let mux = open_vless_mux(&vless).unwrap_or_else(|| panic!("{tag} opens the mux"));
-            dial_mux_stream(&client, mux, &target);
+            let Some(pool) = vless.tcp_pool() else {
+                panic!("{tag} opens the mux")
+            };
+            assert!(dial_pooled_mux(&client, &pool, &target), "{tag} dials");
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
@@ -50555,8 +50831,10 @@ mod tests {
         let dport = downstream.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
-            let mux = open_vless_mux(&vless).unwrap_or_else(|| panic!("{tag} opens the mux"));
-            dial_mux_stream(&client, mux, &target);
+            let Some(pool) = vless.tcp_pool() else {
+                panic!("{tag} opens the mux")
+            };
+            assert!(dial_pooled_mux(&client, &pool, &target), "{tag} dials");
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
@@ -50599,7 +50877,8 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             headers: Vec::new(),
             heartbeat: 0,
-            mux: true,
+            mux: Mux::on(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -50734,8 +51013,9 @@ mod tests {
         let key = trojan_key("secret");
         let (server_config, client_config) = carried_tls_configs();
         let mux = Mux {
-            tcp: true,
-            udp: true,
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Shared,
             udp443: Udp443::Reject,
         };
         let raw = TrojanOut {
@@ -50751,6 +51031,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux,
+            pool: Pools::default(),
             reality: None,
         };
         assert_trojan_mux_tcp_echo(
@@ -50821,8 +51102,9 @@ mod tests {
         ))
         .expect("parses");
         let mux = Mux {
-            tcp: true,
-            udp: true,
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Shared,
             udp443: Udp443::Reject,
         };
         for (tag, inbound, reality, tls) in [
@@ -50855,6 +51137,7 @@ mod tests {
                 quic_ech: None,
                 hysteria_roots: None,
                 mux,
+                pool: Pools::default(),
                 reality,
             };
             let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -50977,6 +51260,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         };
         let target = Destination::from(
@@ -51115,6 +51399,7 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
+            pool: Pools::default(),
             tls: Some(client),
             reality: None,
             headers: Vec::new(),
@@ -51204,6 +51489,7 @@ mod tests {
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
                 mux: Mux::default(),
+                pool: Pools::default(),
                 tls: Some(Arc::clone(&client)),
                 reality: None,
                 headers: Vec::new(),
@@ -51248,10 +51534,14 @@ mod tests {
         )
         .expect("parses");
         let out = find_shadowsocks_outbound(&root).expect("finds");
-        assert!(out.mux.tcp, "the switch is read");
-        assert!(out.mux.udp, "a default xudp pool rides the mux too");
+        assert_eq!(out.mux.tcp, Some(128), "xray folds 0 to the 128 floor");
         assert_eq!(
-            out.mux.udp443,
+            out.mux.udp_manager(),
+            Some(128),
+            "a zero xudp pool rides the mux"
+        );
+        assert_eq!(
+            out.mux.udp_443("192.0.2.1:443".parse().expect("addr")),
             Udp443::Reject,
             "xray's default refuses udp/443"
         );
@@ -51260,7 +51550,11 @@ mod tests {
         )
         .expect("parses");
         let direct = find_shadowsocks_outbound(&direct).expect("finds");
-        assert!(!direct.mux.udp, "a negative xudp pool sends UDP direct");
+        assert_eq!(
+            direct.mux.udp_manager(),
+            None,
+            "a negative xudp pool sends UDP direct"
+        );
         assert_eq!(
             direct.mux.udp443,
             Udp443::Skip,
@@ -51271,11 +51565,43 @@ mod tests {
         )
         .expect("parses");
         let tcp_off = find_shadowsocks_outbound(&tcp_off).expect("finds");
-        assert!(
-            !tcp_off.mux.tcp,
+        assert_eq!(
+            tcp_off.mux.tcp, None,
             "a negative tcp pool turns the session off"
         );
-        assert!(!tcp_off.mux.udp, "udp follows the pool it rides");
+        assert_eq!(
+            tcp_off.mux.udp_manager(),
+            None,
+            "udp follows the pool it rides"
+        );
+        let own = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "concurrency": 300, "xudpConcurrency": 7, "xudpProxyUDP443": "allow"}}]}"#,
+        )
+        .expect("parses");
+        let own = find_shadowsocks_outbound(&own).expect("finds");
+        assert_eq!(own.mux.tcp, Some(300), "a count over 128 is kept");
+        assert_eq!(own.mux.udp_manager(), Some(7), "xudp gets its own pool");
+        assert_eq!(
+            own.mux.udp_443("192.0.2.1:443".parse().expect("addr")),
+            Udp443::Allow,
+            "the policy names the datagram it allows"
+        );
+        let off = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": false, "xudpProxyUDP443": "skip"}}]}"#,
+        )
+        .expect("parses");
+        let off = find_shadowsocks_outbound(&off).expect("finds");
+        assert_eq!(off.mux, Mux::default(), "a disabled mux carries nothing");
+    }
+
+    /// The reference refuses the outbound when `xudpProxyUDP443` names a policy it does not know.
+    #[test]
+    fn an_unknown_udp_443_policy_refuses_the_outbound() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpProxyUDP443": "drop"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_shadowsocks_outbound(&root).is_none());
     }
 
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
@@ -51308,6 +51634,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         };
         let conn = ferrox_core::kcp::dial(
             format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -51671,6 +51999,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         }
     }
 
@@ -52309,6 +52639,8 @@ mod tests {
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_vmess(
@@ -52496,7 +52828,8 @@ mod tests {
             id,
             carrier,
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -52531,6 +52864,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         })
     }
 
@@ -52553,6 +52888,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         })
     }
@@ -52892,7 +53228,8 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             headers: Vec::new(),
             heartbeat: 0,
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -52954,7 +53291,8 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             headers: Vec::new(),
             heartbeat: 0,
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -53725,6 +54063,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -53899,6 +54239,7 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -54434,7 +54775,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -54505,7 +54847,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -54797,7 +55140,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -54894,7 +55238,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -55270,6 +55615,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -55424,6 +55770,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -55736,10 +56084,12 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux {
-                tcp: true,
-                udp: true,
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
                 udp443: Udp443::Reject,
             },
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -55797,10 +56147,12 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux {
-                tcp: true,
-                udp: true,
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
                 udp443: Udp443::Reject,
             },
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -55873,10 +56225,12 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux {
-                tcp: true,
-                udp: true,
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
                 udp443: Udp443::Reject,
             },
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -55923,12 +56277,20 @@ mod tests {
     /// xray's `xudpProxyUDP443` shapes port 443 alone, and only a reject or a skip changes what happens to it.
     #[test]
     fn only_a_reject_or_a_skip_touches_udp443() {
+        fn mux(udp443: Udp443) -> Mux {
+            Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443,
+            }
+        }
         let https: SocketAddr = "192.0.2.1:443".parse().expect("addr");
         let plain: SocketAddr = "192.0.2.1:8443".parse().expect("addr");
-        assert_eq!(ss_mux_443(Udp443::Reject, https), Udp443::Reject);
-        assert_eq!(ss_mux_443(Udp443::Skip, https), Udp443::Skip);
-        assert_eq!(ss_mux_443(Udp443::Reject, plain), Udp443::Allow);
-        assert_eq!(ss_mux_443(Udp443::Allow, https), Udp443::Allow);
+        assert_eq!(mux(Udp443::Reject).udp_443(https), Udp443::Reject);
+        assert_eq!(mux(Udp443::Skip).udp_443(https), Udp443::Skip);
+        assert_eq!(mux(Udp443::Reject).udp_443(plain), Udp443::Allow);
+        assert_eq!(mux(Udp443::Allow).udp_443(https), Udp443::Allow);
     }
 
     /// A datagram the mux skips takes the outbound's own Shadowsocks UDP lane: sealed to the server, never sent to the destination in the clear, one uplink per source, and its reply framed back by the address it came from.
@@ -55952,6 +56314,7 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -56131,6 +56494,7 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -56210,6 +56574,7 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
@@ -56819,7 +57184,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: true,
+            mux: Mux::on(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -57401,41 +57767,6 @@ mod tests {
         assert_eq!(parts[1].iov_len, 1400);
     }
 
-    /// The XUDP uplink hands its datagram over as the frame header plus the relay's own read
-    /// buffer, and those two parts are the frame the single-buffer encoder writes. A staged payload
-    /// passes the byte half and fails the pointer half, and only the pointer half can see the copy.
-    #[test]
-    fn xudp_uplink_hands_the_payload_over_by_pointer() {
-        let target = mux_target_of("198.51.100.7:5353".parse().expect("addr"));
-        let frame = ferrox_core::mux::Outgoing {
-            id: 4,
-            status: ferrox_core::mux::Status::New,
-            options: ferrox_core::mux::DATA,
-            target: Some(target),
-            global_id: Some([3u8; ferrox_core::mux::GLOBAL_ID]),
-        };
-        let payload: Vec<u8> = (0..1400).map(|i| (i as u8) ^ 0x21).collect();
-        let mut header = Vec::with_capacity(64);
-        let (head, body) = xudp_datagram(&frame, &mut header, &payload);
-        assert_eq!(
-            body.as_ptr(),
-            payload.as_ptr(),
-            "the payload must be the writev part itself, not a copy of it"
-        );
-        assert_eq!(body.len(), payload.len());
-        assert_eq!(
-            head.len(),
-            2 + frame.meta_len() + 2,
-            "the head is the metadata and the payload length"
-        );
-
-        let mut whole = vec![0u8; frame.frame_len(payload.len())];
-        let n = frame.encode_into(Some(&payload), &mut whole);
-        let mut joined = head.to_vec();
-        joined.extend_from_slice(body);
-        assert_eq!(joined, whole[..n], "two parts, one frame");
-    }
-
     /// The stream frame is written whole before it is read, so its buffer is claimed, not zeroed: the
     /// bytes match the zero-filled encoding and no byte is zeroed.
     #[test]
@@ -57465,129 +57796,6 @@ mod tests {
             counts.zeroed, 0,
             "the encoder fills the prefix it returns: {counts:?}"
         );
-    }
-
-    /// The framer keeps the mux uplink's rule: a payload longer than the two-byte length field is refused, not wrapped.
-    #[test]
-    #[should_panic(expected = "mux chunk longer than a length field")]
-    fn an_xudp_datagram_longer_than_a_frame_is_refused_not_truncated() {
-        let frame = ferrox_core::mux::Outgoing::bare(
-            4,
-            ferrox_core::mux::Status::Keep,
-            ferrox_core::mux::DATA,
-        );
-        let mut header = Vec::with_capacity(64);
-        let big = vec![0u8; ferrox_core::mux::CHUNK_MAX + 1];
-        let _ = xudp_datagram(&frame, &mut header, &big);
-    }
-
-    /// What a downlink batch reached the sink with: the call shape, which a byte test cannot see.
-    #[derive(Default)]
-    struct RunSink {
-        calls: Vec<(usize, Vec<(usize, usize)>)>,
-        out: Vec<u8>,
-    }
-
-    impl Write for RunSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.calls
-                .push((1, vec![(buf.as_ptr() as usize, buf.len())]));
-            self.out.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn write_vectored(&mut self, parts: &[IoSlice<'_>]) -> std::io::Result<usize> {
-            self.calls.push((
-                parts.len(),
-                parts
-                    .iter()
-                    .map(|part| (part.as_ptr() as usize, part.len()))
-                    .collect(),
-            ));
-            let mut wrote = 0;
-            for part in parts {
-                self.out.extend_from_slice(part);
-                wrote += part.len();
-            }
-            Ok(wrote)
-        }
-    }
-
-    /// Four frames read at once reach the socket as one vectored call whose segments sit where the
-    /// frames put them. A write per frame is four calls; a staged batch moves the segments back to
-    /// back, so the offsets are what tell the two apart.
-    #[test]
-    fn a_mux_downlink_hands_a_batch_of_frames_over_in_one_call() {
-        let id = 7u16;
-        let payloads: [&[u8]; 4] = [b"ping", b"pong-and-more", b"", b"last"];
-        let mut wire = Vec::new();
-        let mut offsets = Vec::new();
-        let keep = ferrox_core::mux::Status::Keep;
-        for (i, payload) in payloads.iter().enumerate() {
-            if i == 2 {
-                let stray = ferrox_core::mux::Outgoing {
-                    id: id + 1,
-                    status: keep,
-                    options: ferrox_core::mux::DATA,
-                    target: None,
-                    global_id: None,
-                };
-                let mut frame = vec![0u8; stray.frame_len(4)];
-                let n = stray.encode_into(Some(b"nope"), &mut frame);
-                wire.extend_from_slice(&frame[..n]);
-            }
-            let frame = ferrox_core::mux::Outgoing {
-                id,
-                status: keep,
-                options: ferrox_core::mux::DATA,
-                target: None,
-                global_id: None,
-            };
-            let mut buf = vec![0u8; frame.frame_len(payload.len())];
-            let n = frame.encode_into(Some(payload), &mut buf);
-            offsets.push(wire.len() + n - payload.len());
-            wire.extend_from_slice(&buf[..n]);
-        }
-
-        let mut source = std::io::Cursor::new(wire);
-        let mut sink = RunSink::default();
-        assert!(
-            !mux_downlink(&mut source, &mut sink, id),
-            "no End frame, so the caller keeps its half open"
-        );
-        assert_eq!(
-            sink.calls.len(),
-            1,
-            "one write for the whole read, not one per frame"
-        );
-        // An empty payload is nothing to write, so the batch carries a segment per non-empty one.
-        let written: Vec<usize> = (0..payloads.len())
-            .filter(|&i| !payloads[i].is_empty())
-            .collect();
-        let (segments, bases) = &sink.calls[0];
-        assert_eq!(
-            *segments,
-            written.len(),
-            "one segment per non-empty payload"
-        );
-        assert_eq!(sink.out, payloads.concat(), "the payloads in arrival order");
-        for (segment, i) in written.iter().enumerate() {
-            let (base, len) = bases[segment];
-            assert_eq!(
-                len,
-                payloads[*i].len(),
-                "segment {segment} is a whole payload"
-            );
-            assert_eq!(
-                base.wrapping_sub(bases[0].0),
-                offsets[*i] - offsets[written[0]],
-                "segment {segment} is the read buffer at its frame's offset, not a staged copy"
-            );
-        }
     }
 
     /// The reply head and the payload leave as two parts. A joined buffer delivers the same
@@ -57958,477 +58166,6 @@ mod tests {
         let _ = write_mux_frame(&shared, &mut staging, keep, Some(&big));
     }
 
-    /// The gate is the wire: a built-once header and an uncopied payload yield the single-buffer encoder's frames.
-    #[test]
-    fn the_mux_uplink_frames_every_relay_read_the_same_way() {
-        for total in [1usize, 15, 16, 1400, 8192, 8193, 20_000] {
-            let payload: Vec<u8> = (0..total).map(|i| (i as u8).wrapping_mul(7)).collect();
-
-            let upstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-            let upstream_port = upstream.local_addr().expect("addr").port();
-            let server = thread::spawn(move || {
-                let (mut sock, _) = upstream.accept().expect("accepts");
-                let mut seen = Vec::new();
-                let mut buf = vec![0u8; 32 * 1024];
-                while let Ok(n) = sock.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    seen.extend_from_slice(&buf[..n]);
-                }
-                seen
-            });
-
-            let mut uplink = Connection::connect(("127.0.0.1", upstream_port)).expect("dials");
-            let client = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-            let client_port = client.local_addr().expect("addr").port();
-            let sent = payload.clone();
-            let writer = thread::spawn(move || {
-                let mut sock = Connection::connect(("127.0.0.1", client_port)).expect("connects");
-                sock.write_all(&sent).expect("writes");
-                sock.shutdown(Shutdown::Write).ok();
-            });
-            let (plain, _peer) = client.accept().expect("accepts");
-
-            let id = 7u16;
-            mux_dial_uplink(&plain, &mut uplink, id);
-            let _ = uplink.shutdown(Shutdown::Write);
-
-            let wire = server.join().expect("joins");
-            writer.join().expect("joins");
-
-            let mut out = Vec::new();
-            let mut frames = 0usize;
-            let mut at = 0usize;
-            while at < wire.len() {
-                let (frame, used) =
-                    ferrox_core::mux::decode(&wire[at..], ferrox_core::mux::NewTail::Forward)
-                        .expect("a frame decodes");
-                at += used;
-                assert_eq!(frame.id, id, "total {total}");
-                let Some(data) = frame.data else {
-                    assert_eq!(
-                        frame.status,
-                        ferrox_core::mux::Status::End,
-                        "total {total}: only the End frame carries no payload"
-                    );
-                    break;
-                };
-                assert_eq!(
-                    frame.status,
-                    ferrox_core::mux::Status::Keep,
-                    "total {total}"
-                );
-                out.extend_from_slice(data);
-                frames += 1;
-            }
-            assert_eq!(out, payload, "total {total}: the relayed bytes differ");
-            assert!(frames >= 1, "total {total}: no frames");
-        }
-    }
-
-    #[test]
-    fn socks_dials_vless_mux_to_echo() {
-        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(read) = stream.read(&mut buf) else {
-                    return;
-                };
-                if read == 0 || stream.write_all(&buf[..read]).is_err() {
-                    return;
-                }
-            }
-        });
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let tunnel_port = tunnel.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &one_vless_user(&id), true, None);
-        });
-        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let front_port = front.local_addr().expect("addr").port();
-        let out = Outbound::Vless(VlessOut {
-            address: "127.0.0.1".to_owned(),
-            port: tunnel_port,
-            id,
-            carrier: Carrier::Raw(Chain::default()),
-            host: "127.0.0.1".to_owned(),
-            mux: true,
-            quic_roots: None,
-            quic_ech: None,
-            hysteria_roots: None,
-            tls: None,
-            flow: String::new(),
-            reality: None,
-            headers: Vec::new(),
-            heartbeat: 0,
-            encryption: None,
-        });
-        thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out, &no_accounts());
-        });
-        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        client.write_all(&[5, 1, 0]).expect("greets");
-        let mut method = [0u8; 2];
-        client.read_exact(&mut method).expect("selects");
-        assert_eq!(method, [5, 0]);
-        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-        request.extend_from_slice(&echo_port.to_be_bytes());
-        client.write_all(&request).expect("connects");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
-    }
-
-    #[test]
-    fn socks_dials_encrypted_vless_mux_to_echo() {
-        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(read) = stream.read(&mut buf) else {
-                    return;
-                };
-                if read == 0 || stream.write_all(&buf[..read]).is_err() {
-                    return;
-                }
-            }
-        });
-        let (client_string, server_string) =
-            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
-        let client = vless_client_encryption(Some(&client_string))
-            .expect("client")
-            .expect("engine");
-        let inbound = crate::json::parse(&format!(
-            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
-        ))
-        .expect("parses");
-        let decryption = crate::config::server_decryption(&inbound)
-            .expect("decryption")
-            .expect("engine");
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let tunnel_port = tunnel.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless(
-                stream,
-                &one_vless_user(&id),
-                &Carrier::Raw(Chain::default()),
-                true,
-                None,
-                Some(&decryption),
-            );
-        });
-        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let front_port = front.local_addr().expect("addr").port();
-        let out = Outbound::Vless(VlessOut {
-            address: "127.0.0.1".to_owned(),
-            port: tunnel_port,
-            id,
-            carrier: Carrier::Raw(Chain::default()),
-            host: "127.0.0.1".to_owned(),
-            mux: true,
-            quic_roots: None,
-            quic_ech: None,
-            hysteria_roots: None,
-            tls: None,
-            flow: String::new(),
-            reality: None,
-            headers: Vec::new(),
-            heartbeat: 0,
-            encryption: Some(Arc::clone(&client)),
-        });
-        thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out, &no_accounts());
-        });
-        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        client.write_all(&[5, 1, 0]).expect("greets");
-        let mut method = [0u8; 2];
-        client.read_exact(&mut method).expect("selects");
-        assert_eq!(method, [5, 0]);
-        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-        request.extend_from_slice(&echo_port.to_be_bytes());
-        client.write_all(&request).expect("connects");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
-    }
-
-    #[test]
-    fn trojan_over_ws_rejects_a_wrong_password() {
-        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let front_port = front.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            serve_trojan_ws(stream, &[trojan_key("secret")], "/tunnel", true);
-        });
-        let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
-        uplink
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        let (mut reader, writer) =
-            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[], &[], 0)
-                .expect("upgrades");
-        let mut header = Vec::new();
-        header.extend_from_slice(&trojan_key("wrong"));
-        header.extend_from_slice(b"\r\n");
-        header.push(1);
-        header.extend_from_slice(&[1, 127, 0, 0, 1]);
-        header.extend_from_slice(&8080u16.to_be_bytes());
-        header.extend_from_slice(b"\r\n");
-        assert!(writer.send(&header));
-        let mut back = [0u8; 4];
-        assert!(reader.read_exact(&mut back).is_err());
-    }
-
-    #[test]
-    fn socks_dials_vmess_over_ws_to_echo() {
-        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(read) = stream.read(&mut buf) else {
-                    return;
-                };
-                if read == 0 {
-                    return;
-                }
-                if stream.write_all(&buf[..read]).is_err() {
-                    return;
-                }
-            }
-        });
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let users = crate::vmess::Users::single(id);
-        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let tunnel_port = tunnel.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
-                let Ok(stream) = stream else { continue };
-                crate::vmess::serve_ws(stream, "/tunnel", &users, true);
-            }
-        });
-        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let front_port = front.local_addr().expect("addr").port();
-        let out = Outbound::Vmess(VmessOut {
-            address: "127.0.0.1".to_owned(),
-            port: tunnel_port,
-            id,
-            cipher: crate::vmess::Cipher::Chacha,
-            auth_len: false,
-            no_termination: false,
-            carrier: Carrier::Ws {
-                path: "/tunnel".to_owned(),
-                ed: 0,
-            },
-            host: "127.0.0.1".to_owned(),
-            tls: None,
-            reality: None,
-            headers: Vec::new(),
-            heartbeat: 0,
-            quic_roots: None,
-            quic_ech: None,
-            hysteria_roots: None,
-        });
-        thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out, &no_accounts());
-        });
-        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        client.write_all(&[5, 1, 0]).expect("greets");
-        let mut method = [0u8; 2];
-        client.read_exact(&mut method).expect("selects");
-        assert_eq!(method, [5, 0]);
-        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-        request.extend_from_slice(&echo_port.to_be_bytes());
-        client.write_all(&request).expect("connects");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
-    }
-
-    #[test]
-    fn socks_dials_vmess_over_httpupgrade_to_echo() {
-        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(read) = stream.read(&mut buf) else {
-                    return;
-                };
-                if read == 0 {
-                    return;
-                }
-                if stream.write_all(&buf[..read]).is_err() {
-                    return;
-                }
-            }
-        });
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let users = crate::vmess::Users::single(id);
-        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let tunnel_port = tunnel.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
-                let Ok(stream) = stream else { continue };
-                crate::vmess::serve_httpupgrade(stream, "/tunnel", "", &users, true);
-            }
-        });
-        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let front_port = front.local_addr().expect("addr").port();
-        let out = Outbound::Vmess(VmessOut {
-            address: "127.0.0.1".to_owned(),
-            port: tunnel_port,
-            id,
-            cipher: crate::vmess::Cipher::Chacha,
-            auth_len: false,
-            no_termination: false,
-            carrier: Carrier::HttpUpgrade {
-                path: "/tunnel".to_owned(),
-                host: String::new(),
-            },
-            host: "127.0.0.1".to_owned(),
-            tls: None,
-            reality: None,
-            headers: Vec::new(),
-            heartbeat: 0,
-            quic_roots: None,
-            quic_ech: None,
-            hysteria_roots: None,
-        });
-        thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out, &no_accounts());
-        });
-        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        client.write_all(&[5, 1, 0]).expect("greets");
-        let mut method = [0u8; 2];
-        client.read_exact(&mut method).expect("selects");
-        assert_eq!(method, [5, 0]);
-        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-        request.extend_from_slice(&echo_port.to_be_bytes());
-        client.write_all(&request).expect("connects");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
-    }
-
-    #[test]
-    fn socks_dials_vmess_over_grpc_to_echo() {
-        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(read) = stream.read(&mut buf) else {
-                    return;
-                };
-                if read == 0 {
-                    return;
-                }
-                if stream.write_all(&buf[..read]).is_err() {
-                    return;
-                }
-            }
-        });
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let users = crate::vmess::Users::single(id);
-        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let tunnel_port = tunnel.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
-                let Ok(stream) = stream else { continue };
-                crate::vmess::serve_grpc(stream, "/TunnelService/Tun", &users, true);
-            }
-        });
-        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let front_port = front.local_addr().expect("addr").port();
-        let out = Outbound::Vmess(VmessOut {
-            address: "127.0.0.1".to_owned(),
-            port: tunnel_port,
-            id,
-            cipher: crate::vmess::Cipher::Chacha,
-            auth_len: false,
-            no_termination: false,
-            carrier: Carrier::Grpc(crate::config::GrpcSettings::path(
-                "/TunnelService/Tun".to_owned(),
-            )),
-            host: "127.0.0.1".to_owned(),
-            tls: None,
-            reality: None,
-            headers: Vec::new(),
-            heartbeat: 0,
-            quic_roots: None,
-            quic_ech: None,
-            hysteria_roots: None,
-        });
-        thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out, &no_accounts());
-        });
-        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        client.write_all(&[5, 1, 0]).expect("greets");
-        let mut method = [0u8; 2];
-        client.read_exact(&mut method).expect("selects");
-        assert_eq!(method, [5, 0]);
-        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-        request.extend_from_slice(&echo_port.to_be_bytes());
-        client.write_all(&request).expect("connects");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
-    }
-
     /// One pool serves both directions of every session: an idle leg that waits inside the carrier
     /// instead of handing its lane back leaves the other direction with nowhere to run.
     #[test]
@@ -58486,6 +58223,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         });
         thread::spawn(move || {
             for stream in front.incoming().take(SESSIONS) {
@@ -58576,6 +58315,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -58647,6 +58387,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -58720,6 +58461,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -58790,6 +58532,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -58860,6 +58603,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -59212,6 +58956,8 @@ mod tests {
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         }
     }
 
@@ -59776,7 +59522,8 @@ mod tests {
             host: "localhost".to_owned(),
             headers: Vec::new(),
             heartbeat: 0,
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -60011,7 +59758,8 @@ mod tests {
             id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
             carrier: Carrier::Quic,
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -60184,7 +59932,8 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -61039,7 +60788,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61102,7 +60852,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61174,7 +60925,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: true,
+            mux: Mux::on(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61253,7 +61005,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: true,
+            mux: Mux::on(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61316,7 +61069,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61378,7 +61132,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61457,7 +61212,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: true,
+            mux: Mux::on(),
+            pool: Pools::default(),
             quic_roots: Some(roots.into()),
             quic_ech: None,
             hysteria_roots: None,
@@ -61505,7 +61261,8 @@ mod tests {
             id,
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
-            mux: true,
+            mux: Mux::on(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -61996,7 +61753,8 @@ mod tests {
             id,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -62088,7 +61846,8 @@ mod tests {
             id,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -62191,7 +61950,8 @@ mod tests {
                 id,
                 carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
                 host: "127.0.0.1".to_owned(),
-                mux: false,
+                mux: Mux::default(),
+                pool: Pools::default(),
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
@@ -62687,7 +62447,7 @@ mod tests {
                 .expect("binds h3");
         let mut out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client_config);
         if let Outbound::Vless(vless) = &mut out {
-            vless.mux = true;
+            vless.mux = Mux::on();
         }
         carrier_echo(out, port);
     }
@@ -62717,7 +62477,7 @@ mod tests {
         let mut out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client_config);
         if let Outbound::Vless(vless) = &mut out {
             vless.encryption = Some(client);
-            vless.mux = true;
+            vless.mux = Mux::on();
         }
         carrier_echo(out, port);
     }
@@ -63019,6 +62779,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: Some(roots.into()),
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         });
         thread::spawn(move || {
@@ -63103,6 +62864,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: Some(roots.into()),
+            mux: Mux::default(),
+            pool: Pools::default(),
         }
     }
 
@@ -64369,7 +64132,8 @@ mod tests {
                 ..ferrox_core::hysteria::Config::default()
             }),
             host: "localhost".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: Some(roots.into()),
@@ -66637,7 +66401,8 @@ mod tests {
             id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -66674,7 +66439,8 @@ mod tests {
             id,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -68215,7 +67981,8 @@ mod tests {
             id,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
+            pool: Pools::default(),
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
@@ -68298,6 +68065,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             mux: Mux::default(),
+            pool: Pools::default(),
             reality: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
@@ -68333,6 +68101,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -70154,6 +69924,7 @@ end
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
+            pool: Pools::default(),
             tls: None,
             reality: None,
             headers: Vec::new(),
