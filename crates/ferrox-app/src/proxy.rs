@@ -29309,6 +29309,7 @@ pub(crate) mod lane_pool {
             };
             if polled < 0 {
                 // A failed poll is a dead set: hand every parked lane back so the closed one leaves and the rest re-arm.
+                std::thread::sleep(crate::budgets::RELAY_POLL);
                 let all = Ready {
                     read: true,
                     write: true,
@@ -30113,11 +30114,8 @@ pub(crate) mod lane_pool {
         #[cfg(windows)]
         #[test]
         fn a_failed_poll_wakes_every_parked_lane() {
-            use std::os::windows::io::AsRawSocket as _;
-
-            let mut reactor = Reactor::new(usize::MAX as WaitFd).expect("a reactor");
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
-            let fd = socket.as_raw_socket();
+            let fd = usize::MAX as WaitFd;
+            let mut reactor = Reactor::new(fd).expect("a reactor");
             let slot = std::sync::Arc::new(ReadySlot {
                 id: 1,
                 due: std::sync::OnceLock::new(),
