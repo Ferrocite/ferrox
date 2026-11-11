@@ -364,7 +364,7 @@ pub(crate) fn send_plain(
     failed: &AtomicBool,
     recycle: Option<SyncSender<Vec<u8>>>,
 ) {
-    send_packets(packets, failed, recycle.as_ref(), |packet| {
+    send_packets(&packets, failed, recycle.as_ref(), |packet| {
         device.send(packet).map(|_| ())
     });
 }
@@ -385,7 +385,7 @@ fn refused(error: &io::Error) -> bool {
 }
 
 fn send_packets<W>(
-    packets: Receiver<Vec<u8>>,
+    packets: &Receiver<Vec<u8>>,
     failed: &AtomicBool,
     recycle: Option<&SyncSender<Vec<u8>>>,
     mut write: W,
@@ -432,7 +432,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut first = true;
         let mut writes = 0;
-        send_packets(rx, &failed, None, |packet| {
+        send_packets(&rx, &failed, None, |packet| {
             writes += 1;
             if first {
                 first = false;
@@ -455,7 +455,7 @@ mod tests {
         drop(tx);
         let failed = AtomicBool::new(false);
         let mut writes = 0;
-        send_packets(rx, &failed, None, |_| {
+        send_packets(&rx, &failed, None, |_| {
             writes += 1;
             Err(io::Error::from_raw_os_error(DEAD))
         });
