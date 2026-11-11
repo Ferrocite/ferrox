@@ -1456,8 +1456,10 @@ fn sequence(parts: &[&[u8]]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::tls::RecordAlignment as _;
+    use std::io::ErrorKind;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::Instant;
 
     const SERVER_PRIVATE: [u8; 32] = [
         0x69, 0x20, 0xca, 0xab, 0x2b, 0x4d, 0xe3, 0x7d, 0xfc, 0xfe, 0xbf, 0x60, 0x8b, 0x2a, 0x43,
@@ -1602,17 +1604,33 @@ mod tests {
         let authenticated = matches!(answer, Some(RealityAccept::Session(_)));
         let mut dialled = 0;
         let mut seen = Vec::new();
+        // A splice that returned is queued only once the peer's final ack lands, so wait for it.
+        let spliced = matches!(answer, Some(RealityAccept::Proxied(_)));
         cover.set_nonblocking(true).expect("nonblocking");
-        if let Ok((mut site, _)) = cover.accept() {
-            dialled += 1;
-            site.set_nonblocking(false).expect("blocking");
-            site.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
-            let mut once = [0u8; 4096];
-            loop {
-                match site.read(&mut once) {
-                    Ok(0) | Err(_) => break,
-                    Ok(took) => seen.extend_from_slice(&once[..took]),
+        let deadline = Instant::now() + COVER_WAIT;
+        loop {
+            match cover.accept() {
+                Ok((mut site, _)) => {
+                    dialled += 1;
+                    site.set_nonblocking(false).expect("blocking");
+                    site.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
+                    let mut once = [0u8; 4096];
+                    loop {
+                        match site.read(&mut once) {
+                            Ok(0) | Err(_) => break,
+                            Ok(took) => seen.extend_from_slice(&once[..took]),
+                        }
+                    }
+                    break;
                 }
+                Err(error)
+                    if spliced
+                        && error.kind() == ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
             }
         }
         Verdict {

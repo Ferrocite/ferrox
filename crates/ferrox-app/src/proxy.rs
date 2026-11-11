@@ -14334,6 +14334,22 @@ fn serve_ss_relay_inbound(
     }
 }
 
+fn serve_ss_relay_front(
+    address: &str,
+    inbound: &Json,
+    accounts: &crate::shadowsocks::SsAccounts,
+    carrier: &Carrier,
+) -> Option<bool> {
+    if !matches!(carrier, Carrier::Raw(_)) {
+        return None;
+    }
+    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method) {
+        RelayFront::Served => Some(true),
+        RelayFront::Refused => Some(false),
+        RelayFront::NotRelay => None,
+    }
+}
+
 /// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
 fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
     let Some(named) = inbound.get("settings").and_then(|s| s.get("network")) else {
@@ -14377,12 +14393,8 @@ fn serve_shadowsocks_inbound(
     let accounts = ss_accounts(inbound, address, password, method, configured);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
-    if matches!(carrier, Carrier::Raw(_)) {
-        match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method) {
-            RelayFront::Served => return true,
-            RelayFront::Refused => return false,
-            RelayFront::NotRelay => {}
-        }
+    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier) {
+        return served;
     }
     // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
     let udp_front = match bind_udp_front(address, tcp, udp_accounts.is_some(), "shadowsocks udp") {
@@ -52006,7 +52018,13 @@ mod tests {
             &mut pad,
         ));
         let mut buf = [0u8; 2048];
-        let (read, _) = relay.recv_from(&mut buf).expect("reply");
+        let local = relay.local_addr().expect("addr");
+        let read = loop {
+            let (read, from) = relay.recv_from(&mut buf).expect("reply");
+            if from == local {
+                break read;
+            }
+        };
         let (_, payload) = parse_socks_udp(&buf[..read]).expect("frames the reply");
         assert_eq!(payload, b"ping");
         (up.close)();
