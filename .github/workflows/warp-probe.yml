@@ -110,8 +110,9 @@ jobs:
                           print(f"{name}: {value}", flush=True)
                       body = self.bodies[sid]
                       print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
-                      method = dict(self.heads[sid]).get(":method", b"").decode()
-                      path = dict(self.heads[sid]).get(":path", b"").decode()
+                      heads = dict(self.heads[sid])
+                      method = heads.get(b":method", b"").decode()
+                      path = heads.get(b":path", b"").decode()
                       if method == "POST" and path.endswith("/reg"):
                           self.conn.send_headers(sid, [(":status", "200"), ("content-type", "application/json")])
                           self.conn.send_data(sid, FAKE_REG, True)
