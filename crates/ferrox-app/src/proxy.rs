@@ -24783,7 +24783,9 @@ fn serve_udp_lane_with(
         Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
         Outbound::Masque(masque) => masque.serve_udp(relay, associate),
         Outbound::Warp(warp) => warp.serve_udp(relay, associate),
-        Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out, source, sockopts),
+        Outbound::Freedom(out) => {
+            serve_socks_udp_freedom(relay, out, source, sockopts, associate);
+        }
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
                 // SOCKS4 has no datagram half: the association is a SOCKS5 request.
@@ -24815,6 +24817,7 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
     struct Lane {
         session: Arc<crate::reverse::Session>,
         id: u16,
+        pump: thread::JoinHandle<()>,
     }
     // The map answers a datagram's key in one probe; `order` keeps insertion order for the teardown ends.
     let mut lanes: HashMap<SocketAddr, Lane> = HashMap::new();
@@ -24856,7 +24859,7 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
                     };
                     let replies = session.clone();
                     let client_addr = src;
-                    thread::spawn(move || {
+                    let pump = thread::spawn(move || {
                         let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
                         while let Ok((data, from)) = flow.down.recv() {
                             // The header names the sender the bridge saw, so the datagram reads as coming from the address that answered.
@@ -24869,19 +24872,21 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
                         replies.end(id);
                     });
                     order.push(dest);
-                    lane.insert(Lane { session, id })
+                    lane.insert(Lane { session, id, pump })
                 }
             };
             lane.session.send(lane.id, payload)
         };
         if let Some(lane) = (!sent).then(|| lanes.remove(&dest)).flatten() {
             lane.session.end(lane.id);
+            let _ = lane.pump.join();
             order.retain(|known| *known != dest);
         }
     }
     for dest in order {
-        if let Some(lane) = lanes.get(&dest) {
+        if let Some(lane) = lanes.remove(&dest) {
             lane.session.end(lane.id);
+            let _ = lane.pump.join();
         }
     }
 }
@@ -25337,9 +25342,14 @@ fn serve_socks_udp_freedom(
     freedom: &FreedomOut,
     send_through: Option<SendThrough>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
+    associate: Option<&Connection>,
 ) {
+    if let Some(associate) = associate {
+        let _ = associate.set_read_timeout(Some(UDP_POLL));
+    }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let replies = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
     let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
     let mut seen = 0u64;
@@ -25353,7 +25363,7 @@ fn serve_socks_udp_freedom(
                 ) || is_udp_gone(&error) =>
             {
                 let now = replies.load(Ordering::Relaxed);
-                if now == seen {
+                if associate.is_some_and(peer_left) || now == seen {
                     break;
                 }
                 seen = now;
@@ -25423,6 +25433,7 @@ fn serve_socks_udp_freedom(
             relay_write,
             Arc::clone(&replies),
             dest,
+            Arc::clone(&stop),
         );
         uplinks.insert(dest, (writer, done, Arc::clone(&gate)));
         start_freedom_noises(
@@ -25433,8 +25444,9 @@ fn serve_socks_udp_freedom(
             gate,
         );
     }
-    for (_, (_, handle, _)) in uplinks {
-        // The relayed datagrams are on their own sockets, so this exit is their idle timeout.
+    stop.store(true, Ordering::Relaxed);
+    for (_, (writer, handle, _)) in uplinks {
+        let _ = writer.set_read_timeout(Some(UDP_POLL));
         let _ = handle.join();
     }
 }
@@ -25477,11 +25489,18 @@ fn freedom_reader(
     relay: UdpSocket,
     replies: Arc<AtomicU64>,
     dest: SocketAddr,
+    stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut back = udp_buffer();
         let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
-        while let Ok(read) = socket.recv(&mut back) {
+        while !stop.load(Ordering::Relaxed) {
+            let Ok(read) = socket.recv(&mut back) else {
+                break;
+            };
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             let Some(source) = source.lock().ok().and_then(|slot| *slot) else {
                 continue;
             };
@@ -68765,7 +68784,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(300)))
             .expect("timeout");
         let _serving = std::thread::spawn(move || {
-            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None);
+            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None, None);
         });
         let client = UdpSocket::bind("127.0.0.1:0").expect("client");
         client
