@@ -259,13 +259,49 @@ fn run_cell_json(run: &Run) -> Json {
     cell
 }
 
+fn interval_json(interval: Option<stats::Interval>) -> Json {
+    match interval {
+        Some(i) => {
+            let mut o = Json::object();
+            o.insert("low", Json::Num(i.low));
+            o.insert("mid", Json::Num(i.mid));
+            o.insert("high", Json::Num(i.high));
+            o.insert("pairs", Json::Num(i.pairs as f64));
+            o
+        }
+        None => Json::Null,
+    }
+}
+
+fn row_json(row: &stats::Row) -> Json {
+    let mut item = Json::object();
+    item.insert("label", Json::Str(row.label.clone()));
+    item.insert("direction", Json::Str(row.direction.as_str().into()));
+    item.insert("interval", interval_json(row.interval));
+    item.insert(
+        "verdict",
+        Json::Str(stats::verdict(row.interval, row.direction).as_str().into()),
+    );
+    item.insert("gates", Json::Bool(row.gates));
+    item.insert("unpriced", Json::Bool(row.unpriced));
+    if let Some(against) = row.against {
+        item.insert("never_below", Json::Bool(true));
+        item.insert("own_mib_s", Json::Num(against.own_mib_s));
+        item.insert("comparator_mib_s", Json::Num(against.other_mib_s));
+        item.insert("ratio", Json::Num(against.ratio()));
+        item.insert("runner_bound", Json::Bool(against.runner_bound()));
+        item.insert("deficit", Json::Bool(against.deficit(row.interval)));
+        item.insert("below_target", Json::Bool(!against.at_target()));
+    }
+    item
+}
+
 impl Comparison {
     fn throughput_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
-            .enumerate()
-            .map(|(i, run)| Cell {
-                run_index: i + 1,
+            .map(|run| Cell {
+                run_index: run.repeat,
                 value: run.throughput_mib_s(),
             })
             .collect()
@@ -274,9 +310,8 @@ impl Comparison {
     fn cpu_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
-            .enumerate()
-            .map(|(i, run)| Cell {
-                run_index: i + 1,
+            .map(|run| Cell {
+                run_index: run.repeat,
                 value: run.cpu_millis_per_gib(),
             })
             .collect()
@@ -285,9 +320,8 @@ impl Comparison {
     fn rss_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
-            .enumerate()
-            .map(|(i, run)| Cell {
-                run_index: i + 1,
+            .map(|run| Cell {
+                run_index: run.repeat,
                 value: run.rss_mib(),
             })
             .collect()
@@ -298,10 +332,9 @@ impl Comparison {
         let runs = self.runs(engine);
         let cells = runs
             .iter()
-            .enumerate()
-            .filter_map(|(i, run)| {
+            .filter_map(|run| {
                 run.outcome.latency_us.map(|q| Cell {
-                    run_index: i + 1,
+                    run_index: run.repeat,
                     value: q.median as f64,
                 })
             })
@@ -320,10 +353,9 @@ impl Comparison {
         let runs = self.runs(engine);
         let cells = runs
             .iter()
-            .enumerate()
-            .filter_map(|(i, run)| {
+            .filter_map(|run| {
                 run.io_per_gib().map(|pair| Cell {
-                    run_index: i + 1,
+                    run_index: run.repeat,
                     value: pick(pair),
                 })
             })
@@ -538,23 +570,44 @@ impl Comparison {
                         }
                     })
             })
+            .chain(self.comparator_rows())
+            .collect()
+    }
+
+    /// One `never below` row per other comparator engine: the gated engine against a peer, not the
+    /// reference, so a cell that loses to the field cannot pass on its reference ratio alone.
+    fn comparator_rows(&self) -> Vec<stats::Row> {
+        let Some(gated) = self.gated else {
+            return Vec::new();
+        };
+        // A latency, idle or held-open cell moves no bytes, so a peer row there would decide on a zero payload.
+        let priced = self.workload.total_bytes() > 0 && self.workload.traffic != "tcp-latency";
+        if !priced || Some(gated) == self.reference() || self.runs(gated).is_empty() {
+            return Vec::new();
+        }
+        let own = self.medians(gated);
+        let ceiling = self.ceiling_summary().map(|(median, _, _)| median);
+        self.by_engine
+            .iter()
+            .filter(|entry| entry.engine != gated && Some(entry.engine) != self.reference())
+            .filter(|entry| !entry.runs.is_empty())
+            .map(|entry| {
+                stats::Row::never_below(
+                    format!("throughput ({gated} vs {})", entry.engine),
+                    stats::bootstrap_ci(&stats::paired_ratios(
+                        &self.throughput_cells(gated),
+                        &self.throughput_cells(entry.engine),
+                        Direction::Higher,
+                    )),
+                    own.throughput,
+                    self.medians(entry.engine).throughput,
+                    ceiling,
+                )
+            })
             .collect()
     }
 
     pub fn comparison_json(&self, scenario: &str) -> Result<String, String> {
-        fn interval_json(interval: Option<stats::Interval>) -> Json {
-            match interval {
-                Some(i) => {
-                    let mut o = Json::object();
-                    o.insert("low", Json::Num(i.low));
-                    o.insert("mid", Json::Num(i.mid));
-                    o.insert("high", Json::Num(i.high));
-                    o.insert("pairs", Json::Num(i.pairs as f64));
-                    o
-                }
-                None => Json::Null,
-            }
-        }
         let mut root = Json::object();
         root.insert("scenario", Json::Str(scenario.to_owned()));
         let mut workload = Json::object();
@@ -594,20 +647,7 @@ impl Comparison {
         }
         root.insert("engines", Json::Arr(engines));
         let gate = self.gate();
-        let mut rows = Vec::new();
-        for row in self.rows() {
-            let mut item = Json::object();
-            item.insert("label", Json::Str(row.label.clone()));
-            item.insert("direction", Json::Str(row.direction.as_str().into()));
-            item.insert("interval", interval_json(row.interval));
-            item.insert(
-                "verdict",
-                Json::Str(stats::verdict(row.interval, row.direction).as_str().into()),
-            );
-            item.insert("gates", Json::Bool(row.gates));
-            item.insert("unpriced", Json::Bool(row.unpriced));
-            rows.push(item);
-        }
+        let rows: Vec<Json> = self.rows().iter().map(row_json).collect();
         root.insert("rows", Json::Arr(rows));
         root.insert("gate_passed", Json::Bool(gate.passed));
         let mut failures = Vec::new();
@@ -976,7 +1016,17 @@ impl Comparison {
              so a rate the {:.0}% tolerance can resolve takes {} ms of cpu, and a shorter span \
              measures the tick instead of the engine. Such a row reports with that reason while \
              the throughput and peak rss rows — same repeats, no per-GiB unit — still decide the \
-             job, so an unpriced row never hides a missing engine.\n",
+             job, so an unpriced row never hides a missing engine.\n\
+             Where another engine ran beside the reference, the engine under test also \
+             carries one `throughput (engine vs comparator)` row per peer, and those rows \
+             gate on the ratio rule's floor rather than the reference: its own median is \
+             never below that comparator's median, because beating the reference while \
+             losing the cell to a peer is still losing the cell. A cell where its whole \
+             interval is under that median fails, unless the engine alone already sits at the \
+             cell's one-hop ceiling — then the runner was the limit and the row reports \
+             instead — one whose interval reaches 1.0x\n\
+             reports that this run cannot resolve it, and a median above the floor but under \
+             the {:.1}x target is published as a warning.\n",
             stats::BOOTSTRAP_RESAMPLES,
             stats::BOOTSTRAP_SEED,
             stats::TOLERANCE * 100.0,
@@ -985,6 +1035,7 @@ impl Comparison {
             parity::cpu_resolution_floor_millis(),
             stats::TOLERANCE * 100.0,
             stats::min_pricable_cpu_millis(),
+            stats::TARGET_RATIO,
         );
         for line in &gate.lines {
             let _ = writeln!(s, "- {line}");
@@ -1236,6 +1287,7 @@ pub fn run(
                 engine.name == "xray-rust",
                 &cell,
                 workload.server_pid,
+                repeat,
             ) {
                 Ok(run) => {
                     let result_path = output.join("result.json");
@@ -1247,7 +1299,7 @@ pub fn run(
                         action: "writing result.json".into(),
                         source,
                     })?;
-                    match revalidate(&result_path) {
+                    match revalidate(&result_path, repeat) {
                         Ok(checked) => {
                             debug_assert_eq!(
                                 checked.engine_sha256, run.engine_sha256,
@@ -1335,7 +1387,7 @@ fn machine_description() -> String {
     )
 }
 
-pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
+pub fn revalidate(result_path: &Path, repeat: usize) -> Result<Run, Error> {
     let text = std::fs::read_to_string(result_path).map_err(|source| Error::Io {
         action: format!("reading {}", result_path.display()),
         source,
@@ -1382,6 +1434,7 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
 
     let samples = read_samples(&root);
     Ok(Run {
+        repeat,
         engine: root
             .get("engine_binary")
             .and_then(Json::as_str)
@@ -1876,6 +1929,7 @@ mod tests {
         parity::Run {
             engine: String::new(),
             engine_sha256: "abc".into(),
+            repeat: 1,
             outcome: parity::Outcome {
                 bytes_sent: mibs * 1024 * 1024,
                 bytes_received: 0,
@@ -1940,8 +1994,13 @@ mod tests {
             engine,
             dialect: parity::Dialect::Xray,
             runs: runs
-                .map(|(mibs, cpu_millis, rss_kib)| synth_run(mibs, cpu_millis, rss_kib))
                 .into_iter()
+                .enumerate()
+                .map(|(i, (mibs, cpu_millis, rss_kib))| {
+                    let mut run = synth_run(mibs, cpu_millis, rss_kib);
+                    run.repeat = i + 1;
+                    run
+                })
                 .collect(),
         }
     }
@@ -1953,13 +2012,15 @@ mod tests {
             engine,
             dialect: parity::Dialect::Xray,
             runs: runs
-                .map(|(bytes, transfer_ms, cpu_millis, rss_kib)| {
+                .into_iter()
+                .enumerate()
+                .map(|(i, (bytes, transfer_ms, cpu_millis, rss_kib))| {
                     let mut run = synth_run(0, cpu_millis, rss_kib);
+                    run.repeat = i + 1;
                     run.outcome.bytes_sent = bytes;
                     run.outcome.transfer = std::time::Duration::from_millis(transfer_ms);
                     run
                 })
-                .into_iter()
                 .collect(),
         }
     }
@@ -2789,6 +2850,130 @@ mod tests {
             !comparison.gate().passed,
             "and missing data must not pass on the strength of an unpriced row"
         );
+    }
+
+    /// Three engines on one cell: the reference, the gated engine, and one peer.
+    fn three_engine_comparison(traffic: &str) -> Comparison {
+        let mut workload = workload();
+        workload.traffic = traffic.to_owned();
+        Comparison {
+            workload,
+            repeats: 3,
+            by_engine: vec![
+                synth_engine(
+                    "xray-core",
+                    [(300, 6000, 20480), (310, 6200, 20500), (320, 6400, 20600)],
+                ),
+                synth_engine(
+                    "ferrox",
+                    [(600, 3000, 10240), (610, 3100, 10250), (620, 3200, 10260)],
+                ),
+                synth_engine(
+                    "zeronet",
+                    [
+                        (1200, 4000, 16000),
+                        (1210, 4100, 16100),
+                        (1220, 4200, 16200),
+                    ],
+                ),
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: Vec::new(),
+            skipped: Vec::new(),
+            machine: "test".into(),
+        }
+    }
+
+    /// #359's shape: ferrox beats the reference but loses the cell to a peer, so the peer row is the
+    /// only thing that can fail it and it must be the gated engine's row, not the peer's.
+    #[test]
+    fn a_cell_ferrox_loses_to_a_peer_fails_on_the_peer_row() {
+        let comparison = three_engine_comparison("upload");
+        let rows = comparison.rows();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label == "throughput (xray-core vs ferrox)"
+                    || row.label == "throughput (zeronet vs ferrox)"),
+            "a peer row prices only the engine under test: {:?}",
+            rows.iter().map(|row| &row.label).collect::<Vec<_>>()
+        );
+        let peer = rows
+            .iter()
+            .find(|row| row.label == "throughput (ferrox vs zeronet)")
+            .expect("the peer row is built");
+        assert!(peer.gates, "the peer row decides the cell: {peer:?}");
+        assert_eq!(
+            peer.against
+                .expect("a peer row carries its medians")
+                .own_mib_s,
+            610.0,
+            "the row gates on the engine's median, not one repeat"
+        );
+        let gate = comparison.gate();
+        assert!(!gate.passed, "{:?}", gate.lines);
+        let line = gate
+            .lines
+            .iter()
+            .find(|line| line.starts_with("throughput (ferrox vs zeronet)"))
+            .expect("the peer row is published");
+        assert!(line.contains("BELOW THE COMPARATOR"), "{line}");
+        assert!(line.contains("0.50x"), "{line}");
+        let root = json::parse(&comparison.comparison_json("t").expect("serialises"))
+            .expect("the document parses");
+        let rows = match root.get("rows").expect("rows") {
+            Json::Arr(items) => items.clone(),
+            other => panic!("rows is an array, got {other:?}"),
+        };
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get("label").and_then(Json::as_str) == Some("throughput (ferrox vs zeronet)")
+            })
+            .expect("the peer row travels in the document");
+        assert_eq!(row.get("gates").and_then(Json::as_bool), Some(true));
+        assert_eq!(row.get("never_below").and_then(Json::as_bool), Some(true));
+        assert_eq!(row.get("deficit").and_then(Json::as_bool), Some(true));
+        assert_eq!(row.get("runner_bound").and_then(Json::as_bool), Some(false));
+        assert_eq!(
+            row.get("comparator_mib_s").and_then(Json::as_num),
+            Some(1210.0)
+        );
+    }
+
+    #[test]
+    fn a_cell_that_moves_no_bytes_prices_no_peer_row() {
+        let comparison = three_engine_comparison("idle");
+        assert!(
+            comparison.rows().iter().all(|row| row.against.is_none()),
+            "an idle cell has no throughput to price against a peer"
+        );
+    }
+
+    /// A lost repeat keeps its own ordinal, so its pair drops instead of pairing one engine's
+    /// third run with another's second.
+    #[test]
+    fn a_lost_repeat_drops_its_pair_and_keeps_the_others_indexed() {
+        let mut comparison = three_engine_comparison("upload");
+        let ferrox = comparison
+            .by_engine
+            .iter_mut()
+            .find(|entry| entry.engine == "ferrox")
+            .expect("ferrox ran");
+        ferrox.runs.remove(1);
+        let indexes: Vec<usize> = comparison
+            .throughput_cells("ferrox")
+            .iter()
+            .map(|cell| cell.run_index)
+            .collect();
+        assert_eq!(indexes, vec![1, 3]);
+        let pairs = stats::paired_ratios(
+            &comparison.throughput_cells("ferrox"),
+            &comparison.throughput_cells("xray-core"),
+            stats::Direction::Higher,
+        );
+        assert_eq!(pairs.len(), 2);
     }
 
     #[test]

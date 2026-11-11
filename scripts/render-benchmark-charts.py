@@ -1182,12 +1182,7 @@ def throughput_table(results):
                 positioned += 1
                 if "ferrox" in leader_engines:
                     leading += 1
-        verdicts = [
-            row["verdict"]
-            for row in scenario.get("rows", [])
-            if row.get("gates") and row["label"].startswith("throughput")
-        ]
-        verdict = verdicts[0] if verdicts else "unproven"
+        verdict = throughput_verdict(scenario)
         base, server = scenario_name(scenario)
         lines.append(
             f"| `{base}` | {server} | " + " | ".join(cells)
@@ -1273,6 +1268,27 @@ def result_cell_status(scenario, engine):
     return "empty", "not attempted"
 
 
+def throughput_verdict(scenario):
+    """The gated throughput verdict, `worse` when any peer row is a deficit.
+
+    The first throughput row prices the gated engine against the reference; the
+    one-per-peer rows price it against every other engine in the cell. A deficit
+    in either is a worse cell, and only the peer row can see a loss the
+    reference ratio does not show.
+    """
+    verdict = "unproven"
+    first = True
+    for row in scenario.get("rows", []):
+        if not row.get("gates") or not str(row.get("label", "")).startswith("throughput"):
+            continue
+        if first:
+            verdict = row.get("verdict", "unproven")
+            first = False
+        if row.get("deficit"):
+            return "worse"
+    return verdict
+
+
 def result_verdict(scenario):
     """The gated throughput verdict and the engine it judges."""
     for row in scenario.get("rows", []):
@@ -1281,7 +1297,7 @@ def result_verdict(scenario):
             engine = ""
             if "(" in label:
                 engine = label.split("(", 1)[1].split(" vs ", 1)[0].strip()
-            return engine, row.get("verdict", "unproven")
+            return engine, throughput_verdict(scenario)
     return "", "unproven"
 
 
