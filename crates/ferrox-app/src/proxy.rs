@@ -4463,7 +4463,8 @@ fn serve_accepted(
 pub(crate) fn spawn_carried<F: FnOnce() + Send + 'static>(body: F) {
     let sniffing = crate::sniff::current();
     let access = crate::accesslog::snapshot();
-    thread::spawn(move || {
+    // The carried flow reads the waits its caller armed, not the constants a new thread defaults to.
+    crate::budgets::spawn(move || {
         crate::sniff::install_current(sniffing);
         let _flow = crate::accesslog::install_snapshot(access);
         body();

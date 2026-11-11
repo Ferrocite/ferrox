@@ -6569,12 +6569,19 @@ mod tests {
             &settings,
             None,
         );
-        let text = String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
-        assert_eq!(
-            text.matches("HTTP/1.1 200 OK").count(),
-            2,
-            "the second post arrived on a connection the first one closed"
-        );
+        // The requests after the first run on a carried thread, so the second answer is waited for rather than assumed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let text = String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
+            if text.matches("HTTP/1.1 200 OK").count() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second post arrived on a connection the first one closed: {text:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
             served.is_none(),
             "an uplink with nothing left to read owns no session"
