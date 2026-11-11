@@ -4072,11 +4072,12 @@ mod tests {
     }
 
     #[inline(never)]
-    fn xhttp_line_probe(prefix: &[u8], at: &mut usize) -> ChunkLine {
+    fn xhttp_line_probe(line: &mut [u8; 12], at: &mut usize) -> ChunkLine {
         let mut parsed = ChunkLine::Need;
-        for _ in 0..256 {
+        for i in 0..256 {
+            line[0] = b'0' + (i % 10) as u8;
             *at = 0;
-            parsed = xhttp_chunk_line(prefix, at);
+            parsed = xhttp_chunk_line(std::hint::black_box(&line[..]), at);
             std::hint::black_box(*at);
         }
         parsed
@@ -4084,10 +4085,11 @@ mod tests {
 
     #[test]
     fn the_chunk_line_costs_one_walk() {
+        let mut line = *b"12345678\r\nne";
         let mut at = 0;
         assert_eq!(
-            xhttp_line_probe(b"12345678\r\nnext", &mut at),
-            ChunkLine::Size(0x1234_5678)
+            xhttp_line_probe(&mut line, &mut at),
+            ChunkLine::Size(0x5234_5678)
         );
     }
 
