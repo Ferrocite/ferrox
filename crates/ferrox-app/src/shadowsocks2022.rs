@@ -823,7 +823,8 @@ fn pump_relay_carried_inner<R, W>(
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
     let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
-    let flow = crate::proxy::RelayFinish::new(true, std::sync::Arc::clone(close), None);
+    // The carrier ends once both legs have: an upload that finishes first must not cut a download still sealing.
+    let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut outbound = outbound;
     let mut writer = writer;
     let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
