@@ -233,7 +233,7 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47475578 psiphon_shad
 # ferrox-app bin, and the release layout puts the 12 Ir back that removing the
 # udp serve wrappers took out; psiphon_shadowsocks.rs is untouched.
 ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
-# The fused size-line walk over one fixed line: the CRLF scan and the hex parse
-# share a pass, so the probe frame is the walk and nothing else. UNBLESSED until
-# ops.yml measures it and the diff is read; nothing on the wire moves.
-ferrox_app::xhttp::tests::xhttp_line_probe UNBLESSED xhttp::tests::the_chunk_line_costs_one_walk
+# The fused size-line walk: 256 turns over a twelve-byte line, the first digit
+# changed each turn so the call is not hoisted. The CRLF scan and the hex parse
+# share a pass and the line is never copied. Nothing on the wire moves.
+ferrox_app::xhttp::tests::xhttp_line_probe 68114 xhttp::tests::the_chunk_line_costs_one_walk
