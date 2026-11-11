@@ -415,7 +415,13 @@ where
         // A refusal that may be about the token is told apart from one about the enrollment: the token's own GET answers where the PATCH cannot.
         let why = call("GET", &path, &headers, b"").map_or_else(
             |get_error| format!("its GET too: {}", get_error.reason),
-            |get| format!("the token answers GET {}", get.status),
+            |get| {
+                format!(
+                    "the token ({}) answers GET {}",
+                    registered.token.len(),
+                    get.status
+                )
+            },
         );
         RegisterError::fatal(format!("{} ({})", error.reason, why))
     })?;
