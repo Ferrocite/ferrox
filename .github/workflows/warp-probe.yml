@@ -31,7 +31,13 @@ jobs:
         run: |
           set -x
           python3 -m pip install --quiet h2
-          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout /tmp/key.pem -out /tmp/cert.pem -subj "/CN=127.0.0.1" >/dev/null 2>&1
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout /tmp/ca.key -out /tmp/ca.pem -subj "/CN=echo ca" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes -keyout /tmp/key.pem -out /tmp/leaf.csr -subj "/CN=echo.example" >/dev/null 2>&1
+          printf "subjectAltName=IP:127.0.0.1,DNS:echo.example\nextendedKeyUsage=serverAuth\n" > /tmp/ext.cnf
+          openssl x509 -req -in /tmp/leaf.csr -CA /tmp/ca.pem -CAkey /tmp/ca.key -CAcreateserial -days 2 -out /tmp/cert.pem -extfile /tmp/ext.cnf >/dev/null 2>&1
+          sudo cp /tmp/ca.pem /usr/local/share/ca-certificates/echo-ca.crt
+          sudo update-ca-certificates >/dev/null 2>&1
+          echo "the leaf is trusted by the system store"
           cat > /tmp/capture.py <<'EOF'
           import ssl, socket, sys
           from h2.connection import H2Connection
