@@ -2988,6 +2988,32 @@ mod tests {
         serving.join().expect("joins");
     }
 
+    /// A peer that completes the HTTP camouflage head and then sends no `VMess` request must not pin the carrier thread: the bounded request read ends at the handshake budget.
+    #[test]
+    fn a_silent_peer_cannot_pin_an_httpheader_vmess_request() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x5du8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_httpheader(stream, "/vmess-camouflage", &Users::single(id), true);
+            let _ = done_tx.send(());
+        });
+        let stream = Connection::connect(addr).expect("connects");
+        let (_reader, _writer) =
+            crate::httpheader::connect(stream, "127.0.0.1", "/vmess-camouflage", &[])
+                .expect("carries");
+        let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
     #[test]
     fn vmess_carries_over_the_ws_carrier_both_ways() {
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
