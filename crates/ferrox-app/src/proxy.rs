@@ -4120,6 +4120,7 @@ pub(crate) struct ShadowsocksOut {
     heartbeat: u32,
     mux: Mux,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+    reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
 }
 
 /// The session's two lanes and xray's `xudpProxyUDP443` for the datagram one, read only while a mux session is enabled.
@@ -12323,6 +12324,37 @@ fn dial_ss_kcp(
     ss: &ShadowsocksOut,
     target: &Destination,
 ) {
+    if let Some(cfg) = ss.reality.as_deref() {
+        let Some(mut session) = kcp_reality_connect(conn, cfg) else {
+            return;
+        };
+        if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+            let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+                &mut session,
+                &ss.password,
+                &ss.method,
+                target,
+            ) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+            let close = kcp_close(conn);
+            crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+            return;
+        }
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+        let close = kcp_close(conn);
+        crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return;
+    }
     if let Some(cfg) = ss.tls.as_deref() {
         let Some(mut session) = kcp_tls_connect(conn, cfg) else {
             return;
@@ -20073,6 +20105,10 @@ fn dial_shadowsocks(
             if dial_ss_tls_headed(client, server, ss, target, cfg) {
                 return;
             }
+        } else if let Some(cfg) = ss.reality.as_deref() {
+            if dial_ss_reality_headed(client, server, ss, target, cfg) {
+                return;
+            }
         } else {
             let Some(uplink) = dial_or_report(server) else {
                 return;
@@ -20186,6 +20222,29 @@ fn dial_ss_tls_headed(
     true
 }
 
+fn dial_ss_reality_headed(
+    client: &Connection,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) -> bool {
+    let Carrier::HttpHeader { path } = &ss.carrier else {
+        return false;
+    };
+    let Some(session) = dial_reality_session(server, cfg, ss.carrier.tcp_mask()) else {
+        return true;
+    };
+    let Some((reader, sink)) = tls_httpheader(server, session, &ss.host, path, &ss.headers) else {
+        return true;
+    };
+    let writer = sink.clone();
+    let closer = sink.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    ss_client_relay(client, reader, writer, &close, ss, target);
+    true
+}
+
 fn tls_session_on(
     uplink: Connection,
     cfg: &ferrox_core::tls::TlsConfig,
@@ -20238,6 +20297,29 @@ where
 struct TlsDial<'a> {
     server: &'a SocketAddr,
     cfg: &'a ferrox_core::tls::TlsConfig,
+}
+
+#[derive(Clone, Copy)]
+struct RealityDial<'a> {
+    server: &'a SocketAddr,
+    cfg: &'a ferrox_core::tls::RealityClientConfig,
+}
+
+fn reality_session_on(
+    uplink: Connection,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) -> Option<
+    ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>,
+> {
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+    let session = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter).ok()?;
+    session
+        .get_ref()
+        .get_ref()
+        .set_read_timeout(Some(SESSION_POLL))
+        .ok()?;
+    Some(session)
 }
 
 fn dial_ss_tls_rung(
@@ -20343,6 +20425,109 @@ fn dial_ss_tls_rung(
     }
 }
 
+fn dial_ss_reality_rung(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+    reality: RealityDial<'_>,
+) -> bool {
+    let RealityDial { server, cfg } = reality;
+    let rung = attempt.rung;
+    if rung == Rung::Raw && !attempt.explicit {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    let Some(session) = reality_session_on(uplink, cfg) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+    };
+    match rung {
+        Rung::Raw => {
+            let Some((reader, writer, raw)) = session.into_halves() else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Ws => {
+            let Some((reader, writer)) = tls_ws(
+                server,
+                session,
+                &ss.host,
+                attempt.path,
+                attempt.ed,
+                &[],
+                &ss.headers,
+                ss.heartbeat,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::HttpUpgrade => {
+            let Some((reader, sink)) =
+                tls_httpupgrade(server, session, &ss.host, attempt.path, &[], &ss.headers)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let writer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sink.clone().close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Grpc => {
+            let settings = ss
+                .carrier
+                .grpc_settings()
+                .cloned()
+                .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, &settings) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Xhttp => {
+            let Carrier::Xhttp { settings, .. } = &ss.carrier else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_reality_session(server, cfg, ss.carrier.tcp_mask()),
+                &ss.host,
+                settings,
+                true,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+    }
+}
+
 fn dial_ss_rung(
     client: &Connection,
     server: &SocketAddr,
@@ -20352,6 +20537,17 @@ fn dial_ss_rung(
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
+    if let Some(cfg) = ss.reality.as_deref() {
+        return dial_ss_reality_rung(
+            client,
+            uplink,
+            ss,
+            target,
+            attempt,
+            ladder,
+            RealityDial { server, cfg },
+        );
+    }
     if let Some(cfg) = ss.tls.as_deref() {
         return dial_ss_tls_rung(
             client,
@@ -34174,7 +34370,7 @@ fn hysteria_transport(outbound: &Json) -> bool {
         == Some("hysteria")
 }
 
-// A shadowsocks row's own fields, and the one security this lane dials: tls rides KCP or the store's lanes, never a carrier it would speak plaintext.
+// A shadowsocks row's own fields, and the one security this lane dials: tls and reality ride the carried lanes, never a carrier they would speak plaintext.
 fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
     if server.get("method").and_then(Json::as_str).is_none() {
         return Some("no cipher method in the server entry".to_owned());
@@ -34191,9 +34387,37 @@ fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
         .and_then(|s| s.get("network"))
         .and_then(Json::as_str)
         .unwrap_or("tcp");
+    let tls_carried = matches!(
+        network,
+        "tcp"
+            | "raw"
+            | "ws"
+            | "websocket"
+            | "httpupgrade"
+            | "grpc"
+            | "xhttp"
+            | "splithttp"
+            | "httpheader"
+            | "kcp"
+            | "mkcp"
+    );
+    let reality_carried = matches!(
+        network,
+        "tcp"
+            | "raw"
+            | "ws"
+            | "websocket"
+            | "httpupgrade"
+            | "grpc"
+            | "xhttp"
+            | "splithttp"
+            | "httpheader"
+            | "kcp"
+            | "mkcp"
+    );
     match (security, network) {
-        (_, "xdrive") => None,
-        ("tls", "kcp") => outbound_tls(
+        ("tls", "xdrive") => None,
+        ("tls", _) if tls_carried => outbound_tls(
             outbound,
             server
                 .get("address")
@@ -34201,6 +34425,20 @@ fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
                 .unwrap_or_default(),
         )
         .err(),
+        ("reality", _) if reality_carried => {
+            let address = server
+                .get("address")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            if outbound_reality(outbound, address).is_none() {
+                let _ = crate::config::reality_mldsa(outbound, false);
+                return Some("no reality config in the outbound".to_owned());
+            }
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                return Some(error);
+            }
+            None
+        }
         (security, network) => Some(format!("security `{security}` does not ride `{network}`")),
     }
 }
@@ -35366,6 +35604,7 @@ fn loopback_shadowsocks(
         host,
         mux: Mux::default(),
         tls: None,
+        reality: None,
         headers,
         heartbeat,
     }))
@@ -36295,6 +36534,40 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 host,
                 mux: Mux::default(),
                 tls: None,
+                reality: None,
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            });
+        }
+        if stream_security(outbound) == "reality" {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(
+                carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+                    | Carrier::Kcp(_)
+            ) {
+                return None;
+            }
+            let reality = outbound_reality(outbound, &address)?;
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                eprintln!("shadowsocks: {error}; outbound refused");
+                return None;
+            }
+            return Some(ShadowsocksOut {
+                address,
+                port,
+                method,
+                password,
+                carrier,
+                host,
+                mux: outbound_mux(outbound),
+                tls: None,
+                reality: Some(reality),
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
@@ -36319,6 +36592,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             host,
             mux: outbound_mux(outbound),
             tls,
+            reality: None,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
@@ -47509,6 +47783,127 @@ mod tests {
         assert!(matches!(out.carrier, Carrier::Raw(_)));
     }
 
+    /// `Shadowsocks` dials REALITY on the raw carrier and every carried lane the `VLESS`,
+    /// `VMess` and Trojan rows ship, so the outbound builds and the refusal stays silent.
+    #[test]
+    fn shadowsocks_reality_outbound_parses_its_identity() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let key = b64url(&public);
+        for method in ["aes-256-gcm", "2022-blake3-aes-128-gcm"] {
+            let dials = |stream: &str| {
+                let json = format!(
+                    r#"{{"outbounds":[{{"protocol":"shadowsocks","settings":{{"servers":[{{"address":"127.0.0.1","port":443,"method":"{method}","password":"secret"}}]}},"streamSettings":{{{stream},"security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{key}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#
+                );
+                let root = crate::json::parse(&json).expect("parses");
+                let out = find_shadowsocks_outbound(&root)?;
+                assert!(out.reality.is_some(), "{method} keeps the identity");
+                assert!(out.tls.is_none(), "{method} adds no tls above REALITY");
+                let outbound = root
+                    .get("outbounds")
+                    .and_then(Json::as_arr)
+                    .and_then(|list| list.first())
+                    .expect("outbound")
+                    .clone();
+                let server = lane_server(outbound.get("settings"), "servers")?.clone();
+                assert!(
+                    ss_outbound_refusal(&outbound, &server).is_none(),
+                    "{method} is not refused"
+                );
+                Some(out)
+            };
+            let raw = dials(r#""network": "tcp""#).expect("raw REALITY dials");
+            assert!(matches!(raw.carrier, Carrier::Raw(_)));
+            assert!(dials(r#""network": "ws""#).is_some(), "ws REALITY dials");
+            assert!(
+                dials(r#""network": "httpupgrade""#).is_some(),
+                "httpupgrade REALITY dials"
+            );
+            assert!(
+                dials(r#""network": "grpc""#).is_some(),
+                "grpc REALITY dials"
+            );
+            assert!(
+                dials(r#""network": "xhttp""#).is_some(),
+                "xhttp REALITY dials"
+            );
+            assert!(
+                dials(
+                    r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": "/"}}}"#
+                )
+                .is_some(),
+                "http-header REALITY dials"
+            );
+            assert!(
+                dials(r#""network": "quic""#).is_none(),
+                "quic REALITY has no second handshake to add"
+            );
+            assert!(
+                dials(r#""network": "kcp""#).is_some(),
+                "kcp REALITY dials the carried tunnel"
+            );
+        }
+    }
+
+    /// The REALITY session sits above the raw socket and below the SS handshake, so a
+    /// byte the client writes reaches the echoed target and comes back sealed.
+    #[test]
+    fn shadowsocks_reality_raw_dials_over_loopback() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let key = b64url(&public);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"method":"aes-256-gcm","password":"an-example-shared-password"}}"#,
+        )
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1",
+            "an-example-shared-password".to_owned(),
+            "aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let Ok(out) = stream.try_clone() else {
+                return;
+            };
+            serve_carrier_reality(stream, &reality_server_config(), move |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                serve_ss_tls_session(reader, writer, &accounts, true, &close);
+            });
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"shadowsocks","settings":{{"servers":[{{"address":"127.0.0.1","port":{port},"method":"aes-256-gcm","password":"an-example-shared-password"}}]}},"streamSettings":{{"network":"tcp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{key}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let ss = find_shadowsocks_outbound(&root).expect("dials raw REALITY");
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let echo_port = echo_loop();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_shadowsocks(&socket, &server, &ss, &asked, Ladder::global());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the reality lane echoes");
+    }
+
     /// A REALITY inbound on a carrier the serve path cannot arm is refused before the role starts,
     /// instead of binding a listener that drops every session.
     #[test]
@@ -50428,6 +50823,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
             tls: Some(client),
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -50516,6 +50912,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 mux: Mux::default(),
                 tls: Some(Arc::clone(&client)),
+                reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
             };
@@ -53207,6 +53604,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -55047,6 +55445,7 @@ mod tests {
                 udp443: Udp443::Reject,
             },
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -55107,6 +55506,7 @@ mod tests {
                 udp443: Udp443::Reject,
             },
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -55182,6 +55582,7 @@ mod tests {
                 udp443: Udp443::Reject,
             },
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -55256,6 +55657,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -55434,6 +55836,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -55512,6 +55915,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -69341,6 +69745,7 @@ end
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
             tls: None,
+            reality: None,
             headers: Vec::new(),
             heartbeat: 0,
         }));
