@@ -2735,11 +2735,53 @@ pub(crate) fn accept_split_with_settings<
         match accept_core(&head, prefix, Upload::Read(read), write, settings, None, fd) {
             Served::Session(reader, writer) => return Some((reader, writer)),
             Served::Again(next, next_write, carry) => {
+                // The first request is served, so the rest of the connection is a keep-alive tail: a pooled connection left idle waits up to the head budget, and that wait belongs to a goroutine, not a setup lane.
+                let settings = settings.clone();
+                crate::proxy::spawn_carried(move || {
+                    keep_alive_tail(next, next_write, &settings, carry);
+                });
+                return None;
+            }
+            Served::Closed => return None,
+        }
+    }
+}
+
+/// The requests after the first on one connection, read where nothing waits on a setup lane.
+fn keep_alive_tail<
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: crate::proxy::FrameWrite + Send + 'static,
+>(
+    mut read: ChainReader<R>,
+    mut write: W,
+    settings: &XhttpSettings,
+    carry: Vec<u8>,
+) {
+    read.set_carry(carry);
+    loop {
+        crate::proxy::RelayPoll::arm_head_poll(&mut read);
+        let Some((mut head, at)) =
+            crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())
+        else {
+            return;
+        };
+        let prefix = head.split_off(at);
+        crate::proxy::RelayPoll::arm_relay_poll(&mut read);
+        match accept_core(
+            &head,
+            prefix,
+            Upload::Read(read),
+            write,
+            settings,
+            None,
+            None,
+        ) {
+            Served::Again(next, next_write, carry) => {
                 read = next;
                 write = next_write;
                 read.set_carry(carry);
             }
-            Served::Closed => return None,
+            Served::Session(..) | Served::Closed => return,
         }
     }
 }
