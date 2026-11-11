@@ -69860,6 +69860,50 @@ end
         );
     }
 
+    /// Silence past the budget is death here too: a sniffed association with no traffic hands its
+    /// thread back at `udp_idle` even while its control stays open.
+    #[test]
+    fn a_quiet_sniffed_udp_association_hands_its_thread_back() {
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let out = freedom();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the sniffed association is served: {reply:?}");
+        let ended = finished
+            .recv_timeout(Duration::from_millis(250) + Duration::from_secs(5))
+            .is_ok();
+        budgets::clear();
+        if ended {
+            serving.join().expect("joins");
+        }
+        assert!(ended, "a quiet sniffed association ends on its idle budget");
+    }
+
     /// A sniffed association lives on its control connection too: dropping the control ends the
     /// relay instead of waiting out `udp_idle`.
     #[test]
