@@ -3190,6 +3190,27 @@ mod tests {
         assert_eq!(recv_endpoint(mapped, true), v4);
     }
 
+    /// A receiver on an ephemeral CI port can see unrelated datagrams; match the sender's port so
+    /// a stray packet neither satisfies nor breaks the claim about what `send_packet` wrote.
+    fn recv_from_port(socket: &UdpSocket, port: u16, buf: &mut [u8]) -> usize {
+        loop {
+            let (n, from) = socket.recv_from(buf).expect("a datagram from the sender");
+            if from.port() == port {
+                return n;
+            }
+        }
+    }
+
+    fn quiet_from_ports(socket: &UdpSocket, ports: &[u16], buf: &mut [u8]) -> bool {
+        loop {
+            match socket.recv_from(buf) {
+                Ok((_, from)) if ports.contains(&from.port()) => return false,
+                Ok(_) => {}
+                Err(_) => return true,
+            }
+        }
+    }
+
     #[test]
     fn a_handshake_races_every_endpoint_candidate_and_data_follows_one() {
         let Ok(v4) = UdpSocket::bind("127.0.0.1:0") else {
@@ -3210,35 +3231,40 @@ mod tests {
             v4.local_addr().expect("v4 address"),
             v6.local_addr().expect("v6 address"),
         ];
+        let sender_port = sender.local_addr().expect("sender address").port();
         let mut initiation = vec![0u8; INITIATION_SIZE];
         initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
         send_packet(&sender, true, candidates[0], &initiation, Some(&candidates));
         let mut buf = [0u8; 256];
         assert_eq!(
-            v4.recv_from(&mut buf).expect("v4 initiation").0,
-            INITIATION_SIZE
+            recv_from_port(&v4, sender_port, &mut buf),
+            INITIATION_SIZE,
+            "v4 initiation"
         );
         assert_eq!(
-            v6.recv_from(&mut buf).expect("v6 initiation").0,
-            INITIATION_SIZE
+            recv_from_port(&v6, sender_port, &mut buf),
+            INITIATION_SIZE,
+            "v6 initiation"
         );
         let mut transport = vec![0u8; 32];
         transport[..4]
             .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
         send_packet(&sender, true, candidates[0], &transport, Some(&candidates));
         assert_eq!(
-            v4.recv_from(&mut buf).expect("v4 transport").0,
-            transport.len()
+            recv_from_port(&v4, sender_port, &mut buf),
+            transport.len(),
+            "v4 transport"
         );
         v6.set_read_timeout(Some(Duration::from_millis(300)))
             .expect("timeout");
         assert!(
-            v6.recv_from(&mut buf).is_err(),
+            quiet_from_ports(&v6, &[sender_port], &mut buf),
             "data follows the pinned endpoint"
         );
         let Ok(v4_only) = UdpSocket::bind("127.0.0.1:0") else {
             return;
         };
+        let fallback_port = v4_only.local_addr().expect("fallback address").port();
         send_packet(
             &v4_only,
             false,
@@ -3247,11 +3273,12 @@ mod tests {
             Some(&candidates),
         );
         assert_eq!(
-            v4.recv_from(&mut buf).expect("v4 fallback").0,
-            INITIATION_SIZE
+            recv_from_port(&v4, fallback_port, &mut buf),
+            INITIATION_SIZE,
+            "v4 fallback"
         );
         assert!(
-            v6.recv_from(&mut buf).is_err(),
+            quiet_from_ports(&v6, &[sender_port, fallback_port], &mut buf),
             "a v4-only socket skips the v6 candidate"
         );
     }

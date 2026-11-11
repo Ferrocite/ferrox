@@ -345,10 +345,11 @@ impl Wire {
                 return false;
             }
         }
-        if !self.pending.starts_with(h2::MAGIC) {
+        if Instant::now() > deadline || !self.pending.starts_with(h2::MAGIC) {
             return false;
         }
         self.pending.drain(..PREFACE);
+        self.deadline.clear();
         true
     }
 

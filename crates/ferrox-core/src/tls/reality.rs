@@ -1456,6 +1456,7 @@ fn sequence(parts: &[&[u8]]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::tls::RecordAlignment as _;
+    use std::io::ErrorKind;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
@@ -1602,17 +1603,28 @@ mod tests {
         let authenticated = matches!(answer, Some(RealityAccept::Session(_)));
         let mut dialled = 0;
         let mut seen = Vec::new();
+        // A splice that returned is queued only once the peer's final ack lands, so wait for it.
+        let spliced = matches!(answer, Some(RealityAccept::Proxied(_)));
         cover.set_nonblocking(true).expect("nonblocking");
-        if let Ok((mut site, _)) = cover.accept() {
-            dialled += 1;
-            site.set_nonblocking(false).expect("blocking");
-            site.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
-            let mut once = [0u8; 4096];
-            loop {
-                match site.read(&mut once) {
-                    Ok(0) | Err(_) => break,
-                    Ok(took) => seen.extend_from_slice(&once[..took]),
+        for _ in 0..COVER_WAIT.as_millis() / 2 {
+            match cover.accept() {
+                Ok((mut site, _)) => {
+                    dialled += 1;
+                    site.set_nonblocking(false).expect("blocking");
+                    site.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
+                    let mut once = [0u8; 4096];
+                    loop {
+                        match site.read(&mut once) {
+                            Ok(0) | Err(_) => break,
+                            Ok(took) => seen.extend_from_slice(&once[..took]),
+                        }
+                    }
+                    break;
                 }
+                Err(error) if spliced && error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
             }
         }
         Verdict {

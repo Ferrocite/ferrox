@@ -1938,13 +1938,6 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     Some((target, used))
 }
 
-pub(crate) fn serve_udp(address: &str, password: &str, method: &str, freedom: bool) {
-    let Ok(clients) = UdpSocket::bind(address) else {
-        return;
-    };
-    serve_udp_on(&clients, password, method, freedom);
-}
-
 pub(crate) fn relay_udp_forward(
     relay_psk: &[u8],
     dests: &[RelayDest<'_>],

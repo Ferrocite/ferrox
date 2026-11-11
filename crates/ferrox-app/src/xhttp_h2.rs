@@ -967,6 +967,9 @@ impl H2Conn {
         else {
             return Some(false);
         };
+        if self.dead.load(Ordering::SeqCst) || state.gone() {
+            return Some(false);
+        }
         let total: u64 = groups
             .iter()
             .filter(|group| group.len() <= 4)
@@ -978,16 +981,18 @@ impl H2Conn {
         let Ok(mut write) = self.write.try_lock() else {
             return None;
         };
-        let (Ok(mut conn), Ok(mut window)) =
-            (self.send_conn.try_lock(), state.send_window.try_lock())
-        else {
-            return None;
-        };
-        if *conn < total || *window < total {
-            return None;
+        {
+            let (Ok(mut conn), Ok(mut window)) =
+                (self.send_conn.try_lock(), state.send_window.try_lock())
+            else {
+                return None;
+            };
+            if *conn < total || *window < total {
+                return None;
+            }
+            *conn -= total;
+            *window -= total;
         }
-        *conn -= total;
-        *window -= total;
         let max = *self
             .max_frame
             .lock()
@@ -1064,6 +1069,10 @@ impl H2Conn {
     /// anyway; holding the connection window across the recheck is what keeps a grant that landed
     /// between the caller's look and this wait from being slept out as a whole poll.
     fn wait_room(&self, stream: u32, turn: std::time::Duration) {
+        if self.client_read.is_some() && self.room(stream) == 0 {
+            // A client shares its transport with the frame reader: a lane waiting for credit reads the grant itself.
+            let _ = self.pump_read(|| false, true);
+        }
         let conn = self
             .send_conn
             .lock()
@@ -4313,6 +4322,56 @@ mod tests {
             !crate::xhttp::session_is_carried(sid),
             "the finished downlink leaves no session parked"
         );
+    }
+
+    /// A server h2 body with no flow-control window parks the relay lane instead of blocking it: the
+    /// offer is retryable and the lane waits on the face that grants the window.
+    #[test]
+    fn a_full_h2_window_parks_the_carrier_instead_of_holding_the_lane() {
+        use crate::proxy::{CarrierSink, Push};
+
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                stopped: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(0),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let out = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 1,
+            _owner: None,
+            client: false,
+        };
+        let writer = crate::xhttp::XhttpWriter::new(H2StreamWriter {
+            conn: Arc::clone(&conn),
+            stream: 1,
+            head: Vec::new(),
+            headed: true,
+        });
+        writer.set_h2(out);
+        let started = std::time::Instant::now();
+        assert!(matches!(writer.push_ready(b"body"), Push::Took(0)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(writer.read_window(), None);
+        *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 65_535;
+        assert!(matches!(writer.push_ready(b"body"), Push::Took(4)));
     }
 
     /// An ended session wakes the upload it was relaying: a stream-up POST parked in `H2StreamReader::read` must not hold its worker until the connection dies.

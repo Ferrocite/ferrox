@@ -14441,20 +14441,68 @@ fn serve_ss_kcp_listener(
     serve_kcp_bound(address, config, &serve)
 }
 
-fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method: &str) -> bool {
+/// The datagram half a shadowsocks listener owns before it reports served: bound here, refused here, or never asked for.
+enum UdpFront {
+    Unasked,
+    Bound(UdpSocket),
+    Refused,
+}
+
+fn bind_udp_front(address: &str, tcp: bool, wanted: bool, label: &str) -> UdpFront {
+    if !wanted {
+        return UdpFront::Unasked;
+    }
+    match UdpSocket::bind(address) {
+        Ok(socket) => UdpFront::Bound(socket),
+        Err(error) if !tcp => {
+            eprintln!("{label} on {address}: {error}; refused, not served");
+            UdpFront::Refused
+        }
+        Err(error) => {
+            eprintln!("{label} on {address}: {error}; serving tcp only");
+            UdpFront::Unasked
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RelayFront {
+    NotRelay,
+    Served,
+    Refused,
+}
+
+fn serve_ss_relay_inbound(
+    address: &str,
+    inbound: &Json,
+    password: &str,
+    method: &str,
+) -> RelayFront {
     let relay_dests = inbound_ss_destinations(inbound, method);
     if relay_dests.is_empty() {
-        return false;
+        return RelayFront::NotRelay;
     }
     let Some(parsed) = ferrox_core::shadowsocks2022::Method::parse(method) else {
-        return false;
+        return RelayFront::NotRelay;
     };
     let Some(psk) = ferrox_core::shadowsocks2022::parse_psk_list(password, parsed.key_len())
         .and_then(|mut list| list.pop())
     else {
-        return false;
+        return RelayFront::NotRelay;
     };
     let (tcp, udp) = inbound_ss_networks(inbound);
+    // Bind the relay's datagram front here, so a caller that reads this true cannot hold a relay whose only requested worker never bound.
+    let udp_front = match bind_udp_front(
+        address,
+        tcp,
+        udp && !parsed.is_chacha(),
+        "shadowsocks relay udp",
+    ) {
+        UdpFront::Refused => return RelayFront::Refused,
+        UdpFront::Unasked => None,
+        UdpFront::Bound(clients) => Some(clients),
+    };
+    let udp_served = udp_front.is_some();
     let tcp_address = address.to_owned();
     if tcp {
         let method = method.to_owned();
@@ -14472,18 +14520,34 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
             }
         });
     }
-    if udp && !parsed.is_chacha() {
-        let udp_address = address.to_owned();
+    if let Some(clients) = udp_front {
         let udp_dests = relay_dests.clone();
         let udp_psk = psk.clone();
         thread::spawn(move || {
-            let Ok(clients) = UdpSocket::bind(&udp_address) else {
-                return;
-            };
             crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
         });
     }
-    tcp || (udp && !parsed.is_chacha())
+    if tcp || udp_served {
+        RelayFront::Served
+    } else {
+        RelayFront::Refused
+    }
+}
+
+fn serve_ss_relay_front(
+    address: &str,
+    inbound: &Json,
+    accounts: &crate::shadowsocks::SsAccounts,
+    carrier: &Carrier,
+) -> Option<bool> {
+    if !matches!(carrier, Carrier::Raw(_)) {
+        return None;
+    }
+    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method) {
+        RelayFront::Served => Some(true),
+        RelayFront::Refused => Some(false),
+        RelayFront::NotRelay => None,
+    }
 }
 
 /// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
@@ -14529,11 +14593,15 @@ fn serve_shadowsocks_inbound(
     let accounts = ss_accounts(inbound, address, password, method, configured);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
-    if matches!(carrier, Carrier::Raw(_))
-        && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
-    {
-        return true;
+    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier) {
+        return served;
     }
+    // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
+    let udp_front = match bind_udp_front(address, tcp, udp_accounts.is_some(), "shadowsocks udp") {
+        UdpFront::Refused => return false,
+        UdpFront::Unasked => None,
+        UdpFront::Bound(socket) => Some(socket),
+    };
     if !tcp && !udp {
         return false;
     }
@@ -14603,18 +14671,17 @@ fn serve_shadowsocks_inbound(
             ),
         }
     }
-    if let Some(accounts) = udp_accounts {
-        let udp_address = address.to_owned();
+    if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
         thread::spawn(move || {
             if accounts.is_2022 {
-                crate::shadowsocks2022::serve_udp(
-                    &udp_address,
+                crate::shadowsocks2022::serve_udp_on(
+                    &clients,
                     &accounts.password,
                     &accounts.method,
                     freedom,
                 );
             } else {
-                crate::shadowsocks::serve_udp(&udp_address, &accounts.users, freedom);
+                crate::shadowsocks::serve_udp_on(&clients, &accounts.users, freedom);
             }
         });
     }
@@ -29431,9 +29498,13 @@ pub(crate) mod lane_pool {
                 )
             };
             if polled < 0 {
-                // A socket closed under the poll fails the call for the whole set; the retire list drops it on the next pass.
+                // A failed poll is a dead set: hand every parked lane back so the closed one leaves and the rest re-arm.
                 std::thread::sleep(crate::budgets::RELAY_POLL);
-                return Vec::new();
+                let all = Ready {
+                    read: true,
+                    write: true,
+                };
+                return self.fds.keys().map(|fd| (*fd, all)).collect();
             }
             if polled == 0 {
                 return Vec::new();
@@ -30225,6 +30296,37 @@ pub(crate) mod lane_pool {
                 received.load(Ordering::Relaxed),
                 1,
                 "the peer's byte never woke the parked lane"
+            );
+        }
+
+        /// A poll that fails for the whole set must hand every parked lane back, not leave them
+        /// waiting on a set that can no longer poll.
+        #[cfg(windows)]
+        #[test]
+        fn a_failed_poll_wakes_every_parked_lane() {
+            let fd = usize::MAX as WaitFd;
+            let mut reactor = Reactor::new(fd).expect("a reactor");
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd,
+                write: false,
+                finish: None,
+                lane: Mutex::new(None),
+                pool: std::sync::Weak::new(),
+            });
+            let _ = slot.due.set(None);
+            slot.put_lane(Lane {
+                step: Box::new(|| Next::Done),
+                complete: None,
+                idle: 0,
+                relay: false,
+            });
+            assert!(reactor.park(slot).is_none(), "the lane parks");
+            let ready = reactor.wait(Duration::ZERO);
+            assert!(
+                ready.iter().any(|(at, _)| *at == fd),
+                "a failed poll must wake the parked set"
             );
         }
 
@@ -52239,7 +52341,13 @@ mod tests {
             &mut pad,
         ));
         let mut buf = [0u8; 2048];
-        let (read, _) = relay.recv_from(&mut buf).expect("reply");
+        let local = relay.local_addr().expect("addr");
+        let read = loop {
+            let (read, from) = relay.recv_from(&mut buf).expect("reply");
+            if from == local {
+                break read;
+            }
+        };
         let (_, payload) = parse_socks_udp(&buf[..read]).expect("frames the reply");
         assert_eq!(payload, b"ping");
         (up.close)();
@@ -56377,16 +56485,27 @@ mod tests {
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
         )
         .expect("parses");
-        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        let address = format!("127.0.0.1:{port}");
-        serve_shadowsocks_inbound(&address, &inbound, true, &std::collections::HashSet::new());
-        thread::sleep(Duration::from_millis(100));
-        assert!(
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
-            "the udp-only front bound no tcp listener"
-        );
+        let address = (0..64)
+            .find_map(|_| {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let port = tcp.local_addr().ok()?.port();
+                let udp = UdpSocket::bind(("127.0.0.1", port)).ok()?;
+                drop(udp);
+                drop(tcp);
+                let address = format!("127.0.0.1:{port}");
+                if !serve_shadowsocks_inbound(
+                    &address,
+                    &inbound,
+                    true,
+                    &std::collections::HashSet::new(),
+                ) {
+                    return None;
+                }
+                std::net::TcpStream::connect(("127.0.0.1", port))
+                    .is_err()
+                    .then_some(address)
+            })
+            .expect("a port free for tcp and udp that the udp-only front binds");
         let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
         let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
         let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
@@ -56402,8 +56521,8 @@ mod tests {
         dial.set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
         let mut back = vec![0u8; UDP_BUF];
-        // A front still binding reads as a reset from a port nothing owns yet, and a macOS read that finds nothing is a would-block; both mean "not up yet", and the re-send below restarts the wait, so the bound is the wall clock rather than the attempts.
-        let until = Instant::now() + Duration::from_secs(10);
+        // The front binds its udp socket before it returns, so the datagram queues for the worker; a retry only covers a scheduler that has not started it yet.
+        let until = Instant::now() + Duration::from_secs(2);
         let n = loop {
             dial.send_to(&packet, &address).expect("sends");
             match dial.recv_from(&mut back) {
@@ -56427,6 +56546,43 @@ mod tests {
                 .expect("opens");
         assert_eq!(source.port(), echo_addr.port());
         assert_eq!(payload, b"ping");
+    }
+
+    /// A udp-only front whose socket cannot be bound is refused, not reported served and then silent for as long as the caller waits.
+    #[test]
+    fn a_udp_only_shadowsocks_front_refuses_an_address_it_cannot_bind() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_shadowsocks_inbound(
+                "203.0.113.1:9",
+                &inbound,
+                true,
+                &std::collections::HashSet::new()
+            ),
+            "a udp-only front that cannot bind is not served"
+        );
+    }
+
+    /// A udp-only 2022 relay whose socket cannot be bound is refused too, not reported served with no worker.
+    #[test]
+    fn a_udp_only_shadowsocks_relay_refuses_an_address_it_cannot_bind() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"method":"2022-blake3-aes-128-gcm","password":"MDEyMzQ1Njc4OUFCQ0RFRg==","network":["udp"],"destinations":[{"key":"MDEyMzQ1Njc4OUFCQ0RFRg==","address":"127.0.0.1","port":9}]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            serve_ss_relay_inbound(
+                "203.0.113.1:9",
+                &inbound,
+                "MDEyMzQ1Njc4OUFCQ0RFRg==",
+                "2022-blake3-aes-128-gcm"
+            ),
+            RelayFront::Refused,
+            "a udp-only relay that cannot bind is not served"
+        );
     }
 
     /// A list naming only a network this front does not carry opens neither listener, as the reference starts no worker for it.
