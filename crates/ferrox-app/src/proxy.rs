@@ -24676,6 +24676,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    let mut quiet = Instant::now();
     let mut checked = Instant::now();
     loop {
         if checked.elapsed() >= UDP_POLL {
@@ -24685,13 +24686,16 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             }
         }
         let (n, src) = match relay.recv_from(&mut buf) {
-            Ok(read) => read,
-            Err(error) if is_timeout(&error) => continue,
-            Err(error) if is_udp_gone(&error) => {
-                thread::sleep(UDP_POLL);
+            Ok(read) => {
+                quiet = Instant::now();
+                read
+            }
+            Err(error) => {
+                if !is_timeout(&error) || quiet.elapsed() >= budgets::udp_idle() {
+                    break;
+                }
                 continue;
             }
-            Err(_) => break,
         };
         if src == lane_address {
             if let Some(client) = client_addr {
