@@ -2722,28 +2722,25 @@ pub(crate) fn accept_split_with_settings<
     fd: Option<crate::proxy::WaitFd>,
 ) -> Option<(Box<dyn crate::proxy::WindowRead + Send>, XhttpWriter)> {
     let mut read = ChainReader::new(Vec::new(), read);
-    let write = write;
-    loop {
-        // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
-        crate::proxy::RelayPoll::arm_head_poll(&mut read);
-        let (mut head, at) =
-            crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-        // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
-        let prefix = head.split_off(at);
-        // The session lands in a boxed window whose own arm is a no-op, so the socket gets its poll quantum here, once the head is in.
-        crate::proxy::RelayPoll::arm_relay_poll(&mut read);
-        match accept_core(&head, prefix, Upload::Read(read), write, settings, None, fd) {
-            Served::Session(reader, writer) => return Some((reader, writer)),
-            Served::Again(next, next_write, carry) => {
-                // The first request is served, so the rest of the connection is a keep-alive tail: a pooled connection left idle waits up to the head budget, and that wait belongs to a goroutine, not a setup lane.
-                let settings = settings.clone();
-                crate::proxy::spawn_carried(move || {
-                    keep_alive_tail(next, next_write, &settings, carry);
-                });
-                return None;
-            }
-            Served::Closed => return None,
+    // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
+    crate::proxy::RelayPoll::arm_head_poll(&mut read);
+    let (mut head, at) =
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+    // The accept hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
+    let prefix = head.split_off(at);
+    // The session lands in a boxed window whose own arm is a no-op, so the socket gets its poll quantum here, once the head is in.
+    crate::proxy::RelayPoll::arm_relay_poll(&mut read);
+    match accept_core(&head, prefix, Upload::Read(read), write, settings, None, fd) {
+        Served::Session(reader, writer) => Some((reader, writer)),
+        Served::Again(next, next_write, carry) => {
+            // The request is served, so the rest of this connection is a keep-alive tail: a pooled connection left idle waits up to the head budget, and that wait belongs to a goroutine, not a setup lane.
+            let settings = settings.clone();
+            crate::proxy::spawn_carried(move || {
+                keep_alive_tail(next, next_write, &settings, carry);
+            });
+            None
         }
+        Served::Closed => None,
     }
 }
 
