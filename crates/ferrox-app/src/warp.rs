@@ -399,6 +399,18 @@ where
     let headers = borrow_headers(&headers);
     let reply = call("POST", "/reg", &headers, &body)
         .map_err(|error| RegisterError::retryable(error.reason))?;
+    // A reply the API shaped for another kind of device shows in its own headers and size.
+    eprintln!(
+        "warp: the registration reply is {}, {} bytes, headers {}",
+        reply.status,
+        reply.body.len(),
+        reply
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ")
+    );
     let registered = parse_registration(&reply)?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
