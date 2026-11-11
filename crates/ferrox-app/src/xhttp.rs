@@ -2722,7 +2722,7 @@ pub(crate) fn accept_split_with_settings<
     fd: Option<crate::proxy::WaitFd>,
 ) -> Option<(Box<dyn crate::proxy::WindowRead + Send>, XhttpWriter)> {
     let mut read = ChainReader::new(Vec::new(), read);
-    let mut write = write;
+    let write = write;
     loop {
         // The head's own clock, because nothing arms the socket before the first read: a partial head that stops must end at its budget.
         crate::proxy::RelayPoll::arm_head_poll(&mut read);
