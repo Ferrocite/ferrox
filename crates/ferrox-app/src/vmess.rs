@@ -2488,7 +2488,9 @@ pub(crate) fn serve_httpheader(stream: Connection, path: &str, users: &Users, fr
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, users);
+    let _ = reader.set_poll(Some(crate::budgets::RELAY_POLL));
+    let decoded = accept_request_bounded(&mut reader, users);
+    let _ = reader.set_poll(None);
     let Ok(closer) = write.try_clone() else {
         return;
     };
