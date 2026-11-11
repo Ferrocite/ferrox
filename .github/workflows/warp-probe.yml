@@ -65,7 +65,7 @@ jobs:
           sudo update-ca-certificates >/dev/null 2>&1
           echo "the leaf is trusted by the system store"
           cat > /tmp/capture.py <<'EOF'
-          import ssl, socket, sys, base64, json, urllib.request, urllib.error
+          import ssl, socket, sys, base64, json, urllib.request, urllib.error, subprocess
           from h2.connection import H2Connection
           from h2.config import H2Configuration
           from h2.events import RequestReceived, DataReceived, StreamEnded, RemoteSettingsChanged, WindowUpdated, PingReceived, PriorityUpdated
@@ -100,23 +100,38 @@ jobs:
                       heads = dict(self.heads[sid])
                       method = heads.get(b":method", b"").decode()
                       path = heads.get(b":path", b"").decode()
+                      auth = heads.get(b"authorization", b"")
+                      print(f"auth: len={len(auth)}", flush=True)
                       fwd = {}
                       for name, value in self.heads[sid]:
                           if name.startswith(b":") or name in (b"host", b"content-length", b"connection"):
                               continue
                           fwd[name.decode()] = value.decode()
-                      url = "https://api.cloudflareclient.com" + path
-                      try:
-                          req = urllib.request.Request(url, data=body, method=method, headers=fwd)
-                          with urllib.request.urlopen(req, timeout=30) as r:
-                              status, payload = r.status, r.read()
-                      except urllib.error.HTTPError as e:
-                          status, payload = e.code, e.read()
-                      except Exception as e:
-                          status, payload = 502, str(e).encode()
-                      print(f"FORWARDED {method} {path} -> {status} ({len(payload)} bytes)", flush=True)
-                      self.conn.send_headers(sid, [(":status", str(status)), ("content-type", "application/json")])
-                      self.conn.send_data(sid, payload, True)
+                      def relay(tag, body_override, reply=True):
+                          url = "https://api.cloudflareclient.com" + path
+                          try:
+                              req = urllib.request.Request(url, data=body_override, method=method, headers=fwd)
+                              with urllib.request.urlopen(req, timeout=30) as r:
+                                  status, payload = r.status, r.read()
+                          except urllib.error.HTTPError as e:
+                              status, payload = e.code, e.read()
+                          except Exception as e:
+                              status, payload = 502, str(e).encode()
+                          print(f"FORWARDED[{tag}] {method} {path} -> {status} ({len(payload)} bytes)", flush=True)
+                          if reply:
+                              self.conn.send_headers(sid, [(":status", str(status)), ("content-type", "application/json")])
+                              self.conn.send_data(sid, payload, True)
+                      relay("orig", body)
+                      if method == "PATCH":
+                          try:
+                              parsed = json.loads(body)
+                              keypem = subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout"], capture_output=True, check=True).stdout
+                              pubpem = subprocess.run(["openssl", "pkey", "-pubout"], input=keypem, capture_output=True, check=True).stdout
+                              fresh = pubpem.decode().splitlines()[1]
+                              parsed["key"] = fresh
+                              relay("mutated-key", json.dumps(parsed, separators=(",", ":")).encode(), reply=False)
+                          except Exception as e:
+                              print(f"mutation failed: {e}", flush=True)
                   self.flush()
               def flush(self):
                   data = self.conn.data_to_send()
