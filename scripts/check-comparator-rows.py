@@ -1,9 +1,9 @@
 """Fail a cell whose engine under test is below another comparator's median.
 
 The harness already decides this once, on the `never_below` rows it publishes: a
-`throughput (engine vs comparator)` row fails the cell when the engine's own
-median is under that comparator's median, unless the runner's own generator
-bound was the limit. This check does not restate the rule; it reads the verdict
+`throughput (engine vs comparator)` row fails the cell when the whole interval
+sits under that comparator's median, unless the engine alone already reaches the
+cell's one-hop ceiling. This check does not restate the rule; it reads the verdict
 the harness wrote and turns the gaps filed in `scripts/comparator-gaps.txt` into
 warnings, so a new loss fails the matrix and a known one is fixed rather than
 re-noticed on every run.
@@ -66,7 +66,7 @@ def deficits(cells_dir):
     for path in sorted(Path(cells_dir).glob("*/cell.json")):
         cell = load(path)
         if cell is None:
-            continue
+            raise SystemExit(f"::error::{path}: a cell the matrix renders cannot be checked")
         scenario = cell.get("scenario") or path.parent.name
         for row in cell.get("rows", []):
             if not row.get("never_below"):
