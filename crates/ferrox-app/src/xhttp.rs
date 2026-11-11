@@ -800,6 +800,11 @@ impl<R: Read> crate::proxy::WindowRead for Reader<R> {
         self.pending_head
     }
 
+    /// A body with nothing to read yet is a descriptor wait: the lane parks on the socket and its next byte wakes it, instead of holding a worker a download-only flow's other leg needs.
+    fn parks_on_timeout(&self) -> bool {
+        true
+    }
+
     /// Every body the prefix already holds, as spans of it: the relay writes them in one gather without moving them again.
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         self.open()?;
@@ -5611,7 +5616,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A plaintext session's upload lane must park on a poll quantum: the boxed window cannot arm the socket itself, and an unarmed read holds its worker for as long as the peer keeps the body open, which is the whole download.
+    /// A plaintext session's upload lane must park on a poll quantum: the boxed window cannot arm the socket itself, and an unarmed read holds its worker for as long as the peer keeps the body open, which is the whole download. The lane only parses that timeout if the reader also reports it, or the relay answers `More` and keeps the worker for a streak.
     #[test]
     fn a_plaintext_session_upload_parks_instead_of_holding_its_worker() {
         let settings = settings_from(
@@ -5636,7 +5641,8 @@ mod tests {
                 Ok(_) => false,
                 Err(error) => crate::proxy::is_timeout(&error),
             };
-            tx.send(parked).expect("sends");
+            let parks = crate::proxy::WindowRead::parks_on_timeout(&*reader);
+            tx.send((parked, parks)).expect("sends");
         });
         let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         let head = format!(
@@ -5644,10 +5650,13 @@ mod tests {
             "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
         );
         client.write_all(head.as_bytes()).expect("head");
+        let (parked, parks) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the upload lane parked instead of blocking its worker");
+        assert!(parked, "the session's socket carries no poll quantum");
         assert!(
-            rx.recv_timeout(std::time::Duration::from_secs(2))
-                .expect("the upload lane parked instead of blocking its worker"),
-            "the session's socket carries no poll quantum"
+            parks,
+            "the relay answers More for a timed-out upload, so the lane keeps the worker a download leg needs"
         );
     }
 
