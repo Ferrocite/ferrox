@@ -69863,7 +69863,15 @@ end
         while !handle.is_finished() {
             thread::yield_now();
         }
-        let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
+        let waker = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut lanes = HashMap::from([(
+            key.clone(),
+            UdpLane {
+                address,
+                handle,
+                waker,
+            },
+        )]);
         let mut replies = HashMap::from([(address, key.clone())]);
         let _ = retire_finished_lane(&mut lanes, &mut replies, &key);
         assert!(!lanes.contains_key(&key));
