@@ -2301,6 +2301,7 @@ pub(crate) fn serve_grpc_muxed(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
@@ -2309,6 +2310,24 @@ pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.finish());
     serve_decoded(reader, writer, &close, decoded, freedom);
+}
+
+pub(crate) fn serve_xhttp_settings(
+    stream: Connection,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &Users,
+    freedom: bool,
+) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let Ok(closer) = stream.try_clone() else {
+        return;
+    };
+    let close: Close = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    serve_xhttp_split(read, stream, settings, users, freedom, &close);
 }
 
 pub(crate) fn serve_xhttp_split<R, W>(

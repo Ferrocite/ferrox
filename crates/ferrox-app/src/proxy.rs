@@ -4352,7 +4352,7 @@ fn serve_shadowsocks(
             crate::shadowsocks::serve_grpc_with(stream, users, settings, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::shadowsocks::serve_xhttp(stream, users, settings.path.as_str(), freedom);
+            crate::shadowsocks::serve_xhttp(stream, users, settings, freedom);
         }
         Carrier::HttpHeader { path } => {
             crate::shadowsocks::serve_httpheader(stream, users, path.as_str(), freedom);
@@ -21751,7 +21751,10 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     relay_sink_ws(creader, &cwriter, &uplink);
 }
 
-fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_session_trojan_xhttp<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -21769,7 +21772,10 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
 
 /// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
 /// session every TLS xhttp client has always reached.
-fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_trojan_xhttp_carrier<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -21796,7 +21802,10 @@ fn serve_trojan_xhttp_carrier<R: Read + Send + 'static, W: FrameWrite + Send + '
     );
 }
 
-fn serve_trojan_xhttp_carrier_now<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_trojan_xhttp_carrier_now<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -53033,6 +53042,9 @@ mod tests {
                 Ok(0)
             }
         }
+        impl RelayPoll for Stalled {
+            fn arm_relay_poll(&mut self) {}
+        }
         struct Null;
         impl Write for Null {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -53693,7 +53705,7 @@ mod tests {
             Carrier::Xhttp {
                 settings: xhttp_settings("/ss-xhttp"),
             },
-            ss_serve(crate::shadowsocks::serve_xhttp),
+            ss_serve(crate::shadowsocks::serve_xhttp_legacy),
             "/ss-xhttp",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -73226,7 +73238,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 crate::vmess::serve_ws(stream, path.as_str(), &users, freedom);
             }
             Carrier::Xhttp { settings, .. } => {
-                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &users, freedom);
+                crate::vmess::serve_xhttp_settings(stream, &settings, &users, freedom);
             }
             Carrier::HttpHeader { path } => {
                 crate::vmess::serve_httpheader(stream, path.as_str(), &users, freedom);

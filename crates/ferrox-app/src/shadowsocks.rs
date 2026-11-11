@@ -363,7 +363,32 @@ pub(crate) fn serve_grpc_muxed(
     serve_accepted(accepted, reader, writer, close, meter);
 }
 
-pub(crate) fn serve_xhttp(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
+pub(crate) fn serve_xhttp(
+    stream: Connection,
+    users: &[SsUser],
+    settings: &crate::xhttp::XhttpSettings,
+    freedom: bool,
+) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let Some((mut reader, mut writer)) =
+        crate::xhttp::accept_split_with_settings(read, stream, settings, None)
+    else {
+        return;
+    };
+    let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+        return;
+    };
+    let closer = writer.clone();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> =
+        std::sync::Arc::new(move || closer.finish());
+    serve_accepted(accepted, reader, writer, close, meter);
+}
+
+/// The stream-one handshake the in-memory test dials still speak: one chunked POST, no mode metadata.
+#[cfg(test)]
+pub(crate) fn serve_xhttp_legacy(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
@@ -2738,7 +2763,7 @@ mod tests {
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
         let (mut reader, mut writer) = crate::xhttp::connect(
-            tunnel(serve_xhttp, "/ss-xhttp"),
+            tunnel(serve_xhttp_legacy, "/ss-xhttp"),
             "127.0.0.1",
             "/ss-xhttp",
             &[],
