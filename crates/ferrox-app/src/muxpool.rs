@@ -477,6 +477,14 @@ mod tests {
         }
     }
 
+    fn datagram() -> mux::Target<'static> {
+        mux::Target {
+            network: mux::Network::Udp,
+            port: 53,
+            addr: ferrox_core::addr::Addr::V4([127, 0, 0, 1]),
+        }
+    }
+
     /// A manager whose carriers are loopback pairs the test keeps alive, so the demux never sees
     /// an end and the pool's own bookkeeping is what the assertions read.
     fn pooled(cap: usize, lifetime: usize) -> (Arc<Manager>, Arc<Mutex<Vec<UnixStream>>>) {
@@ -543,7 +551,7 @@ mod tests {
             })
         });
         let flow = manager
-            .udp(&target(), None, b"first", Arc::new(|_, _| {}))
+            .udp(&datagram(), None, b"first", Arc::new(|_, _| {}))
             .expect("a session");
         let mut header = Vec::new();
         let end = mux::Outgoing {
@@ -563,16 +571,16 @@ mod tests {
                 .expect("the end frame");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while flow.send(&target(), b"later") && std::time::Instant::now() < deadline {
+        while flow.send(&datagram(), b"later") && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            !flow.send(&target(), b"later"),
+            !flow.send(&datagram(), b"later"),
             "the ended flow refuses a send"
         );
         assert!(
             manager
-                .udp(&target(), None, b"next", Arc::new(|_, _| {}))
+                .udp(&datagram(), None, b"next", Arc::new(|_, _| {}))
                 .is_some(),
             "the id came back"
         );
