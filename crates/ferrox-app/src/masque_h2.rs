@@ -264,7 +264,6 @@ fn connection(
     if tls.alpn() != Some(b"h2") {
         return;
     }
-    deadline.clear();
     tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));
     let mut wire = Wire {
         stream: Box::new(tls),
@@ -346,7 +345,7 @@ impl Wire {
                 return false;
             }
         }
-        if !self.pending.starts_with(h2::MAGIC) {
+        if Instant::now() > deadline || !self.pending.starts_with(h2::MAGIC) {
             return false;
         }
         self.pending.drain(..PREFACE);

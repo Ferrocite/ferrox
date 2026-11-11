@@ -3622,8 +3622,12 @@ impl crate::proxy::CarrierSink for XhttpWriter {
     #[inline]
     fn push_ready(&self, bytes: &[u8]) -> crate::proxy::Push {
         if let Some(StreamOut::H2(out)) = self.stream.get() {
-            return match out.try_batch_parts(&[&[bytes]]) {
-                Some(true) => crate::proxy::Push::Took(bytes.len()),
+            let Some(room) = usize::try_from(out.room()).ok().filter(|room| *room > 0) else {
+                return crate::proxy::Push::Took(0);
+            };
+            let offer = &bytes[..bytes.len().min(room)];
+            return match out.try_batch_parts(&[&[offer]]) {
+                Some(true) => crate::proxy::Push::Took(offer.len()),
                 Some(false) => crate::proxy::Push::Lost,
                 None => crate::proxy::Push::Took(0),
             };
