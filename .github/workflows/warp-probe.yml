@@ -44,14 +44,23 @@ jobs:
           import ssl, socket, sys
           from h2.connection import H2Connection
           from h2.config import H2Configuration
-          from h2.events import RequestReceived, DataReceived, StreamEnded
+          from h2.events import RequestReceived, DataReceived, StreamEnded, RemoteSettingsChanged, WindowUpdated, PingReceived, PriorityUpdated
 
           class Cap:
-              def __init__(self, conn, sock):
-                  self.conn, self.sock = conn, sock
+              def __init__(self, conn, sock, tag):
+                  self.conn, self.sock, self.tag = conn, sock, tag
                   self.bodies = {}
                   self.heads = {}
               def handle(self, event):
+                  if isinstance(event, RemoteSettingsChanged):
+                      for cid, cv in event.changed_settings.items():
+                          print(f"[{self.tag}] SETTINGS {cid.name}={cv.new_value}", flush=True)
+                  elif isinstance(event, WindowUpdated):
+                      print(f"[{self.tag}] WINDOW stream={event.stream_id} delta={event.delta}", flush=True)
+                  elif isinstance(event, PingReceived):
+                      print(f"[{self.tag}] PING {event.ping_data.hex()}", flush=True)
+                  elif isinstance(event, PriorityUpdated):
+                      print(f"[{self.tag}] PRIORITY stream={event.stream_id} dep={event.depends_on} weight={event.weight} excl={event.exclusive}", flush=True)
                   if isinstance(event, RequestReceived):
                       self.heads[event.stream_id] = event.headers
                       self.bodies[event.stream_id] = b""
@@ -97,13 +106,15 @@ jobs:
                   continue
               conn = H2Connection(H2Configuration(client_side=False))
               conn.initiate_connection()
-              cap = Cap(conn, tls)
+              cap = Cap(conn, tls, "conn")
               cap.flush()
               try:
                   while True:
                       data = tls.recv(65536)
                       if not data:
+                          print("TLS EOF", flush=True)
                           break
+                      print(f"frames: {len(data)} bytes", flush=True)
                       for event in conn.receive_data(data):
                           cap.handle(event)
               except Exception as e:
