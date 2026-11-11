@@ -56073,6 +56073,42 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    /// A udp-only front whose socket cannot be bound is refused, not reported served and then silent for as long as the caller waits.
+    #[test]
+    fn a_udp_only_shadowsocks_front_refuses_an_address_it_cannot_bind() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_shadowsocks_inbound(
+                "203.0.113.1:9",
+                &inbound,
+                true,
+                &std::collections::HashSet::new()
+            ),
+            "a udp-only front that cannot bind is not served"
+        );
+    }
+
+    /// A udp-only 2022 relay whose socket cannot be bound is refused too, not reported served with no worker.
+    #[test]
+    fn a_udp_only_shadowsocks_relay_refuses_an_address_it_cannot_bind() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"method":"2022-blake3-aes-128-gcm","password":"MDEyMzQ1Njc4OUFCQ0RFRg==","network":["udp"],"destinations":[{"key":"MDEyMzQ1Njc4OUFCQ0RFRg==","address":"127.0.0.1","port":9}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_ss_relay_inbound(
+                "203.0.113.1:9",
+                &inbound,
+                "MDEyMzQ1Njc4OUFCQ0RFRg==",
+                "2022-blake3-aes-128-gcm"
+            ),
+            "a udp-only relay that cannot bind is not served"
+        );
+    }
+
     /// A list naming only a network this front does not carry opens neither listener, as the reference starts no worker for it.
     #[test]
     fn an_unsupported_shadowsocks_network_opens_no_listener() {
