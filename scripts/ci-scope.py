@@ -360,7 +360,8 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
     for path in changed:
         if path.startswith(TOOL):
             continue
-        if path.startswith("dist/") or path == "scripts/check-share-links.py":
+        if path.startswith(("dist/", "crates/ferrox-app/")) \
+                or path == "scripts/check-share-links.py":
             links = True
         if path.endswith((".rs", ".toml")) and path.startswith("crates/"):
             rust = True
@@ -1027,8 +1028,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         ("a CLI edit owes the share-link gate", ["dist/ferrox-cli.sh"], True),
         ("a script edit owes it too",
          ["scripts/check-share-links.py"], True),
-        ("a Rust edit does not by itself",
-         ["crates/ferrox-app/src/vmess.rs"], False),
+        ("an app edit owes the share-link gate",
+         ["crates/ferrox-app/src/vmess.rs"], True),
+        ("a core edit does not by itself",
+         ["crates/ferrox-core/src/record.rs"], False),
     ]:
         flags = output_flags(build_plan(root, changed))
         got = flags["links"] == "true"
