@@ -1064,6 +1064,10 @@ impl H2Conn {
     /// anyway; holding the connection window across the recheck is what keeps a grant that landed
     /// between the caller's look and this wait from being slept out as a whole poll.
     fn wait_room(&self, stream: u32, turn: std::time::Duration) {
+        if self.client_read.is_some() {
+            // A client shares its transport with the frame reader: a lane waiting for credit reads the grant itself.
+            let _ = self.pump_read(|| false, true);
+        }
         let conn = self
             .send_conn
             .lock()
