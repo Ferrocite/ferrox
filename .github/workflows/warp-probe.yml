@@ -73,11 +73,19 @@ jobs:
           server.listen(4)
           server.settimeout(300)
           while True:
-              sock, _ = server.accept()
+              try:
+                  sock, _ = server.accept()
+              except Exception as e:
+                  print(f"accept failed: {e}", flush=True)
+                  continue
               try:
                   tls = ctx.wrap_socket(sock, server_side=True)
               except Exception as e:
                   print(f"TLS accept failed: {e}", flush=True)
+                  try:
+                      sock.close()
+                  except Exception:
+                      pass
                   continue
               conn = H2Connection(H2Configuration(client_side=False))
               conn.initiate_connection()
