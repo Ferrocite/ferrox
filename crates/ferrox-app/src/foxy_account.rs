@@ -682,6 +682,9 @@ impl H2Connection {
             }
             fields.push((lower, (*value).to_owned()));
         }
+        if !body.is_empty() {
+            fields.push(("content-length".to_owned(), body.len().to_string()));
+        }
         let borrowed: Vec<(&str, &str)> = fields
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
