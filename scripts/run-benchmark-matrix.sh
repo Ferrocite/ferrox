@@ -120,8 +120,9 @@ selftest_gaps() {
   matrix_engine_skip_reason xray-core warp-masque-down-8 client \
     | grep -q "no WARP carrier" \
     || { echo "selftest: the xray-core WARP client skip lost its reason" >&2; failed=1; }
-  python3 scripts/xray-to-zeronet-warp.py --selftest \
-    || { echo "selftest: the ZeroNet WARP key translation lost its shape" >&2; failed=1; }
+  matrix_engine_skip_reason zeronet warp-masque-down-8 client \
+    | grep -q "ADDRESS_ASSIGN" \
+    || { echo "selftest: the ZeroNet WARP client skip lost its reason" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
@@ -580,17 +581,6 @@ while read -r id traffic connections iterations payload duration_ms; do
             continue 2
           }
           client_args+=(--outbound-config-for "xray-rust=$(cat "$celldir/client-xray-rust.json")")
-          ;;
-        zeronet)
-          if [[ "$id" == warp-* ]]; then
-            python3 scripts/xray-to-zeronet-warp.py \
-              "$celldir/client.json" >"$celldir/client-zeronet.json" || {
-              cells_failed+=("$cell (could not translate the client config for zeronet)")
-              status=1
-              continue 2
-            }
-            client_args+=(--outbound-config-for "zeronet=$(cat "$celldir/client-zeronet.json")")
-          fi
           ;;
       esac
     done

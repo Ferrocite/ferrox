@@ -97,6 +97,10 @@ matrix_engine_skip_reason() {
     printf '%s\n' "ZeroNet at this pin has a WARP client, not a WARP server"
     return 0
   fi
+  if [[ "$engine" == zeronet && "$id" == warp-* ]]; then
+    printf '%s\n' "ZeroNet at this pin drops ADDRESS_ASSIGN and dials from its configured address, which a shared WARP server has already assigned to another tunnel"
+    return 0
+  fi
   if [[ "$engine" == "leaf" && "$id" == vless-* && "$id" != *-vision-* ]]; then
     printf '%s\n' "leaf at this pin only sends VLESS with the Vision flow, which this scenario does not configure"
     return 0
