@@ -296,6 +296,21 @@ pub fn packet_encode_bare(packet: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(packet);
 }
 
+/// The header of a DATAGRAM capsule naming a context-zero packet, read before the packet arrives: the bytes the header takes and the packet's length. It is [`packet_encode`]'s prefix read back, so a reader can hand the packet straight to its caller instead of staging the capsule. The context is a varint like the length, so a zero written wider than one byte still names this lane's context.
+#[must_use]
+pub fn packet_header(capsule: &[u8]) -> Option<(usize, usize)> {
+    let mut at = 0usize;
+    if quic_read(capsule, &mut at)? != 0 {
+        return None;
+    }
+    let length = usize::try_from(quic_read(capsule, &mut at)?).ok()?;
+    let context_at = at;
+    if quic_read(capsule, &mut at)? != 0 {
+        return None;
+    }
+    Some((at, length.checked_sub(at - context_at)?))
+}
+
 /// What one capsule was, as far as this lane reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capsule<'a> {
@@ -1365,6 +1380,37 @@ mod tests {
         let (used, capsule) = capsule_split_bare(&buf).expect("a capsule");
         assert_eq!(used, buf.len());
         assert_eq!(capsule, Capsule::Datagram(b"\x45\x00\x00\x14"));
+    }
+
+    /// The WARP's bare capsule and the tunnel's context-zero capsule both name their packet before it arrives, so the read side can size a caller's buffer from the header alone.
+    #[test]
+    fn a_packet_header_names_the_packet_before_it_arrives() {
+        let payloads: [&[u8]; 3] = [b"", b"\x45\x00", &[0x5a; 1_300]];
+        for payload in payloads {
+            let mut buf = Vec::new();
+            packet_encode(payload, &mut buf);
+            let (head, length) = packet_header(&buf[..buf.len() - payload.len()])
+                .expect("the header alone is enough");
+            assert_eq!(head + length, buf.len());
+            assert_eq!(length, payload.len());
+            assert_eq!(packet_header(&buf[..head - 1]), None, "a cut header");
+        }
+        assert_eq!(
+            packet_header(&[0x00, 0x05, 0x40, 0x00, 0xaa, 0xbb, 0xcc]),
+            Some((4, 3)),
+            "a zero context written wider still names this lane"
+        );
+        assert_eq!(
+            packet_header(&[0x00, 0x02, 0x01, 0xaa]),
+            None,
+            "a context this lane does not read"
+        );
+        assert_eq!(
+            packet_header(&[0x00, 0x05, 0x41, 0x00, 0xaa, 0xbb, 0xcc]),
+            None,
+            "a nonzero context written wider"
+        );
+        assert_eq!(packet_header(&[0x01, 0x01, 0x00]), None, "not a DATAGRAM");
     }
 
     /// The IP/UDP header walk reads a datagram this lane builds without a copy, at both versions, and verifies what it read.

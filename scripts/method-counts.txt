@@ -357,6 +357,7 @@ carrier-foxy h3-bytes-lost-behind-a-parked-frame 0 ferrox-app-foxy::loopback::a_
 carrier-foxy h3-empty-frames-called-the-end 0 ferrox-app-foxy::loopback::an_empty_data_frame_is_not_the_end_of_the_tunnel
 carrier-foxy h3-datagram-write-staging-bytes 19 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
 carrier-foxy h3-datagram-read-staging-copies-per-byte 0 ferrox-app-foxy::loopback::a_quic_datagram_in_one_frame_never_enters_the_capsule_buffer
+carrier-foxy h3-connect-ip-read-staging-copies-per-packet 0 ferrox-app-foxy::loopback::a_connect_ip_packet_in_one_frame_is_read_into_the_caller
 carrier-foxy h3-bytes-lost-in-a-block-arriving-in-pieces 0 ferrox-app-foxy::loopback::a_quic_block_that_arrives_in_pieces_keeps_the_pieces_it_already_holds
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy uplink-bytes-blocked-by-a-parked-leg 0 ferrox-app-foxy::loopback::a_parked_downlink_leg_does_not_hold_the_uplink_behind_its_wait
