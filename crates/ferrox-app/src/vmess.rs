@@ -842,8 +842,12 @@ fn request_bytes(
     clear.push(options);
     clear.push((pad_len as u8) << 4 | cipher.code());
     clear.push(0);
-    clear.push(cmd);
-    encode_target(&mut clear, target);
+    // A mux request is its command alone: `v1.mux.cool` carries no address (`proxy/vmess/encoding/client.go`).
+    let mux = matches!(target, crate::proxy::Destination::Name(host, _) if host == "v1.mux.cool");
+    clear.push(if mux { 3 } else { cmd });
+    if !mux {
+        encode_target(&mut clear, target);
+    }
     if pad_len > 0 {
         let mut pad = [0u8; 15];
         if !random_into(&mut pad[..pad_len]) {
@@ -1366,6 +1370,73 @@ impl<R: Read> Read for Wire<R> {
     }
 }
 
+/// A `VMess` body read as a plain byte stream: the mux demux's own `Read` over the frames of one
+/// session, so the carrier keeps a single session type.
+pub(crate) struct CarriedReader<R> {
+    wire: Wire<R>,
+    recv: Flow,
+}
+
+impl<R: Read> CarriedReader<R> {
+    pub(crate) fn new(carrier: R, recv: Flow) -> Self {
+        Self {
+            wire: Wire::new(carrier),
+            recv,
+        }
+    }
+}
+
+impl<R: Read> Read for CarriedReader<R> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        if self.wire.buffered() == 0 && self.wire.batch(&mut self.recv).is_none() {
+            return Ok(0);
+        }
+        let take = self.wire.buffered().min(dst.len());
+        dst[..take].copy_from_slice(&self.wire.held[self.wire.start..self.wire.start + take]);
+        self.wire.start += take;
+        Ok(take)
+    }
+}
+
+/// A `VMess` body written as a plain byte stream; one caller write is one sealed frame, and the
+/// staging buffer is the writer's own so a frame costs no allocation.
+pub(crate) struct CarriedWriter<W> {
+    out: W,
+    send: Flow,
+    staging: Vec<u8>,
+    pad: PadSource,
+}
+
+impl<W: Write> CarriedWriter<W> {
+    pub(crate) fn new(out: W, send: Flow) -> Option<Self> {
+        Some(Self {
+            out,
+            send,
+            staging: Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN)),
+            pad: PadSource::fresh()?,
+        })
+    }
+}
+
+impl<W: Write> Write for CarriedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !write_frame(
+            &mut self.out,
+            &mut self.send,
+            buf,
+            &mut self.staging,
+            &mut self.pad,
+        ) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Other));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
 pub(crate) type ClientSession = (Flow, Flow, [u8; 16], [u8; 16], u8);
 
 pub(crate) type ClientRequest = (Vec<u8>, Flow, Flow, [u8; 16], [u8; 16], u8);
@@ -1584,12 +1655,14 @@ fn read_open_header(
     let head_nonce: [u8; 12] = head_full[..12].try_into().unwrap();
     open_header(&head_key, &head_nonce, &sealed_head, auth_id)
 }
-fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {
+type HeaderParts = (Option<SocketAddr>, Flow, Flow, Vec<u8>, u8);
+
+fn decode_header(header: &[u8]) -> Option<HeaderParts> {
     if header.len() < 38 || header[0] != 1 || header[34] & OPT_STREAM == 0 {
         return None;
     }
     let cmd = header[37];
-    if cmd != 1 && cmd != 2 {
+    if !matches!(cmd, 1..=3) {
         return None;
     }
     let cipher = Cipher::from_code(header[35] & 0x0f)?;
@@ -1603,7 +1676,12 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
         return None;
     }
     let mut cursor = 38;
-    let target = decode_target(header, &mut cursor)?;
+    // A mux request names the command alone: the reference reads no address for it (`proxy/vmess/encoding/server.go`).
+    let target = if cmd == 3 {
+        None
+    } else {
+        Some(decode_target(header, &mut cursor)?)
+    };
     let margin = usize::from(header[35] >> 4);
     if cursor + margin + 4 > header.len() {
         return None;
@@ -2007,7 +2085,7 @@ fn backward_step<R: Read + crate::proxy::RelayPoll>(
 }
 
 pub(crate) struct Accepted {
-    pub(crate) target: SocketAddr,
+    pub(crate) target: Option<SocketAddr>,
     pub(crate) send: Flow,
     pub(crate) recv: Flow,
     pub(crate) prefix: Vec<u8>,
@@ -2105,7 +2183,32 @@ fn serve_decoded_impl<R, W>(
         abandon(close, &mut abort);
         return;
     };
-    if !freedom || !matches!(cmd, 1 | 2) {
+    if !freedom {
+        abandon(close, &mut abort);
+        return;
+    }
+    if cmd == 3 {
+        if !write_prefix(&mut writer, &prefix) {
+            abandon(close, &mut abort);
+            return;
+        }
+        let Some(sealed) = CarriedWriter::new(writer, send) else {
+            abandon(close, &mut abort);
+            return;
+        };
+        crate::proxy::serve_mux_tunnel(
+            Box::new(CarriedReader::new(reader, recv)),
+            Box::new(sealed),
+            std::sync::Arc::clone(close),
+            &[],
+        );
+        return;
+    }
+    let Some(target) = target else {
+        abandon(close, &mut abort);
+        return;
+    };
+    if !matches!(cmd, 1 | 2) {
         abandon(close, &mut abort);
         return;
     }
@@ -2497,6 +2600,33 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     if !freedom {
         return;
     }
+    if cmd == 3 {
+        if stream.write_all(&prefix).is_err() {
+            return;
+        }
+        let Ok(reader) = stream.try_clone() else {
+            return;
+        };
+        let Ok(closer) = stream.try_clone() else {
+            return;
+        };
+        let close: Close = std::sync::Arc::new(move || {
+            let _ = closer.shutdown(Shutdown::Both);
+        });
+        let Some(writer) = CarriedWriter::new(stream, send) else {
+            return;
+        };
+        crate::proxy::serve_mux_tunnel(
+            Box::new(CarriedReader::new(reader, recv)),
+            Box::new(writer),
+            close,
+            &[],
+        );
+        return;
+    }
+    let Some(target) = target else {
+        return;
+    };
     crate::accesslog::record_current(&target);
     if cmd == 2 {
         crate::proxy::spawn_carried(move || {
@@ -2697,7 +2827,7 @@ mod tests {
             panic!("decodes a header");
         };
         assert_eq!(cmd, 1);
-        assert_eq!(got, target);
+        assert_eq!(got, Some(target));
         let mut scratch = Vec::with_capacity(16 * 1024);
         let Some(back) = read_frame(&mut cursor, &mut take, &mut scratch) else {
             panic!("reads a coalesced frame");
@@ -4322,7 +4452,7 @@ mod tests {
         header.extend_from_slice(&[127, 0, 0, 1]);
         header.extend_from_slice(&fnv1a(&header).to_be_bytes());
         let (got, _send, _recv, prefix, cmd) = decode_header(&header).expect("decodes");
-        assert_eq!(got, target);
+        assert_eq!(got, Some(target));
         assert_eq!(cmd, 1);
         assert_eq!(prefix.len(), 38);
         let mut bad = header.clone();
@@ -4334,7 +4464,7 @@ mod tests {
         let sum = fnv1a(&udp[..cut]);
         udp[cut..].copy_from_slice(&sum.to_be_bytes());
         let (got, _, _, _, cmd) = decode_header(&udp).expect("decodes udp");
-        assert_eq!(got, target);
+        assert_eq!(got, Some(target));
         assert_eq!(cmd, 2);
         let mut bad = header.clone();
         bad[37] = 5;
@@ -4563,7 +4693,7 @@ mod tests {
                 let clear =
                     open_header(&head_key, &head_nonce, &request[42..], &auth_id).expect("opens");
                 let (got, _, _, _, _) = decode_header(&clear).expect("decodes");
-                assert_eq!(got, target);
+                assert_eq!(got, Some(target));
             }
         }
     }
