@@ -24660,6 +24660,8 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
+    let _ = client.set_read_timeout(Some(UDP_POLL));
     let local = relay
         .local_addr()
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
@@ -24668,11 +24670,34 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     let Some(lane) = spawn_udp_lane(out, local, None) else {
         return;
     };
+    let lane_address = lane.address;
+    let mut lanes = HashMap::new();
+    lanes.insert(None, lane);
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if src == lane.address {
+    let mut quiet = Instant::now();
+    let mut checked = Instant::now();
+    loop {
+        if checked.elapsed() >= UDP_POLL {
+            checked = Instant::now();
+            if peer_left(&client) {
+                break;
+            }
+        }
+        let (n, src) = match relay.recv_from(&mut buf) {
+            Ok(read) => {
+                quiet = Instant::now();
+                read
+            }
+            Err(error) => {
+                if !is_timeout(&error) || quiet.elapsed() >= budgets::udp_idle() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if src == lane_address {
             if let Some(client) = client_addr {
                 let _ = relay.send_to(&buf[..n], client);
             }
@@ -24694,8 +24719,9 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
             None => &buf[..n],
         };
-        let _ = relay.send_to(frame, lane.address);
+        let _ = relay.send_to(frame, lane_address);
     }
+    retire_udp_lanes(relay, lanes);
 }
 
 /// One lane for the whole association: every datagram reaches the same outbound.
@@ -25080,7 +25106,7 @@ fn spawn_udp_lane(
     })
 }
 
-/// A split association owns its lanes: when it ends, each lane is woken with a datagram that names
+/// An association that owns its lanes: when it ends, each lane is woken with a datagram that names
 /// no destination and its read timeout is shortened, while the relay stays bound until every lane
 /// has joined so a late answer cannot reach a later association on the reused port.
 fn retire_udp_lanes(relay: UdpSocket, lanes: HashMap<Option<String>, UdpLane>) {
@@ -69862,6 +69888,87 @@ end
         assert!(
             ended,
             "the split association outlived its control under a datagram stream"
+        );
+    }
+
+    /// Silence past the budget is death here too: a sniffed association with no traffic hands its
+    /// thread back at `udp_idle` even while its control stays open.
+    #[test]
+    fn a_quiet_sniffed_udp_association_hands_its_thread_back() {
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let out = freedom();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the sniffed association is served: {reply:?}");
+        let ended = finished
+            .recv_timeout(Duration::from_millis(250) + Duration::from_secs(5))
+            .is_ok();
+        budgets::clear();
+        if ended {
+            serving.join().expect("joins");
+        }
+        assert!(ended, "a quiet sniffed association ends on its idle budget");
+    }
+
+    /// A sniffed association lives on its control connection too: dropping the control ends the
+    /// relay instead of waiting out `udp_idle`.
+    #[test]
+    fn a_sniffed_udp_association_ends_with_its_control_connection() {
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let out = freedom();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the sniffed association is served: {reply:?}");
+        drop(client);
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the sniffed association outlived its control connection"
         );
     }
 
