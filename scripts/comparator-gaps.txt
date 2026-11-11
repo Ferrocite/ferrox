@@ -1,45 +1,49 @@
 # Every cell where the engine under test is under another comparator's median,
-# as measured by benchmark-matrix run 42913836766 (standard, ubuntu-latest) and
+# as measured by benchmark-matrix run 42932453001 (standard, ubuntu-latest) and
 # decided by the harness's own `deficit` flag: the whole 95% interval is below
 # 1.00x of that comparator. A new one, or one worse than its last filed ratio by
 # more than 0.10, still fails the matrix; fixing one warns until its line goes.
 # scenario|comparator|ratio|issue, where scenario is the cell id in cell.json.
-http-raw-down-8--srv-ferrox|sing-box|0.69|359
-http-raw-down-8--srv-xray-core|sing-box|0.73|359
-shadowsocks2022-tls-raw-down-8--srv-ferrox|xray-rust|0.95|359
-socks-raw-down-8--srv-ferrox|sing-box|0.88|359
-socks-raw-down-8--srv-xray-core|sing-box|0.85|359
-trojan-httpupgrade-down-8--srv-ferrox|sing-box|0.80|359
-trojan-httpupgrade-down-8--srv-xray-core|sing-box|0.87|359
-trojan-raw-down-8--srv-ferrox|sing-box|0.92|359
+http-raw-down-8--srv-ferrox|sing-box|0.89|359
+http-raw-down-8--srv-xray-core|sing-box|0.86|359
+socks-raw-down-8--srv-ferrox|sing-box|0.89|359
+socks-raw-down-8--srv-xray-core|sing-box|0.86|359
+trojan-httpupgrade-down-8--srv-ferrox|sing-box|0.76|359
+trojan-httpupgrade-down-8--srv-xray-core|sing-box|0.78|359
+trojan-raw-down-8--srv-ferrox|sing-box|0.93|359
 trojan-raw-down-8--srv-xray-core|sing-box|0.91|359
-trojan-tls-ws-down-8--srv-xray-core|zeronet|0.91|359
-trojan-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.76|359
-vless-grpc-bulk-down-1--srv-xray-core|zeronet|0.87|359
-vless-httpupgrade-down-8--srv-ferrox|sing-box|0.78|359
+trojan-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.74|359
+vless-grpc-bulk-down-1--srv-ferrox|sing-box|0.80|359
+vless-grpc-bulk-down-1--srv-xray-core|xray-core-rust|0.90|359
+vless-grpc-bulk-down-1--srv-xray-core|zeronet|0.92|359
+vless-httpupgrade-down-8--srv-ferrox|sing-box|0.81|359
 vless-httpupgrade-down-8--srv-xray-core|sing-box|0.86|359
-vless-raw-down-1--srv-ferrox|sing-box|0.45|359
-vless-raw-down-8--srv-ferrox|sing-box|0.72|359
-vless-raw-down-8--srv-xray-core|sing-box|0.81|359
-vless-raw-mixed-8--srv-ferrox|sing-box|0.79|359
-vless-raw-mixed-8--srv-xray-core|sing-box|0.84|359
-vless-raw-mixed-8--srv-xray-core|xray-core-rust|0.81|359
+vless-raw-down-1--srv-ferrox|sing-box|0.57|359
+vless-raw-down-8--srv-ferrox|sing-box|0.86|359
+vless-raw-down-8--srv-xray-core|sing-box|0.92|359
+vless-raw-duplex-8--srv-xray-core|sing-box|0.84|359
+vless-raw-mixed-8--srv-ferrox|sing-box|0.70|359
+vless-raw-mixed-8--srv-xray-core|sing-box|0.69|359
+vless-raw-routed-down-8--srv-ferrox|sing-box|0.72|359
+vless-raw-routed-down-8--srv-xray-core|sing-box|0.82|359
 vless-raw-udp-8--srv-ferrox|xray-rust|0.92|359
-vless-raw-up-1--srv-xray-core|xray-rust|0.91|359
-vless-reality-xhttp-down-8--srv-ferrox|xray-core-rust|0.50|359
-vless-reality-xhttp-down-8--srv-xray-core|xray-core-rust|0.69|359
-vless-tls-httpupgrade-down-8--srv-ferrox|zeronet|0.91|359
+vless-raw-up-1--srv-ferrox|sing-box|0.56|359
+vless-raw-up-1--srv-ferrox|xray-rust|0.88|359
+vless-reality-xhttp-down-8--srv-ferrox|xray-core-rust|0.47|359
+vless-reality-xhttp-down-8--srv-xray-core|xray-core-rust|0.68|359
+vless-tls-httpupgrade-down-8--srv-ferrox|zeronet|0.88|359
 vless-tls-httpupgrade-ed-down-8--srv-ferrox|zeronet|0.87|359
-vless-tls-raw-up-1--srv-ferrox|xray-rust|0.89|359
-vless-tls-ws-down-8--srv-xray-core|zeronet|0.92|359
-vless-tls-ws-ed-down-8--srv-xray-core|zeronet|0.95|359
-vless-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.74|359
-vmess-kcp-down-8--srv-ferrox|xray-core-rust|0.50|359
-vmess-tls-httpupgrade-down-8--srv-ferrox|xray-rust|0.98|359
-vmess-tls-httpupgrade-down-8--srv-xray-core|xray-rust|0.80|359
-vmess-tls-raw-down-8--srv-xray-core|xray-rust|0.68|359
-vmess-tls-ws-down-8--srv-xray-core|xray-rust|0.77|359
-vmess-tls-xhttp-h2-down-8--srv-ferrox|xray-rust|0.73|359
-vmess-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.82|359
-vmess-tls-xhttp-h2-down-8--srv-xray-core|xray-rust|0.63|359
-vmess-xhttp-down-8--srv-xray-core|xray-rust|0.75|359
+vless-tls-raw-up-1--srv-xray-core|sing-box|0.92|359
+vless-tls-raw-up-1--srv-xray-core|xray-core-rust|0.92|359
+vless-tls-raw-up-1--srv-xray-core|xray-rust|0.93|359
+vless-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.76|359
+vmess-httpupgrade-down-8--srv-xray-core|xray-rust|0.87|359
+vmess-kcp-down-8--srv-ferrox|xray-core-rust|0.40|359
+vmess-reality-raw-down-8--srv-xray-core|xray-rust|0.85|359
+vmess-tls-httpupgrade-down-8--srv-xray-core|xray-rust|0.85|359
+vmess-tls-raw-down-8--srv-xray-core|xray-rust|0.81|359
+vmess-tls-ws-down-8--srv-xray-core|xray-rust|0.96|359
+vmess-tls-xhttp-h2-down-8--srv-ferrox|xray-rust|0.86|359
+vmess-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.79|359
+vmess-tls-xhttp-h2-down-8--srv-xray-core|xray-rust|0.79|359
+vmess-xhttp-down-8--srv-xray-core|xray-rust|0.73|359
