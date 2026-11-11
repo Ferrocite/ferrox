@@ -4315,6 +4315,56 @@ mod tests {
         );
     }
 
+    /// A server h2 body with no flow-control window parks the relay lane instead of blocking it: the
+    /// offer is retryable and the lane waits on the face that grants the window.
+    #[test]
+    fn a_full_h2_window_parks_the_carrier_instead_of_holding_the_lane() {
+        use crate::proxy::{CarrierSink, Push};
+
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                stopped: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(0),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let out = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 1,
+            _owner: None,
+            client: false,
+        };
+        let writer = crate::xhttp::XhttpWriter::new(H2StreamWriter {
+            conn: Arc::clone(&conn),
+            stream: 1,
+            head: Vec::new(),
+            headed: true,
+        });
+        writer.set_h2(out);
+        let started = std::time::Instant::now();
+        assert!(matches!(writer.push_ready(b"body"), Push::Took(0)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(writer.read_window(), None);
+        *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 65_535;
+        assert!(matches!(writer.push_ready(b"body"), Push::Took(4)));
+    }
+
     /// An ended session wakes the upload it was relaying: a stream-up POST parked in `H2StreamReader::read` must not hold its worker until the connection dies.
     #[test]
     fn an_ended_session_wakes_its_upload_reader() {
