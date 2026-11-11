@@ -201,6 +201,15 @@ jobs:
 
             Unpack the package for your platform. The engine and launcher are side by side; no cargo, repository, or config is needed.
 
+            ### What is new in this build
+
+            - **`--warp`**: chain any lane through a one-tap Cloudflare WARP registration (WireGuard, with the MASQUE dialect as its peer). No account and no client binary: `ferrox-cli up --foxy --warp`.
+            - **Foxy sign-in over WARP**: on the Foxy lane `--warp` is applied before the account plane, so the Firefox sign-in and the carrier catalogue see a WARP exit instead of a region block. An explicit `--upstream` still wins.
+            - **VMess share links**: `ferrox-cli up --vmess 'vmess://...'` reads the v2rayN base64-JSON form and the standard URI form, with the carrier, TLS, REALITY, ALPN, fingerprint and pin fields mapped the same way as VLESS. `--vmess HOST:PORT --uuid ID` still works. `--vless` now reads the full field set: every supported carrier, early data, `alpn`, `fp`, `allowInsecure`, certificate pins, verify names and REALITY's `pbk`/`sid`/`spx`/`pqv`.
+            - **More carriers on existing lanes**: xHTTP (including h2/h3 and stream modes), HTTP/3, MASQUE/Connect-UDP, REALITY over QUIC and KCP, and the Linux TUN system stack. Psiphon keeps CDN fronting and the wider establishment race.
+
+            These packages are rebuilt from the commit that carries this release; `SHA256SUMS` is regenerated for every asset, so a download from an older date cannot be mixed with this one.
+
             ### Windows: use `ferrox-cli.exe`
 
             It is native and needs no Bash, WSL, or Python.
@@ -237,7 +246,7 @@ jobs:
             | VeePN | nothing: anonymous, no account, no server | `ferrox-cli up --veepn` |
             | Psiphon | nothing: no account, no client binary | `ferrox-cli up --psiphon` |
             | VLESS | a `vless://` link | `ferrox-cli up --vless 'vless://...'` |
-            | VMess | `HOST:PORT` and a user id | `ferrox-cli up --vmess host:443 --uuid ID` |
+            | VMess | a `vmess://` link, or `HOST:PORT` and a user id | `ferrox-cli up --vmess 'vmess://...'` |
             | Trojan | `HOST:PORT` and a password | `ferrox-cli up --trojan host:443 --password PW` |
             | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
             | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |

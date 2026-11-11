@@ -354,11 +354,14 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
     unclaimed: set[str] = set()
     attributed: list[str] = []
     rust = False
+    links = False
     # A plan with nothing to look at has no evidence to narrow on, so it runs wide.
     shared = "" if changed else "no changed-path list to plan against"
     for path in changed:
         if path.startswith(TOOL):
             continue
+        if path.startswith("dist/") or path == "scripts/check-share-links.py":
+            links = True
         if path.endswith((".rs", ".toml")) and path.startswith("crates/"):
             rust = True
         elif path in ("Cargo.toml", "Cargo.lock"):
@@ -402,7 +405,7 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
     reason = shared or ("" if methods else "nothing a method page owns")
     return {"wide": wide, "reason": reason, "methods": sorted(methods),
             "unclaimed": sorted(unclaimed), "attributed": attributed,
-            "planned": bool(changed), "rust": rust}
+            "planned": bool(changed), "rust": rust, "links": links}
 
 
 def is_shared_source(path: str) -> bool:
@@ -520,6 +523,7 @@ def output_flags(plan: dict) -> dict[str, str]:
     return {
         "wide": "true" if plan["wide"] else "false",
         "rust": "true" if plan["rust"] or not plan["planned"] else "false",
+        "links": "true" if plan["links"] or not plan["planned"] else "false",
         "methods": ",".join(plan["methods"]),
         "cells": ",".join(plan["scenarios"]),
         "engines": ",".join(plan["engines"]),
@@ -1014,10 +1018,23 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     # A job gated on `rust` must still run for the scheduled `--wide` plan, which
     # has an empty change list and so never sees a .rs path at all.
     scheduled = output_flags(build_plan(root, []))
-    ok = scheduled["wide"] == "true" and scheduled["rust"] == "true"
+    ok = scheduled["wide"] == "true" and scheduled["rust"] == "true" \
+        and scheduled["links"] == "true"
     failed += 0 if ok else 1
     print(f"selftest: {'ok  ' if ok else 'FAIL'} --wide still owes the build "
           f"and its tests (rust={scheduled['rust']})")
+    for label, changed, want in [
+        ("a CLI edit owes the share-link gate", ["dist/ferrox-cli.sh"], True),
+        ("a script edit owes it too",
+         ["scripts/check-share-links.py"], True),
+        ("a Rust edit does not by itself",
+         ["crates/ferrox-app/src/vmess.rs"], False),
+    ]:
+        flags = output_flags(build_plan(root, changed))
+        got = flags["links"] == "true"
+        ok = got == want
+        failed += 0 if ok else 1
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> links={got}")
     # The other half of that rule: a plan read off a real diff that moves no Rust
     # cannot move a test's outcome either, so three compilers are not owed.
     infra = output_flags(build_plan(root, [".github/workflows/ci.yml",
