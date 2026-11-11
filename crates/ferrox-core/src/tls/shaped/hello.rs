@@ -649,7 +649,7 @@ impl Hello {
                 let slot = match *grease_exts {
                     0 | 1 => *grease_exts,
                     2 => 3,
-                    other => other,
+                    _ => 4,
                 };
                 *grease_exts += 1;
                 (
