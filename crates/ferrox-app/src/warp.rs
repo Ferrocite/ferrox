@@ -417,8 +417,9 @@ where
             |get_error| format!("its GET too: {}", get_error.reason),
             |get| {
                 format!(
-                    "the token ({}) answers GET {}",
+                    "the token ({}, starts {}) answers GET {}",
                     registered.token.len(),
+                    &registered.token[..3],
                     get.status
                 )
             },
