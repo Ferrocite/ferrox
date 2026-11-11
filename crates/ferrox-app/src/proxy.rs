@@ -24904,6 +24904,7 @@ fn serve_socks_udp_split(
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
     let relay_local = relay.local_addr().ok();
     let local = relay
         .local_addr()
