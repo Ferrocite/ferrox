@@ -1014,7 +1014,7 @@ fn write_body(response: &Response, writer: &mut impl Write) -> Result<(), String
             .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
     }) || response.body.starts_with(&[0x1f, 0x8b]);
     let written = if gzip {
-        let mut decoder = flate2::read::GzDecoder::new(response.body.as_slice());
+        let mut decoder = flate2::read::MultiGzDecoder::new(response.body.as_slice());
         copied(&mut decoder, writer)?
     } else {
         writer
@@ -1421,6 +1421,25 @@ mod tests {
             "the decoded asset was staged whole: a {} byte write",
             sink.largest
         );
+    }
+
+    #[test]
+    fn every_member_of_a_concatenated_gzip_asset_is_decoded() {
+        let mut body = Vec::new();
+        for part in [b"geosite".as_slice(), b"geoip".as_slice()] {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(part).expect("compresses");
+            body.extend_from_slice(&encoder.finish().expect("finishes"));
+        }
+        let response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body,
+        };
+        let mut decoded = Vec::new();
+        write_body(&response, &mut decoded).expect("decodes every member");
+        assert_eq!(decoded, b"geositegeoip");
     }
 
     #[test]
