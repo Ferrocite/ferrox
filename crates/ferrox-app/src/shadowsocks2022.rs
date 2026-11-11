@@ -528,7 +528,7 @@ pub(crate) fn serve_xhttp(
     });
 }
 
-fn serve_xhttp_accepted(
+pub(crate) fn serve_xhttp_accepted(
     reader: Box<dyn crate::proxy::WindowRead + Send>,
     writer: crate::xhttp::XhttpWriter,
     password: &str,

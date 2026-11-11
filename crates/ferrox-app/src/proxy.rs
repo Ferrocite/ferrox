@@ -4585,6 +4585,91 @@ fn serve_shadowsocks(
     }
 }
 
+/// The h2 preface uses the demux the Trojan and `VMess` TLS carriers answer; an H1 peer keeps its session.
+fn serve_ss_xhttp_carrier<
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    accounts: crate::shadowsocks::SsAccounts,
+    freedom: bool,
+) {
+    let settings = settings.clone();
+    let sniffing = crate::sniff::current();
+    let mut access = Some(crate::accesslog::snapshot());
+    let mut read = Some(read);
+    let mut write = Some(write);
+    let mut accounts = Some(accounts);
+    lane_pool::submit_setup(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let access = access.take().expect("one xhttp preface");
+            let _flow = crate::accesslog::install_snapshot(access);
+            let read = read.take().expect("one xhttp preface");
+            let write = write.take().expect("one xhttp preface");
+            let accounts = accounts.take().expect("one xhttp preface");
+            let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+                return lane_pool::Next::Done;
+            };
+            if !h2 {
+                let Some((reader, writer)) =
+                    crate::xhttp::accept_split_with_settings(chained, write, &settings, None)
+                else {
+                    return lane_pool::Next::Done;
+                };
+                let closer = writer.clone();
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+                serve_ss_tls_session(reader, writer, &accounts, freedom, &close);
+                return lane_pool::Next::Done;
+            }
+            #[cfg(test)]
+            if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+                paths.push(settings.path.clone());
+            }
+            let service = crate::xhttp_h2::XhttpSessionService::new(
+                settings.clone(),
+                Arc::new(move |reader, writer, _decryption| {
+                    if accounts.is_2022 {
+                        crate::shadowsocks2022::serve_xhttp_accepted(
+                            reader,
+                            writer,
+                            &accounts.password,
+                            &accounts.method,
+                            &accounts.identities,
+                            freedom,
+                        );
+                    } else {
+                        crate::shadowsocks::serve_xhttp_accepted(
+                            reader,
+                            writer,
+                            &accounts.users,
+                            freedom,
+                        );
+                    }
+                }),
+            );
+            let until = Instant::now() + crate::budgets::handshake();
+            let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut step =
+                crate::xhttp_h2::h2_lane(chained, write, service, None, Some((until, opened)));
+            let sniffing = crate::sniff::current();
+            let access = crate::accesslog::snapshot();
+            lane_pool::submit_demux(
+                Box::new(move || {
+                    crate::sniff::install_current(sniffing.clone());
+                    let _flow = crate::accesslog::install_snapshot(access.clone());
+                    step()
+                }),
+                Box::new(|| {}),
+            );
+            lane_pool::Next::Done
+        }),
+        Box::new(|| {}),
+    );
+}
+
 fn serve_shadowsocks_tls(
     stream: Connection,
     accounts: &crate::shadowsocks::SsAccounts,
@@ -4661,14 +4746,7 @@ fn serve_shadowsocks_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            let Some((reader, writer)) =
-                crate::xhttp::accept_split_with_settings(reader, writer, settings, None)
-            else {
-                return;
-            };
-            let closer = writer.clone();
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
-            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
+            serve_ss_xhttp_carrier(reader, writer, settings, accounts.clone(), freedom);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -53334,6 +53412,101 @@ mod tests {
                 .iter()
                 .any(|path| path == WITNESS),
             "an ALPN-negotiated h2 session must open with the H2 preface"
+        );
+    }
+
+    /// xray-core's shadowsocks 2022 client opens its TLS xHTTP carrier with the h2 preface. The
+    /// server used to hand that preface to the H1 head parser, which refused it after the
+    /// handshake: the benchmark's `shadowsocks2022-tls-xhttp-h2` server leg landed no bytes.
+    #[test]
+    fn shadowsocks2022_tls_xhttp_h2_carries_an_echo() {
+        const WITNESS: &str = "/ss2022-h2";
+        const METHOD: &str = "2022-blake3-aes-256-gcm";
+        let password = ferrox_core::b64::encode(&[0x42u8; 32]);
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
+        let echo_addr: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).expect("reads");
+            stream.write_all(&buf).expect("echoes");
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let settings = xhttp_settings(WITNESS);
+        let accounts = crate::shadowsocks::SsAccounts {
+            users: std::sync::Arc::from([]),
+            password: password.clone(),
+            method: METHOD.to_owned(),
+            is_2022: true,
+            identities: Vec::new(),
+        };
+        let serving_settings = settings.clone();
+        let serving_config = Arc::clone(&server_config);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_shadowsocks_tls(
+                stream,
+                &accounts,
+                &Carrier::Xhttp {
+                    settings: serving_settings,
+                },
+                true,
+                &serving_config,
+            );
+        });
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        assert_eq!(
+            session.alpn(),
+            Some(&b"h2"[..]),
+            "the handshake negotiates h2"
+        );
+        let (reader, mut writer) = tls_xhttp(
+            &server,
+            session,
+            || None::<ferrox_core::tls::ClientSession<crate::conn::Connection>>,
+            "127.0.0.1",
+            &settings,
+            false,
+        )
+        .expect("dials xhttp");
+        let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &password,
+            METHOD,
+            &Destination::from(echo_addr),
+        )
+        .expect("sends the shadowsocks header");
+        let closer = writer.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+        let plain = crate::conn::test_bind("127.0.0.1:0").expect("binds plain");
+        let plain_port = plain.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (peer, _) = plain.accept().expect("accepts");
+            crate::shadowsocks2022::pump_relay_carried(&peer, reader, writer, &close, send, recv);
+        });
+        let mut client = Connection::connect(("127.0.0.1", plain_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the h2 preface must reach the demux instead of the H1 head parser"
         );
     }
 
