@@ -85,7 +85,7 @@ graph TD
 ## Time
 
 No local duration is quoted: every contributor dials through a VPN, so a local race measures the tunnel.
-The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP data plane is compared in the benchmark matrix's WARP rows — `warp-masque-down-8` in standard, `-down-16`, `-down-64` and `-duplex-64` in full — against Aether and ZeroNet in the same cell, ZeroNet through `scripts/xray-to-zeronet-warp.py`, the certificate's own SPKI as its pin and the identity key rewritten to SEC1 because ZeroNet reads an outer version 1 as SEC1. A host where neither external leg built skips the WARP cell with that reason instead of reporting a one-engine comparison.
+The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP data plane is compared in the benchmark matrix's WARP rows — `warp-masque-down-8` in standard, `-down-16`, `-down-64` and `-duplex-64` in full — against Aether and ZeroNet in the same cell, ZeroNet through `scripts/xray-to-zeronet-warp.py`, the certificate's own SPKI as its pin and the identity key rewritten to SEC1 with its public point because ZeroNet reads an outer version 1 as SEC1 and ring checks the point. A host where neither external leg built skips the WARP cell with that reason instead of reporting a one-engine comparison.
 
 ## CI scope
 

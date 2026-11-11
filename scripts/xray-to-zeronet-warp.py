@@ -12,7 +12,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cert_spki import sec1_private_key, spki_base64
+from cert_spki import sec1_private_key, sec1_with_public_key, spki_base64
 
 
 def fail(message):
@@ -21,10 +21,11 @@ def fail(message):
 
 
 def zeronet_private_key(text):
-    """The identity key as SEC1, the shape ZeroNet's outer version check reads.
+    """The identity key as SEC1 with its public point, the shape ring parses.
 
     A PKCS #8 v2 key also starts with version 1, so ZeroNet wraps the whole
-    SubjectPublicKeyInfo as if it were SEC1 and the key no longer parses.
+    SubjectPublicKeyInfo as if it were SEC1 and the key no longer parses. The
+    inner key needs the point because ring's PKCS #8 reader checks it.
     """
     try:
         der = base64.b64decode(text, validate=True)
@@ -33,6 +34,9 @@ def zeronet_private_key(text):
     sec1 = sec1_private_key(der)
     if sec1 is None:
         raise ValueError("the warp private key is neither PKCS #8 nor SEC1")
+    sec1 = sec1_with_public_key(sec1)
+    if sec1 is None:
+        raise ValueError("the warp private key has no P-256 scalar")
     return base64.b64encode(sec1).decode()
 
 
@@ -44,8 +48,13 @@ def selftest():
     raw = base64.b64decode(key)
     assert raw[2:5] == b"\x02\x01\x01" and raw[5] == 0x30, raw.hex()
     sec1 = base64.b64decode(zeronet_private_key(key))
-    assert sec1[:5] == b"\x30\x25\x02\x01\x01", sec1.hex()
+    assert sec1[:5] == b"\x30\x77\x02\x01\x01", sec1.hex()
     assert sec1[5] == 0x04, sec1.hex()
+    assert sec1[56:] == bytes.fromhex(
+        "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b"
+        "90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c"
+        "8e83388d"
+    ), sec1.hex()
     assert base64.b64decode(zeronet_private_key(base64.b64encode(sec1).decode())) == sec1
     print("xray-to-zeronet-warp selftest: PKCS #8 v2 and SEC1 keys")
 
