@@ -386,6 +386,7 @@ pub(crate) fn connect_inproxy(
         let fragment = server_name.parse::<IpAddr>().is_err()
             && meek.shape.fragment_client_hello(meek.protocol);
         let verify = !meek.verify_server_names.is_empty() || !meek.verify_pins.is_empty();
+        let fingerprint = meek.shape.fingerprint();
         let config = TlsConfig {
             server_name,
             alpn: vec![b"http/1.1".to_vec()].into(),
@@ -398,7 +399,8 @@ pub(crate) fn connect_inproxy(
             },
             pins: ferrox_core::foxy::pin::Pins::parse(meek.verify_pins.clone()),
             resumption: true,
-            fingerprint: Some(meek.shape.fingerprint()),
+            fingerprint: Some(fingerprint),
+            omit_session_id: meek.shape.omit_session_id(fingerprint),
             padding: meek.shape.padding(),
             ..TlsConfig::default()
         };
@@ -1054,6 +1056,7 @@ impl MeekHttp {
         let fragment = server_name.parse::<IpAddr>().is_err()
             && self.meek.shape.fragment_client_hello(self.meek.protocol);
         let verify = !self.meek.verify_server_names.is_empty() || !self.meek.verify_pins.is_empty();
+        let fingerprint = self.meek.shape.fingerprint();
         let config = TlsConfig {
             server_name,
             alpn: alpn.into(),
@@ -1066,7 +1069,8 @@ impl MeekHttp {
             },
             pins: ferrox_core::foxy::pin::Pins::parse(self.meek.verify_pins.clone()),
             resumption: true,
-            fingerprint: Some(self.meek.shape.fingerprint()),
+            fingerprint: Some(fingerprint),
+            omit_session_id: self.meek.shape.omit_session_id(fingerprint),
             padding: self.meek.shape.padding(),
             ..TlsConfig::default()
         };

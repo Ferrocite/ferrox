@@ -3,8 +3,8 @@
 
 use crate::json::{self, Json};
 use crate::psiphon_ssh::{
-    Channel, ChannelChunk, Identity, KeepAlive, Proxy, Server, Session, TlsShape, MAX_PADDING,
-    MIN_PADDING,
+    ApiEncoding, Channel, ChannelChunk, Identity, KeepAlive, Proxy, Server, Session, TlsShape,
+    MAX_PADDING, MIN_PADDING,
 };
 use crate::socks::{Credential, Destination, Version};
 use ferrox_core::tls::Fingerprint;
@@ -1131,6 +1131,7 @@ struct Settings {
     propagation: String,
     platform: String,
     client_version: String,
+    api_encoding: ApiEncoding,
     device_region: Option<String>,
     device_location: Option<String>,
     client_features: Vec<String>,
@@ -1656,6 +1657,8 @@ impl Inner {
             let propagation = self.settings.propagation.clone();
             let platform = self.settings.platform.clone();
             let client_version = self.settings.client_version.clone();
+            let api_encoding = self.settings.api_encoding;
+            let compress_tactics = self.settings.compress_tactics;
             let egress_region = self.settings.region.clone();
             let device_region = self.settings.device_region.clone();
             let device_location = self.settings.device_location.clone();
@@ -1706,6 +1709,8 @@ impl Inner {
                     client_features: &client_features,
                     split_tunnel,
                     split_tunnel_regions: &split_tunnel_regions,
+                    api_encoding,
+                    compress_tactics,
                 };
                 match Session::connect(
                     selected,
@@ -3176,6 +3181,12 @@ impl Settings {
                     .min(65_533),
             )
             .unwrap_or(65_533),
+            no_default_tls_session_id_probability: decimal(
+                settings,
+                "NoDefaultTLSSessionIDProbability",
+            )
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
             tls_fragment_client_hello: decimal(settings, "TLSFragmentClientHelloProbability")
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
@@ -3510,6 +3521,13 @@ impl Settings {
                 number(settings, "ClientBurstDownstreamDeadlineMilliseconds").unwrap_or(0),
             ),
         );
+        let api_encoding = match text(settings, "TargetAPIEncoding").as_deref() {
+            None | Some("cbor") => ApiEncoding::Cbor,
+            Some("json") => ApiEncoding::Json,
+            Some(other) => {
+                return Err(format!("psiphon: invalid TargetAPIEncoding {other:?}"));
+            }
+        };
         let light = light_settings(
             settings,
             &tls_shape,
@@ -3551,6 +3569,7 @@ impl Settings {
             propagation,
             platform,
             client_version,
+            api_encoding,
             device_region,
             device_location,
             client_features,
@@ -4893,7 +4912,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "MeekPayloadPaddingMaxSize",
     "MeekPayloadPaddingOmitProbability",
     "TLSTunnelTrafficShapingProbability",
+    "NoDefaultTLSSessionIDProbability",
     "TLSFragmentClientHelloProbability",
+    "TargetAPIEncoding",
     "TLSFragmentClientHelloLimitProtocols",
     "PickUserAgentProbability",
     "QUICDialEarlyProbability",
@@ -5433,6 +5454,8 @@ pub(crate) fn broker_offer(
         client_features: &settings.client_features,
         split_tunnel: settings.split_tunnel_own_region,
         split_tunnel_regions: &settings.split_tunnel_regions,
+        api_encoding: settings.api_encoding,
+        compress_tactics: settings.compress_tactics,
     };
     let fronts = broker_fronts(broker);
     if fronts.is_empty() {
@@ -5526,6 +5549,8 @@ fn fetch_tactics_from(
         client_features: &settings.client_features,
         split_tunnel: settings.split_tunnel_own_region,
         split_tunnel_regions: &settings.split_tunnel_regions,
+        api_encoding: settings.api_encoding,
+        compress_tactics: settings.compress_tactics,
     };
     let timing = tactics_timing(settings.raw.as_ref());
     let timeout = timing.timeout.unwrap_or(settings.ready);
@@ -5633,8 +5658,8 @@ fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
 fn load_tactics_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     let servers = load_source_entries(settings, false, true)?;
     let mut servers = filter_region(servers, settings);
-    apply_tactics_overrides(&mut servers, settings);
     apply_session_settings(&mut servers, settings);
+    apply_tactics_overrides(&mut servers, settings);
     if servers.is_empty() {
         return Err("psiphon: no usable server entries".to_owned());
     }
@@ -5731,8 +5756,8 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
         }
         selected
     };
-    apply_fronting_overrides_selected(&mut servers, settings);
     apply_session_settings(&mut servers, settings);
+    apply_fronting_overrides_selected(&mut servers, settings);
     if servers.is_empty() {
         return Err("psiphon: no usable server entries".to_owned());
     }
@@ -6303,6 +6328,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 fronted.tls_profile.as_deref(),
                 fronted.skip_cert_verify,
                 front,
+                true,
                 &mut group,
                 &mut variants,
             );
@@ -6329,6 +6355,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 None,
                 false,
                 front,
+                false,
                 &mut group,
                 &mut variants,
             );
@@ -6345,6 +6372,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                     None,
                     false,
                     front,
+                    false,
                     &mut group,
                     &mut variants,
                 );
@@ -6375,7 +6403,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     *servers = expanded;
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn add_fronted_variants(
     server: &Server,
     dials: &[(String, u16)],
@@ -6388,6 +6416,7 @@ fn add_fronted_variants(
     tls_profile: Option<&str>,
     skip_cert_verify: bool,
     front: Front,
+    override_rules: bool,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
 ) {
@@ -6406,6 +6435,7 @@ fn add_fronted_variants(
                 tls_profile,
                 skip_cert_verify,
                 front,
+                override_rules,
                 expanded,
                 variants,
             ) {
@@ -6431,6 +6461,7 @@ fn add_fronted_variants(
                     tls_profile,
                     skip_cert_verify,
                     front,
+                    override_rules,
                     expanded,
                     variants,
                 ) {
@@ -6456,6 +6487,7 @@ fn add_fronted_variants(
             tls_profile,
             skip_cert_verify,
             front,
+            override_rules,
             expanded,
             variants,
         ) {
@@ -6464,7 +6496,7 @@ fn add_fronted_variants(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn push_fronted_variant(
     server: &Server,
     dial: &str,
@@ -6478,6 +6510,7 @@ fn push_fronted_variant(
     tls_profile: Option<&str>,
     skip_cert_verify: bool,
     front: Front,
+    override_rules: bool,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
 ) -> bool {
@@ -6498,6 +6531,8 @@ fn push_fronted_variant(
                 .meek
         }
     };
+    let original_dial = meek.dial.clone();
+    let original_sni = meek.sni.clone();
     dial.clone_into(&mut meek.dial);
     meek.port = port;
     if disable_sni {
@@ -6506,13 +6541,28 @@ fn push_fronted_variant(
         sni.clone_into(&mut meek.sni);
     }
     meek.disable_sni = disable_sni;
+    if override_rules && !meek.https {
+        // The plain-HTTP front consumes only the dial address and Host header.
+        meek.sni.clear();
+        meek.disable_sni = true;
+    } else if override_rules && meek.quic && !meek.disable_sni && is_ip_literal(sni) {
+        // A QUIC CDN edge reached by IP keeps a routable fronting name in SNI.
+        let fallback = if is_ip_literal(&original_dial) {
+            original_sni.as_str()
+        } else {
+            original_dial.as_str()
+        };
+        if !fallback.is_empty() && !is_ip_literal(fallback) {
+            fallback.clone_into(&mut meek.sni);
+        }
+    }
     if !keep_candidates {
         meek.fronts = vec![(dial.to_owned(), port)];
         let host = meek.host.clone();
         meek.hosts = vec![host];
     }
     // The reference applies an override's ALPN to a TLS front; QUIC keeps its own h3 ALPN.
-    if !alpn.is_empty() && !meek.quic {
+    if !alpn.is_empty() && meek.https && !meek.quic {
         meek.alpn = alpn.to_vec();
     }
     meek.verify_server_names = if skip_cert_verify || meek.quic || !meek.https {
@@ -6525,7 +6575,7 @@ fn push_fronted_variant(
     } else {
         verify_pins.to_vec()
     };
-    if let Some(profile) = tls_profile {
+    if let Some(profile) = tls_profile.filter(|_| meek.https && !meek.quic) {
         if let Some(fingerprint) = Fingerprint::resolve(profile) {
             meek.shape.profiles = vec![fingerprint];
             meek.shape.randomized_probability = 0.0;
@@ -6536,6 +6586,10 @@ fn push_fronted_variant(
     expanded.push(variant);
     *variants += 1;
     true
+}
+
+fn is_ip_literal(value: &str) -> bool {
+    value.parse::<std::net::IpAddr>().is_ok()
 }
 
 fn expand_cidr(raw: &str) -> Vec<String> {
@@ -7279,6 +7333,15 @@ fn decode_entry_with(
     {
         return None;
     }
+    let ssh_api = entry
+        .get("capabilities")
+        .and_then(Json::as_arr)
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(Json::as_str)
+                .any(|capability| capability == "ssh-api-requests")
+        });
     Some(Server {
         host,
         address,
@@ -7294,6 +7357,7 @@ fn decode_entry_with(
         provider_id,
         fronting_provider_id,
         scan_cdn: true,
+        ssh_api,
         direct,
         tls,
         tls_port,
@@ -7740,8 +7804,8 @@ fn fetch_osl_entries(
         settings.fronted_fallback,
         None,
     );
-    apply_fronting_overrides(&mut selected, settings);
     apply_session_settings(&mut selected, settings);
+    apply_fronting_overrides(&mut selected, settings);
     Ok(limit_quic_versions(selected, settings))
 }
 
@@ -9821,6 +9885,166 @@ mod tests {
     }
 
     #[test]
+    fn an_http_fronted_override_keeps_only_the_dial_and_host() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekDialOverrides": [{
+                        "DialAddresses": ["edge.example:80"],
+                        "SNIServerName": "sni.example",
+                        "ALPNProtocols": ["http/1.1"],
+                        "TLSProfile": "chrome_120",
+                        "VerifyServerNames": ["cdn.example"]
+                    }]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 80,
+            host: "cdn.example".to_owned(),
+            sni: String::new(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 80)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: false,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-HTTP-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            verify_server_names: Vec::new(),
+            verify_pins: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        let meek = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .find(|meek| meek.dial == "edge.example")
+            .expect("http override");
+        assert_eq!(meek.sni, "");
+        assert!(meek.disable_sni);
+        assert_eq!(meek.alpn, Vec::<Vec<u8>>::new());
+        assert_eq!(meek.verify_server_names, Vec::<String>::new());
+        assert_ne!(
+            meek.shape.profiles,
+            vec![Fingerprint::resolve("chrome_120").expect("profile")]
+        );
+    }
+
+    #[test]
+    fn a_quic_override_keeps_a_routable_sni_for_an_edge_ip() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekDialOverrides": [{
+                        "DialAddresses": ["192.0.2.9:443"],
+                        "SNIServerName": "192.0.2.9",
+                        "ALPNProtocols": ["http/1.1"],
+                        "TLSProfile": "chrome_120",
+                        "VerifyServerNames": ["cdn.example"]
+                    }]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: vec![b"h3".to_vec()],
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: true,
+            fronted: true,
+            protocol: "FRONTED-MEEK-QUIC-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            verify_server_names: Vec::new(),
+            verify_pins: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        let meek = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .find(|meek| meek.dial == "192.0.2.9")
+            .expect("quic override");
+        assert_eq!(meek.sni, "front.example");
+        assert_eq!(meek.alpn, vec![b"h3".to_vec()]);
+        assert_eq!(meek.verify_server_names, Vec::<String>::new());
+        assert_eq!(meek.verify_pins, Vec::<String>::new());
+        assert_ne!(
+            meek.shape.profiles,
+            vec![Fingerprint::resolve("chrome_120").expect("profile")]
+        );
+    }
+
+    #[test]
+    fn a_fronted_override_keeps_its_tls_profile_after_session_settings() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"FrontedMeekDialOverrides":[{"DialAddresses":["edge.example:443"],"TLSProfile":"chrome_120"}]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            quic: false,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
+            headers: Vec::new(),
+            dns: Vec::new(),
+            provider_id: None,
+            verify_server_names: Vec::new(),
+            verify_pins: Vec::new(),
+            shape: TlsShape::default(),
+        });
+        let mut servers = vec![server];
+        apply_session_settings(&mut servers, &settings);
+        apply_fronting_overrides(&mut servers, &settings);
+        let meek = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .find(|meek| meek.dial == "edge.example")
+            .expect("matched override");
+        assert_eq!(
+            meek.shape.profiles,
+            vec![Fingerprint::resolve("chrome_120").expect("profile")]
+        );
+    }
+
+    #[test]
     fn a_fronted_override_that_does_not_match_is_skipped() {
         let settings = Settings::from_json(Some(
             &json::parse(
@@ -10625,6 +10849,7 @@ mod tests {
             provider_id: None,
             fronting_provider_id: None,
             scan_cdn: true,
+            ssh_api: true,
             direct: true,
             tls: false,
             tls_port: None,
@@ -11947,6 +12172,7 @@ mod tests {
                 provider_id: None,
                 fronting_provider_id: None,
                 scan_cdn: true,
+                ssh_api: true,
                 direct: true,
                 tls: false,
                 tls_port: None,
@@ -12004,6 +12230,7 @@ mod tests {
                 provider_id: None,
                 fronting_provider_id: None,
                 scan_cdn: true,
+                ssh_api: true,
                 direct: true,
                 tls: false,
                 tls_port: None,
@@ -12525,6 +12752,12 @@ mod tests {
         socks_udp_frame_into(&mut frame, address, 5300, b"x");
         assert_eq!(frame.len(), 11);
         assert_eq!(&frame[10..], b"x");
+    }
+
+    #[test]
+    fn an_unknown_api_encoding_is_refused() {
+        let settings = json::parse(r#"{"TargetAPIEncoding":"bogus"}"#).expect("settings");
+        assert!(PsiphonOut::validate(Some(&settings)).is_err());
     }
 
     #[test]

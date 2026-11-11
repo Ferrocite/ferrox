@@ -304,6 +304,7 @@ pub(crate) struct Server {
     /// Whether the protocol limit that selected this entry lets it take CDN
     /// scan candidates; a bare limit keeps the advertised fronting host.
     pub(crate) scan_cdn: bool,
+    pub(crate) ssh_api: bool,
     pub(crate) direct: bool,
     pub(crate) tls: bool,
     pub(crate) tls_port: Option<u16>,
@@ -471,6 +472,8 @@ pub(crate) struct TlsShape {
     pub(crate) meek_payload_padding_min: usize,
     /// The largest padding size.
     pub(crate) meek_payload_padding_max: usize,
+    /// The chance a randomized TLS 1.3 dial omits the legacy session id.
+    pub(crate) no_default_tls_session_id_probability: f64,
     /// The chance a TLS dial splits its `ClientHello` at the SNI.
     pub(crate) tls_fragment_client_hello: f64,
     /// The protocols that admit `ClientHello` fragmentation; empty admits all.
@@ -515,6 +518,7 @@ impl Default for TlsShape {
             meek_payload_padding_omit: 0.0,
             meek_payload_padding_min: 0,
             meek_payload_padding_max: 65_533,
+            no_default_tls_session_id_probability: 0.5,
             tls_fragment_client_hello: 0.0,
             tls_fragment_client_hello_protocols: Vec::new(),
             user_agent_probability: 0.5,
@@ -627,6 +631,16 @@ impl TlsShape {
             }
         }
         server_name.to_owned()
+    }
+
+    /// Whether this randomized TLS 1.3 dial omits its legacy session id, as uTLS does when
+    /// Psiphon's `NoDefaultTLSSessionIDProbability` coin lands.
+    pub(crate) fn omit_session_id(&self, fingerprint: Fingerprint) -> bool {
+        if self.no_default_tls_session_id_probability <= 0.0 || !fingerprint.is_randomized() {
+            return false;
+        }
+        let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
+        draw < self.no_default_tls_session_id_probability
     }
 
     /// Whether this TLS dial splits its `ClientHello` at the SNI, when the
@@ -1426,6 +1440,13 @@ impl std::fmt::Debug for Channel {
     }
 }
 
+/// The encoding an SSH API request uses: the reference's packed CBOR by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApiEncoding {
+    Json,
+    Cbor,
+}
+
 /// The fields the server's auth and handshake read, taken from the lane's settings.
 pub(crate) struct Identity<'a> {
     pub(crate) session_id: &'a str,
@@ -1440,6 +1461,8 @@ pub(crate) struct Identity<'a> {
     pub(crate) client_features: &'a [String],
     pub(crate) split_tunnel: bool,
     pub(crate) split_tunnel_regions: &'a [String],
+    pub(crate) api_encoding: ApiEncoding,
+    pub(crate) compress_tactics: bool,
 }
 
 /// The server's handshake reply: new server entries, client region, tactics and steering IP.
@@ -1578,6 +1601,7 @@ impl Session {
             &mut input,
             relay_protocol,
             identity,
+            server.ssh_api,
             &mut relay,
             requests.as_deref(),
         )?;
@@ -2661,12 +2685,14 @@ fn tls_tunnel(
     // An IP literal omits SNI, matching the reference's default; a host name is sent as the SNI it is.
     let name = shape.sni(protocol, server_name);
     let fragment = name.parse::<IpAddr>().is_err() && shape.fragment_client_hello(protocol);
+    let fingerprint = shape.fingerprint();
     let config = TlsConfig {
         server_name: name.clone(),
         roots: crate::quic::system_roots(),
         insecure: true,
-        fingerprint: Some(shape.fingerprint()),
+        fingerprint: Some(fingerprint),
         client_random: Some(tls_passthrough(passthrough_key)?),
+        omit_session_id: shape.omit_session_id(fingerprint),
         padding: shape.padding(),
         ..TlsConfig::default()
     };
@@ -3897,8 +3923,245 @@ fn handshake_body(relay_protocol: &str, identity: &Identity<'_>, relay: Option<&
         }
         body.push(']');
     }
+    if identity.compress_tactics {
+        body.push_str(r#","psiphon_api_response_version":"1""#);
+    }
     body.push('}');
     body
+}
+
+/// The packed authorization list, following the reference's access-control struct.
+fn packed_authorizations(authorizations: &[String]) -> Result<Vec<u8>, String> {
+    let mut packed = Vec::with_capacity(authorizations.len());
+    for authorization in authorizations {
+        let decoded = ferrox_core::b64::decode(authorization.as_bytes())
+            .ok_or_else(|| "psiphon authorization is not base64".to_owned())?;
+        let text = std::str::from_utf8(&decoded)
+            .map_err(|_| "psiphon authorization is not utf-8".to_owned())?;
+        let json =
+            crate::json::parse(text).map_err(|_| "psiphon authorization is not json".to_owned())?;
+        let signed = json
+            .get("Authorization")
+            .ok_or_else(|| "psiphon authorization has no payload".to_owned())?;
+        let bytes = |object: &crate::json::Json, key: &str| -> Result<Vec<u8>, String> {
+            object
+                .get(key)
+                .and_then(crate::json::Json::as_str)
+                .and_then(|value| ferrox_core::b64::decode(value.as_bytes()))
+                .ok_or_else(|| format!("psiphon authorization has no {key}"))
+        };
+        let expires = signed
+            .get("Expires")
+            .and_then(crate::json::Json::as_str)
+            .ok_or_else(|| "psiphon authorization has no expiry".to_owned())?;
+        let access_type = signed
+            .get("AccessType")
+            .and_then(crate::json::Json::as_str)
+            .ok_or_else(|| "psiphon authorization has no access type".to_owned())?;
+        let mut entries = vec![
+            (
+                crate::psiphon_broker::Value::UInt(1),
+                crate::psiphon_broker::Value::Bytes(bytes(signed, "ID")?),
+            ),
+            (
+                crate::psiphon_broker::Value::UInt(2),
+                crate::psiphon_broker::Value::Text(access_type.to_owned()),
+            ),
+            (
+                crate::psiphon_broker::Value::UInt(4),
+                crate::psiphon_broker::Value::Bytes(bytes(&json, "SigningKeyID")?),
+            ),
+            (
+                crate::psiphon_broker::Value::UInt(5),
+                crate::psiphon_broker::Value::Bytes(bytes(&json, "Signature")?),
+            ),
+        ];
+        if expires != "0001-01-01T00:00:00Z" {
+            entries.push((
+                crate::psiphon_broker::Value::UInt(3),
+                crate::psiphon_broker::Value::Text(expires.to_owned()),
+            ));
+        }
+        entries.sort_by_key(|(key, _)| match key {
+            crate::psiphon_broker::Value::UInt(key) => *key,
+            _ => 0,
+        });
+        packed.push(crate::psiphon_broker::Value::Map(entries));
+    }
+    Ok(crate::psiphon_broker::encode(
+        &crate::psiphon_broker::Value::Array(packed),
+    ))
+}
+
+/// The packed CBOR SSH API request: integer keys and the fields the server reads from SSH.
+fn packed_handshake_body(
+    relay_protocol: &str,
+    identity: &Identity<'_>,
+    relay: Option<&Relay>,
+) -> Result<Vec<u8>, String> {
+    let mut entries = Vec::new();
+    let mut push = |key: u64, value: crate::psiphon_broker::Value| {
+        entries.push((crate::psiphon_broker::Value::UInt(key), value));
+    };
+    push(
+        1,
+        crate::psiphon_broker::Value::Bytes(packed_authorizations(identity.authorizations)?),
+    );
+    push(
+        6,
+        crate::psiphon_broker::Value::Bytes(
+            crate::psiphon::hex_decode(identity.propagation)
+                .ok_or_else(|| "psiphon propagation channel id is not hex".to_owned())?,
+        ),
+    );
+    push(
+        7,
+        crate::psiphon_broker::Value::Bytes(
+            crate::psiphon::hex_decode(identity.sponsor)
+                .ok_or_else(|| "psiphon sponsor id is not hex".to_owned())?,
+        ),
+    );
+    push(
+        8,
+        crate::psiphon_broker::Value::UInt(
+            identity
+                .version
+                .parse()
+                .map_err(|_| "psiphon client version is not a number".to_owned())?,
+        ),
+    );
+    push(
+        9,
+        crate::psiphon_broker::Value::Text(identity.platform.to_owned()),
+    );
+    if !identity.client_features.is_empty() {
+        push(
+            10,
+            crate::psiphon_broker::Value::Array(
+                identity
+                    .client_features
+                    .iter()
+                    .map(|feature| crate::psiphon_broker::Value::Text(feature.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(region) = identity.device_region {
+        push(12, crate::psiphon_broker::Value::Text(region.to_owned()));
+    }
+    if let Some(location) = identity.device_location {
+        push(13, crate::psiphon_broker::Value::Text(location.to_owned()));
+    }
+    push(
+        15,
+        crate::psiphon_broker::Value::Text(relay_protocol.to_owned()),
+    );
+    if let Some(region) = identity.egress_region {
+        push(43, crate::psiphon_broker::Value::Text(region.to_owned()));
+    }
+    if identity.split_tunnel {
+        push(63, crate::psiphon_broker::Value::Text("1".to_owned()));
+    }
+    if !identity.split_tunnel_regions.is_empty() {
+        push(
+            64,
+            crate::psiphon_broker::Value::Array(
+                identity
+                    .split_tunnel_regions
+                    .iter()
+                    .map(|region| crate::psiphon_broker::Value::Text(region.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(relay) = relay {
+        push(
+            76,
+            crate::psiphon_broker::Value::Bytes(relay.connection_id().to_vec()),
+        );
+        push(
+            77,
+            crate::psiphon_broker::Value::Bytes(relay.initial().to_vec()),
+        );
+    }
+    if identity.compress_tactics {
+        push(168, crate::psiphon_broker::Value::UInt(1));
+    }
+    entries.sort_by_key(|(key, _)| match key {
+        crate::psiphon_broker::Value::UInt(key) => *key,
+        _ => 0,
+    });
+    let mut payload = vec![0, 1];
+    payload.extend_from_slice(&crate::psiphon_broker::encode(
+        &crate::psiphon_broker::Value::Map(entries),
+    ));
+    Ok(payload)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn cbor_value_json(value: &crate::psiphon_broker::Value) -> Option<crate::json::Json> {
+    match value {
+        crate::psiphon_broker::Value::Text(text) => Some(crate::json::Json::Str(text.clone())),
+        crate::psiphon_broker::Value::Bytes(bytes) => std::str::from_utf8(bytes).ok().map(|text| {
+            crate::json::parse(text).unwrap_or_else(|_| crate::json::Json::Str(text.to_owned()))
+        }),
+        crate::psiphon_broker::Value::Array(items) => Some(crate::json::Json::Arr(
+            items.iter().filter_map(cbor_value_json).collect(),
+        )),
+        crate::psiphon_broker::Value::Bool(flag) => Some(crate::json::Json::Bool(*flag)),
+        crate::psiphon_broker::Value::UInt(number) => Some(crate::json::Json::Num(*number as f64)),
+        crate::psiphon_broker::Value::Int(number) => Some(crate::json::Json::Num(*number as f64)),
+        crate::psiphon_broker::Value::Float(number) => Some(crate::json::Json::Num(*number)),
+        crate::psiphon_broker::Value::Null => Some(crate::json::Json::Null),
+        crate::psiphon_broker::Value::Map(_) => None,
+    }
+}
+
+/// The integer-keyed CBOR handshake reply as the lane's own JSON.
+fn cbor_handshake_json(body: &[u8]) -> Option<crate::json::Json> {
+    let (value, used) = crate::psiphon_broker::decode(body)?;
+    if used != body.len() {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    if let crate::psiphon_broker::Value::Map(entries) = value {
+        for (key, value) in entries {
+            let crate::psiphon_broker::Value::UInt(key) = key else {
+                continue;
+            };
+            let Some(name) = handshake_key_name(key) else {
+                continue;
+            };
+            let Some(json) = cbor_value_json(&value) else {
+                continue;
+            };
+            pairs.push((name.to_owned(), json));
+        }
+    } else {
+        return None;
+    }
+    Some(crate::json::Json::Obj(pairs))
+}
+
+fn handshake_key_name(key: u64) -> Option<&'static str> {
+    Some(match key {
+        1 => "homepages",
+        2 => "upgrade_client_version",
+        3 => "page_view_regexes",
+        4 => "https_request_regexes",
+        5 => "encoded_server_list",
+        6 => "client_region",
+        7 => "client_address",
+        8 => "server_timestamp",
+        9 => "active_authorization_ids",
+        10 => "tactics_payload",
+        11 => "tactics_payload_compression",
+        12 => "upstream",
+        13 => "downstream",
+        14 => "steering_ip",
+        15 => "padding",
+        _ => return None,
+    })
 }
 
 /// The SSH API handshake every Psiphon server requires before it permits a port forward.
@@ -3907,14 +4170,23 @@ fn handshake(
     reader: &mut PacketReader,
     relay_protocol: &str,
     identity: &Identity<'_>,
+    ssh_api: bool,
     relay: &mut Option<Relay>,
     requests: Option<&dyn ServerRequests>,
 ) -> Result<HandshakeState, String> {
-    let body = handshake_body(relay_protocol, identity, relay.as_ref());
+    let encoding = if ssh_api {
+        identity.api_encoding
+    } else {
+        ApiEncoding::Json
+    };
+    let body = match encoding {
+        ApiEncoding::Json => handshake_body(relay_protocol, identity, relay.as_ref()).into_bytes(),
+        ApiEncoding::Cbor => packed_handshake_body(relay_protocol, identity, relay.as_ref())?,
+    };
     let mut request = vec![MSG_GLOBAL_REQUEST];
     put_str(&mut request, b"psiphon-handshake");
     request.push(1);
-    request.extend_from_slice(body.as_bytes());
+    request.extend_from_slice(&body);
     writer
         .send(&request)
         .map_err(|error| format!("psiphon ssh handshake: {error}"))?;
@@ -3967,12 +4239,21 @@ fn handshake(
     }
 }
 
-/// The JSON handshake reply; an empty or malformed body leaves every field empty.
+/// The JSON or CBOR handshake reply; an empty or malformed body leaves every field empty.
 fn parse_handshake(body: &[u8]) -> HandshakeState {
-    let Ok(text) = std::str::from_utf8(body) else {
-        return HandshakeState::default();
+    let json = if body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'{')
+    {
+        std::str::from_utf8(body)
+            .ok()
+            .and_then(|text| crate::json::parse(text).ok())
+    } else {
+        cbor_handshake_json(body)
     };
-    let Ok(json) = crate::json::parse(text) else {
+    let Some(json) = json else {
         return HandshakeState::default();
     };
     let strings = |key: &str| {
@@ -5167,6 +5448,94 @@ mod tests {
     }
 
     #[test]
+    fn the_cbor_handshake_uses_reference_keys_and_types() {
+        let authorization = ferrox_core::b64::encode(
+            br#"{"Authorization":{"ID":"AQID","AccessType":"test","Expires":"2030-01-02T03:04:05.123456789Z"},"SigningKeyID":"BAUG","Signature":"BwgJ"}"#,
+        );
+        let authorizations = [authorization];
+        let features = vec!["coarse-location".to_owned()];
+        let identity = Identity {
+            session_id: "session",
+            authorizations: &authorizations,
+            sponsor: "07D1ACD69B3AC7A2",
+            propagation: "EE0B7486ACAE75AA",
+            platform: "Android",
+            version: "453",
+            egress_region: Some("IR"),
+            device_region: Some("IR"),
+            device_location: Some("w3g"),
+            client_features: &features,
+            split_tunnel: true,
+            split_tunnel_regions: &["US".to_owned()],
+            api_encoding: ApiEncoding::Cbor,
+            compress_tactics: true,
+        };
+        let payload = packed_handshake_body("SSH", &identity, None).expect("packed handshake");
+        assert_eq!(&payload[..2], &[0, 1]);
+        let (value, used) = crate::psiphon_broker::decode(&payload[2..]).expect("cbor map");
+        assert_eq!(used, payload.len() - 2);
+        assert_eq!(value.get(5), None);
+        assert_eq!(value.get(8), Some(&crate::psiphon_broker::Value::UInt(453)));
+        assert_eq!(
+            value.get(15),
+            Some(&crate::psiphon_broker::Value::Text("SSH".to_owned()))
+        );
+        assert_eq!(
+            value.get(43),
+            Some(&crate::psiphon_broker::Value::Text("IR".to_owned()))
+        );
+        assert_eq!(
+            value.get(63),
+            Some(&crate::psiphon_broker::Value::Text("1".to_owned()))
+        );
+        assert_eq!(value.get(168), Some(&crate::psiphon_broker::Value::UInt(1)));
+        let packed = match value.get(1) {
+            Some(crate::psiphon_broker::Value::Bytes(bytes)) => bytes,
+            other => panic!("authorizations: {other:?}"),
+        };
+        let (auths, used) = crate::psiphon_broker::decode(packed).expect("authorization array");
+        assert_eq!(used, packed.len());
+        let crate::psiphon_broker::Value::Array(items) = auths else {
+            panic!("authorizations are not an array");
+        };
+        let Some(crate::psiphon_broker::Value::Map(auth)) = items.first() else {
+            panic!("authorization is not a map");
+        };
+        assert_eq!(
+            auth.iter()
+                .find(|(key, _)| { key == &crate::psiphon_broker::Value::UInt(3) }),
+            Some(&(
+                crate::psiphon_broker::Value::UInt(3),
+                crate::psiphon_broker::Value::Text("2030-01-02T03:04:05.123456789Z".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn a_cbor_handshake_reply_maps_integer_keys() {
+        let reply = crate::psiphon_broker::Value::Map(vec![
+            (
+                crate::psiphon_broker::Value::UInt(1),
+                crate::psiphon_broker::Value::Array(vec![crate::psiphon_broker::Value::Text(
+                    "https://example.test/".to_owned(),
+                )]),
+            ),
+            (
+                crate::psiphon_broker::Value::UInt(6),
+                crate::psiphon_broker::Value::Text("IR".to_owned()),
+            ),
+            (
+                crate::psiphon_broker::Value::UInt(7),
+                crate::psiphon_broker::Value::Text("192.0.2.1".to_owned()),
+            ),
+        ]);
+        let state = parse_handshake(&crate::psiphon_broker::encode(&reply));
+        assert_eq!(state.homepages, vec!["https://example.test/".to_owned()]);
+        assert_eq!(state.client_region.as_deref(), Some("IR"));
+        assert_eq!(state.client_address.as_deref(), Some("192.0.2.1"));
+    }
+
+    #[test]
     fn the_handshake_carries_device_identity() {
         let features = vec!["coarse-location".to_owned(), "unsafe\"feature".to_owned()];
         let identity = Identity {
@@ -5182,6 +5551,8 @@ mod tests {
             client_features: &features,
             split_tunnel: true,
             split_tunnel_regions: &["US".to_owned(), "DE".to_owned()],
+            api_encoding: ApiEncoding::Json,
+            compress_tactics: false,
         };
         assert_eq!(
             handshake_body("UNFRONTED-MEEK-HTTPS-OSSH", &identity, None),
@@ -5204,6 +5575,8 @@ mod tests {
             client_features: &[],
             split_tunnel: false,
             split_tunnel_regions: &[],
+            api_encoding: ApiEncoding::Json,
+            compress_tactics: false,
         };
         assert_eq!(
             handshake_body("SSH", &identity, None),

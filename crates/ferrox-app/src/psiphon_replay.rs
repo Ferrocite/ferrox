@@ -416,6 +416,7 @@ mod tests {
             provider_id: None,
             fronting_provider_id: None,
             scan_cdn: true,
+            ssh_api: true,
             direct: true,
             tls: false,
             tls_port: None,

@@ -568,6 +568,7 @@ impl Endpoint {
             client_cert: None,
             client_random: None,
             padding: None,
+            ..Default::default()
         }
     }
 

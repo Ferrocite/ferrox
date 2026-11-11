@@ -16,6 +16,8 @@ pub(crate) struct Hello {
     pub msg: Vec<u8>,
     pub random: [u8; 32],
     pub session_id: [u8; 32],
+    /// A shaped hello that omits the legacy session id entirely.
+    session_id_empty: bool,
     pub shares: Vec<Share>,
     profile: &'static Profile,
     /// A config's `cipherSuites` list, which the stock hello puts where a preset's table would.
@@ -92,6 +94,7 @@ impl Hello {
             msg: Vec::new(),
             random,
             session_id,
+            session_id_empty: false,
             shares,
             profile,
             ciphers: None,
@@ -234,7 +237,7 @@ impl Hello {
         let mut outer = self.encode_body(
             TLS12,
             &self.random,
-            &self.session_id,
+            self.session_id(),
             entries,
             false,
             shares,
@@ -291,10 +294,11 @@ impl Hello {
             message_len,
             shares,
         };
+        let session_id = self.session_id();
         let transcript = self.encode_prepared(
             Prepared {
-                session_id: &self.session_id,
-                message_len: message_len + self.session_id.len(),
+                session_id,
+                message_len: message_len + session_id.len(),
                 ..head
             },
             &entries,
@@ -336,6 +340,7 @@ impl Hello {
             msg,
             random: self.random,
             session_id: self.session_id,
+            session_id_empty: self.session_id_empty,
             shares,
             profile: self.profile,
             ciphers: self.ciphers.clone(),
@@ -441,14 +446,29 @@ impl Hello {
     /// The 16-byte sealed session id replaces the random one in place, at the
     /// handshake message's fixed session-id offset (4 header + 2 version + 32 random + 1).
     pub(crate) fn seal_session(&mut self, sealed: [u8; 32]) {
+        if self.session_id_empty {
+            self.session_id_empty = false;
+            self.msg = self.encode(None);
+        }
         self.session_id = sealed;
         self.msg[39..71].copy_from_slice(&sealed);
     }
 
     /// Clears the session id so the REALITY seal covers an all-zero id, as xray zeroes it.
     pub(crate) fn zero_session(&mut self) {
+        if self.session_id_empty {
+            self.session_id_empty = false;
+            self.msg = self.encode(None);
+        }
         self.session_id = [0u8; 32];
         self.msg[39..71].fill(0);
+    }
+
+    /// Omits the legacy session id, as uTLS does for Psiphon's
+    /// `NoDefaultTLSSessionIDProbability`.
+    pub(crate) fn clear_session_id(&mut self) {
+        self.session_id_empty = true;
+        self.msg = self.encode(None);
     }
 
     pub(crate) fn ech_inner(&self) -> Option<&[u8]> {
@@ -470,11 +490,20 @@ impl Hello {
         self.encode_with(&self.shares, cookie)
     }
 
+    /// The legacy session id this hello puts on the wire, or no bytes when it is omitted.
+    fn session_id(&self) -> &[u8] {
+        if self.session_id_empty {
+            &[]
+        } else {
+            &self.session_id
+        }
+    }
+
     /// The hello's own length ahead of its extensions: version, random, session id, cipher list
     /// and the one compression method. The padding extension is sized from it, and the message
     /// is reserved to it, so neither pass guesses at the width.
     fn fixed_len(&self) -> usize {
-        2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.cipher_table().len() + 1 + 1
+        2 + 32 + 1 + self.session_id().len() + 2 + 2 * self.cipher_table().len() + 1 + 1
     }
 
     /// Two walks of one body rule and two buffers: the first runs every walk into a width, so the
@@ -496,8 +525,9 @@ impl Hello {
         msg.extend_from_slice(&(body as u32).to_be_bytes()[1..]);
         msg.extend_from_slice(&TLS12.to_be_bytes());
         msg.extend_from_slice(&self.random);
-        msg.push(self.session_id.len() as u8);
-        msg.extend_from_slice(&self.session_id);
+        let session_id = self.session_id();
+        msg.push(session_id.len() as u8);
+        msg.extend_from_slice(session_id);
         msg.extend_from_slice(&(2 * self.cipher_table().len() as u16).to_be_bytes());
         for &cipher in self.cipher_table() {
             msg.extend_from_slice(&grease_or(cipher, &self.grease, 0).to_be_bytes());
@@ -724,7 +754,7 @@ impl Hello {
         Self::pad_prepared(
             entries,
             self.cipher_table().len(),
-            self.session_id.len(),
+            self.session_id().len(),
             self.padding,
         )
     }
@@ -769,6 +799,7 @@ impl Hello {
             msg: Vec::new(),
             random: [0u8; 32],
             session_id: [0u8; 32],
+            session_id_empty: false,
             shares: keys::canonical(groups),
             profile,
             ciphers: None,
@@ -875,7 +906,7 @@ fn distinct_grease(mut grease: [u16; 7]) -> [u16; 7] {
             .iter()
             .any(|other| grease_value(&grease, *other) == grease_value(&grease, slot))
         {
-            grease[slot] = (grease[slot] & 0xff00) | (grease[slot] + 0x10) & 0xf0;
+            grease[slot] = (grease[slot] & 0xff00) | (grease[slot].wrapping_add(0x10)) & 0xf0;
         }
     }
     grease
@@ -1143,6 +1174,20 @@ mod tests {
             .expect("a shaped dial hello");
         assert_eq!(hello.random, random);
         assert_eq!(&hello.msg[6..38], &random);
+    }
+
+    #[test]
+    fn an_omitted_session_id_leaves_no_bytes() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        let before = hello.msg.len();
+        hello.clear_session_id();
+        assert_eq!(hello.msg[38], 0);
+        assert_eq!(hello.msg.len(), before - 32);
     }
 
     #[test]

@@ -156,6 +156,12 @@ impl Fingerprint {
         self.0
     }
 
+    /// Whether this hello is uTLS's randomized generator, the one profile Psiphon's
+    /// `NoDefaultTLSSessionIDProbability` may strip a session id from on TLS 1.3.
+    pub fn is_randomized(self) -> bool {
+        self.0.is_some_and(|profile| profile.name == "randomized")
+    }
+
     /// REALITY needs TLS 1.3 suites and an X25519MLKEM768 share; android is the one preset without them.
     pub(crate) fn reality_profile(self) -> Option<&'static Profile> {
         self.0
