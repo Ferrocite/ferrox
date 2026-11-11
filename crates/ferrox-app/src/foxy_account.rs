@@ -495,6 +495,8 @@ pub(crate) struct Endpoint {
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
     /// The shaped hello the HTTP/2 dials ride; `None` keeps the plane's own.
     pub(crate) h2_fingerprint: Option<ferrox_core::tls::shaped::Fingerprint>,
+    /// A dial that reopens the session instead of resuming it, the way a first connection does.
+    pub(crate) no_resumption: bool,
 }
 
 impl Endpoint {
@@ -521,6 +523,7 @@ impl Endpoint {
             roots,
             upstream: None,
             h2_fingerprint: None,
+            no_resumption: false,
         })
     }
 
@@ -575,6 +578,9 @@ impl Endpoint {
         cfg.fingerprint = self
             .h2_fingerprint
             .or_else(|| ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148"));
+        if self.no_resumption {
+            cfg.resumption = false;
+        }
         cfg
     }
 
@@ -582,6 +588,14 @@ impl Endpoint {
     #[must_use]
     pub(crate) fn with_h2_fingerprint(mut self, name: &str) -> Self {
         self.h2_fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve(name);
+        self
+    }
+
+    /// A dial that does not resume the plane's session: the reference dials a full
+    /// handshake per call, so its every exchange is the one a first connection makes.
+    #[must_use]
+    pub(crate) fn without_resumption(mut self) -> Self {
+        self.no_resumption = true;
         self
     }
 

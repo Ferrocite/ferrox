@@ -357,9 +357,11 @@ impl RegisterError {
 fn register(spec: &WarpSpec) -> Result<Identity, String> {
     let mut last = String::new();
     for base in spec.api_url() {
-        let Some(endpoint) = Endpoint::parse(&base, crate::quic::system_roots())
-            .map(|endpoint| endpoint.with_h2_fingerprint("chrome_plain"))
-        else {
+        let Some(endpoint) = Endpoint::parse(&base, crate::quic::system_roots()).map(|endpoint| {
+            endpoint
+                .with_h2_fingerprint("chrome_plain")
+                .without_resumption()
+        }) else {
             last = format!("warp: `{base}` is not an https API origin");
             continue;
         };
