@@ -46,6 +46,7 @@ pub(crate) struct SsUser {
 pub(crate) type SsUsers = std::sync::Arc<[SsUser]>;
 
 /// An inbound's clients, plus the single password a 2022 inbound's PSK list is read from.
+#[derive(Clone)]
 pub(crate) struct SsAccounts {
     pub(crate) users: SsUsers,
     pub(crate) password: String,
@@ -384,7 +385,7 @@ pub(crate) fn serve_xhttp(
     });
 }
 
-fn serve_xhttp_accepted(
+pub(crate) fn serve_xhttp_accepted(
     reader: Box<dyn crate::proxy::WindowRead + Send>,
     mut writer: crate::xhttp::XhttpWriter,
     users: &[SsUser],
