@@ -323,7 +323,7 @@ fn registration_headers(bearer: Option<&str>) -> Vec<(String, String)> {
         ("Accept".to_owned(), "application/json".to_owned()),
     ];
     if let Some(token) = bearer {
-        headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
+        headers.push(("Authorization".to_owned(), token.to_owned()));
     }
     headers
 }
