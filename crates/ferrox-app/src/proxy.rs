@@ -14265,7 +14265,7 @@ fn bind_udp_front(address: &str, tcp: bool, wanted: bool, label: &str) -> UdpFro
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RelayFront {
     NotRelay,
     Served,
