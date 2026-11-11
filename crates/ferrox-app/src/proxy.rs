@@ -2012,7 +2012,14 @@ impl Role {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
                     let reader = crate::xhttp::ChainReader::new(prefix, reader);
-                    serve_trojan_xhttp_carrier(reader, writer, &settings, keys.as_ref(), freedom);
+                    serve_trojan_xhttp_carrier(
+                        reader,
+                        writer,
+                        &settings,
+                        keys.as_ref(),
+                        freedom,
+                        |_, _| true,
+                    );
                 });
             }
             Carrier::HttpUpgrade { path, host, .. } => {
@@ -21161,7 +21168,9 @@ fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom
             let Ok(read) = stream.try_clone() else {
                 return;
             };
-            serve_trojan_xhttp_carrier(read, stream, settings, key, freedom);
+            // A bare H1 socket can bound its own first read: an idle peer must not hold a setup lane.
+            let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
+            serve_trojan_xhttp_carrier(read, stream, settings, key, freedom, arm);
         }
         Carrier::HttpHeader { path } => {
             serve_trojan_httpheader(stream, key, path.as_str(), freedom);
@@ -21602,7 +21611,7 @@ fn serve_trojan_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom);
+            serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom, |_, _| true);
         }
         Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -21670,7 +21679,7 @@ fn serve_trojan_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom);
+                serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom, |_, _| true);
             });
         }
         Carrier::HttpUpgrade { path, host, .. } => {
@@ -22105,17 +22114,20 @@ fn serve_session_trojan_xhttp<
 fn serve_trojan_xhttp_carrier<
     R: Read + Send + 'static + RelayPoll,
     W: FrameWrite + Send + 'static,
+    A: FnMut(&R, Option<Duration>) -> bool + Send + 'static,
 >(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
     key: &[[u8; 56]],
     freedom: bool,
+    arm: A,
 ) {
     let settings = settings.clone();
     let key = key.to_vec();
     let sniffing = crate::sniff::current();
     let mut access = Some(crate::accesslog::snapshot());
+    let mut arm = Some(arm);
     let mut read = Some(read);
     let mut write = Some(write);
     lane_pool::submit_setup(
@@ -22125,7 +22137,8 @@ fn serve_trojan_xhttp_carrier<
             let _flow = crate::accesslog::install_snapshot(access);
             let read = read.take().expect("one xhttp preface");
             let write = write.take().expect("one xhttp preface");
-            serve_trojan_xhttp_carrier_now(read, write, &settings, &key, freedom);
+            let arm = arm.take().expect("one xhttp preface");
+            serve_trojan_xhttp_carrier_now(read, write, &settings, &key, freedom, arm);
             Next::Done
         }),
         Box::new(|| {}),
@@ -22135,14 +22148,16 @@ fn serve_trojan_xhttp_carrier<
 fn serve_trojan_xhttp_carrier_now<
     R: Read + Send + 'static + RelayPoll,
     W: FrameWrite + Send + 'static,
+    A: FnMut(&R, Option<Duration>) -> bool,
 >(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
     key: &[[u8; 56]],
     freedom: bool,
+    arm: A,
 ) {
-    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+    let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
         return;
     };
     if !h2 {
@@ -53771,7 +53786,9 @@ mod tests {
         lane_pool::submit(
             Box::new(move || {
                 let gate = read_gate.take().expect("one xhttp preface");
-                serve_trojan_xhttp_carrier(Stalled(gate), Null, &settings, &[key], true);
+                serve_trojan_xhttp_carrier(Stalled(gate), Null, &settings, &[key], true, |_, _| {
+                    true
+                });
                 done.send(()).expect("done");
                 Next::Done
             }),
@@ -53851,7 +53868,14 @@ mod tests {
                         let _flow = lane_flow(None, None, "", 0);
                         let (reader, writer) = session_halves(session, out);
                         let reader = crate::xhttp::ChainReader::new(prefix, reader);
-                        serve_trojan_xhttp_carrier(reader, writer, &settings, &keys, true);
+                        serve_trojan_xhttp_carrier(
+                            reader,
+                            writer,
+                            &settings,
+                            &keys,
+                            true,
+                            |_, _| true,
+                        );
                     });
                 });
             }
@@ -58646,7 +58670,14 @@ mod tests {
                 let Ok(read) = stream.try_clone() else {
                     continue;
                 };
-                serve_trojan_xhttp_carrier(read, stream, &served, &[trojan_key("secret")], true);
+                serve_trojan_xhttp_carrier(
+                    read,
+                    stream,
+                    &served,
+                    &[trojan_key("secret")],
+                    true,
+                    |_, _| true,
+                );
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
