@@ -8,6 +8,7 @@
 #   ferrox-cli up --psiphon-cdn --vpn          the same lane, CDN fronting requested
 #   ferrox-cli locations --veepn               VeePN region ids
 #   ferrox-cli up --vless 'vless://...'        any vless share link
+#   ferrox-cli up --vmess 'vmess://...'        any vmess share link
 #   ferrox-cli up --config mine.json           any config the binary serves
 #   ferrox-cli down | status | ports | tun | version
 #
@@ -201,6 +202,12 @@ need_value() {
   a config instead: ferrox-cli up --config mine.json
   no server to name: ferrox-cli up --foxy   or   ferrox-cli up --veepn   or   ferrox-cli up --psiphon"
   fi
+  if [ "$flag" = --vmess ]; then
+    die "--vmess needs a vmess:// share link or HOST:PORT; nothing was started.
+  example: ferrox-cli up --vmess 'vmess://base64-json'
+  or: ferrox-cli up --vmess host:443 --uuid UUID
+  a config instead: ferrox-cli up --config mine.json"
+  fi
   die "$flag needs $hint; nothing was started (see --help)."
 }
 
@@ -275,8 +282,8 @@ outbound (choose one)
   --veepn                VeePN lane; anonymous, no account and no server
   --psiphon              Psiphon lane; native OSSH/SSH, no client binary
   --psiphon-cdn          the same lane with CDN fronting + beast mode requested
-  --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
-  --vmess HOST:PORT --uuid ID
+  --vless LINK           any vless:// share link
+  --vmess LINK|HOST:PORT any vmess:// share link, or HOST:PORT with --uuid ID
   --trojan HOST:PORT --password PW
   --ss HOST:PORT --method METHOD --password PW
   --config FILE          any JSON config this binary serves, used verbatim
@@ -1174,111 +1181,267 @@ print(json.dumps({"protocol": "psiphon", "settings": settings}))
 PY
 }
 
-# vless link -> xray json, for the five carriers this tree proves in CI.
-vless_outbound() {
-  python3 - "$VLESS" <<'PY'
-import json, sys
-from urllib.parse import unquote, urlsplit
+# A vless:// or vmess:// share link, or --vmess HOST:PORT, -> xray json.
+vless_outbound() { share_outbound vless "$VLESS" "" ""; }
+vmess_outbound() { share_outbound vmess "$VMESS" "$VMESS_ID" "$VMESS_NETWORK"; }
 
-link = sys.argv[1]
-if not link.startswith("vless://"):
-    sys.exit("--vless wants a vless:// link")
-body, _, name = link[len("vless://"):].partition("#")
-body, _, query = body.partition("?")
-uuid, _, hostport = body.rpartition("@")
-if not uuid or not hostport:
-    sys.exit("a vless link is vless://{uuid}@{host}:{port}?{query}")
-host, _, port = hostport.rpartition(":")
-params = {}
-for pair in query.split("&"):
-    if pair:
+share_outbound() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import base64, json, sys
+from urllib.parse import unquote
+
+def fail(message):
+    sys.exit(message)
+
+def text(value):
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return text(value[0]) if value else ""
+    return str(value)
+
+def flag(value):
+    return text(value).strip().lower() in ("1", "true", "yes", "on")
+
+def host_port(value, who):
+    raw = text(value).strip().split("/", 1)[0]
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end < 0:
+            fail(f"{who} wants [host]:port")
+        host = raw[1:end]
+        rest = raw[end + 1:]
+        if not rest.startswith(":"):
+            fail(f"{who} wants [host]:port")
+        port = rest[1:]
+    else:
+        host, sep, port = raw.rpartition(":")
+        if not sep:
+            fail(f"{who} wants HOST:PORT")
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        fail(f"{who} wants HOST:PORT")
+    return host, int(port)
+
+def parse_uri(link, scheme):
+    if not link.lower().startswith(scheme + "://"):
+        fail(f"--{scheme} wants a {scheme}:// link")
+    body, _, name = link[len(scheme) + 3:].partition("#")
+    body, _, query = body.partition("?")
+    user, _, hostport = body.rpartition("@")
+    if not user or not hostport:
+        fail(f"a {scheme} link is {scheme}://{{uuid}}@{{host}}:{{port}}?{{query}}")
+    host, port = host_port(hostport, f"--{scheme}")
+    params = {}
+    for pair in query.split("&"):
+        if not pair:
+            continue
         key, _, value = pair.partition("=")
-        params[unquote(key)] = unquote(value)
+        key = unquote(key).lower()
+        if key not in params:
+            params[key] = unquote(value)
+    return unquote(user), host, port, params, network_of(params), params.get("headertype", "")
 
-kind = (params.get("type") or "tcp").lower()
-security = (params.get("security") or "none").lower()
-sni = params.get("sni") or params.get("peer") or ""
-hosthdr = params.get("host") or ""
-path = params.get("path") or ""
-service = params.get("serviceName") or ""
-mode = params.get("mode") or ""
-flow = params.get("flow") or ""
+def network_of(params):
+    kind = text(params.get("type")) or text(params.get("net")) or "tcp"
+    return kind.strip().lower()
 
-stream = {"network": "tcp" if kind == "raw" else kind}
-if kind in ("ws", "websocket"):
-    ws = {"path": path or "/"}
-    if hosthdr:
-        ws["headers"] = {"Host": hosthdr}
-    stream["wsSettings"] = ws
-elif kind == "grpc":
-    stream["grpcSettings"] = {"serviceName": service}
-elif kind == "httpupgrade":
-    settings = {"path": path or "/"}
-    if hosthdr:
-        settings["host"] = hosthdr
-    stream["httpupgradeSettings"] = settings
-elif kind == "xhttp":
-    settings = {"path": path or "/"}
-    if hosthdr:
-        settings["host"] = hosthdr
-    if mode:
-        settings["mode"] = mode
-    stream["xhttpSettings"] = settings
-elif kind in ("tcp", "raw", ""):
-    pass
+def decode_vmess(payload):
+    payload = unquote(payload).strip()
+    compact = "".join(payload.split())
+    for decode in (base64.urlsafe_b64decode, base64.b64decode):
+        for candidate in (compact, compact + "=" * (-len(compact) % 4)):
+            try:
+                data = json.loads(decode(candidate).decode("utf-8"))
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+    fail("--vmess could not decode the vmess:// payload as base64 JSON")
+
+def parse_vmess(link, uuid_arg, network_arg):
+    if link.lower().startswith("vmess://"):
+        head = link[len("vmess://"):].partition("#")[0]
+        if "@" in head.partition("?")[0]:
+            uuid, host, port, params, network, header = parse_uri(link, "vmess")
+            cipher = text(params.get("encryption")) or text(params.get("scy")) or "auto"
+            return uuid, host, port, params, network, header, cipher
+        data = decode_vmess(head)
+        for key in ("add", "port", "id"):
+            if not text(data.get(key)):
+                fail(f"a vmess link needs `{key}`")
+        host, port = host_port(f"{text(data.get('add'))}:{text(data.get('port'))}", "--vmess")
+        params = {key.lower(): (value if key.lower() == "extra" else text(value))
+                  for key, value in data.items()}
+        network = text(data.get("net")) or "tcp"
+        header = text(data.get("type"))
+        cipher = text(data.get("scy")) or "auto"
+        if not params.get("security") and text(data.get("tls")).lower() not in ("", "none"):
+            params["security"] = text(data.get("tls"))
+        return text(data.get("id")), host, port, params, network, header, cipher
+    host, port = host_port(link, "--vmess")
+    if not uuid_arg:
+        fail("--vmess needs --uuid ID as well, e.g. ferrox-cli up --vmess host:443 --uuid UUID")
+    return uuid_arg, host, port, {}, network_arg or "tcp", "", "auto"
+
+def value(params, *names):
+    for name in names:
+        found = text(params.get(name))
+        if found:
+            return found
+    return ""
+
+def alpn_list(text_value):
+    return [item.strip() for item in text_value.split(",") if item.strip()]
+
+def build_stream(params, address, network, header):
+    kind = network.strip().lower()
+    if kind in ("raw", ""):
+        kind = "tcp"
+    if kind == "websocket":
+        kind = "ws"
+    security = value(params, "security", "tls").strip().lower()
+    if security in ("", "none", "false", "off"):
+        security = "none"
+    if security == "xtls":
+        security = "tls"
+    if security == "reality" or value(params, "pbk"):
+        security = "reality"
+
+    host_header = value(params, "host")
+    path = value(params, "path") or "/"
+    stream = {"network": kind}
+
+    if kind == "tcp":
+        if header.strip().lower() == "http":
+            request = {"version": "1.1", "method": "GET", "path": [path]}
+            if host_header:
+                request["headers"] = {"Host": [host_header]}
+            stream["tcpSettings"] = {"header": {"type": "http", "request": request}}
+    elif kind == "ws":
+        settings = {"path": path}
+        if host_header:
+            settings["headers"] = {"Host": host_header}
+        if value(params, "ed").isdigit() and "ed=" not in path:
+            settings["path"] = f"{path}{'&' if '?' in path else '?'}ed={value(params, 'ed')}"
+            settings["maxEarlyData"] = int(value(params, "ed"))
+        if value(params, "eh"):
+            settings["earlyDataHeaderName"] = value(params, "eh")
+        stream["wsSettings"] = settings
+    elif kind == "grpc":
+        settings = {"serviceName": value(params, "servicename", "service", "path")}
+        if (value(params, "mode") or header).lower() == "multi":
+            settings["multiMode"] = True
+        if value(params, "authority") or host_header:
+            settings["authority"] = value(params, "authority") or host_header
+        stream["grpcSettings"] = settings
+    elif kind == "httpupgrade":
+        settings = {"path": path}
+        if host_header:
+            settings["host"] = host_header
+        stream["httpupgradeSettings"] = settings
+    elif kind in ("xhttp", "splithttp"):
+        settings = {"path": path}
+        if host_header:
+            settings["host"] = host_header
+        if value(params, "mode"):
+            settings["mode"] = value(params, "mode")
+        extra = params.get("extra")
+        if extra:
+            settings["extra"] = extra if isinstance(extra, dict) else text(extra)
+        stream["xhttpSettings"] = settings
+    elif kind in ("http", "h2", "h3"):
+        settings = {"path": path}
+        if host_header:
+            settings["host"] = [host_header]
+        stream["httpSettings"] = settings
+    elif kind in ("kcp", "mkcp"):
+        settings = {}
+        seed = value(params, "seed") or value(params, "path")
+        if seed:
+            settings["seed"] = seed
+        if header:
+            settings["header"] = {"type": header}
+        for source, target in (
+            ("mtu", "mtu"), ("tti", "tti"),
+            ("uplinkcapacity", "uplinkCapacity"),
+            ("downlinkcapacity", "downlinkCapacity"),
+            ("congestion", "congestion"),
+            ("readbuffersize", "readBufferSize"),
+            ("writebuffersize", "writeBufferSize"),
+        ):
+            raw = value(params, source)
+            if raw.isdigit():
+                settings[target] = int(raw)
+        stream["kcpSettings"] = settings
+    elif kind == "quic":
+        settings = {
+            "security": value(params, "quicsecurity") or host_header or "none",
+            "key": value(params, "key") or value(params, "path"),
+            "header": {"type": header or "none"},
+        }
+        stream["quicSettings"] = settings
+    else:
+        fail(f"`{kind}` needs --config: this converter writes tcp, ws, grpc, httpupgrade, xhttp, h2, kcp and quic")
+
+    if security == "tls":
+        settings = {"serverName": value(params, "sni", "peer") or address}
+        if any(flag(params.get(key)) for key in ("allowinsecure", "insecure")):
+            settings["allowInsecure"] = True
+        if value(params, "fp"):
+            settings["fingerprint"] = value(params, "fp")
+        if value(params, "alpn"):
+            settings["alpn"] = alpn_list(value(params, "alpn"))
+        if value(params, "cs"):
+            settings["cipherSuites"] = value(params, "cs")
+        if value(params, "cp"):
+            settings["curvePreferences"] = value(params, "cp")
+        if flag(params.get("esr")):
+            settings["enableSessionResumption"] = True
+        if value(params, "vcn"):
+            settings["verifyPeerCertByName"] = value(params, "vcn")
+        if value(params, "pcs"):
+            settings["pinnedPeerCertSha256"] = value(params, "pcs")
+        if value(params, "ech"):
+            settings["echConfigList"] = value(params, "ech")
+        stream["security"] = "tls"
+        stream["tlsSettings"] = settings
+    elif security == "reality":
+        if not value(params, "pbk"):
+            fail("a reality link without `pbk` names no server key")
+        settings = {"serverName": value(params, "sni", "peer") or address,
+                    "publicKey": value(params, "pbk")}
+        if value(params, "sid"):
+            settings["shortId"] = value(params, "sid")
+        if value(params, "fp"):
+            settings["fingerprint"] = value(params, "fp")
+        if value(params, "spx"):
+            settings["spiderX"] = value(params, "spx")
+        if value(params, "pqv"):
+            settings["mldsa65Verify"] = value(params, "pqv")
+        stream["security"] = "reality"
+        stream["realitySettings"] = settings
+    elif security == "none":
+        stream["security"] = "none"
+    else:
+        fail(f"security `{security}` needs --config")
+    return stream
+
+scheme, link, uuid_arg, network_arg = sys.argv[1:5]
+if scheme == "vless":
+    uuid, host, port, params, network, header = parse_uri(link, "vless")
+    cipher = ""
 else:
-    sys.exit(f"`{kind}` needs --config: this converter writes tcp, ws, grpc, httpupgrade and xhttp")
-
-if security == "tls":
-    tls = {"serverName": sni or host, "allowInsecure": False}
-    if params.get("fp"):
-        tls["fingerprint"] = params["fp"]
-    if params.get("alpn"):
-        tls["alpn"] = params["alpn"].split(",")
-    stream["security"] = "tls"
-    stream["tlsSettings"] = tls
-elif security == "reality":
-    if not params.get("pbk"):
-        sys.exit("a reality link without `pbk` names no server key")
-    reality = {"serverName": sni or host, "publicKey": params["pbk"]}
-    if params.get("sid"):
-        reality["shortId"] = params["sid"]
-    if params.get("fp"):
-        reality["fingerprint"] = params["fp"]
-    if params.get("spx"):
-        reality["spiderX"] = params["spx"]
-    stream["security"] = "reality"
-    stream["realitySettings"] = reality
-elif security in ("none", ""):
-    stream["security"] = "none"
+    uuid, host, port, params, network, header, cipher = parse_vmess(link, uuid_arg, network_arg)
+stream = build_stream(params, host, network, header)
+if scheme == "vless":
+    user = {"id": uuid, "encryption": value(params, "encryption") or "none"}
+    if value(params, "flow") and value(params, "flow") != "none":
+        user["flow"] = value(params, "flow")
 else:
-    sys.exit(f"security `{security}` needs --config")
-
-user = {"id": uuid, "encryption": "none"}
-if flow and flow != "none":
-    user["flow"] = flow
+    user = {"id": uuid, "security": cipher or "auto"}
 print(json.dumps({
-    "protocol": "vless",
-    "settings": {"vnext": [{"address": host, "port": int(port), "users": [user]}]},
-    "streamSettings": stream,
-}))
-PY
-}
-
-vmess_outbound() {
-  python3 - "$VMESS" "$VMESS_ID" "$VMESS_NETWORK" <<'PY'
-import json, sys
-hostport, uuid, network = sys.argv[1:4]
-host, _, port = hostport.rpartition(":")
-if not host or not port.isdigit():
-    sys.exit("--vmess wants HOST:PORT and --uuid ID")
-if not uuid:
-    sys.exit("--vmess needs --uuid ID as well, e.g. ferrox-cli up --vmess host:443 --uuid UUID")
-stream = {"network": network or "tcp"}
-print(json.dumps({
-    "protocol": "vmess",
-    "settings": {"vnext": [{"address": host, "port": int(port),
-                            "users": [{"id": uuid, "security": "auto"}]}]},
+    "protocol": scheme if scheme == "vless" else "vmess",
+    "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
     "streamSettings": stream,
 }))
 PY
@@ -2053,7 +2216,18 @@ build_config() {
       outbound="$(build_outbound psiphon)" || exit 1
       save_lane_location
       ;;
-    vmess) outbound="$(build_outbound vmess)" || exit 1 ;;
+    vmess)
+      case "$VMESS" in
+        vmess://*) ;;
+        *:*)
+          [ -n "$VMESS_ID" ] || die "--vmess wants a vmess:// share link, or HOST:PORT with --uuid ID; nothing was started."
+          ;;
+        *) die "--vmess wants a vmess:// share link, or HOST:PORT with --uuid ID, got '$VMESS'; nothing was started.
+  example: ferrox-cli up --vmess 'vmess://base64-json'
+  or: ferrox-cli up --vmess host:443 --uuid UUID" ;;
+      esac
+      outbound="$(build_outbound vmess)" || exit 1
+      ;;
     trojan) outbound="$(build_outbound trojan)" || exit 1 ;;
     ss) outbound="$(build_outbound ss)" || exit 1 ;;
     config)
@@ -2068,7 +2242,7 @@ ferrox-cli: no outbound chosen; nothing was started.
   --veepn                anonymous: no account and no server
   --psiphon              native OSSH/SSH, no client binary
   --vless 'vless://...'  a share link
-  --vmess HOST:PORT --uuid ID
+  --vmess 'vmess://...'  a share link, or HOST:PORT with --uuid ID
   --trojan HOST:PORT --password PW
   --ss HOST:PORT --method METHOD --password PW
   --config FILE          any JSON config this binary serves
@@ -2777,7 +2951,7 @@ while [ $# -gt 0 ]; do
     --psiphon-establish-timeout) need_value --psiphon-establish-timeout "seconds, at least 1" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-establish-timeout wants seconds, at least 1, got '$2'; nothing was started." ;; esac; PSIPHON_ESTABLISH_TIMEOUT="$2"; shift 2 ;;
     --psiphon-emit-bytes) PSIPHON_EMIT_BYTES=1; shift ;;
     --vless) need_value --vless "a vless:// share link" "$#" "${2:-}"; OUTBOUND=vless; VLESS="$2"; shift 2 ;;
-    --vmess) need_value --vmess "HOST:PORT" "$#" "${2:-}"; OUTBOUND=vmess; VMESS="$2"; shift 2 ;;
+    --vmess) need_value --vmess "a vmess:// share link or HOST:PORT" "$#" "${2:-}"; OUTBOUND=vmess; VMESS="$2"; shift 2 ;;
     --uuid) need_value --uuid "the VMess user id" "$#" "${2:-}"; VMESS_ID="$2"; shift 2 ;;
     --network) need_value --network "tcp or ws" "$#" "${2:-}"; VMESS_NETWORK="$2"; shift 2 ;;
     --trojan) need_value --trojan "HOST:PORT" "$#" "${2:-}"; OUTBOUND=trojan; TROJAN="$2"; shift 2 ;;
