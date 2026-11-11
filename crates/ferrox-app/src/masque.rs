@@ -73,7 +73,6 @@ const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 pub(crate) struct MasqueOut {
     spec: ClientSpec,
     inner: Mutex<Option<Arc<Inner>>>,
-    edge: Option<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -88,19 +87,14 @@ struct Inner {
 impl MasqueOut {
     pub(crate) fn new(outbound: &Json) -> Result<Self, String> {
         let spec = ClientSpec::from(outbound)?;
-        let edge = format!("{}:{}", spec.address, spec.port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut resolved| resolved.next());
         Ok(Self {
             spec,
             inner: Mutex::new(None),
-            edge,
         })
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
-        self.edge
+        crate::proxy::resolve_outbound(&self.spec.address, self.spec.port)
     }
 
     fn ensure(&self) -> Result<Arc<Inner>, String> {
@@ -251,21 +245,7 @@ fn uses_h1(tls: &TlsConfig) -> bool {
 
 /// Open the TLS/HTTP-2 carrier and assemble its tunnel.
 fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
-    let edge = format!("{}:{}", spec.address, spec.port)
-        .to_socket_addrs()
-        .map_err(|error| {
-            format!(
-                "masque: cannot resolve `{}:{}`: {error}",
-                spec.address, spec.port
-            )
-        })?
-        .next()
-        .ok_or_else(|| {
-            format!(
-                "masque: `{}:{}` resolves to nothing",
-                spec.address, spec.port
-            )
-        })?;
+    let edge = resolve_edge(spec)?;
     let mut authority = authority(spec);
     if spec.warp.is_some() && split_host_port(&authority).is_none() {
         authority = format!("{authority}:443");
@@ -349,23 +329,11 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     ))
 }
 
-/// Resolve the configured edge to the first address it names.
+/// Resolve the configured edge to the first address it names, after the
+/// socket config's `addressPortStrategy` replaces it.
 fn resolve_edge(spec: &ClientSpec) -> Result<SocketAddr, String> {
-    format!("{}:{}", spec.address, spec.port)
-        .to_socket_addrs()
-        .map_err(|error| {
-            format!(
-                "masque: cannot resolve `{}:{}`: {error}",
-                spec.address, spec.port
-            )
-        })?
-        .next()
-        .ok_or_else(|| {
-            format!(
-                "masque: `{}:{}` resolves to nothing",
-                spec.address, spec.port
-            )
-        })
+    crate::proxy::resolve_outbound(&spec.address, spec.port)
+        .ok_or_else(|| format!("masque: cannot resolve `{}:{}`", spec.address, spec.port))
 }
 
 /// The stack every carrier feeds, and the thread that hands the handshake's

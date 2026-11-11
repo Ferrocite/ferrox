@@ -10,6 +10,7 @@ macro_rules! census {
 static ALLOC_COUNT: ferrox_core::alloc_count::Counting = ferrox_core::alloc_count::Counting;
 
 mod accesslog;
+mod address_port;
 mod budgets;
 #[cfg(test)]
 #[macro_use]

@@ -1317,11 +1317,23 @@ fn parse_target_strategy(outbound: &Json) -> Result<Option<FreedomDomain>, Strin
 fn parse_outbound_sockopt(
     outbound: &Json,
 ) -> Result<Option<crate::sockopt::SocketOptions>, String> {
-    crate::sockopt::parse_outbound(
+    let Some(options) = crate::sockopt::parse_outbound(
         outbound
             .get("streamSettings")
             .and_then(|s| s.get("sockopt")),
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    if options.address_port_strategy() != crate::sockopt::AddressPortStrategy::None
+        && outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("freedom"))
+    {
+        return Err("freedom outbound does not support \"sockopt.addressPortStrategy\"".to_owned());
+    }
+    Ok(Some(options))
 }
 
 /// The routing table a config runs with: its own block, or an empty one when an outbound names a
@@ -10864,12 +10876,19 @@ struct RungAttempt<'a> {
     explicit: bool,
 }
 
-/// The edge a configured address names: a numeric address parses straight from its parts, so no `String` is written only for the parser to take it apart again, and a name keeps the resolver's own host-and-port form rather than a `host:port` serialisation it would re-split. A numeric host in a name field is answered identically by both routes, so the resolution and the bytes on the wire do not change.
-fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
+/// The edge a configured address names: a numeric address parses straight from its parts, so no `String` is written only for the parser to take it apart again, and a name keeps the resolver's own host-and-port form rather than a `host:port` serialisation it would re-split. A numeric host in a name field is answered identically by both routes, so the resolution and the bytes on the wire do not change. The picked lane's `addressPortStrategy`, when it names one, replaces the name before the resolver sees it.
+pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
-    resolve_name(address, port, true)
+    let (address, port) = match DIAL_SOCKOPTS.with(|cell| cell.borrow().clone()) {
+        Some(options) => match options.address_port(address, port) {
+            Some((address, port)) => (std::borrow::Cow::Owned(address), port),
+            None => (std::borrow::Cow::Borrowed(address), port),
+        },
+        None => (std::borrow::Cow::Borrowed(address), port),
+    };
+    resolve_name(address.as_ref(), port, true)
 }
 
 fn dial_vless(
@@ -24391,7 +24410,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
 pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
-    serve_udp_lane_with(relay, out, associate, source, sockopts.as_deref());
+    serve_udp_lane_with(relay, out, associate, source, sockopts.as_ref());
 }
 
 fn serve_udp_lane_with(
@@ -24399,8 +24418,10 @@ fn serve_udp_lane_with(
     out: &Outbound,
     associate: Option<&Connection>,
     source: Option<SendThrough>,
-    sockopts: Option<&crate::sockopt::SocketOptions>,
+    sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
 ) {
+    let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
+    let sockopts = sockopts.map(Arc::as_ref);
     match out {
         // Loopback is TCP-only in the reference; a routed front tag has no datagram lane.
         Outbound::Loopback(loopback) => {
@@ -37548,6 +37569,88 @@ mod tests {
     /// The eight-flow cells each need the whole test pool; running two at once measures the
     /// harness's parallelism, not the lane scheduler.
     static EIGHT_FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_address_port_strategy_moves_the_outbound_edges_dial() {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+        let echo_port = echo.local_addr().expect("echo address").port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = echo.accept() {
+                let mut said = [0u8; 4];
+                if stream.read_exact(&mut said).is_ok() {
+                    let _ = stream.write_all(&said);
+                }
+            }
+        });
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns binds");
+        let dns_addr = dns.local_addr().expect("dns address");
+        thread::spawn(move || {
+            let mut query = vec![0u8; 512];
+            let Ok((read, from)) = dns.recv_from(&mut query) else {
+                return;
+            };
+            let mut target = Vec::new();
+            for label in ["127", "0", "0", "1"] {
+                target.push(label.len() as u8);
+                target.extend_from_slice(label.as_bytes());
+            }
+            target.push(0);
+            let mut rdata = Vec::new();
+            rdata.extend_from_slice(&0u16.to_be_bytes());
+            rdata.extend_from_slice(&0u16.to_be_bytes());
+            rdata.extend_from_slice(&echo_port.to_be_bytes());
+            rdata.extend_from_slice(&target);
+            let mut answer = query[..read].to_vec();
+            answer[2] = 0x81;
+            answer[3] = 0x80;
+            answer[6..8].copy_from_slice(&1u16.to_be_bytes());
+            answer.extend_from_slice(&[0xC0, 0x0C, 0, 33, 0, 1]);
+            answer.extend_from_slice(&60u32.to_be_bytes());
+            answer.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            answer.extend_from_slice(&rdata);
+            let _ = dns.send_to(&answer, from);
+        });
+        let _servers = crate::address_port::test_servers(vec![dns_addr]);
+
+        let json =
+            crate::json::parse(r#"{"addressPortStrategy":"SrvPortAndAddress"}"#).expect("json");
+        let options = crate::sockopt::parse_outbound(Some(&json))
+            .expect("parses")
+            .expect("present");
+        let _options = DialSockoptsGuard::enter(Some(Arc::new(options)));
+
+        let edge = resolve_outbound("_svc._tcp.example.test", 1).expect("the SRV answer resolves");
+        assert_eq!(edge, SocketAddr::new([127, 0, 0, 1].into(), echo_port));
+
+        let mut stream = std::net::TcpStream::connect(edge).expect("dials the replacement");
+        stream.write_all(b"ping").expect("writes");
+        let mut said = [0u8; 4];
+        stream.read_exact(&mut said).expect("reads");
+        assert_eq!(&said, b"ping", "the wire reached the strategy's edge");
+    }
+
+    #[test]
+    fn freedom_refuses_an_address_port_strategy() {
+        let freedom = crate::json::parse(
+            r#"{"protocol":"freedom","streamSettings":{"sockopt":{"addressPortStrategy":"SrvPortOnly"}}}"#,
+        )
+        .expect("json");
+        assert!(super::parse_outbound_sockopt(&freedom)
+            .expect_err("freedom refuses")
+            .contains("freedom outbound does not support"));
+
+        let chained = crate::json::parse(
+            r#"{"protocol":"vless","streamSettings":{"sockopt":{"addressPortStrategy":"TxtPortOnly","dialerProxy":"hop"}}}"#,
+        )
+        .expect("json");
+        let options = super::parse_outbound_sockopt(&chained)
+            .expect("a chain keeps it")
+            .expect("present");
+        assert_eq!(
+            options.address_port_strategy(),
+            crate::sockopt::AddressPortStrategy::TxtPortOnly
+        );
+    }
 
     #[test]
     fn a_tun_field_with_the_wrong_type_is_refused() {
