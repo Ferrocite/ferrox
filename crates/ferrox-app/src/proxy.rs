@@ -388,7 +388,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         .any(|seam| std::env::var_os(seam).is_some())
     {
         // The startup record both pinned interop harnesses scan the server log for; not this binary's name.
-        println!("ferrox-app serving; harness readiness token: core: Xray 26.10.21 started");
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.11.9 started");
     }
     loop {
         thread::park();
@@ -71232,8 +71232,6 @@ mod poll_copy {
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::Duration;
 
-    const WINDOW: usize = 64 * 1024;
-
     #[cfg(unix)]
     type Row = libc::pollfd;
     #[cfg(windows)]
@@ -71455,7 +71453,7 @@ mod poll_copy {
     struct Direction {
         src: Connection,
         dst: Connection,
-        bytes: Vec<u8>,
+        bytes: RelayBuf,
         filled: usize,
         off: usize,
         src_at_eof: bool,
@@ -71471,7 +71469,7 @@ mod poll_copy {
             Self {
                 src,
                 dst,
-                bytes: RelayBuf::with_len(WINDOW).into_vec(),
+                bytes: RelayBuf::new(),
                 filled: 0,
                 off: 0,
                 src_at_eof: false,
@@ -71482,7 +71480,7 @@ mod poll_copy {
         }
 
         fn can_ingest(&self) -> bool {
-            !self.ended && !self.src_at_eof && self.filled < self.bytes.len()
+            !self.ended && !self.src_at_eof && self.filled == 0
         }
 
         fn can_drain(&self) -> bool {
@@ -71496,15 +71494,14 @@ mod poll_copy {
             if self.off == self.filled {
                 self.off = 0;
                 self.filled = 0;
-            } else if self.off > 0 && self.filled == self.bytes.len() {
-                self.bytes.copy_within(self.off..self.filled, 0);
-                self.filled -= self.off;
-                self.off = 0;
             }
             if self.can_ingest() {
-                match self.src.read(&mut self.bytes[self.filled..]) {
+                match self.src.read(self.bytes.as_mut()) {
                     Ok(0) => self.src_at_eof = true,
-                    Ok(n) => self.filled += n,
+                    Ok(n) => {
+                        let _ = self.bytes.filled(n);
+                        self.filled = n;
+                    }
                     Err(error) if would_block(&error) => {}
                     Err(_) => {
                         self.end();
@@ -71513,7 +71510,7 @@ mod poll_copy {
                 }
             }
             while self.off < self.filled {
-                match self.dst.write(&self.bytes[self.off..self.filled]) {
+                match self.dst.write(&self.bytes.prefix(self.filled)[self.off..]) {
                     Ok(0) => {
                         self.end();
                         return;
