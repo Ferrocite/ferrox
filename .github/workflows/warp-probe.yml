@@ -96,6 +96,13 @@ jobs:
                   print(f"accept failed: {e}", flush=True)
                   continue
               try:
+                  sock.settimeout(1)
+                  hello = sock.recv(4096, socket.MSG_PEEK)
+                  sock.settimeout(300)
+                  print(f"HELLO {hello[:900].hex()}", flush=True)
+              except Exception as e:
+                  print(f"hello peek failed: {e}", flush=True)
+              try:
                   tls = ctx.wrap_socket(sock, server_side=True)
               except Exception as e:
                   print(f"TLS accept failed: {e}", flush=True)
