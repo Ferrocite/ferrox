@@ -7372,6 +7372,7 @@ struct UdpMux {
     dest: Mutex<SocketAddr>,
     id: Arc<AtomicU16>,
     done: Arc<AtomicBool>,
+    stop: std::sync::mpsc::Sender<()>,
     wire: MuxWire,
 }
 
@@ -7514,6 +7515,7 @@ fn teardown_mux(
         flow.control.cancel();
     }
     for session in udp.values() {
+        let _ = session.stop.send(());
         session.done.store(true, Ordering::Relaxed);
     }
     if let Some(worker) = worker {
@@ -7811,14 +7813,16 @@ fn handle_mux_udp_new(
         let Ok(socket) = bound else {
             return send_mux_end(out.wire, out.staging, frame.id);
         };
+        let (stop, stopped) = std::sync::mpsc::channel();
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
             dest: Mutex::new(dest),
             id: Arc::new(AtomicU16::new(frame.id)),
             done: Arc::new(AtomicBool::new(false)),
+            stop,
             wire: out.wire.clone(),
         });
-        let Some(reader) = spawn_mux_udp_reader(&session) else {
+        let Some(reader) = spawn_mux_udp_reader(&session, stopped) else {
             return send_mux_end(out.wire, out.staging, frame.id);
         };
         out.handles.push(reader);
@@ -7828,6 +7832,8 @@ fn handle_mux_udp_new(
         session
     };
     if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
+        // The stop orders the death with a reader's check-then-write, so no replaced datagram lands after the id.
+        let _ = old.stop.send(());
         old.done.store(true, Ordering::Relaxed);
         if let Some(worker) = out.worker {
             worker.release_connection();
@@ -7842,7 +7848,10 @@ fn handle_mux_udp_new(
     }
 }
 
-fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
+fn spawn_mux_udp_reader(
+    session: &Arc<UdpMux>,
+    stopped: std::sync::mpsc::Receiver<()>,
+) -> Option<RelayEnd> {
     let read = session.socket.try_clone().ok()?;
     read.set_read_timeout(Some(RELAY_POLL)).ok()?;
     let wire = session.wire.clone();
@@ -7856,7 +7865,7 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
         lane_pool::submit(
             Box::new(move || match read.recv_from(&mut buf) {
                 Ok((n, source)) => {
-                    if done.load(Ordering::Relaxed) {
+                    if done.load(Ordering::Relaxed) || stopped.try_recv().is_ok() {
                         return Next::Done;
                     }
                     let keep = ferrox_core::mux::Outgoing {
@@ -7901,7 +7910,7 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
             loop {
                 match read.recv_from(&mut buf) {
                     Ok((n, source)) => {
-                        if done.load(Ordering::Relaxed) {
+                        if done.load(Ordering::Relaxed) || stopped.try_recv().is_ok() {
                             return;
                         }
                         let keep = ferrox_core::mux::Outgoing {
@@ -17521,6 +17530,10 @@ where
             .map(|()| cipher)
     });
     let mut session = session;
+    if cipher.is_none() {
+        // A session that reads its own transport waits inside its lock, so the split arms that read too.
+        session.arm_own_transport(RELAY_POLL);
+    }
     let shared = match cipher.as_ref() {
         Some(_) => {
             // The reader bypasses the limiter from here on, so record framing stops here.
@@ -18139,6 +18152,9 @@ fn is_driven_yield(error: &std::io::Error) -> bool {
 /// caller keeps it behind the shared shape's lock.
 trait Drivable {
     fn transport(&self) -> Option<Connection>;
+
+    /// Arms the read a session performs on its own transport, under its own lock.
+    fn arm_own_transport(&self, _grain: Duration) {}
 }
 
 impl Drivable
@@ -18178,6 +18194,12 @@ impl Drivable for ferrox_core::tls::ClientSession<Connection> {
             return None;
         }
         self.get_ref().try_clone().ok()
+    }
+
+    fn arm_own_transport(&self, grain: Duration) {
+        if !self.separates_ciphertext() {
+            let _ = self.get_ref().set_read_timeout(Some(grain));
+        }
     }
 }
 
@@ -45498,6 +45520,62 @@ mod tests {
         (server, client)
     }
 
+    /// A TLS 1.2-only dial reads inside its session lock, so the split must arm that read.
+    #[test]
+    fn a_legacy_tls_read_yields_the_relay_lane() {
+        let (server, mut client) = carried_tls_configs();
+        let mut server = (*server).clone();
+        server.min_version = Some(0x0303);
+        server.max_version = Some(0x0303);
+        server.cipher_suites = vec![0xc02b];
+        client.cipher_suites = vec![0xc02b].into();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let serving = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut session = ferrox_core::tls::accept(&server, stream).expect("accepts tls");
+            session.handshake().expect("server handshake");
+            let _ = stop_rx.recv();
+        });
+        let conn = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let mut session = ferrox_core::tls::connect(&client, conn).expect("dials");
+        session.handshake().expect("client handshake");
+        assert!(
+            !session.separates_ciphertext(),
+            "a TLS 1.2-only dial rides the legacy lane"
+        );
+        let close = session.get_ref().try_clone().expect("clone");
+        let out = session.get_ref().try_clone().expect("clone");
+        let (mut reader, _writer) = session_halves(session, out);
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            let began = std::time::Instant::now();
+            let verdict = reader.read(&mut buf);
+            let _ = verdict_tx.send((verdict, began.elapsed()));
+        });
+        if let Ok((verdict, took)) = verdict_rx.recv_timeout(Duration::from_millis(500)) {
+            assert!(
+                took < Duration::from_millis(400),
+                "the legacy read yielded after {took:?}"
+            );
+            assert!(
+                verdict.as_ref().is_err_and(is_timeout),
+                "the legacy read timed out, got {verdict:?}"
+            );
+        } else {
+            let _ = close.shutdown(Shutdown::Both);
+            let _ = running.join();
+            let _ = stop_tx.send(());
+            panic!("the legacy read held the relay lane");
+        }
+        let _ = close.shutdown(Shutdown::Both);
+        running.join().expect("reader thread");
+        let _ = stop_tx.send(());
+        serving.join().expect("server thread");
+    }
+
     /// `allowInsecure` dials with no root at all: the handshake still completes against a
     /// certificate no store holds, and the session speaks both ways.
     trait FakeIo: Read + Write {}
@@ -56356,6 +56434,116 @@ mod tests {
         for session in udp.values() {
             session.done.store(true, Ordering::Relaxed);
         }
+    }
+
+    struct BlockingWriter {
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        started: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Read for BlockingWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.started.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A replacement must drop the datagram the old reader already took off its socket.
+    #[test]
+    fn a_replaced_udp_session_drops_the_datagram_that_raced_its_stop() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocking = BlockingWriter {
+            writes: std::sync::Arc::clone(&count),
+            started,
+            release: Mutex::new(release_rx),
+        };
+        let wire = MuxWire::Stream {
+            stream: std::sync::Arc::new(Mutex::new(Box::new(blocking))),
+            close: std::sync::Arc::new(|| {}),
+        };
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let new = |port| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(mux_test_udp_target(port)),
+            global_id: None,
+            reflection: None,
+            data: None,
+        };
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+        }
+        let old = Arc::clone(udp.get(&7).expect("first session"));
+        let old_addr = SocketAddr::from((
+            [127, 0, 0, 1],
+            old.socket.local_addr().expect("addr").port(),
+        ));
+        first.send_to(b"one", old_addr).expect("sends");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the reader entered its write");
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+        }
+        // The replacement's flag can still read false on the old reader; the stop is the ordered signal.
+        old.done.store(false, Ordering::Relaxed);
+        first.send_to(b"stale", old_addr).expect("sends");
+        release.send(()).expect("releases the header");
+        release.send(()).expect("releases the payload");
+        assert!(
+            join_within(&handles[0], Duration::from_secs(2)),
+            "the replaced session's reader kept forwarding after the stop"
+        );
+        let _ = release.send(());
+        for session in udp.values() {
+            let _ = session.stop.send(());
+            session.done.store(true, Ordering::Relaxed);
+        }
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the replaced reader wrote the stale datagram"
+        );
     }
 
     #[test]
