@@ -2528,7 +2528,9 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let decoded = accept_request(&mut reader, users);
+    reader.set_poll(Some(crate::budgets::RELAY_POLL));
+    let decoded = accept_request_bounded(&mut reader, users);
+    reader.set_poll(None);
     let Ok(closer) = write.try_clone() else {
         return;
     };
