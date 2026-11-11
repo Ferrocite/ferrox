@@ -300,9 +300,8 @@ impl Comparison {
     fn throughput_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
-            .enumerate()
-            .map(|(i, run)| Cell {
-                run_index: i + 1,
+            .map(|run| Cell {
+                run_index: run.repeat,
                 value: run.throughput_mib_s(),
             })
             .collect()
@@ -311,9 +310,8 @@ impl Comparison {
     fn cpu_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
-            .enumerate()
-            .map(|(i, run)| Cell {
-                run_index: i + 1,
+            .map(|run| Cell {
+                run_index: run.repeat,
                 value: run.cpu_millis_per_gib(),
             })
             .collect()
@@ -322,9 +320,8 @@ impl Comparison {
     fn rss_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
-            .enumerate()
-            .map(|(i, run)| Cell {
-                run_index: i + 1,
+            .map(|run| Cell {
+                run_index: run.repeat,
                 value: run.rss_mib(),
             })
             .collect()
@@ -335,10 +332,9 @@ impl Comparison {
         let runs = self.runs(engine);
         let cells = runs
             .iter()
-            .enumerate()
-            .filter_map(|(i, run)| {
+            .filter_map(|run| {
                 run.outcome.latency_us.map(|q| Cell {
-                    run_index: i + 1,
+                    run_index: run.repeat,
                     value: q.median as f64,
                 })
             })
@@ -357,10 +353,9 @@ impl Comparison {
         let runs = self.runs(engine);
         let cells = runs
             .iter()
-            .enumerate()
-            .filter_map(|(i, run)| {
+            .filter_map(|run| {
                 run.io_per_gib().map(|pair| Cell {
-                    run_index: i + 1,
+                    run_index: run.repeat,
                     value: pick(pair),
                 })
             })
@@ -1292,6 +1287,7 @@ pub fn run(
                 engine.name == "xray-rust",
                 &cell,
                 workload.server_pid,
+                repeat,
             ) {
                 Ok(run) => {
                     let result_path = output.join("result.json");
@@ -1303,7 +1299,7 @@ pub fn run(
                         action: "writing result.json".into(),
                         source,
                     })?;
-                    match revalidate(&result_path) {
+                    match revalidate(&result_path, repeat) {
                         Ok(checked) => {
                             debug_assert_eq!(
                                 checked.engine_sha256, run.engine_sha256,
@@ -1391,7 +1387,7 @@ fn machine_description() -> String {
     )
 }
 
-pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
+pub fn revalidate(result_path: &Path, repeat: usize) -> Result<Run, Error> {
     let text = std::fs::read_to_string(result_path).map_err(|source| Error::Io {
         action: format!("reading {}", result_path.display()),
         source,
@@ -1438,6 +1434,7 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
 
     let samples = read_samples(&root);
     Ok(Run {
+        repeat,
         engine: root
             .get("engine_binary")
             .and_then(Json::as_str)
@@ -1932,6 +1929,7 @@ mod tests {
         parity::Run {
             engine: String::new(),
             engine_sha256: "abc".into(),
+            repeat: 1,
             outcome: parity::Outcome {
                 bytes_sent: mibs * 1024 * 1024,
                 bytes_received: 0,
@@ -1996,8 +1994,13 @@ mod tests {
             engine,
             dialect: parity::Dialect::Xray,
             runs: runs
-                .map(|(mibs, cpu_millis, rss_kib)| synth_run(mibs, cpu_millis, rss_kib))
                 .into_iter()
+                .enumerate()
+                .map(|(i, (mibs, cpu_millis, rss_kib))| {
+                    let mut run = synth_run(mibs, cpu_millis, rss_kib);
+                    run.repeat = i + 1;
+                    run
+                })
                 .collect(),
         }
     }
@@ -2009,13 +2012,15 @@ mod tests {
             engine,
             dialect: parity::Dialect::Xray,
             runs: runs
-                .map(|(bytes, transfer_ms, cpu_millis, rss_kib)| {
+                .into_iter()
+                .enumerate()
+                .map(|(i, (bytes, transfer_ms, cpu_millis, rss_kib))| {
                     let mut run = synth_run(0, cpu_millis, rss_kib);
+                    run.repeat = i + 1;
                     run.outcome.bytes_sent = bytes;
                     run.outcome.transfer = std::time::Duration::from_millis(transfer_ms);
                     run
                 })
-                .into_iter()
                 .collect(),
         }
     }
@@ -2944,6 +2949,31 @@ mod tests {
             comparison.rows().iter().all(|row| row.against.is_none()),
             "an idle cell has no throughput to price against a peer"
         );
+    }
+
+    /// A lost repeat keeps its own ordinal, so its pair drops instead of pairing one engine's
+    /// third run with another's second.
+    #[test]
+    fn a_lost_repeat_drops_its_pair_and_keeps_the_others_indexed() {
+        let mut comparison = three_engine_comparison("upload");
+        let ferrox = comparison
+            .by_engine
+            .iter_mut()
+            .find(|entry| entry.engine == "ferrox")
+            .expect("ferrox ran");
+        ferrox.runs.remove(1);
+        let indexes: Vec<usize> = comparison
+            .throughput_cells("ferrox")
+            .iter()
+            .map(|cell| cell.run_index)
+            .collect();
+        assert_eq!(indexes, vec![1, 3]);
+        let pairs = stats::paired_ratios(
+            &comparison.throughput_cells("ferrox"),
+            &comparison.throughput_cells("xray-core"),
+            stats::Direction::Higher,
+        );
+        assert_eq!(pairs.len(), 2);
     }
 
     #[test]

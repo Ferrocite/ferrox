@@ -706,6 +706,9 @@ pub struct Outcome {
 pub struct Run {
     pub engine: String,
     pub engine_sha256: String,
+    /// Which repeat of the cell this run is, so two engines pair the same window even when one
+    /// repeat did not land.
+    pub repeat: usize,
     pub outcome: Outcome,
 }
 
@@ -1120,6 +1123,7 @@ pub fn measure(
     allow_unauthenticated_lan: bool,
     cell: &Cell,
     server_pid: Option<u32>,
+    repeat: usize,
 ) -> Result<Run, Error> {
     remeasure_disturbed(REMEASURE_ATTEMPTS, cell.budget(), || {
         measure_once(
@@ -1128,6 +1132,7 @@ pub fn measure(
             dialect,
             allow_unauthenticated_lan,
             server_pid,
+            repeat,
         )
     })
 }
@@ -1187,6 +1192,7 @@ fn measure_once(
     dialect: Dialect,
     allow_unauthenticated_lan: bool,
     server_pid: Option<u32>,
+    repeat: usize,
 ) -> Result<Run, Error> {
     let ip = local_non_loopback_ipv4()?;
     let tcp_sink = if request.traffic.tcp_sink() {
@@ -1296,6 +1302,7 @@ fn measure_once(
     Ok(Run {
         engine: request.binary.display().to_string(),
         engine_sha256: file_sha256(&request.binary),
+        repeat,
         outcome: Outcome {
             bytes_sent: moved.sent,
             bytes_received: moved.received,

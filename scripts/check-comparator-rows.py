@@ -60,23 +60,26 @@ def comparator_of(label):
 
 
 def deficits(cells_dir):
-    """Every peer row the harness called a deficit, plus the cells that were measured."""
+    """Every peer row the harness called a deficit, plus the peers it actually paired."""
     found = []
-    measured = set()
+    paired = set()
     for path in sorted(Path(cells_dir).glob("*/cell.json")):
         cell = load(path)
         if cell is None:
             continue
         scenario = cell.get("scenario") or path.parent.name
-        measured.add(scenario)
         for row in cell.get("rows", []):
-            if not row.get("never_below") or not row.get("deficit"):
+            if not row.get("never_below"):
                 continue
             label = str(row.get("label", ""))
             own = row.get("own_mib_s")
             other = row.get("comparator_mib_s")
             ratio = row.get("ratio")
             comparator = comparator_of(label)
+            if comparator:
+                paired.add((scenario, comparator))
+            if not row.get("deficit"):
+                continue
             if not comparator or not isinstance(ratio, (int, float)):
                 raise SystemExit(
                     f"::error::{scenario}: a deficit row names no comparator or ratio: {label!r}"
@@ -94,7 +97,7 @@ def deficits(cells_dir):
                     "text": f"{scenario} {label}: {ratio:.2f}x of {comparator}",
                 }
             )
-    return found, measured
+    return found, paired
 
 
 def worse_than_filed(ratio, filed):
@@ -102,9 +105,9 @@ def worse_than_filed(ratio, filed):
     return ratio < filed - TOLERANCE
 
 
-def report(found, measured, baseline, stream=sys.stderr):
-    """Errors for new or worse deficits; warnings for filed and fixed ones."""
-    new, known, fixed = [], [], []
+def report(found, paired, baseline, stream=sys.stderr):
+    """Errors for new or worse deficits; warnings for filed, fixed and unpaired ones."""
+    new, known, fixed, unpaired = [], [], [], []
     for hole in found:
         filed = baseline.get((hole["scenario"], hole["comparator"]))
         if filed is None or worse_than_filed(hole["ratio"], filed[0]):
@@ -113,12 +116,22 @@ def report(found, measured, baseline, stream=sys.stderr):
             known.append((hole, filed[1]))
     seen = {(hole["scenario"], hole["comparator"]) for hole in found}
     for key, (ratio, issue) in sorted(baseline.items()):
-        if key[0] in measured and key not in seen:
+        if key in seen:
+            continue
+        if key in paired:
             fixed.append((key, ratio, issue))
+        else:
+            unpaired.append((key, ratio, issue))
     for hole in new:
         print(f"::error::per-comparator deficit: {hole['text']}", file=stream)
     for hole, issue in known:
         print(f"::warning::known per-comparator deficit ({issue}): {hole['text']}", file=stream)
+    for (scenario, comparator), ratio, issue in unpaired:
+        print(
+            f"::warning::{scenario} {comparator} was not paired this run (baseline {ratio:.2f}x, "
+            f"{issue}); the line stays filed",
+            file=stream,
+        )
     for (scenario, comparator), ratio, issue in fixed:
         print(
             f"::warning::{scenario} {comparator} no longer gaps (baseline {ratio:.2f}x, "
@@ -127,7 +140,8 @@ def report(found, measured, baseline, stream=sys.stderr):
         )
     print(
         f"per-comparator rows checked: {len(found)} "
-        f"(new {len(new)}, known {len(known)}, fixed {len(fixed)}; "
+        f"(new {len(new)}, known {len(known)}, fixed {len(fixed)}, "
+        f"unpaired {len(unpaired)}; "
         f"tolerance {TOLERANCE:.2f})",
         file=stream,
     )
@@ -202,6 +216,18 @@ def selftest():
             return f"a cell whose peer row is not a deficit passed: {proc.stderr}"
         if "no longer gaps" not in proc.stderr:
             return f"a filed line whose cell no longer gaps was not reported: {proc.stderr}"
+
+        baseline.write_text(
+            "vless-raw-down-8--srv-ferrox|zeronet|0.24|359\n"
+            "vless-raw-down-8--srv-ferrox|sing-box|0.50|359\n"
+        )
+        proc = run_self(cells, baseline)
+        if proc.returncode != 0:
+            return f"a filed line whose peer did not run failed: {proc.stderr}"
+        if "was not paired" not in proc.stderr:
+            return f"a filed line whose peer did not run was not reported: {proc.stderr}"
+        if "no longer gaps" in proc.stderr:
+            return f"a filed line whose peer did not run was called fixed: {proc.stderr}"
     print("check-comparator-rows selftest: passed")
     return None
 
@@ -225,8 +251,8 @@ def main():
     if not Path(args.cells).is_dir():
         parser.error(f"{args.cells} is not a directory")
     baseline = {} if args.no_baseline else load_baseline(args.baseline)
-    found, measured = deficits(args.cells)
-    return report(found, measured, baseline)
+    found, paired = deficits(args.cells)
+    return report(found, paired, baseline)
 
 
 if __name__ == "__main__":
