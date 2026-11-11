@@ -323,7 +323,7 @@ impl Against {
             (
                 true,
                 format!(
-                    "{label}: {evidence}{ceiling}; above the 1.00x floor and under the \
+                    "{label}: {evidence}{ceiling}; between the 1.00x floor and the \
                      {TARGET_RATIO}x target, so this row is a warning"
                 ),
             )
@@ -1092,7 +1092,7 @@ mod tests {
         )]);
         assert!(under.passed, "{:?}", under.lines);
         let line = &under.lines[0];
-        assert!(line.contains("above the 1.00x floor"), "{line}");
+        assert!(line.contains("between the 1.00x floor"), "{line}");
         assert!(line.contains("1.08x"), "{line}");
         assert!(line.contains("no one-hop ceiling"), "{line}");
 
