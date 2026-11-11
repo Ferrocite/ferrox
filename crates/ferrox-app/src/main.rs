@@ -135,8 +135,14 @@ fn usage() -> ! {
     );
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
-    eprintln!("  ferrox-app warp-register [-o warp-identity.json] [--mode auto|wireguard|masque] [--api URL]");
-    eprintln!("                                register a WARP device once, save the identity (0600), print the outbound");
+    eprintln!("  ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all]");
+    eprintln!(
+        "        [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR]"
+    );
+    eprintln!("        [--mode auto|wireguard|masque]");
+    eprintln!(
+        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600), print the outbound"
+    );
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"
     );

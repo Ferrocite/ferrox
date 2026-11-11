@@ -110,6 +110,10 @@ selftest_gaps() {
   scenario_kept vless-raw-down-16 || { echo "selftest: --exclude took the down-16 neighbour" >&2; failed=1; }
   scenario_kept vless-raw-down-1 && { echo "selftest: --exclude kept its own rung" >&2; failed=1; }
   only=(); exclude=()
+  matrix_warp_needs_external_reference warp-masque-down-8 \
+    || { echo "selftest: a WARP cell no longer needs an external reference" >&2; failed=1; }
+  matrix_warp_needs_external_reference masque-down-8 \
+    && { echo "selftest: a plain MASQUE cell was taken for a WARP cell" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
@@ -468,6 +472,12 @@ while read -r id traffic connections iterations payload duration_ms; do
     echo "# $id: skipped, Hysteria v1 needs sing-box as its reference" >>"$out/commands.sh"
     continue
   fi
+  if matrix_warp_needs_external_reference "$id" \
+    && ! engine_path aether >/dev/null && ! engine_path zeronet >/dev/null; then
+    note "skipping $id: no external WARP reference on this host"
+    echo "# $id: skipped, no external WARP reference on this host" >>"$out/commands.sh"
+    continue
+  fi
   if matrix_udp_carrier "$id"; then
     srvport="$(matrix_udp_srvport)"
   else
@@ -562,6 +572,17 @@ while read -r id traffic connections iterations payload duration_ms; do
             continue 2
           }
           client_args+=(--outbound-config-for "xray-rust=$(cat "$celldir/client-xray-rust.json")")
+          ;;
+        zeronet)
+          if [[ "$id" == warp-* ]]; then
+            python3 scripts/xray-to-zeronet-warp.py \
+              "$celldir/client.json" >"$celldir/client-zeronet.json" || {
+              cells_failed+=("$cell (could not translate the client config for zeronet)")
+              status=1
+              continue 2
+            }
+            client_args+=(--outbound-config-for "zeronet=$(cat "$celldir/client-zeronet.json")")
+          fi
           ;;
       esac
     done

@@ -32,6 +32,11 @@ matrix_udp_carrier() {
   esac
 }
 
+# A WARP cell needs an external engine that speaks WARP: Aether or ZeroNet.
+matrix_warp_needs_external_reference() {
+  [[ "$1" == warp-* ]]
+}
+
 # A filter names a whole rung: the id itself or a `-`-separated child of it, so
 # `vless-raw-down-1` never selects `vless-raw-down-16`.
 scenario_matches() {
@@ -87,6 +92,10 @@ matrix_engine_skip_reason() {
       printf '%s\n' "Aether is a client-only reference"
       return 0
     fi
+  fi
+  if [[ "$engine" == zeronet && "$role" == server && "$id" == warp-* ]]; then
+    printf '%s\n' "ZeroNet at this pin has a WARP client, not a WARP server"
+    return 0
   fi
   if [[ "$engine" == "leaf" && "$id" == vless-* && "$id" != *-vision-* ]]; then
     printf '%s\n' "leaf at this pin only sends VLESS with the Vision flow, which this scenario does not configure"
@@ -147,7 +156,7 @@ matrix_engine_skip_reason() {
       printf '%s\n' "xray-rust at this pin has no VLESS over Hysteria; its Hysteria outbound is the native proxy protocol" ;;
     xray-core-rust:masque-*|zeronet:masque-*|sing-box:masque-*|xray-rust:masque-*|leaf:masque-*)
       printf '%s\n' "$engine at this pin has no MASQUE CONNECT-IP outbound" ;;
-    xray-core:warp-*|xray-core-rust:warp-*|zeronet:warp-*|sing-box:warp-*|xray-rust:warp-*|leaf:warp-*)
+    xray-core:warp-*|xray-core-rust:warp-*|sing-box:warp-*|xray-rust:warp-*|leaf:warp-*)
       printf '%s\n' "$engine at this pin has no WARP carrier" ;;
     *)
       return 1 ;;
@@ -233,6 +242,11 @@ matrix_tls_pin() {
 pem = open(sys.argv[1]).read()
 body = "".join(line for line in pem.splitlines() if line and not line.startswith("-----"))
 print(hashlib.sha256(base64.b64decode(body)).hexdigest())' "$1"
+}
+
+# WARP pins the edge's SubjectPublicKeyInfo, not the certificate hash.
+matrix_tls_spki() {
+  python3 scripts/cert_spki.py "$1"
 }
 
 matrix_reality_dir() {
@@ -379,8 +393,10 @@ masque_client_settings() {
 # dialect with a pinned mode, a WireGuard half the pinned mode never dials, and
 # a stream TLS fixture the Aether adapter alone reads for its client identity.
 warp_client_settings() {
-  local port="$1" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg=="
-  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"masque\", \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$key\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$(matrix_tls_dir)/cert.pem\", \"certificates\": [{\"certificateFile\": \"$(matrix_tls_dir)/cert.pem\", \"keyFile\": \"$(matrix_tls_dir)/key.pem\", \"usage\": \"verify\"}]}}"
+  local port="$1" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==" dir pin
+  dir="$(matrix_tls_dir)" || return 1
+  pin="$(matrix_tls_spki "$dir/cert.pem")" || return 1
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"masque\", \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$pin\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\", \"usage\": \"verify\"}]}}"
 }
 
 httpupgrade_settings() {
@@ -889,6 +905,9 @@ scenarios() {
       echo "wireguard-raw-duplex-8 full-duplex 8 128 65536"
       echo "warp-masque-up-1 upload 1 2048 65536"
       echo "warp-masque-duplex-8 full-duplex 8 128 65536"
+      echo "warp-masque-down-16 download 16 128 65536"
+      echo "warp-masque-down-64 download 64 64 65536"
+      echo "warp-masque-duplex-64 full-duplex 64 64 65536"
       echo "wireguard-kernel-raw-up-1 upload 1 2048 65536"
       echo "wireguard-kernel-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-reality-raw-up-1 upload 1 2048 65536"

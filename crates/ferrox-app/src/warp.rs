@@ -6,7 +6,7 @@
 //! a second account.
 
 use std::io::Write as _;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -48,7 +48,7 @@ const TUNNEL_DNS: [&str; 2] = ["1.1.1.1", "2606:4700:4700::1111"];
 /// The API reply holds the `WireGuard` half's private key only on this side; the
 /// peer key, endpoint, reserved bytes and tunnel addresses come back over the
 /// wire, and the MASQUE key is the one enrolled after the device exists.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
     device_id: String,
     token: String,
@@ -56,7 +56,7 @@ struct Identity {
     masque: Option<MasqueIdentity>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WireGuardIdentity {
     private: [u8; 32],
     peer: [u8; 32],
@@ -65,7 +65,7 @@ struct WireGuardIdentity {
     reserved: [u8; 3],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MasqueIdentity {
     private: Vec<u8>,
     server: Vec<u8>,
@@ -110,6 +110,7 @@ struct WarpSpec {
     identity_file: Option<PathBuf>,
     inline: Option<Identity>,
     api: Option<String>,
+    api_address: Option<String>,
     endpoint: Option<SocketAddr>,
     mtu: u16,
     keepalive: u16,
@@ -149,6 +150,11 @@ impl WarpSpec {
             .get("api")
             .and_then(crate::json::Json::as_str)
             .filter(|api| !api.is_empty())
+            .map(str::to_owned);
+        let api_address = settings
+            .get("apiAddress")
+            .and_then(crate::json::Json::as_str)
+            .filter(|address| !address.is_empty())
             .map(str::to_owned);
         let endpoint = settings
             .get("endpoint")
@@ -194,6 +200,7 @@ impl WarpSpec {
             identity_file,
             inline,
             api,
+            api_address,
             endpoint,
             mtu,
             keepalive,
@@ -209,26 +216,54 @@ impl WarpSpec {
     }
 
     /// The identity a config names: inline wins, then a saved file, then a new
-    /// registration saved into `identityFile`.
+    /// registration saved into `identityFile`. A saved file is checked against
+    /// the API; a refused one is replaced unless `AETHER_REPROVISION=0`.
     fn identity(&self) -> Result<Identity, String> {
         if let Some(identity) = &self.inline {
             return Ok(identity.clone());
         }
-        if let Some(path) = &self.identity_file {
-            if path.is_file() {
-                return Identity::load(path);
+        let Some(path) = self.identity_file.as_deref() else {
+            if !self.register {
+                return Err("warp outbound needs `identityFile` or an inline `identity`".to_owned());
             }
+            return Err(
+                "warp: `register: true` needs an `identityFile` to save the account".into(),
+            );
+        };
+        if path.is_file() {
+            let saved = match Identity::load(path) {
+                Ok(saved) => saved,
+                Err(_reason) if self.register && reprovision_enabled() => {
+                    quarantine(path);
+                    let identity = register(self, self.mode != Mode::WireGuard)?;
+                    identity.save(path)?;
+                    return Ok(identity);
+                }
+                Err(reason) => return Err(reason),
+            };
+            return match refresh_saved(self, &saved) {
+                Ok(fresh) if fresh != saved => {
+                    fresh.save(path)?;
+                    Ok(fresh)
+                }
+                Ok(_) => Ok(saved),
+                Err(error) if error.refused && reprovision_enabled() => {
+                    let identity = register(self, saved.masque.is_some())?;
+                    identity.save(path)?;
+                    Ok(identity)
+                }
+                Err(error) => {
+                    eprintln!("warp: the saved identity was not checked: {}", error.reason);
+                    Ok(saved)
+                }
+            };
         }
         if !self.register {
             return Err(
                 "warp: the identity file does not exist and `register` is false".to_owned(),
             );
         }
-        let path = self
-            .identity_file
-            .as_deref()
-            .ok_or("warp: `register: true` needs an `identityFile` to save the account")?;
-        let identity = register(self)?;
+        let identity = register(self, self.mode != Mode::WireGuard)?;
         identity.save(path)?;
         Ok(identity)
     }
@@ -242,6 +277,90 @@ impl WarpSpec {
                 .collect(),
         }
     }
+
+    fn for_command(mode: Mode, api: Option<String>, api_address: Option<String>) -> Self {
+        Self {
+            mode,
+            register: true,
+            identity_file: None,
+            inline: None,
+            api,
+            api_address,
+            endpoint: None,
+            mtu: DEFAULT_MTU,
+            keepalive: DEFAULT_KEEPALIVE,
+            probe_host: PROBE_HOST.to_owned(),
+            probe_port: PROBE_PORT,
+            dns: TUNNEL_DNS
+                .iter()
+                .filter_map(|text| text.parse().ok())
+                .collect(),
+            masque_address: CONNECT_HOST.to_owned(),
+            masque_port: QUIC_PORT,
+            masque_server_name: CONNECT_SNI.to_owned(),
+            masque_host: CONNECT_HOST.to_owned(),
+            masque_path: "/".to_owned(),
+        }
+    }
+}
+
+/// One API origin, its dialled address moved by `apiAddress` while the TLS
+/// name and HTTP host stay the origin's.
+fn api_endpoint(spec: &WarpSpec, base: &str) -> Result<Endpoint, String> {
+    let mut endpoint = Endpoint::parse(base, crate::quic::system_roots())
+        .ok_or_else(|| format!("warp: `{base}` is not an https API origin"))?
+        .with_h2_fingerprint("chrome_plain")
+        .without_resumption();
+    if let Some(address) = &spec.api_address {
+        let (host, port) = split_host_port(address, 443).ok_or_else(|| {
+            format!(
+                "warp: apiAddress: `{address}` is no IP address or domain name, with or without a port"
+            )
+        })?;
+        let peer = match host.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, port),
+            Err(_) => (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|error| format!("warp: apiAddress `{host}`: {error}"))?
+                .next()
+                .ok_or_else(|| format!("warp: apiAddress `{host}` resolves to nothing"))?,
+        };
+        endpoint.address = Some(peer);
+    }
+    Ok(endpoint)
+}
+
+/// An IP address, an IPv6 one with or without brackets, or a domain name,
+/// optionally followed by `:port`.
+fn split_host_port(text: &str, default_port: u16) -> Option<(String, u16)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(address) = text.parse::<SocketAddr>() {
+        return Some((address.ip().to_string(), address.port()));
+    }
+    if let Ok(ip) = text.parse::<IpAddr>() {
+        return Some((ip.to_string(), default_port));
+    }
+    if let Some(rest) = text.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        return match tail.strip_prefix(':') {
+            Some(port) => port.parse().ok().map(|port| (host.to_owned(), port)),
+            None if tail.is_empty() => Some((host.to_owned(), default_port)),
+            None => None,
+        };
+    }
+    if let Some((host, port)) = text.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') || host.parse::<IpAddr>().is_ok() {
+            return None;
+        }
+        return port.parse().ok().map(|port| (host.to_owned(), port));
+    }
+    Some((text.to_owned(), default_port))
 }
 
 /// The `masque` block's five fields, each defaulting to the WARP edge the API names.
@@ -329,48 +448,54 @@ fn registration_headers(bearer: Option<&str>) -> Vec<(String, String)> {
 }
 
 /// A registration can fail before the device exists (another API host may
-/// answer) or after it exists (a retry would create a second device).
+/// answer) or after it exists (a retry would create a second device); only a
+/// refusal of the identity is worth replacing rather than retrying.
 #[derive(Debug)]
 struct RegisterError {
     fatal: bool,
+    refused: bool,
     reason: String,
-    /// The device a refusal left behind, its key made but its enrollment refused;
-    /// the caller saves it, for a later run to resume instead of minting another.
-    kept: Option<Box<Identity>>,
 }
 
 impl RegisterError {
     fn retryable(reason: impl Into<String>) -> Self {
         Self {
             fatal: false,
+            refused: false,
             reason: reason.into(),
-            kept: None,
         }
     }
 
     fn fatal(reason: impl Into<String>) -> Self {
         Self {
             fatal: true,
+            refused: false,
             reason: reason.into(),
-            kept: None,
+        }
+    }
+
+    fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            fatal: true,
+            refused: true,
+            reason: reason.into(),
         }
     }
 }
 
 /// Register against the first host that answers, then enroll and enable; a
 /// refusal names the host that refused so a runner's console can act on it.
-fn register(spec: &WarpSpec) -> Result<Identity, String> {
+fn register(spec: &WarpSpec, enroll: bool) -> Result<Identity, String> {
     let mut last = String::new();
     for base in spec.api_url() {
-        let Some(endpoint) = Endpoint::parse(&base, crate::quic::system_roots()).map(|endpoint| {
-            endpoint
-                .with_h2_fingerprint("chrome_plain")
-                .without_resumption()
-        }) else {
-            last = format!("warp: `{base}` is not an https API origin");
-            continue;
+        let endpoint = match api_endpoint(spec, &base) {
+            Ok(endpoint) => endpoint,
+            Err(reason) => {
+                last = reason;
+                continue;
+            }
         };
-        match register_with(spec, &|method, path, headers, body| {
+        match register_with(spec, enroll, &|method, path, headers, body| {
             let url = endpoint.url(path);
             // The reference dials one fresh HTTP/2 connection per call and never retries over HTTP/1.1; a failed leg says so.
             crate::foxy_account::h2_ask(&endpoint, method, &url, headers, body)
@@ -378,20 +503,11 @@ fn register(spec: &WarpSpec) -> Result<Identity, String> {
         }) {
             Ok(identity) => return Ok(identity),
             Err(error) if error.fatal => {
-                let note = match error.kept.zip(spec.identity_file.as_ref()) {
-                    Some((identity, path)) => match identity.save(path) {
-                        Ok(()) => format!(
-                            "; its device {} is saved at {}",
-                            identity.device_id,
-                            path.display()
-                        ),
-                        Err(why) => format!("; saving its device failed: {why}"),
-                    },
-                    None => String::new(),
-                };
-                return Err(format!("{}{} (earlier: {last})", error.reason, note)
-                    .trim_end()
-                    .to_owned());
+                return Err(if last.is_empty() {
+                    error.reason
+                } else {
+                    format!("{} (earlier: {last})", error.reason)
+                });
             }
             Err(error) => last = error.reason,
         }
@@ -399,9 +515,9 @@ fn register(spec: &WarpSpec) -> Result<Identity, String> {
     Err(last)
 }
 
-/// The three calls, with the transport injected so a test records them and a
-/// real run sends them over TLS.
-fn register_with<F>(spec: &WarpSpec, call: &F) -> Result<Identity, RegisterError>
+/// The calls, with the transport injected so a test records them and a real run
+/// sends them over TLS. A device is saved only once WARP is enabled on it.
+fn register_with<F>(spec: &WarpSpec, enroll: bool, call: &F) -> Result<Identity, RegisterError>
 where
     F: Fn(&str, &str, &[(&str, &str)], &[u8]) -> Result<Reply, RegisterError>,
 {
@@ -417,73 +533,174 @@ where
     let headers = borrow_headers(&headers);
     let reply = call("POST", "/reg", &headers, &body)
         .map_err(|error| RegisterError::retryable(error.reason))?;
-    // A reply the API shaped for another kind of device shows in its own headers and size.
     let registered = parse_registration(&reply)?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
+    let mut masque = None;
 
-    let key = rcgen::KeyPair::generate()
-        .map_err(|error| RegisterError::fatal(format!("warp MASQUE key: {error}")))?;
-    let spki = decode_pem(&key.public_key_pem())
-        .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
-    // The device exists from here on, for the caller to save rather than orphan.
-    let mut identity = Identity {
-        device_id: registered.device_id.clone(),
-        token: registered.token.clone(),
-        wireguard: WireGuardIdentity {
-            private,
-            peer: registered.peer,
-            endpoint: spec.endpoint.unwrap_or(registered.endpoint),
+    if enroll {
+        let key = rcgen::KeyPair::generate()
+            .map_err(|error| RegisterError::fatal(format!("warp MASQUE key: {error}")))?;
+        let spki = decode_pem(&key.public_key_pem())
+            .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
+        let headers = registration_headers(Some(&bearer));
+        let headers = borrow_headers(&headers);
+        let reply = call("PATCH", &path, &headers, &enrollment_body(&spki)).map_err(|error| {
+            RegisterError::fatal(format!("the WARP key enrollment failed: {}", error.reason))
+        })?;
+        let server = parse_masque_server(&reply)?;
+        masque = Some(MasqueIdentity {
+            private: key.serialize_der(),
+            server,
             addresses: registered.addresses.clone(),
-            reserved: registered.reserved,
-        },
-        masque: None,
-    };
-    let headers = registration_headers(Some(&bearer));
-    let headers = borrow_headers(&headers);
-    let reply = call("PATCH", &path, &headers, &enrollment_body(&spki)).map_err(|error| {
-        let mut refused = RegisterError::fatal(error.reason);
-        refused.kept = Some(Box::new(identity.clone()));
-        refused
-    })?;
-    let server = parse_masque_server(&reply).map_err(|error| {
-        // A refusal that may be about the token is told apart from one about the enrollment: the token's own GET answers where the PATCH cannot.
-        let why = call("GET", &path, &headers, b"").map_or_else(
-            |get_error| format!("its GET too: {}", get_error.reason),
-            |get| {
-                format!(
-                    "the token ({}, starts {}) answers GET {}",
-                    registered.token.len(),
-                    registered.token.chars().take(3).collect::<String>(),
-                    get.status
-                )
-            },
-        );
-        let mut refused = RegisterError::fatal(format!("{} ({})", error.reason, why));
-        refused.kept = Some(Box::new(identity.clone()));
-        refused
-    })?;
+        });
+    }
 
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
     match call("PATCH", &path, &headers, ENABLE_BODY) {
-        Err(error) => eprintln!(
-            "warp: {}; the tunnel may carry nothing until it is enabled",
-            error.reason
-        ),
-        Ok(reply) if reply.status / 100 != 2 => eprintln!(
-            "warp: the enable answered {}; the tunnel may carry nothing until it is enabled",
-            reply.status
-        ),
+        Err(error) => {
+            return Err(RegisterError::fatal(format!(
+                "the WARP enable failed: {}",
+                error.reason
+            )))
+        }
+        Ok(reply) if reply.status / 100 != 2 => {
+            return Err(RegisterError::fatal(format!(
+                "the WARP enable answered {}: {}",
+                reply.status,
+                reply_snippet(&reply.body)
+            )))
+        }
         Ok(_) => {}
     }
 
-    identity.masque = Some(MasqueIdentity {
-        private: key.serialize_der(),
-        server,
-        addresses: registered.addresses,
-    });
-    Ok(identity)
+    Ok(Identity {
+        device_id: registered.device_id,
+        token: registered.token,
+        wireguard: WireGuardIdentity {
+            private,
+            peer: registered.peer,
+            endpoint: spec.endpoint.unwrap_or(registered.endpoint),
+            addresses: registered.addresses,
+            reserved: registered.reserved,
+        },
+        masque,
+    })
+}
+
+/// Read a device back from the API, so an identity Cloudflare no longer knows
+/// is replaced instead of handshaking into nothing.
+fn refresh<F>(
+    spec: &WarpSpec,
+    identity: &Identity,
+    single: bool,
+    call: &F,
+) -> Result<Identity, RegisterError>
+where
+    F: Fn(&str, &str, &[(&str, &str)], &[u8]) -> Result<Reply, RegisterError>,
+{
+    let path = format!("/reg/{}", identity.device_id);
+    let bearer = format!("Bearer {}", identity.token);
+    let headers = registration_headers(Some(&bearer));
+    let headers = borrow_headers(&headers);
+    let reply = call("GET", &path, &headers, b"")?;
+    if refuses_identity(&reply) || (single && reply.status == 404) {
+        return Err(RegisterError::refused(format!(
+            "the API answered the saved identity with {}: {}",
+            reply.status,
+            reply_snippet(&reply.body)
+        )));
+    }
+    if !(200..300).contains(&reply.status) {
+        return Err(RegisterError::retryable(format!(
+            "the API answered the saved identity with {}: {}",
+            reply.status,
+            reply_snippet(&reply.body)
+        )));
+    }
+    let root = reply_root(&reply)?;
+    let config = parse_config(&root)?;
+    let mut fresh = identity.clone();
+    fresh.wireguard.peer = config.peer;
+    fresh.wireguard.endpoint = spec.endpoint.unwrap_or(config.endpoint);
+    fresh.wireguard.reserved = config.reserved;
+    if !config.addresses.is_empty() {
+        fresh.wireguard.addresses.clone_from(&config.addresses);
+        if let Some(masque) = &mut fresh.masque {
+            masque.addresses = config.addresses;
+        }
+    }
+    Ok(fresh)
+}
+
+fn refuses_identity(reply: &Reply) -> bool {
+    matches!(reply.status, 401 | 410) || (reply.status == 404 && is_api_envelope(&reply.body))
+}
+
+/// Cloudflare's JSON envelope, rather than a page of another server that fronts
+/// the name: a 404 page says nothing about the identity.
+fn is_api_envelope(body: &[u8]) -> bool {
+    crate::json::parse(&String::from_utf8_lossy(body)).is_ok_and(|root| {
+        matches!(root.get("success"), Some(crate::json::Json::Bool(_)))
+            && matches!(root.get("errors"), Some(crate::json::Json::Arr(_)))
+    })
+}
+
+/// The API's own answers only: an error page of another server is not a refusal
+/// of the identity.
+fn reply_root(reply: &Reply) -> Result<crate::json::Json, RegisterError> {
+    crate::json::parse(&String::from_utf8_lossy(&reply.body))
+        .map_err(|_| RegisterError::retryable("the WARP reply is not JSON"))
+}
+
+fn refresh_saved(spec: &WarpSpec, identity: &Identity) -> Result<Identity, RegisterError> {
+    let mut last = String::new();
+    let bases = spec.api_url();
+    let routes = bases.len();
+    for base in bases {
+        let endpoint = match api_endpoint(spec, &base) {
+            Ok(endpoint) => endpoint,
+            Err(reason) => {
+                last = reason;
+                continue;
+            }
+        };
+        let single = routes == 1;
+        match refresh(spec, identity, single, &|method, path, headers, body| {
+            let url = endpoint.url(path);
+            crate::foxy_account::h2_ask(&endpoint, method, &url, headers, body)
+                .map_err(RegisterError::retryable)
+        }) {
+            Ok(fresh) => return Ok(fresh),
+            Err(error) if error.fatal => return Err(error),
+            Err(error) => last = error.reason,
+        }
+    }
+    Err(RegisterError::retryable(last))
+}
+
+fn reprovision_enabled() -> bool {
+    reprovision_enabled_for(std::env::var("AETHER_REPROVISION").ok().as_deref())
+}
+
+fn reprovision_enabled_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "off" | "false"))
+}
+
+fn quarantine(path: &Path) {
+    let mut target = path.to_path_buf();
+    let name = target.file_name().map_or_else(
+        || "warp-identity.json".to_owned(),
+        |name| name.to_string_lossy().to_string(),
+    );
+    target.set_file_name(format!("{name}.corrupt"));
+    if let Err(error) = std::fs::rename(path, &target) {
+        eprintln!(
+            "warp: the damaged identity at {} could not be moved aside: {error}",
+            path.display()
+        );
+    }
 }
 
 fn borrow_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -511,8 +728,32 @@ fn parse_registration(reply: &Reply) -> Result<Registered, RegisterError> {
             reply_snippet(&reply.body)
         )));
     }
-    let root = crate::json::parse(&String::from_utf8_lossy(&reply.body))
-        .map_err(|_| RegisterError::retryable("the WARP reply is not JSON"))?;
+    let root = reply_root(reply)?;
+    let config = parse_config(&root)?;
+    let device_id = root
+        .get("id")
+        .and_then(crate::json::Json::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| RegisterError::retryable("the WARP reply has no device id"))?
+        .to_owned();
+    let token = root
+        .get("token")
+        .and_then(crate::json::Json::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| RegisterError::retryable("the WARP reply has no token"))?
+        .to_owned();
+    Ok(Registered {
+        device_id,
+        token,
+        peer: config.peer,
+        endpoint: config.endpoint,
+        addresses: config.addresses,
+        reserved: config.reserved,
+    })
+}
+
+/// The `config` object both a registration and a read-back carry.
+fn parse_config(root: &crate::json::Json) -> Result<DeviceConfig, RegisterError> {
     let config = root
         .get("config")
         .ok_or_else(|| RegisterError::retryable("the WARP reply has no `config`"))?;
@@ -566,27 +807,19 @@ fn parse_registration(reply: &Reply) -> Result<Registered, RegisterError> {
     } else {
         ports[0]
     };
-    let addresses = reply_addresses(config);
-    let device_id = root
-        .get("id")
-        .and_then(crate::json::Json::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| RegisterError::retryable("the WARP reply has no device id"))?
-        .to_owned();
-    let token = root
-        .get("token")
-        .and_then(crate::json::Json::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| RegisterError::retryable("the WARP reply has no token"))?
-        .to_owned();
-    Ok(Registered {
-        device_id,
-        token,
+    Ok(DeviceConfig {
         peer: peer_key,
         endpoint: SocketAddr::new(ip, port),
-        addresses,
+        addresses: reply_addresses(config),
         reserved,
     })
+}
+
+struct DeviceConfig {
+    peer: [u8; 32],
+    endpoint: SocketAddr,
+    addresses: Vec<IpAddr>,
+    reserved: [u8; 3],
 }
 
 fn reply_addresses(config: &crate::json::Json) -> Vec<IpAddr> {
@@ -782,6 +1015,8 @@ impl Identity {
         Self::from_json(&value).map_err(|error| format!("warp: `{}`: {error}", path.display()))
     }
 
+    /// Write beside the target and rename over it, so a reader never sees half
+    /// an identity and a failure leaves the old keys in place.
     fn save(&self, path: &Path) -> Result<(), String> {
         let mut text = String::new();
         crate::json::write(&self.to_json(), &mut text);
@@ -792,24 +1027,43 @@ impl Identity {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("warp: cannot create `{}`: {error}", parent.display()))?;
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+        let mut temp = path.to_path_buf();
+        let name = temp.file_name().map_or_else(
+            || "warp-identity.json".to_owned(),
+            |name| name.to_string_lossy().to_string(),
+        );
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        temp.set_file_name(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+        let mut created = false;
+        let result = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temp)
+                .map_err(|error| format!("warp: cannot write `{}`: {error}", temp.display()))?;
+            created = true;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| format!("warp: cannot lock `{}`: {error}", temp.display()))?;
+            }
+            file.write_all(text.as_bytes())
+                .map_err(|error| format!("warp: cannot write `{}`: {error}", temp.display()))?;
+            std::fs::rename(&temp, path)
+                .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))
+        })();
+        if result.is_err() && created {
+            let _ = std::fs::remove_file(&temp);
         }
-        let mut file = options
-            .open(path)
-            .map_err(|error| format!("warp: cannot write `{}`: {error}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| format!("warp: cannot lock `{}`: {error}", path.display()))?;
-        }
-        file.write_all(text.as_bytes())
-            .map_err(|error| format!("warp: cannot write `{}`: {error}", path.display()))
+        result
     }
 }
 
@@ -1148,10 +1402,176 @@ fn build_masque(identity: &Identity, spec: &WarpSpec) -> Result<crate::masque::M
     crate::masque::MasqueOut::new(&outbound)
 }
 
+/// The `--register` kinds: one protocol, both hops of a two-hop one, or all five.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    Masque,
+    WireGuard,
+    Gool,
+    GoolClassic,
+    Mim,
+    All,
+}
+
+impl KeyKind {
+    fn parse(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "masque" => Ok(Self::Masque),
+            "wg" | "wireguard" | "warp" => Ok(Self::WireGuard),
+            "gool" | "wg-over-masque" => Ok(Self::Gool),
+            "gool-classic" | "wiw" | "warp-in-warp" => Ok(Self::GoolClassic),
+            "mim" | "masque-in-masque" => Ok(Self::Mim),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "warp-register: --register takes masque, wg, gool, gool-classic, mim or all, not `{other}`"
+            )),
+        }
+    }
+
+    fn slots(self) -> &'static [Slot] {
+        match self {
+            Self::Masque => &[Slot::Masque],
+            Self::WireGuard => &[Slot::WireGuard],
+            Self::Gool => &[Slot::Masque, Slot::Gool],
+            Self::GoolClassic => &[Slot::WireGuard, Slot::WireGuardInner],
+            Self::Mim => &[Slot::Masque, Slot::MasqueInner],
+            Self::All => &[
+                Slot::WireGuard,
+                Slot::WireGuardInner,
+                Slot::Masque,
+                Slot::MasqueInner,
+                Slot::Gool,
+            ],
+        }
+    }
+}
+
+/// One identity file: a transport's first hop, its second, or the `WireGuard`
+/// identity gool carries inside its MASQUE tunnel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    WireGuard,
+    WireGuardInner,
+    Masque,
+    MasqueInner,
+    Gool,
+}
+
+impl Slot {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WireGuard => "wireguard",
+            Self::WireGuardInner => "wireguard inner",
+            Self::Masque => "masque",
+            Self::MasqueInner => "masque inner",
+            Self::Gool => "gool",
+        }
+    }
+
+    /// Only a MASQUE identity carries the P-256 key the tunnel presents; the
+    /// gool slot is `WireGuard` carried inside that tunnel, not a MASQUE device.
+    fn enrolls_masque(self) -> bool {
+        matches!(self, Self::Masque | Self::MasqueInner)
+    }
+
+    fn path(self, paths: &KeyPaths) -> PathBuf {
+        match self {
+            Self::WireGuard => paths.wireguard.clone(),
+            Self::WireGuardInner => derive_sibling_path(&paths.wireguard, "secondary"),
+            Self::Masque => paths.masque.clone(),
+            Self::MasqueInner => derive_sibling_path(&paths.masque, "secondary"),
+            Self::Gool => derive_sibling_path(&paths.masque, "gool"),
+        }
+    }
+}
+
+/// Where each transport keeps its identity: the `WireGuard` file as named, the
+/// MASQUE file beside it, and every second hop derived from its own first.
+struct KeyPaths {
+    wireguard: PathBuf,
+    masque: PathBuf,
+}
+
+impl KeyPaths {
+    fn new(base: &Path, wireguard: Option<&Path>, masque: Option<&Path>) -> Self {
+        Self {
+            wireguard: wireguard.map_or_else(|| base.to_path_buf(), Path::to_path_buf),
+            masque: masque.map_or_else(|| derive_sibling_path(base, "masque"), Path::to_path_buf),
+        }
+    }
+}
+
+fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
+    let name = base
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let derived = match name.rfind('.') {
+        Some(dot) if dot > 0 => format!("{}-{}{}", &name[..dot], suffix, &name[dot..]),
+        _ => format!("{name}-{suffix}"),
+    };
+    base.with_file_name(derived)
+}
+
+/// Load or make every identity the kind names, all in memory before any save,
+/// so a failed registration leaves the old keys where they are.
+fn provision_kind(
+    spec: &WarpSpec,
+    kind: KeyKind,
+    paths: &KeyPaths,
+) -> Result<Vec<(Slot, PathBuf, Identity)>, String> {
+    let mut planned = Vec::new();
+    for &slot in kind.slots() {
+        let path = slot.path(paths);
+        let identity = if path.is_file() {
+            match Identity::load(&path) {
+                Ok(saved) => match refresh_saved(spec, &saved) {
+                    Ok(fresh) => fresh,
+                    Err(error) if error.refused && reprovision_enabled() => {
+                        eprintln!(
+                            "warp-register: the saved {} identity was refused: {}; registering a fresh one",
+                            slot.label(),
+                            error.reason
+                        );
+                        quarantine(&path);
+                        register(spec, slot.enrolls_masque())?
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warp-register: keeping the saved {} identity unchecked: {}",
+                            slot.label(),
+                            error.reason
+                        );
+                        saved
+                    }
+                },
+                Err(reason) if reprovision_enabled() => {
+                    eprintln!(
+                        "warp-register: {reason}; registering a fresh {} identity",
+                        slot.label()
+                    );
+                    quarantine(&path);
+                    register(spec, slot.enrolls_masque())?
+                }
+                Err(reason) => return Err(reason),
+            }
+        } else {
+            register(spec, slot.enrolls_masque())?
+        };
+        planned.push((slot, path, identity));
+    }
+    Ok(planned)
+}
+
 /// One-tap registration: create a device, enroll its MASQUE key, enable it,
 /// save the identity where only the user can read it, and return the outbound
 /// config that references the saved file.
-pub(crate) fn one_tap(path: &str, mode: &str, api: Option<&str>) -> Result<String, String> {
+pub(crate) fn one_tap(
+    path: &str,
+    mode: &str,
+    api: Option<&str>,
+    api_address: Option<&str>,
+) -> Result<String, String> {
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
     if path.is_file() {
@@ -1166,6 +1586,7 @@ pub(crate) fn one_tap(path: &str, mode: &str, api: Option<&str>) -> Result<Strin
         identity_file: Some(path.clone()),
         inline: None,
         api: api.map(str::to_owned),
+        api_address: api_address.map(str::to_owned),
         endpoint: None,
         mtu: DEFAULT_MTU,
         keepalive: DEFAULT_KEEPALIVE,
@@ -1181,7 +1602,7 @@ pub(crate) fn one_tap(path: &str, mode: &str, api: Option<&str>) -> Result<Strin
         masque_host: CONNECT_HOST.to_owned(),
         masque_path: "/".to_owned(),
     };
-    let identity = register(&spec)?;
+    let identity = register(&spec, true)?;
     identity.save(&path)?;
     let outbound = obj_pairs(vec![
         ("protocol", string("warp")),
@@ -1287,35 +1708,79 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-/// The `warp-register` command: parse the flags, register once, print the outbound.
+/// The `warp-register` command: with `--register` make the identities a kind
+/// names and print where they are; without it, register once and print the
+/// outbound that references the saved combined identity.
 pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage: fn() -> !) {
-    let mut identity = String::from("warp-identity.json");
+    let mut base = String::from("warp-identity.json");
     let mut mode = String::from("auto");
     let mut api = None;
+    let mut api_address = None;
+    let mut kind = None;
+    let mut wireguard = None;
+    let mut masque = None;
     while let Some(arg) = args.next() {
+        let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
-            "-o" | "--out" | "--identity" => {
-                identity = match args.next() {
-                    Some(v) => v,
-                    None => usage(),
-                };
-            }
-            "--mode" => {
-                mode = match args.next() {
-                    Some(v) => v,
-                    None => usage(),
-                };
-            }
-            "--api" => {
-                api = Some(match args.next() {
-                    Some(v) => v,
-                    None => usage(),
+            "-o" | "--out" | "--identity" | "--config" => base = value(),
+            "--mode" => mode = value(),
+            "--api" => api = Some(value()),
+            "--api-address" => api_address = Some(value()),
+            "--wg-config" => wireguard = Some(value()),
+            "--masque-config" => masque = Some(value()),
+            "--register" => {
+                let text = value();
+                kind = Some(match KeyKind::parse(&text) {
+                    Ok(kind) => kind,
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        std::process::exit(2);
+                    }
                 });
             }
             _ => usage(),
         }
     }
-    match one_tap(&identity, &mode, api.as_deref()) {
+    let result = match kind {
+        None => {
+            if wireguard.is_some() || masque.is_some() {
+                usage();
+            }
+            one_tap(&base, &mode, api.as_deref(), api_address.as_deref())
+        }
+        Some(kind) => {
+            let mode = match Mode::parse(Some(&mode)) {
+                Ok(mode) => mode,
+                Err(reason) => {
+                    eprintln!("warp-register: {reason}");
+                    std::process::exit(1);
+                }
+            };
+            let spec = WarpSpec::for_command(mode, api, api_address);
+            let paths = KeyPaths::new(
+                Path::new(&base),
+                wireguard.as_deref().map(Path::new),
+                masque.as_deref().map(Path::new),
+            );
+            match provision_kind(&spec, kind, &paths).and_then(|planned| {
+                for (slot, path, identity) in &planned {
+                    identity.save(path)?;
+                    println!(
+                        "[+] {} identity ready: device={} at {}",
+                        slot.label(),
+                        identity.device_id,
+                        path.display()
+                    );
+                }
+                Ok(())
+            }) {
+                Ok(()) => Ok(String::new()),
+                Err(reason) => Err(reason),
+            }
+        }
+    };
+    match result {
+        Ok(text) if text.is_empty() => {}
         Ok(text) => println!("{text}"),
         Err(reason) => {
             eprintln!("warp-register: {reason}");
@@ -1380,6 +1845,7 @@ mod tests {
             identity_file: None,
             inline: None,
             api: None,
+            api_address: None,
             endpoint: None,
             mtu: DEFAULT_MTU,
             keepalive: DEFAULT_KEEPALIVE,
@@ -1407,7 +1873,7 @@ mod tests {
             };
             Ok::<_, RegisterError>(reply)
         };
-        let identity = register_with(&spec, &call).expect("a registration");
+        let identity = register_with(&spec, true, &call).expect("a registration");
         let recorded = calls.lock().expect("the call log");
         assert_eq!(recorded.len(), 3);
         assert_eq!(recorded[0].0, "POST");
@@ -1454,6 +1920,7 @@ mod tests {
             identity_file: None,
             inline: Some(identity.clone()),
             api: None,
+            api_address: None,
             endpoint: None,
             mtu: DEFAULT_MTU,
             keepalive: DEFAULT_KEEPALIVE,
@@ -1589,5 +2056,323 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "the identity is owner-only");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_api_address_moves_the_dial_not_the_name() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, Some("198.51.100.7:8443".to_owned()));
+        let endpoint =
+            api_endpoint(&spec, "https://api.cloudflareclient.com/v0a4471").expect("an endpoint");
+        assert_eq!(endpoint.host, "api.cloudflareclient.com");
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(
+            endpoint.address,
+            Some("198.51.100.7:8443".parse().expect("an address"))
+        );
+        let plain = api_endpoint(
+            &WarpSpec::for_command(Mode::Auto, None, None),
+            "https://api.cloudflareclient.com/v0a4471",
+        )
+        .expect("an endpoint");
+        assert_eq!(plain.address, None);
+        for (text, want) in [
+            ("2606:4700::1", "[2606:4700::1]:443"),
+            ("[2606:4700::1]", "[2606:4700::1]:443"),
+            ("[2606:4700::1]:8443", "[2606:4700::1]:8443"),
+        ] {
+            let spec = WarpSpec::for_command(Mode::Auto, None, Some(text.to_owned()));
+            let endpoint = api_endpoint(&spec, "https://api.cloudflareclient.com/v0a4471")
+                .expect("an endpoint");
+            assert_eq!(
+                endpoint.address,
+                Some(want.parse().expect("an address")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_and_port_split_every_shape_the_flag_takes() {
+        let cases = [
+            ("198.51.100.7", ("198.51.100.7", 443)),
+            ("198.51.100.7:80", ("198.51.100.7", 80)),
+            ("2606:4700::1", ("2606:4700::1", 443)),
+            ("[2606:4700::1]:8443", ("2606:4700::1", 8443)),
+            ("[2606:4700::1]", ("2606:4700::1", 443)),
+            ("api.example.com", ("api.example.com", 443)),
+            ("api.example.com:8080", ("api.example.com", 8080)),
+        ];
+        for (text, (host, port)) in cases {
+            assert_eq!(
+                split_host_port(text, 443),
+                Some((host.to_owned(), port)),
+                "{text}"
+            );
+        }
+        assert_eq!(split_host_port("", 443), None);
+        assert_eq!(split_host_port("[2606:4700::1", 443), None);
+        assert_eq!(split_host_port("api.example.com:port", 443), None);
+    }
+
+    #[test]
+    fn every_slot_derives_beside_its_own_first_hop() {
+        assert_eq!(KeyKind::All.slots().len(), 5);
+        assert_eq!(KeyKind::Gool.slots().len(), 2);
+        let base = Path::new("/tmp/warp-identity.json");
+        let paths = KeyPaths::new(base, None, None);
+        assert_eq!(Slot::WireGuard.path(&paths), base);
+        assert_eq!(
+            Slot::WireGuardInner.path(&paths),
+            Path::new("/tmp/warp-identity-secondary.json")
+        );
+        assert_eq!(
+            Slot::Masque.path(&paths),
+            Path::new("/tmp/warp-identity-masque.json")
+        );
+        assert_eq!(
+            Slot::MasqueInner.path(&paths),
+            Path::new("/tmp/warp-identity-masque-secondary.json")
+        );
+        assert_eq!(
+            Slot::Gool.path(&paths),
+            Path::new("/tmp/warp-identity-masque-gool.json")
+        );
+        let overridden = KeyPaths::new(
+            base,
+            Some(Path::new("/etc/wg.json")),
+            Some(Path::new("/etc/masque.json")),
+        );
+        assert_eq!(
+            Slot::WireGuardInner.path(&overridden),
+            Path::new("/etc/wg-secondary.json")
+        );
+        assert_eq!(
+            Slot::Gool.path(&overridden),
+            Path::new("/etc/masque-gool.json")
+        );
+    }
+
+    #[test]
+    fn a_wireguard_slot_registers_without_enrolling_masque() {
+        let calls = Mutex::new(Vec::new());
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
+        let call = |method: &str, path: &str, _headers: &[(&str, &str)], body: &[u8]| {
+            calls.lock().expect("the call log").push((
+                method.to_owned(),
+                path.to_owned(),
+                body.to_vec(),
+            ));
+            Ok::<_, RegisterError>(wireguard_reply.clone())
+        };
+        let identity = register_with(&spec, false, &call).expect("a registration");
+        let recorded = calls.lock().expect("the call log");
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "POST");
+        assert_eq!(recorded[1].0, "PATCH");
+        assert_eq!(recorded[1].1, "/reg/a-device");
+        assert_eq!(recorded[1].2, ENABLE_BODY);
+        assert!(identity.masque.is_none());
+    }
+
+    #[test]
+    fn a_refused_enable_is_fatal_and_saves_nothing() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
+        let call = |method: &str, _path: &str, _headers: &[(&str, &str)], body: &[u8]| {
+            if method == "PATCH" && body == ENABLE_BODY {
+                return Ok::<_, RegisterError>(Reply {
+                    status: 403,
+                    headers: Vec::new(),
+                    body: b"{\"error\":\"refused\"}".to_vec(),
+                });
+            }
+            Ok::<_, RegisterError>(wireguard_reply.clone())
+        };
+        let error = register_with(&spec, false, &call).expect_err("the enable is refused");
+        assert!(error.fatal);
+        assert!(error.reason.contains("403"), "{}", error.reason);
+    }
+
+    #[test]
+    fn a_failed_enrollment_does_not_mint_a_second_device() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
+        let posts = Mutex::new(0usize);
+        let call = |method: &str, _path: &str, _headers: &[(&str, &str)], _body: &[u8]| {
+            if method == "POST" {
+                *posts.lock().expect("the post count") += 1;
+                return Ok::<_, RegisterError>(wireguard_reply.clone());
+            }
+            Err::<Reply, _>(RegisterError::retryable("the enrollment leg is down"))
+        };
+        let error = register_with(&spec, true, &call).expect_err("the enrollment fails");
+        assert!(error.fatal, "{}", error.reason);
+        assert!(
+            error.reason.contains("enrollment failed"),
+            "{}",
+            error.reason
+        );
+        assert_eq!(*posts.lock().expect("the post count"), 1);
+    }
+
+    #[test]
+    fn a_read_back_updates_the_saved_identity() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let saved = Identity {
+            device_id: "a-device".to_owned(),
+            token: "a-token".to_owned(),
+            wireguard: WireGuardIdentity {
+                private: [7u8; 32],
+                peer: [8u8; 32],
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
+                addresses: vec!["172.16.0.2".parse().expect("a v4 address")],
+                reserved: [1, 2, 3],
+            },
+            masque: None,
+        };
+        let fresh_reply = sample_reply(&b64(&[0x55; 32]));
+        let call = |method: &str, path: &str, _headers: &[(&str, &str)], body: &[u8]| {
+            assert_eq!(method, "GET");
+            assert_eq!(path, "/reg/a-device");
+            assert_eq!(body, []);
+            Ok::<_, RegisterError>(fresh_reply.clone())
+        };
+        let fresh = refresh(&spec, &saved, true, &call).expect("a read-back");
+        assert_eq!(fresh.wireguard.peer, [0x55; 32]);
+        assert_eq!(fresh.wireguard.reserved, [9, 8, 7]);
+        assert_eq!(fresh.wireguard.addresses.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_read_back_is_told_apart_from_an_outage() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let saved = Identity {
+            device_id: "a-device".to_owned(),
+            token: "a-token".to_owned(),
+            wireguard: WireGuardIdentity {
+                private: [7u8; 32],
+                peer: [8u8; 32],
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
+                addresses: Vec::new(),
+                reserved: [1, 2, 3],
+            },
+            masque: None,
+        };
+        for (status, refused) in [(401, true), (404, true), (410, true), (503, false)] {
+            let call = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+                Ok::<_, RegisterError>(Reply {
+                    status,
+                    headers: Vec::new(),
+                    body: b"{\"error\":\"x\"}".to_vec(),
+                })
+            };
+            let error = refresh(&spec, &saved, true, &call).expect_err("not a usable read-back");
+            assert_eq!(error.refused, refused, "{status}");
+        }
+    }
+
+    #[test]
+    fn three_spellings_turn_reprovisioning_off() {
+        for off in ["0", "off", "false"] {
+            assert!(!reprovision_enabled_for(Some(off)), "{off}");
+        }
+        assert!(reprovision_enabled_for(None));
+        assert!(reprovision_enabled_for(Some("1")));
+        assert!(reprovision_enabled_for(Some("true")));
+    }
+
+    #[test]
+    fn a_404_page_from_a_front_is_not_a_refusal() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let saved = Identity {
+            device_id: "a-device".to_owned(),
+            token: "a-token".to_owned(),
+            wireguard: WireGuardIdentity {
+                private: [7u8; 32],
+                peer: [8u8; 32],
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
+                addresses: Vec::new(),
+                reserved: [1, 2, 3],
+            },
+            masque: None,
+        };
+        let page = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+            Ok::<_, RegisterError>(Reply {
+                status: 404,
+                headers: Vec::new(),
+                body: b"<html>not the API</html>".to_vec(),
+            })
+        };
+        let error = refresh(&spec, &saved, false, &page).expect_err("a 404 page");
+        assert!(!error.refused, "{}", error.reason);
+        let error = refresh(&spec, &saved, true, &page).expect_err("a 404 on the only route");
+        assert!(error.refused, "{}", error.reason);
+        let envelope = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+            Ok::<_, RegisterError>(Reply {
+                status: 404,
+                headers: Vec::new(),
+                body: b"{\"success\":false,\"errors\":[]}".to_vec(),
+            })
+        };
+        let error = refresh(&spec, &saved, false, &envelope).expect_err("a refusal");
+        assert!(error.refused, "{}", error.reason);
+    }
+
+    #[test]
+    fn six_register_kinds_parse() {
+        let kinds = ["masque", "wg", "gool", "gool-classic", "mim", "all"];
+        assert_eq!(kinds.len(), 6);
+        for kind in kinds {
+            assert!(KeyKind::parse(kind).is_ok(), "{kind}");
+        }
+        for alias in [
+            "wireguard",
+            "warp",
+            "wg-over-masque",
+            "wiw",
+            "warp-in-warp",
+            "masque-in-masque",
+        ] {
+            assert!(KeyKind::parse(alias).is_ok(), "{alias}");
+        }
+        assert!(KeyKind::parse("other").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_loose_identity_locks_it_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("ferrox-warp-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("warp-identity.json");
+        std::fs::write(&path, b"loose").expect("a pre-existing identity");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("a world-readable identity");
+        let identity = Identity {
+            device_id: "a-device".to_owned(),
+            token: "a-token".to_owned(),
+            wireguard: WireGuardIdentity {
+                private: [1; 32],
+                peer: [2; 32],
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
+                addresses: vec!["172.16.0.2".parse().expect("an address")],
+                reserved: [0, 0, 0],
+            },
+            masque: Some(MasqueIdentity {
+                private: vec![3; 32],
+                server: vec![4; 32],
+                addresses: vec!["172.16.0.2".parse().expect("an address")],
+            }),
+        };
+        identity.save(&path).expect("the identity is saved");
+        let mode = std::fs::metadata(&path)
+            .expect("the saved identity")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the keys are not readable by anyone else");
+        assert_eq!(Identity::load(&path).expect("the saved identity"), identity);
+        std::fs::remove_dir_all(&dir).expect("the scratch directory is removed");
     }
 }
