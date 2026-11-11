@@ -163,8 +163,17 @@ fn rules_dataset(url: &str) -> bool {
 
 /// `.dat` anywhere, and the rules dataset's `.dat.gz` form, which is always stored decompressed.
 fn asset_extension_ok(file: &str, url: &str) -> bool {
-    let lower = file.to_ascii_lowercase();
-    lower.ends_with(".dat") || (rules_dataset(url) && lower.ends_with(".dat.gz"))
+    let path = Path::new(file);
+    let extension = |path: &Path, wanted: &str| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(wanted))
+    };
+    extension(path, "dat")
+        || (rules_dataset(url)
+            && extension(path, "gz")
+            && path
+                .file_stem()
+                .is_some_and(|stem| extension(Path::new(stem), "dat")))
 }
 
 /// A local regular file the asset directories can find, as the reference's `ResolveAsset` reads them.
@@ -1021,7 +1030,7 @@ fn write_body(response: &Response, writer: &mut impl Write) -> Result<(), String
 
 fn copied(reader: &mut impl Read, writer: &mut impl Write) -> Result<usize, String> {
     let limit = usize::try_from(MAX_DOWNLOAD).unwrap_or(usize::MAX);
-    let mut buffer = [0u8; COPY_BUFFER];
+    let mut buffer = vec![0u8; COPY_BUFFER];
     let mut total = 0usize;
     loop {
         let read = reader
