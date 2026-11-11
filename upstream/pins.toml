@@ -43,7 +43,7 @@ note          = "the C++ Amnezia core; the second implementation of the same wir
 
 [sources.xray-rust]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "20b86c9603d1ba83b0d5a5f8fc1be1ea9287700a"
+rev           = "fb3a27f57595e140128e219209bc0ca2a02d51a0"
 topics        = "interop, balancer, round robin, proxy chain"
 default_branch = "main"
 path          = "crates"
@@ -55,7 +55,7 @@ note          = "Rust VLESS core; 24 of local_xray_interop_tests.rs's 29 interop
 
 [sources.xray-rust-hysteria]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "20b86c9603d1ba83b0d5a5f8fc1be1ea9287700a"
+rev           = "fb3a27f57595e140128e219209bc0ca2a02d51a0"
 topics        = "hysteria"
 default_branch = "main"
 path          = "crates"
