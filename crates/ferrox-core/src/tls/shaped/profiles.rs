@@ -320,14 +320,6 @@ pub(crate) static P_CHROME_PLAIN: Profile = Profile {
             kind: 0x0a0a,
             body: Body::Grease,
         },
-        Ext {
-            kind: 0x0a0a,
-            body: Body::Grease,
-        },
-        Ext {
-            kind: 0x0a0a,
-            body: Body::Grease,
-        },
     ],
 };
 

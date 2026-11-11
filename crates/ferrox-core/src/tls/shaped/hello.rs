@@ -774,7 +774,7 @@ impl Hello {
             profile,
             ciphers: None,
             groups: None,
-            grease: distinct_grease([0; 5]),
+            grease: distinct_grease([0; 7]),
             alpn: None,
             stock_alpn: None,
             sni: sni_name(server_name).map(str::to_owned),

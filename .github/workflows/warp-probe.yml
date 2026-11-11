@@ -65,10 +65,23 @@ jobs:
           sudo update-ca-certificates >/dev/null 2>&1
           echo "the leaf is trusted by the system store"
           cat > /tmp/capture.py <<'EOF'
-          import ssl, socket, sys
+          import ssl, socket, sys, base64, json
           from h2.connection import H2Connection
           from h2.config import H2Configuration
           from h2.events import RequestReceived, DataReceived, StreamEnded, RemoteSettingsChanged, WindowUpdated, PingReceived, PriorityUpdated
+
+          FAKE_REG = json.dumps({
+              "id": "3d1f2e3a-4b5c-4d6e-8f90-1a2b3c4d5e6f",
+              "token": "fake" + "0123456789abcdef" * 2,
+              "config": {
+                  "client_id": base64.b64encode(bytes([0, 0, 2])).decode(),
+                  "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700:110:8a36::df9:2a4c"}},
+                  "peers": [{"public_key": base64.b64encode(bytes(range(32))).decode(),
+                             "endpoint": {"v4": "162.159.192.1:2408", "v6": "[2606:4700:190::a413:badb]:2408", "host": "162.159.192.1:2408", "ports": [2408]}}],
+              },
+              "account": {"id": "3d1f2e3a-4b5c-4d6e-8f90-1a2b3c4d5e6f", "account_type": "free"},
+          }).encode()
+          REFUSED = b'{"result":null,"success":false,"errors":[{"code":1012,"message":"Not authorized"}],"messages":[]}'
 
           class Cap:
               def __init__(self, conn, sock, tag):
@@ -97,8 +110,14 @@ jobs:
                           print(f"{name}: {value}", flush=True)
                       body = self.bodies[sid]
                       print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
-                      self.conn.send_headers(sid, [(":status", "404"), ("content-type", "application/json")])
-                      self.conn.send_data(sid, b'{"result":null,"success":false,"errors":[{"code":1012,"message":"Not authorized"}],"messages":[]}', True)
+                      method = dict(self.heads[sid]).get(":method", "")
+                      path = dict(self.heads[sid]).get(":path", "")
+                      if method == "POST" and path.endswith("/reg"):
+                          self.conn.send_headers(sid, [(":status", "200"), ("content-type", "application/json")])
+                          self.conn.send_data(sid, FAKE_REG, True)
+                      else:
+                          self.conn.send_headers(sid, [(":status", "404"), ("content-type", "application/json")])
+                          self.conn.send_data(sid, REFUSED, True)
                   self.flush()
               def flush(self):
                   data = self.conn.data_to_send()
@@ -167,5 +186,5 @@ jobs:
           sleep 1
           kill %1 2>/dev/null || true
           echo "captured requests:"
-          head -120 /tmp/capture.log || true
+          cat /tmp/capture.log || true
           grep -c "==== REQUEST ====" /tmp/capture.log || true
