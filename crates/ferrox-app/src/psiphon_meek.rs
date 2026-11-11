@@ -304,6 +304,7 @@ pub(crate) struct Meek {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) dns: Vec<SocketAddr>,
     pub(crate) verify_server_names: Vec<String>,
+    pub(crate) verify_pins: Vec<String>,
     pub(crate) shape: TlsShape,
 }
 
@@ -384,7 +385,7 @@ pub(crate) fn connect_inproxy(
         };
         let fragment = server_name.parse::<IpAddr>().is_err()
             && meek.shape.fragment_client_hello(meek.protocol);
-        let verify = !meek.verify_server_names.is_empty();
+        let verify = !meek.verify_server_names.is_empty() || !meek.verify_pins.is_empty();
         let config = TlsConfig {
             server_name,
             alpn: vec![b"http/1.1".to_vec()].into(),
@@ -395,6 +396,7 @@ pub(crate) fn connect_inproxy(
             } else {
                 std::sync::Arc::from([])
             },
+            pins: ferrox_core::foxy::pin::Pins::parse(meek.verify_pins.clone()),
             resumption: true,
             fingerprint: Some(meek.shape.fingerprint()),
             padding: meek.shape.padding(),
@@ -1051,7 +1053,7 @@ impl MeekHttp {
             };
         let fragment = server_name.parse::<IpAddr>().is_err()
             && self.meek.shape.fragment_client_hello(self.meek.protocol);
-        let verify = !self.meek.verify_server_names.is_empty();
+        let verify = !self.meek.verify_server_names.is_empty() || !self.meek.verify_pins.is_empty();
         let config = TlsConfig {
             server_name,
             alpn: alpn.into(),
@@ -1062,6 +1064,7 @@ impl MeekHttp {
             } else {
                 std::sync::Arc::from([])
             },
+            pins: ferrox_core::foxy::pin::Pins::parse(self.meek.verify_pins.clone()),
             resumption: true,
             fingerprint: Some(self.meek.shape.fingerprint()),
             padding: self.meek.shape.padding(),
@@ -1348,6 +1351,7 @@ mod tests {
             dns: Vec::new(),
             provider_id: None,
             verify_server_names: Vec::new(),
+            verify_pins: Vec::new(),
             shape: TlsShape {
                 meek_alternate_cookie_name: 0.0,
                 meek_alternate_content_type: 0.0,

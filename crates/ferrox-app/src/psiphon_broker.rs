@@ -503,6 +503,7 @@ impl Client {
             dns: Vec::new(),
             provider_id: None,
             verify_server_names: Vec::new(),
+            verify_pins: Vec::new(),
             shape: crate::psiphon_ssh::TlsShape::default(),
         };
         let http = psiphon_meek::MeekHttp::new_plain(meek, proxy.cloned(), timeout, BROKER_PATH)

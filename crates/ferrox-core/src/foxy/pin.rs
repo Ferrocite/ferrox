@@ -1,4 +1,4 @@
-//! Leaf-key pinning, authoritative for the leaf it names: a pin is `sha256/` plus base64 of SHA-256 over the leaf's `SubjectPublicKeyInfo`, so a chain this device cannot build still verifies against that key; an empty set pins and refuses nothing.
+//! Leaf-key pinning, authoritative for the leaf it names: a pin is base64 of SHA-256 over the leaf's `SubjectPublicKeyInfo`, with an optional `sha256/` prefix, so a chain this device cannot build still verifies against that key; an empty set pins and refuses nothing.
 
 use crate::b64;
 use sha2::{Digest, Sha256};
@@ -91,9 +91,7 @@ impl Pins {
     pub fn parse<I: IntoIterator<Item = String>>(pins: I) -> Self {
         let mut entries = Vec::new();
         for pin in pins {
-            let Some(raw) = pin.strip_prefix("sha256/") else {
-                continue;
-            };
+            let raw = pin.strip_prefix("sha256/").unwrap_or(&pin);
             if let Some(bytes) = b64::decode(raw.as_bytes()) {
                 if let Ok(entry) = <[u8; 32]>::try_from(bytes.as_slice()) {
                     entries.push(entry);
@@ -213,5 +211,15 @@ mod tests {
         c[inside] ^= 0x01;
         assert_eq!(spki_pin(a.as_ref()), spki_pin(b.as_ref()));
         assert_ne!(spki_pin(a.as_ref()), spki_pin(c.as_ref()));
+    }
+
+    #[test]
+    fn a_plain_psiphon_pin_parses_beside_the_prefixed_form() {
+        let (leaf, _) = certificate(11);
+        let prefixed = spki_pin(&leaf).expect("pin");
+        let plain = prefixed.trim_start_matches("sha256/").to_owned();
+        let pins = Pins::parse([prefixed, plain]);
+        assert_eq!(pins.len(), 2);
+        assert!(pins.holds(&leaf));
     }
 }
