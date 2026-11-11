@@ -2160,6 +2160,8 @@ pub(crate) struct H3 {
     packet: Vec<u8>,
     /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here. The answer's header block rides through it too, and it is cleared once the status is decoded.
     capsule_buf: Vec<u8>,
+    /// The first byte of `capsule_buf` the reader has not consumed: readers advance this instead of draining, so a frame of many capsules moves the tail once rather than once per capsule.
+    capsule_at: usize,
     /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
     handed: usize,
     /// Payload octets still owed by a DATA frame that held exactly one DATAGRAM capsule: the capsule's bytes are read from the stream straight into the caller, so the frame is not first staged in `capsule_buf`.
@@ -2231,6 +2233,7 @@ impl H3 {
             out: Vec::new(),
             packet: Vec::new(),
             capsule_buf: Vec::new(),
+            capsule_at: 0,
             handed: 0,
             direct: 0,
             fin: false,
@@ -2311,6 +2314,7 @@ impl H3 {
             out: Vec::new(),
             packet: Vec::new(),
             capsule_buf: Vec::new(),
+            capsule_at: 0,
             handed: 0,
             direct: 0,
             fin: false,
@@ -2338,6 +2342,7 @@ impl H3 {
             out: Vec::new(),
             packet: Vec::new(),
             capsule_buf: Vec::new(),
+            capsule_at: 0,
             handed: 0,
             direct: 0,
             fin: false,
@@ -2399,7 +2404,29 @@ impl H3 {
             // A block that arrived in pieces resumes its own count; the caller's split test sees it as soon as it is whole.
             return self.pending_block(started);
         }
+        self.compact_capsules();
         self.walk_capsules(started)
+    }
+
+    /// Moves the capsules the reader has consumed off the front once per frame: a frame holding many capsules then moves its tail once, not once per capsule.
+    fn compact_capsules(&mut self) {
+        if self.capsule_at == 0 {
+            return;
+        }
+        if self.capsule_at == self.capsule_buf.len() {
+            self.capsule_buf.clear();
+        } else {
+            self.capsule_buf.drain(..self.capsule_at);
+        }
+        self.capsule_at = 0;
+    }
+
+    /// Releases the capsules the cursor has passed: a stream with nothing left is emptied, so the one-capsule datagram path still sees an empty buffer.
+    fn release_capsules(&mut self) {
+        if self.capsule_at == self.capsule_buf.len() {
+            self.capsule_buf.clear();
+            self.capsule_at = 0;
+        }
     }
 
     /// Consumes one frame per turn: a header that is not whole yet leaves the caller to retry, because the capsules already in the buffer are what its reader is waiting for.
@@ -2444,7 +2471,9 @@ impl H3 {
         let deadline = Instant::now() + HEADER_TIMEOUT;
         let mut assigned = None;
         while Instant::now() < deadline {
-            if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
+            if let Some((used, capsule)) =
+                connectip::capsule_split(&self.capsule_buf[self.capsule_at..])
+            {
                 let (granted, quit) = match capsule {
                     connectip::Capsule::AddressAssign(body) => {
                         let mut into = Vec::new();
@@ -2461,7 +2490,8 @@ impl H3 {
                     }
                     _ => (None, false),
                 };
-                self.capsule_buf.drain(..used);
+                self.capsule_at += used;
+                self.release_capsules();
                 if let Some(granted) = granted {
                     assigned = Some(granted);
                 }
@@ -2481,18 +2511,54 @@ impl H3 {
         Ok(assigned)
     }
 
-    /// One IP packet, as a frame's payload the caller takes whole: the packet is written into the caller's buffer, so a datagram costs a copy and no allocation of its own.
+    /// One IP packet, as a frame's payload the caller takes whole: a frame that is exactly one DATAGRAM capsule whose packet is already queued is read straight into the caller's buffer, so the packet crosses userspace once; a capsule that spanned frames is staged and then copied, as before.
     pub(crate) fn read_ip(&mut self, into: &mut Vec<u8>) -> std::io::Result<bool> {
         let started = Instant::now();
+        // One wait per call, armed from its start: the peek below may pull before the first walk arms it.
+        self.deadline = started + HEADER_TIMEOUT;
         loop {
-            if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
+            // A DATA frame that is exactly one DATAGRAM capsule is handed straight to the caller once its packet is queued: the capsule header is spent in the peek window, the packet lands in the caller's own buffer, and the frame never enters `capsule_buf`.
+            if self.capsule_buf.len() == self.capsule_at && self.pending.is_none() {
+                if let Some((frame, head)) = self.peek().map_err(io)? {
+                    let body = self
+                        .carried
+                        .checked_add(head)
+                        .ok_or_else(|| io(Failure::Frame))?;
+                    if frame.kind == frames::H3_DATA && body < self.filled {
+                        let length =
+                            usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
+                        if let Some((capsule_head, payload)) =
+                            connectip::packet_header(&self.head[body..self.filled])
+                        {
+                            let here = self.filled - (body + capsule_head);
+                            let id = self.quic.id;
+                            let queued = self
+                                .with_conn_read(|conn| conn.stream_readable_len(id, payload))
+                                .unwrap_or(0);
+                            if length == capsule_head + payload
+                                && payload > 0
+                                && payload <= DATAGRAM_BUF_MAX
+                                && here + queued >= payload
+                            {
+                                self.carried = body + capsule_head;
+                                return self.direct_packet(into, payload);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((used, capsule)) =
+                connectip::capsule_split(&self.capsule_buf[self.capsule_at..])
+            {
                 let connectip::Capsule::Datagram(packet) = capsule else {
-                    self.capsule_buf.drain(..used);
+                    self.capsule_at += used;
+                    self.release_capsules();
                     continue;
                 };
                 into.clear();
                 into.extend_from_slice(packet);
-                self.capsule_buf.drain(..used);
+                self.capsule_at += used;
+                self.release_capsules();
                 if !into.is_empty() {
                     return Ok(true);
                 }
@@ -2513,6 +2579,45 @@ impl H3 {
             }
             self.fill_capsules().map_err(io)?;
         }
+    }
+
+    /// One DATAGRAM capsule's packet read from the stream into the caller's buffer: the capsule header is spent in the window and the packet never enters `capsule_buf`. The caller is only taken here once every byte is queued, so a short read is a stream that ended early rather than a wait.
+    fn direct_packet(&mut self, into: &mut Vec<u8>, payload: usize) -> std::io::Result<bool> {
+        into.clear();
+        crate::proxy::grow_scratch(into, payload);
+        let mut filled = 0usize;
+        while filled < payload {
+            if self.carried < self.filled {
+                let n = (self.filled - self.carried).min(payload - filled);
+                into[filled..filled + n]
+                    .copy_from_slice(&self.head[self.carried..self.carried + n]);
+                self.carried += n;
+                filled += n;
+                continue;
+            }
+            let id = self.quic.id;
+            let read = self.with_conn(|conn| conn.stream_recv(id, &mut into[filled..]));
+            match read {
+                Some(Ok((read, fin))) if read > 0 => {
+                    filled += read;
+                    if fin && filled < payload {
+                        into.truncate(filled);
+                        self.closed = true;
+                        return Err(io(Failure::Stream));
+                    }
+                }
+                Some(Ok((_, true)) | Err(quiche::Error::Done)) => {
+                    into.truncate(filled);
+                    self.closed = true;
+                    return Err(io(Failure::Stream));
+                }
+                _ => {
+                    into.truncate(filled);
+                    return Err(io(Failure::Io));
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// One UDP payload as one DATAGRAM capsule inside one DATA frame. The two headers ride the lane's own scratch and the payload keeps the caller's buffer: quiche copies every slice it is handed, so joining the datagram ahead of that copy crossed each of its bytes in userspace twice.
@@ -2544,7 +2649,7 @@ impl H3 {
         }
         loop {
             // A DATA frame that is exactly one DATAGRAM capsule is handed straight to the caller: the capsule header is spent in the peek window, the payload lands in the caller's own buffer, and the frame never enters `capsule_buf`.
-            if self.capsule_buf.is_empty() && self.pending.is_none() {
+            if self.capsule_buf.len() == self.capsule_at && self.pending.is_none() {
                 if let Some((frame, head)) = self.peek().map_err(io)? {
                     let body = self
                         .carried
@@ -2568,14 +2673,17 @@ impl H3 {
                     }
                 }
             }
-            if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
+            if let Some((used, payload)) =
+                masque::datagram_split(&self.capsule_buf[self.capsule_at..])
+            {
                 let len = payload.len();
                 let at = self.handed;
                 let take = buf.len().min(len - at);
                 buf[..take].copy_from_slice(&payload[at..at + take]);
                 // A capsule is released only when its last octet has been copied, and the count is what the caller got rather than what the capsule holds.
                 if at + take == len {
-                    self.capsule_buf.drain(..used);
+                    self.capsule_at += used;
+                    self.release_capsules();
                     self.handed = 0;
                 } else {
                     self.handed = at + take;
@@ -2598,8 +2706,9 @@ impl H3 {
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+            if self.capsule_buf.len() - self.capsule_at > DATAGRAM_BUF_MAX {
                 self.capsule_buf.clear();
+                self.capsule_at = 0;
                 self.handed = 0;
                 return Err(std::io::Error::other(
                     "foxy: a capsule stream that never parses",
@@ -9531,6 +9640,120 @@ pub(crate) mod loopback {
             "the payload crossed straight into the caller, not through the capsule buffer"
         );
         assert_eq!(lane.direct, 0, "the frame is spent");
+        edge.join().expect("joins");
+    }
+
+    /// A DATA frame holding many DATAGRAM capsules advances a cursor instead of draining the buffer per capsule: the consumed prefix stays until the frame is done, and every payload still arrives in order.
+    #[test]
+    fn a_frame_of_capsules_advances_a_cursor_instead_of_draining() {
+        const COUNT: usize = 32;
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let mut capsules = Vec::new();
+        let mut sent = Vec::new();
+        for at in 0..COUNT {
+            let payload = [at as u8; 8];
+            sent.extend_from_slice(&payload);
+            masque::datagram_encode(&payload, &mut capsules);
+        }
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(&capsules), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_secs(5));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < sent.len() {
+            assert!(std::time::Instant::now() < until, "the payloads arrive");
+            match lane.read_datagram(&mut buf) {
+                Ok(0) => panic!("an empty read with {} bytes owed", sent.len() - got.len()),
+                Ok(read) => {
+                    got.extend_from_slice(&buf[..read]);
+                    if got.len() < sent.len() {
+                        assert_eq!(
+                            lane.capsule_buf.len(),
+                            capsules.len(),
+                            "the consumed capsule is a cursor, not a drain"
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        }
+        assert_eq!(got, sent, "every payload once, in the order it was sent");
+        assert!(
+            lane.capsule_buf.is_empty(),
+            "nothing is left for the next frame"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A CONNECT-IP packet that arrives as one DATAGRAM capsule in one frame is read straight into the caller's buffer: the capsule buffer's allocation never grows, so the packet was not staged between the stream and its caller.
+    #[test]
+    fn a_connect_ip_packet_in_one_frame_is_read_into_the_caller() {
+        let (roots, server) = minted(b"h3");
+        // A packet wider than one QUIC datagram leaves in two, and a coalescing edge socket would hand its one-datagram read a burst it truncates.
+        let sock = crate::quic::Datagram::plain(
+            crate::quic::bind_datagram_plain("127.0.0.1:0").expect("binds"),
+        );
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let (mut lane, _) = Ip::open(&dial, Some(quic)).expect("opens");
+        let wide = vec![0x5a; 1_300];
+        assert!(lane
+            .write(&[198, 51, 100, 9], &[203, 0, 113, 9], 40_000, 443, &wide)
+            .expect("writes"));
+        lane.flush().expect("flushes");
+        udp_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the edge read it");
+        let mut packet = Vec::with_capacity(2_048);
+        let base = packet.as_ptr();
+        let staged = match &lane {
+            Ip::H3(inner) => inner.capsule_buf.capacity(),
+            Ip::H2(_) => unreachable!("an h3 tunnel"),
+        };
+        assert!(lane.read(&mut packet).expect("reads"), "a reply");
+        assert_eq!(
+            packet.as_ptr(),
+            base,
+            "the packet landed in the caller's own allocation"
+        );
+        assert_eq!(
+            packet.capacity(),
+            2_048,
+            "the caller's buffer did not regrow"
+        );
+        let Ip::H3(inner) = &lane else {
+            unreachable!("an h3 tunnel");
+        };
+        assert_eq!(
+            inner.capsule_buf.capacity(),
+            staged,
+            "the packet never entered the capsule buffer"
+        );
+        assert!(inner.capsule_buf.is_empty(), "nothing is left staged");
+        assert_eq!(
+            connectip::udp_from_packet(&packet).expect("parses").payload,
+            &wide[..]
+        );
         edge.join().expect("joins");
     }
 
