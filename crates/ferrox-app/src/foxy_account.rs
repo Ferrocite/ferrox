@@ -632,10 +632,6 @@ struct H2Connection {
     decoder: crate::h2::Decoder,
 }
 
-thread_local! {
-    static H2: std::cell::RefCell<Option<(String, H2Connection)>> = const { std::cell::RefCell::new(None) };
-}
-
 impl H2Connection {
     fn connect(endpoint: &Endpoint) -> Result<Self, String> {
         use crate::h2::{frame_head, MAGIC, S_HEADER_LIST, S_PUSH, T_SETTINGS};
@@ -827,22 +823,15 @@ fn h2_ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
+    // One call, one connection: the exchange the reference makes, and nothing kept for the next call to trust.
+    let mut connection = H2Connection::connect(endpoint)?;
     let mut retried = false;
     loop {
-        let result = H2.with(|cached| {
-            let mut cached = cached.borrow_mut();
-            let fresh = !matches!(cached.as_ref(), Some((host, _)) if host == &endpoint.host);
-            if fresh {
-                *cached = Some((endpoint.host.clone(), H2Connection::connect(endpoint)?));
-            }
-            let (_, connection) = cached.as_mut().expect("a connection was just built");
-            connection.request(endpoint, method, path, headers, body)
-        });
-        match result {
+        match connection.request(endpoint, method, path, headers, body) {
             Ok(reply) => return Ok(reply),
             Err(why) if retried => return Err(why),
             Err(_) => {
-                H2.with(|cached| *cached.borrow_mut() = None);
+                connection = H2Connection::connect(endpoint)?;
                 retried = true;
             }
         }
