@@ -17,12 +17,43 @@ pub(crate) enum Tproxy {
     Tproxy,
 }
 
+/// xray's `AddressPortStrategy`: which half of a named edge an SRV or TXT
+/// answer replaces before the socket is dialled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum AddressPortStrategy {
+    #[default]
+    None,
+    SrvPortOnly,
+    SrvAddressOnly,
+    SrvPortAndAddress,
+    TxtPortOnly,
+    TxtAddressOnly,
+    TxtPortAndAddress,
+}
+
+impl AddressPortStrategy {
+    /// The record family, and whether its port, its address, or both replace
+    /// the configured edge.
+    pub(crate) fn overrides(self) -> Option<(bool, bool, bool)> {
+        match self {
+            Self::None => None,
+            Self::SrvPortOnly => Some((true, true, false)),
+            Self::SrvAddressOnly => Some((true, false, true)),
+            Self::SrvPortAndAddress => Some((true, true, true)),
+            Self::TxtPortOnly => Some((false, true, false)),
+            Self::TxtAddressOnly => Some((false, false, true)),
+            Self::TxtPortAndAddress => Some((false, true, true)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SocketOptions {
     mark: Option<i32>,
     tfo: Option<i32>,
     tproxy: Tproxy,
     domain: DomainStrategy,
+    address_port: AddressPortStrategy,
     keep_alive: Option<KeepAlive>,
     congestion: Option<String>,
     window_clamp: Option<i32>,
@@ -173,6 +204,7 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
         },
     };
     let keep_alive = Some(keep_alive(node)?);
+    let address_port = address_port(node)?;
     let congestion = text(node, "tcpCongestion")?;
     let window_clamp = int(node, "tcpWindowClamp")?.filter(|value| *value > 0);
     let user_timeout = int(node, "tcpUserTimeout")?.filter(|value| *value > 0);
@@ -186,6 +218,7 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
         tfo,
         tproxy,
         domain,
+        address_port,
         keep_alive,
         congestion,
         window_clamp,
@@ -198,14 +231,26 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
     }))
 }
 
-fn warn_unsupported(node: &Json, dialer: &str) {
-    if node
-        .get("addressPortStrategy")
-        .and_then(Json::as_str)
-        .is_some_and(|text| !text.is_empty() && !text.eq_ignore_ascii_case("none"))
-    {
-        eprintln!("sockopt.addressPortStrategy is not wired; {dialer} dials its own target");
+fn address_port(node: &Json) -> Result<AddressPortStrategy, String> {
+    let Some(text) = node.get("addressPortStrategy") else {
+        return Ok(AddressPortStrategy::None);
+    };
+    let text = text
+        .as_str()
+        .ok_or_else(|| "sockopt.addressPortStrategy is not a string".to_owned())?;
+    match text.to_ascii_lowercase().as_str() {
+        "none" | "" => Ok(AddressPortStrategy::None),
+        "srvportonly" => Ok(AddressPortStrategy::SrvPortOnly),
+        "srvaddressonly" => Ok(AddressPortStrategy::SrvAddressOnly),
+        "srvportandaddress" => Ok(AddressPortStrategy::SrvPortAndAddress),
+        "txtportonly" => Ok(AddressPortStrategy::TxtPortOnly),
+        "txtaddressonly" => Ok(AddressPortStrategy::TxtAddressOnly),
+        "txtportandaddress" => Ok(AddressPortStrategy::TxtPortAndAddress),
+        other => Err(format!("unsupported address and port strategy: {other}")),
     }
+}
+
+fn warn_unsupported(node: &Json, dialer: &str) {
     if node
         .get("happyEyeballs")
         .is_some_and(|value| !matches!(value, Json::Null))
@@ -329,6 +374,17 @@ fn roll(addresses: &[SocketAddr]) -> Option<SocketAddr> {
 }
 
 impl SocketOptions {
+    /// The strategy this socket config names.
+    pub(crate) fn address_port_strategy(&self) -> AddressPortStrategy {
+        self.address_port
+    }
+
+    /// The edge a named destination dials after its SRV or TXT answer, or
+    /// `None` when the name is dialled as configured.
+    pub(crate) fn address_port(&self, host: &str, port: u16) -> Option<(String, u16)> {
+        crate::address_port::replace(self.address_port, host, port)
+    }
+
     /// The DNS cache key differs whenever an option that changes the query socket differs.
     pub(crate) fn cache_key(&self) -> String {
         format!("{self:?}")
@@ -353,6 +409,11 @@ impl SocketOptions {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
+        let (host, port) = match self.address_port(host, port) {
+            Some((host, port)) => (std::borrow::Cow::Owned(host), port),
+            None => (std::borrow::Cow::Borrowed(host), port),
+        };
+        let host = host.as_ref();
         let mut all = Vec::new();
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
@@ -797,6 +858,41 @@ mod tests {
             DomainStrategy::ForceIp64
         );
         assert!(refused(r#"{"domainStrategy":"preferIp"}"#).contains("domainStrategy"));
+    }
+
+    #[test]
+    fn address_port_strategy_names_and_refusals_match_the_reference() {
+        assert_eq!(parsed("{}").address_port, AddressPortStrategy::None);
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"none"}"#).address_port,
+            AddressPortStrategy::None
+        );
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"SRVPortOnly"}"#).address_port,
+            AddressPortStrategy::SrvPortOnly
+        );
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"srvAddressOnly"}"#).address_port,
+            AddressPortStrategy::SrvAddressOnly
+        );
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"SrvPortAndAddress"}"#).address_port,
+            AddressPortStrategy::SrvPortAndAddress
+        );
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"txtportonly"}"#).address_port,
+            AddressPortStrategy::TxtPortOnly
+        );
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"txtAddressOnly"}"#).address_port,
+            AddressPortStrategy::TxtAddressOnly
+        );
+        assert_eq!(
+            parsed(r#"{"addressPortStrategy":"TxtPortAndAddress"}"#).address_port,
+            AddressPortStrategy::TxtPortAndAddress
+        );
+        assert!(refused(r#"{"addressPortStrategy":"preferIp"}"#)
+            .contains("unsupported address and port strategy"));
     }
 
     #[test]

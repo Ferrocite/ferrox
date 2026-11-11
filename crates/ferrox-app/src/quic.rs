@@ -2975,7 +2975,7 @@ pub(crate) fn udp_to_server(
     address: &str,
     port: u16,
 ) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
-    let peer = format!("{address}:{port}").to_socket_addrs().ok()?.next()?;
+    let peer = crate::proxy::resolve_outbound(address, port)?;
     let sock = if peer.is_ipv6() {
         bind_datagram("[::]:0").ok()?
     } else {
