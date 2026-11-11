@@ -23,7 +23,7 @@ pub(crate) struct Hello {
     /// The groups a config's `curvePreferences` names, in its order: `None` keeps the profile's
     /// own list and shares, the hello a browser would send.
     groups: Option<Vec<u16>>,
-    grease: [u16; 5],
+    grease: [u16; 7],
     alpn: Option<&'static [&'static [u8]]>,
     /// A stock hello's config-named ALPN list, which Go puts where the preset's table would.
     stock_alpn: Option<Vec<Vec<u8>>>,
@@ -70,12 +70,12 @@ impl Hello {
         curves: &[u16],
         client_random: Option<[u8; 32]>,
     ) -> Result<Self, TlsError> {
-        // One draw for the whole hello: its random, its session id, five GREASE pairs.
-        let mut seed = [0u8; 74];
+        // One draw for the whole hello: its random, its session id, seven GREASE pairs.
+        let mut seed = [0u8; 78];
         getrandom::fill(&mut seed).map_err(entropy)?;
         let (blocks, draws) = seed.as_chunks::<32>();
         let (random, session_id) = (client_random.unwrap_or(blocks[0]), blocks[1]);
-        let mut grease = [0u16; 5];
+        let mut grease = [0u16; 7];
         for (slot, pair) in grease.iter_mut().zip(draws.as_chunks::<2>().0) {
             *slot = u16::from_le_bytes(*pair);
         }
@@ -644,12 +644,18 @@ impl Hello {
     ) -> Option<Entry<'a>> {
         let (kind, invariant, source) = match &ext.body {
             Body::Grease => {
-                let slot = (*grease_exts).min(1);
+                // The first two extensions draw uTLS's slots; a hello with more greases (the
+                // reference's own) draws the later slots, so no two of its greases repeat.
+                let slot = match *grease_exts {
+                    0 | 1 => *grease_exts,
+                    2 => 3,
+                    other => other,
+                };
                 *grease_exts += 1;
                 (
                     grease_value(&self.grease, 2 + slot),
                     true,
-                    Source::Zeros(slot),
+                    Source::Zeros(slot.min(1)),
                 )
             }
             Body::Sni => (0x0000, false, Source::Name(sni?)),
@@ -858,15 +864,23 @@ fn share_spec(profile: &Profile) -> (&'static [u16], bool) {
     (&[], false)
 }
 
-/// uTLS moves the second extension off the first when the two draws collide.
-fn distinct_grease(mut grease: [u16; 5]) -> [u16; 5] {
+/// uTLS moves the second extension off the first when the two draws collide; the four
+/// extension slots each hold a draw of their own, so a hello's greases never repeat.
+fn distinct_grease(mut grease: [u16; 7]) -> [u16; 7] {
     if grease_value(&grease, 2) == grease_value(&grease, 3) {
         grease[3] ^= 0x1010;
+    }
+    for slot in [5, 6] {
+        for other in [2usize, 3, 5] {
+            if other != slot && grease_value(&grease, other) == grease_value(&grease, slot) {
+                grease[slot] ^= 0x1010;
+            }
+        }
     }
     grease
 }
 
-fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
+fn grease_or(value: u16, grease: &[u16; 7], slot: usize) -> u16 {
     if value == GREASE {
         grease_value(grease, slot)
     } else {
@@ -874,7 +888,7 @@ fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
     }
 }
 
-fn grease_value(grease: &[u16; 5], slot: usize) -> u16 {
+fn grease_value(grease: &[u16; 7], slot: usize) -> u16 {
     // The masked nibble carries through and the fixed low nibble keeps the value nonzero.
     let value = u16::from((grease[slot] & 0x00f0) as u8 | 0x0a);
     value | (value << 8)

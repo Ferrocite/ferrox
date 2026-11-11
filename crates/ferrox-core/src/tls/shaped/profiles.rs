@@ -747,8 +747,16 @@ static P_HELLOCHROME_100_PSK: Profile = Profile {
             body: Body::Raw(&[0x02, 0x00, 0x02]),
         },
         Ext {
-            kind: 0x4469,
-            body: Body::Raw(&[0x00, 0x03, 0x02, 0x68, 0x32]),
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
         },
         Ext {
             kind: 0x0a0a,
