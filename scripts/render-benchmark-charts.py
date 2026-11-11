@@ -1277,11 +1277,13 @@ def throughput_verdict(scenario):
     reference ratio does not show.
     """
     verdict = "unproven"
+    first = True
     for row in scenario.get("rows", []):
         if not row.get("gates") or not str(row.get("label", "")).startswith("throughput"):
             continue
-        if verdict == "unproven":
+        if first:
             verdict = row.get("verdict", "unproven")
+            first = False
         if row.get("deficit"):
             return "worse"
     return verdict
