@@ -71731,9 +71731,17 @@ mod poll_copy {
     }
 
     pub(super) fn available() -> bool {
-        !workers().is_empty()
+        #[cfg(windows)]
+        {
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            !workers().is_empty()
+        }
     }
 
+    /// Windows keeps the lane pool: `WSAPoll` costs more per wake than a timed read, and the pool already runs both directions.
     pub(super) fn handoff(
         client_read: Connection,
         target_write: Connection,
