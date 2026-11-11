@@ -273,20 +273,27 @@ fn parse_endpoint(text: &str) -> Option<SocketAddr> {
 
 /// The body `POST /reg` sends: a fresh Curve25519 key and the device shape the
 /// API answers with the account's own keys and addresses.
-fn registration_body(public: &[u8; 32], tos: &str) -> Vec<u8> {
+fn registration_body(public: &[u8; 32], tos: &str, serial: &str) -> Vec<u8> {
     let pairs = vec![
         ("key", string(&b64(public))),
         ("install_id", string("")),
         ("fcm_token", string("")),
         ("tos", string(tos)),
         ("model", string("PC")),
-        ("serial_number", string("")),
+        ("serial_number", string(serial)),
         ("os_version", string("")),
         ("key_type", string("curve25519")),
         ("tunnel_type", string("wireguard")),
         ("locale", string("en_US")),
     ];
     json_bytes(&obj_pairs(pairs))
+}
+
+/// A serial of eight random bytes in hex, the shape the API's POST reads.
+fn android_serial() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the OS entropy");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The body that enrolls the P-256 key the MASQUE half presents.
@@ -378,7 +385,8 @@ where
     clamp(&mut private);
     let public = x25519_dalek::x25519(private, x25519_dalek::X25519_BASEPOINT_BYTES);
     let tos = tos_now();
-    let body = registration_body(&public, &tos);
+    let serial = android_serial();
+    let body = registration_body(&public, &tos, &serial);
     let headers = registration_headers(None);
     let headers = borrow_headers(&headers);
     let reply = call("POST", "/reg", &headers, &body)
@@ -1165,7 +1173,7 @@ fn tos_now() -> String {
     let rest = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}+00:00",
         rest / 3600,
         rest % 3600 / 60,
         rest % 60,
