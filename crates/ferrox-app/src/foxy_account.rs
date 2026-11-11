@@ -495,6 +495,8 @@ pub(crate) struct Endpoint {
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
     /// The shaped hello the HTTP/2 dials ride; `None` keeps the plane's own.
     pub(crate) h2_fingerprint: Option<ferrox_core::tls::shaped::Fingerprint>,
+    /// The groups the HTTP/2 hello offers beside its profile's own; empty keeps the profile's.
+    pub(crate) h2_curves: Vec<u16>,
 }
 
 impl Endpoint {
@@ -521,6 +523,7 @@ impl Endpoint {
             roots,
             upstream: None,
             h2_fingerprint: None,
+            h2_curves: Vec::new(),
         })
     }
 
@@ -575,6 +578,9 @@ impl Endpoint {
         cfg.fingerprint = self
             .h2_fingerprint
             .or_else(|| ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148"));
+        if !self.h2_curves.is_empty() {
+            cfg.curves = std::sync::Arc::from(self.h2_curves.as_slice());
+        }
         cfg
     }
 
@@ -582,6 +588,13 @@ impl Endpoint {
     #[must_use]
     pub(crate) fn with_h2_fingerprint(mut self, name: &str) -> Self {
         self.h2_fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve(name);
+        self
+    }
+
+    /// The origin whose HTTP/2 dials offer these groups and no other, shares drawn per group.
+    #[must_use]
+    pub(crate) fn with_h2_curves<const N: usize>(mut self, curves: [u16; N]) -> Self {
+        self.h2_curves = curves.to_vec();
         self
     }
 

@@ -128,6 +128,7 @@ impl VeepnOut {
                 roots: Arc::clone(&roots),
                 upstream: None,
                 h2_fingerprint: None,
+                h2_curves: Vec::new(),
             });
         }
         if origins.is_empty() {
