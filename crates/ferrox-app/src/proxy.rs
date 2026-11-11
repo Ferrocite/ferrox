@@ -25346,6 +25346,7 @@ fn serve_socks_udp_freedom(
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let replies = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let mut pinned = None;
     let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
     let mut seen = 0u64;
@@ -25368,6 +25369,10 @@ fn serve_socks_udp_freedom(
             Err(_) => break,
         };
         seen = replies.load(Ordering::Relaxed);
+        // The first sender is the relay's peer; a later one cannot redirect the replies.
+        if !source_allowed(None, &mut pinned, &source, src) {
+            continue;
+        }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
@@ -25378,9 +25383,6 @@ fn serve_socks_udp_freedom(
             continue;
         };
         let blocked = freedom.blocks(crate::router::Network::Udp, dest.ip(), dest.port());
-        if let Ok(mut slot) = source.lock() {
-            *slot = Some(src);
-        }
         if let Some((socket, _, gate)) = uplinks.get(&dest) {
             if blocked {
                 continue;
