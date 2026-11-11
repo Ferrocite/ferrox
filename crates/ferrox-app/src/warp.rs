@@ -432,9 +432,6 @@ where
     let registered = parse_registration(&reply)?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
-    // The reference's rhythm: its key generation leaves the enrollment a second behind
-    // the registration, where an instant PATCH reads as a script the edge may refuse.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
 
     let key = rcgen::KeyPair::generate()
         .map_err(|error| RegisterError::fatal(format!("warp MASQUE key: {error}")))?;

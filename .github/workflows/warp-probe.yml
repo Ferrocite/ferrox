@@ -65,23 +65,10 @@ jobs:
           sudo update-ca-certificates >/dev/null 2>&1
           echo "the leaf is trusted by the system store"
           cat > /tmp/capture.py <<'EOF'
-          import ssl, socket, sys, base64, json
+          import ssl, socket, sys, base64, json, urllib.request, urllib.error
           from h2.connection import H2Connection
           from h2.config import H2Configuration
           from h2.events import RequestReceived, DataReceived, StreamEnded, RemoteSettingsChanged, WindowUpdated, PingReceived, PriorityUpdated
-
-          FAKE_REG = json.dumps({
-              "id": "3d1f2e3a-4b5c-4d6e-8f90-1a2b3c4d5e6f",
-              "token": "fake" + "0123456789abcdef" * 2,
-              "config": {
-                  "client_id": base64.b64encode(bytes([0, 0, 2])).decode(),
-                  "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700:110:8a36::df9:2a4c"}},
-                  "peers": [{"public_key": base64.b64encode(bytes(range(32))).decode(),
-                             "endpoint": {"v4": "162.159.192.1:2408", "v6": "[2606:4700:190::a413:badb]:2408", "host": "162.159.192.1:2408", "ports": [2408]}}],
-              },
-              "account": {"id": "3d1f2e3a-4b5c-4d6e-8f90-1a2b3c4d5e6f", "account_type": "free"},
-          }).encode()
-          REFUSED = b'{"result":null,"success":false,"errors":[{"code":1012,"message":"Not authorized"}],"messages":[]}'
 
           class Cap:
               def __init__(self, conn, sock, tag):
@@ -113,12 +100,23 @@ jobs:
                       heads = dict(self.heads[sid])
                       method = heads.get(b":method", b"").decode()
                       path = heads.get(b":path", b"").decode()
-                      if method == "POST" and path.endswith("/reg"):
-                          self.conn.send_headers(sid, [(":status", "200"), ("content-type", "application/json")])
-                          self.conn.send_data(sid, FAKE_REG, True)
-                      else:
-                          self.conn.send_headers(sid, [(":status", "404"), ("content-type", "application/json")])
-                          self.conn.send_data(sid, REFUSED, True)
+                      fwd = {}
+                      for name, value in self.heads[sid]:
+                          if name.startswith(b":") or name in (b"host", b"content-length", b"connection"):
+                              continue
+                          fwd[name.decode()] = value.decode()
+                      url = "https://api.cloudflareclient.com" + path
+                      try:
+                          req = urllib.request.Request(url, data=body, method=method, headers=fwd)
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              status, payload = r.status, r.read()
+                      except urllib.error.HTTPError as e:
+                          status, payload = e.code, e.read()
+                      except Exception as e:
+                          status, payload = 502, str(e).encode()
+                      print(f"FORWARDED {method} {path} -> {status} ({len(payload)} bytes)", flush=True)
+                      self.conn.send_headers(sid, [(":status", str(status)), ("content-type", "application/json")])
+                      self.conn.send_data(sid, payload, True)
                   self.flush()
               def flush(self):
                   data = self.conn.data_to_send()
