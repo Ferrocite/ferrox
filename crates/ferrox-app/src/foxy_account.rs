@@ -685,9 +685,14 @@ impl H2Connection {
         };
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
-        fields.push((":path".to_owned(), path.to_owned()));
         fields.push((":scheme".to_owned(), "https".to_owned()));
-        fields.push((":authority".to_owned(), endpoint.host.clone()));
+        let authority = if endpoint.port == 443 {
+            endpoint.host.clone()
+        } else {
+            format!("{}:{}", endpoint.host, endpoint.port)
+        };
+        fields.push((":authority".to_owned(), authority));
+        fields.push((":path".to_owned(), path.to_owned()));
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if matches!(lower.as_str(), "connection" | "host") {
