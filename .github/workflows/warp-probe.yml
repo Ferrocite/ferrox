@@ -28,6 +28,28 @@ jobs:
           (cd upstream/aether/aether \
             && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether 2>&1 | tail -2)
           mv upstream/aether/aether/target/release/aether /tmp/aether
+          echo "---- the reference adopts the device ours minted ----"
+          if test -f warp-identity.json; then
+            python3 - <<'EOF'
+          import json, os
+          me = json.load(open('warp-identity.json'))
+          wg = me['wireguard']
+          v4 = next((a for a in wg['address'] if ':' not in a), '')
+          v6 = next((a for a in wg['address'] if ':' in a), '')
+          toml = (f'device_id = "{me["deviceId"]}"\n'
+                  f'access_token = "{me["token"]}"\n'
+                  f'ipv4 = "{v4}"\n'
+                  f'ipv6 = "{v6}"\n'
+                  f'wg_private_key = "{wg["privateKey"]}"\n'
+                  f'wg_peer_public_key = "{wg["publicKey"]}"\n')
+          os.makedirs('target/probe', exist_ok=True)
+          open('target/probe/mine-as-aether.toml', 'w').write(toml)
+          print(f"my device {me['deviceId']}, token({len(me['token'])}) -> target/probe/mine-as-aether.toml")
+          EOF
+            /tmp/aether --register masque --masque-config target/probe/mine-as-aether.toml 2>&1 | tail -6 || true
+          else
+            echo "no warp-identity.json was saved; the register died before a device existed"
+          fi
           /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -6
           echo "the reference's own token, for length beside ours:"
           grep -o 'token = "[^"]*"' target/probe/identities.toml | head -1 | wc -c || true

@@ -334,6 +334,9 @@ fn registration_headers(bearer: Option<&str>) -> Vec<(String, String)> {
 struct RegisterError {
     fatal: bool,
     reason: String,
+    /// The device a refusal left behind, its key made but its enrollment refused;
+    /// the caller saves it, for a later run to resume instead of minting another.
+    kept: Option<Box<Identity>>,
 }
 
 impl RegisterError {
@@ -341,6 +344,7 @@ impl RegisterError {
         Self {
             fatal: false,
             reason: reason.into(),
+            kept: None,
         }
     }
 
@@ -348,6 +352,7 @@ impl RegisterError {
         Self {
             fatal: true,
             reason: reason.into(),
+            kept: None,
         }
     }
 }
@@ -373,7 +378,18 @@ fn register(spec: &WarpSpec) -> Result<Identity, String> {
         }) {
             Ok(identity) => return Ok(identity),
             Err(error) if error.fatal => {
-                return Err(format!("{} (earlier: {last})", error.reason)
+                let note = match error.kept.zip(spec.identity_file.as_ref()) {
+                    Some((identity, path)) => match identity.save(path) {
+                        Ok(()) => format!(
+                            "; its device {} is saved at {}",
+                            identity.device_id,
+                            path.display()
+                        ),
+                        Err(why) => format!("; saving its device failed: {why}"),
+                    },
+                    None => String::new(),
+                };
+                return Err(format!("{}{} (earlier: {last})", error.reason, note)
                     .trim_end()
                     .to_owned());
             }
@@ -421,6 +437,20 @@ where
         .map_err(|error| RegisterError::fatal(format!("warp MASQUE key: {error}")))?;
     let spki = decode_pem(&key.public_key_pem())
         .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
+    // The device exists from here on: its keys, id and token stay a full identity
+    // even when the enrollment is refused, for the caller to save rather than orphan.
+    let mut identity = Identity {
+        device_id: registered.device_id.clone(),
+        token: registered.token.clone(),
+        wireguard: WireGuardIdentity {
+            private,
+            peer: registered.peer,
+            endpoint: spec.endpoint.unwrap_or(registered.endpoint),
+            addresses: registered.addresses.clone(),
+            reserved: registered.reserved,
+        },
+        masque: None,
+    };
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
     let reply = call("PATCH", &path, &headers, &enrollment_body(&spki))
@@ -438,7 +468,9 @@ where
                 )
             },
         );
-        RegisterError::fatal(format!("{} ({})", error.reason, why))
+        let mut refused = RegisterError::fatal(format!("{} ({})", error.reason, why));
+        refused.kept = Some(Box::new(identity.clone()));
+        refused
     })?;
 
     let headers = registration_headers(Some(&bearer));
@@ -450,22 +482,12 @@ where
         );
     }
 
-    Ok(Identity {
-        device_id: registered.device_id,
-        token: registered.token,
-        wireguard: WireGuardIdentity {
-            private,
-            peer: registered.peer,
-            endpoint: spec.endpoint.unwrap_or(registered.endpoint),
-            addresses: registered.addresses.clone(),
-            reserved: registered.reserved,
-        },
-        masque: Some(MasqueIdentity {
-            private: key.serialize_der(),
-            server,
-            addresses: registered.addresses,
-        }),
-    })
+    identity.masque = Some(MasqueIdentity {
+        private: key.serialize_der(),
+        server,
+        addresses: registered.addresses,
+    });
+    Ok(identity)
 }
 
 fn borrow_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
