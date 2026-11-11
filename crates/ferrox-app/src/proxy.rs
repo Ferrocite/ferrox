@@ -24665,7 +24665,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
             addr.ip()
         });
-    let Some(lane) = spawn_udp_lane(out, local) else {
+    let Some(lane) = spawn_udp_lane(out, local, None) else {
         return;
     };
     let mut client_addr: Option<SocketAddr> = None;
@@ -24886,8 +24886,10 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
 struct UdpLane {
     address: SocketAddr,
     handle: thread::JoinHandle<()>,
+    waker: UdpSocket,
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_socks_udp_split(
     mut client: Connection,
     plan: &RoutePlan,
@@ -24897,6 +24899,8 @@ fn serve_socks_udp_split(
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
+    let _ = client.set_read_timeout(Some(UDP_POLL));
     let relay_local = relay.local_addr().ok();
     let local = relay
         .local_addr()
@@ -24910,79 +24914,103 @@ fn serve_socks_udp_split(
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     let mut process = None;
     let mut process_src = None;
-    while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if replies.contains_key(&src) {
-            if let Some(client) = client_addr {
-                let _ = relay.send_to(&buf[..n], client);
+    let mut quiet = Instant::now();
+    let mut checked = Instant::now();
+    loop {
+        if checked.elapsed() >= UDP_POLL {
+            checked = Instant::now();
+            if peer_left(&client) {
+                break;
             }
-            continue;
         }
-        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
-            continue;
-        };
-        let mut route = dest.clone();
-        let mut dial = None;
-        let mut protocol = None;
-        let mut route_only = None;
-        if let Some(sniffing) = crate::sniff::current().filter(|sniffing| sniffing.enabled()) {
-            if let Some(found) = sniffing.inspect_udp(&dest, payload) {
-                protocol = Some(found.protocol);
-                if found.override_destination {
-                    route = Destination::Name(found.domain.clone(), dest.port());
-                    if sniffing.should_dial_override(&found) {
-                        dial = route.socket();
-                    } else {
-                        route_only = Some(&route);
+        match relay.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                quiet = Instant::now();
+                if replies.contains_key(&src) {
+                    if let Some(client) = client_addr {
+                        let _ = relay.send_to(&buf[..n], client);
                     }
+                    continue;
+                }
+                let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+                    continue;
+                };
+                let mut route = dest.clone();
+                let mut dial = None;
+                let mut protocol = None;
+                let mut route_only = None;
+                if let Some(sniffing) =
+                    crate::sniff::current().filter(|sniffing| sniffing.enabled())
+                {
+                    if let Some(found) = sniffing.inspect_udp(&dest, payload) {
+                        protocol = Some(found.protocol);
+                        if found.override_destination {
+                            route = Destination::Name(found.domain.clone(), dest.port());
+                            if sniffing.should_dial_override(&found) {
+                                dial = route.socket();
+                            } else {
+                                route_only = Some(&route);
+                            }
+                        }
+                    }
+                }
+                client_addr = Some(src);
+                if process_src != Some(src) {
+                    process = plan.process_owner_from(crate::router::Network::Udp, src);
+                    process_src = Some(src);
+                }
+                let (out, key) = plan.lane_with_protocol(
+                    &route,
+                    crate::router::Network::Udp,
+                    Some(&client),
+                    FlowFacts {
+                        source: Some(src),
+                        local: relay_local,
+                        protocol,
+                        user,
+                        level,
+                        attrs: None,
+                        process: process.as_ref(),
+                        original: Some(&dest),
+                        route: route_only,
+                    },
+                );
+                let key = key.map(std::borrow::Cow::into_owned);
+                if matches!(&*out, Outbound::Block(_)) {
+                    continue;
+                }
+                let lane_address = match retire_finished_lane(&mut lanes, &mut replies, &key) {
+                    Some(address) => Some(address),
+                    None => match lanes.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            Some(entry.get().address)
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
+                                replies.insert(lane.address, entry.key().clone());
+                                let address = lane.address;
+                                entry.insert(lane);
+                                address
+                            })
+                        }
+                    },
+                };
+                if let Some(lane_address) = lane_address {
+                    let frame = match dial {
+                        Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
+                        None => &buf[..n],
+                    };
+                    let _ = relay.send_to(frame, lane_address);
+                }
+            }
+            Err(error) => {
+                if !is_timeout(&error) || quiet.elapsed() >= budgets::udp_idle() {
+                    break;
                 }
             }
         }
-        client_addr = Some(src);
-        if process_src != Some(src) {
-            process = plan.process_owner_from(crate::router::Network::Udp, src);
-            process_src = Some(src);
-        }
-        let (out, key) = plan.lane_with_protocol(
-            &route,
-            crate::router::Network::Udp,
-            Some(&client),
-            FlowFacts {
-                source: Some(src),
-                local: relay_local,
-                protocol,
-                user,
-                level,
-                attrs: None,
-                process: process.as_ref(),
-                original: Some(&dest),
-                route: route_only,
-            },
-        );
-        let key = key.map(std::borrow::Cow::into_owned);
-        if matches!(&*out, Outbound::Block(_)) {
-            continue;
-        }
-        let lane_address = match retire_finished_lane(&mut lanes, &mut replies, &key) {
-            Some(address) => Some(address),
-            None => match lanes.entry(key) {
-                std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().address),
-                std::collections::hash_map::Entry::Vacant(entry) => spawn_udp_lane(&out, local)
-                    .map(|lane| {
-                        replies.insert(lane.address, entry.key().clone());
-                        let address = lane.address;
-                        entry.insert(lane);
-                        address
-                    }),
-            },
-        };
-        if let Some(lane_address) = lane_address {
-            let frame = match dial {
-                Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
-                None => &buf[..n],
-            };
-            let _ = relay.send_to(frame, lane_address);
-        }
     }
+    retire_udp_lanes(relay, lanes);
 }
 
 /// The upstream socket's family follows the relay's: an IPv4 relay gets an unspecified IPv4 bind, an IPv6 relay an unspecified IPv6 bind.
@@ -25015,10 +25043,18 @@ fn retire_finished_lane(
     None
 }
 
-fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
+fn spawn_udp_lane(
+    out: &Outbound,
+    local: std::net::IpAddr,
+    associate: Option<Connection>,
+) -> Option<UdpLane> {
     let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
     let address = socket.local_addr().ok()?;
+    let waker = socket.try_clone().ok()?;
     let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    if let Some(associate) = associate.as_ref() {
+        let _ = associate.set_read_timeout(Some(UDP_POLL));
+    }
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
     let out = out.clone();
@@ -25026,9 +25062,31 @@ fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
         // The lane's own thread starts with the settings the pick left on this one.
         SEND_THROUGH.with(|cell| cell.set(source));
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
-        serve_udp_lane(&socket, &out, None);
+        serve_udp_lane(&socket, &out, associate.as_ref());
     });
-    Some(UdpLane { address, handle })
+    Some(UdpLane {
+        address,
+        handle,
+        waker,
+    })
+}
+
+/// A split association owns its lanes: when it ends, each lane is woken with a datagram that names
+/// no destination and its read timeout is shortened, while the relay stays bound until every lane
+/// has joined so a late answer cannot reach a later association on the reused port.
+fn retire_udp_lanes(relay: UdpSocket, lanes: HashMap<Option<String>, UdpLane>) {
+    if lanes.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        for lane in lanes.values() {
+            let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
+            let _ = relay.send_to(&[0u8], lane.address);
+        }
+        for lane in lanes.into_values() {
+            let _ = lane.handle.join();
+        }
+    });
 }
 
 /// The SOCKS5 client lane for datagrams: one association to the upstream server, and
@@ -68793,7 +68851,8 @@ mod tests {
                 }
             });
             let out = Outbound::clone(&lane);
-            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let lane =
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
             let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -68827,7 +68886,7 @@ mod tests {
             }
         });
         let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
-        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
         let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -68863,7 +68922,8 @@ mod tests {
                     let _ = echo.send_to(&buf[..n], peer);
                 }
             });
-            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let lane =
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
             let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
             client
                 .set_read_timeout(Some(Duration::from_secs(1)))
@@ -69665,12 +69725,117 @@ end
         };
         udp.send_to(&frame(blocked, b"drop"), relay).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        assert!(
-            udp.recv_from(&mut back).is_err(),
-            "the blocked lane never answers"
-        );
+        if let Ok((n, from)) = udp.recv_from(&mut back) {
+            panic!(
+                "the blocked lane answered from {from} with {:?}",
+                &back[..n]
+            );
+        }
         let source = udp_roundtrip(&udp, relay, &frame(allowed, b"ping"), b"ping");
         assert_eq!(source.port(), allowed);
+    }
+
+    /// A split association lives on its control connection: once the client drops it, the relay
+    /// and its lanes must end, or a lane's late answer can land on the next association's reused
+    /// port.
+    #[test]
+    fn a_split_udp_association_ends_with_its_control_connection() {
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        drop(client);
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the split association outlived its control connection"
+        );
+    }
+
+    /// The control close is noticed while datagrams keep arriving, not only on an idle tick: a
+    /// steady stream used to keep the relay alive after the client had gone.
+    #[test]
+    fn a_split_udp_association_ends_under_a_datagram_stream() {
+        let allowed = udp_echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        udp_roundtrip(&udp, relay, &frame, b"ping");
+        drop(client);
+        udp.set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let sending = Arc::clone(&stop);
+        let stream = thread::spawn(move || {
+            let mut back = vec![0u8; UDP_BUF];
+            while !sending.load(Ordering::Relaxed) {
+                let _ = udp.send_to(&frame, relay);
+                let _ = udp.recv_from(&mut back);
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let ended = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        let _ = stream.join();
+        assert!(
+            ended,
+            "the split association outlived its control under a datagram stream"
+        );
     }
 
     /// A split association resolves the process from the UDP sender, not the TCP control
@@ -69800,7 +69965,15 @@ end
         while !handle.is_finished() {
             thread::yield_now();
         }
-        let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
+        let waker = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut lanes = HashMap::from([(
+            key.clone(),
+            UdpLane {
+                address,
+                handle,
+                waker,
+            },
+        )]);
         let mut replies = HashMap::from([(address, key.clone())]);
         let _ = retire_finished_lane(&mut lanes, &mut replies, &key);
         assert!(!lanes.contains_key(&key));
