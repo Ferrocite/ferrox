@@ -826,6 +826,19 @@ fn h2_ask(
     }
 }
 
+/// One request and its answer over HTTP/2 with an HTTP/1.1 fallback: the WARP API
+/// refuses the account plane's authenticated mutations from the HTTP/1.1 stack.
+pub(crate) fn ask_h2(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Reply, String> {
+    h2_ask(endpoint, method, url, headers, body)
+        .or_else(|_| ask(endpoint, method, url, headers, body))
+}
+
 /// One request and its answer over HTTP/1.1, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.
 pub(crate) fn ask(
     endpoint: &Endpoint,
