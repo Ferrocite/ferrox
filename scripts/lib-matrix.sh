@@ -156,7 +156,13 @@ matrix_engine_skip_reason() {
       printf '%s\n' "xray-rust at this pin has no VLESS over Hysteria; its Hysteria outbound is the native proxy protocol" ;;
     xray-core-rust:masque-*|zeronet:masque-*|sing-box:masque-*|xray-rust:masque-*|leaf:masque-*)
       printf '%s\n' "$engine at this pin has no MASQUE CONNECT-IP outbound" ;;
-    xray-core:warp-*|xray-core-rust:warp-*|sing-box:warp-*|xray-rust:warp-*|leaf:warp-*)
+    xray-core:warp-*)
+      if [[ "$role" == server ]]; then
+        printf '%s\n' "xray-core's MASQUE inbound speaks CONNECT-IP, not WARP's profile"
+      else
+        printf '%s\n' "xray-core at this pin has no WARP carrier"
+      fi ;;
+    xray-core-rust:warp-*|sing-box:warp-*|xray-rust:warp-*|leaf:warp-*)
       printf '%s\n' "$engine at this pin has no WARP carrier" ;;
     *)
       return 1 ;;

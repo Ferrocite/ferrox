@@ -114,6 +114,12 @@ selftest_gaps() {
     || { echo "selftest: a WARP cell no longer needs an external reference" >&2; failed=1; }
   matrix_warp_needs_external_reference masque-down-8 \
     && { echo "selftest: a plain MASQUE cell was taken for a WARP cell" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core warp-masque-down-8 server \
+    | grep -q "CONNECT-IP" \
+    || { echo "selftest: the xray-core WARP server skip lost its reason" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core warp-masque-down-8 client \
+    | grep -q "no WARP carrier" \
+    || { echo "selftest: the xray-core WARP client skip lost its reason" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
