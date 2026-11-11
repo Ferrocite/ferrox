@@ -418,17 +418,6 @@ where
     let reply = call("POST", "/reg", &headers, &body)
         .map_err(|error| RegisterError::retryable(error.reason))?;
     // A reply the API shaped for another kind of device shows in its own headers and size.
-    eprintln!(
-        "warp: the registration reply is {}, {} bytes, headers {}",
-        reply.status,
-        reply.body.len(),
-        reply
-            .headers
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<&str>>()
-            .join(", ")
-    );
     let registered = parse_registration(&reply)?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
@@ -437,8 +426,7 @@ where
         .map_err(|error| RegisterError::fatal(format!("warp MASQUE key: {error}")))?;
     let spki = decode_pem(&key.public_key_pem())
         .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
-    // The device exists from here on: its keys, id and token stay a full identity
-    // even when the enrollment is refused, for the caller to save rather than orphan.
+    // The device exists from here on, for the caller to save rather than orphan.
     let mut identity = Identity {
         device_id: registered.device_id.clone(),
         token: registered.token.clone(),

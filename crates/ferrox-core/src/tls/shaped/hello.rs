@@ -909,8 +909,7 @@ fn uint8_list<W: Sink>(out: &mut W, values: &[u16], each: impl Fn(u16) -> u16) {
 }
 
 fn key_share_body<W: Sink>(out: &mut W, shares: &[Share], grease: &[u16; 7]) {
-    // The reference's one GREASE draw serves the supported-groups list and the key share
-    // alike; a share group absent from the list reads as a bad key share.
+    // The reference's one GREASE draw serves the groups list and the key share alike.
     let total: usize = shares.iter().map(|share| 4 + share.data.len()).sum();
     out.put(&(total as u16).to_be_bytes());
     for share in shares {
