@@ -441,8 +441,11 @@ where
     };
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
-    let reply = call("PATCH", &path, &headers, &enrollment_body(&spki))
-        .map_err(|error| RegisterError::fatal(error.reason))?;
+    let reply = call("PATCH", &path, &headers, &enrollment_body(&spki)).map_err(|error| {
+        let mut refused = RegisterError::fatal(error.reason);
+        refused.kept = Some(Box::new(identity.clone()));
+        refused
+    })?;
     let server = parse_masque_server(&reply).map_err(|error| {
         // A refusal that may be about the token is told apart from one about the enrollment: the token's own GET answers where the PATCH cannot.
         let why = call("GET", &path, &headers, b"").map_or_else(
@@ -451,7 +454,7 @@ where
                 format!(
                     "the token ({}, starts {}) answers GET {}",
                     registered.token.len(),
-                    &registered.token[..3],
+                    registered.token.chars().take(3).collect::<String>(),
                     get.status
                 )
             },
@@ -463,11 +466,16 @@ where
 
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
-    if let Err(error) = call("PATCH", &path, &headers, ENABLE_BODY) {
-        eprintln!(
+    match call("PATCH", &path, &headers, ENABLE_BODY) {
+        Err(error) => eprintln!(
             "warp: {}; the tunnel may carry nothing until it is enabled",
             error.reason
-        );
+        ),
+        Ok(reply) if reply.status / 100 != 2 => eprintln!(
+            "warp: the enable answered {}; the tunnel may carry nothing until it is enabled",
+            reply.status
+        ),
+        Ok(_) => {}
     }
 
     identity.masque = Some(MasqueIdentity {
@@ -794,6 +802,12 @@ impl Identity {
         let mut file = options
             .open(path)
             .map_err(|error| format!("warp: cannot write `{}`: {error}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("warp: cannot lock `{}`: {error}", path.display()))?;
+        }
         file.write_all(text.as_bytes())
             .map_err(|error| format!("warp: cannot write `{}`: {error}", path.display()))
     }
@@ -924,12 +938,30 @@ pub(crate) struct WarpOut {
 }
 
 impl WarpOut {
-    pub(crate) fn new(outbound: &crate::json::Json) -> Result<Self, String> {
+    pub(crate) fn new(outbound: &crate::json::Json, test: bool) -> Result<Self, String> {
         let settings = outbound
             .get("settings")
             .ok_or("warp outbound has no settings")?;
         let spec = WarpSpec::from(settings)?;
-        let identity = spec.identity()?;
+        let identity = if test
+            && spec.inline.is_none()
+            && !spec
+                .identity_file
+                .as_ref()
+                .is_some_and(|path| path.is_file())
+        {
+            // A config test names the settings; the registration stays a runtime act.
+            return Ok(Self {
+                mode: spec.mode,
+                wireguard: None,
+                masque: None,
+                chosen: Mutex::new(None),
+                probe_host: spec.probe_host,
+                probe_port: spec.probe_port,
+            });
+        } else {
+            spec.identity()?
+        };
         let wireguard = if spec.mode == Mode::Masque {
             None
         } else {
@@ -992,9 +1024,9 @@ impl WarpOut {
         if let Some(lane) = *chosen {
             return lane;
         }
-        let lane = match (&self.wireguard, &self.masque) {
-            (Some(_) | None, None) => Lane::WireGuard,
-            (None, Some(_)) => Lane::Masque,
+        let (lane, answered) = match (&self.wireguard, &self.masque) {
+            (Some(_) | None, None) => (Lane::WireGuard, true),
+            (None, Some(_)) => (Lane::Masque, true),
             (Some(wireguard), Some(masque)) => {
                 let wg = Arc::clone(wireguard);
                 let mq = Arc::clone(masque);
@@ -1007,7 +1039,10 @@ impl WarpOut {
                 )
             }
         };
-        *chosen = Some(lane);
+        // Only a half that answered is a winner; a deadline fallback races again.
+        if answered {
+            *chosen = Some(lane);
+        }
         lane
     }
 
@@ -1069,8 +1104,9 @@ impl WarpOut {
 
 /// The first half to answer the probe wins. A failed answer is not the race's
 /// end: the other half may still carry. If neither answers by the deadline,
-/// `WireGuard` is the fallback a fixed config would have chosen.
-fn race_probes<W, M>(wireguard: W, masque: M, budget: Duration) -> Lane
+/// `WireGuard` is the fallback a fixed config would have chosen, reported as
+/// unanswered so the caller keeps racing on later flows.
+fn race_probes<W, M>(wireguard: W, masque: M, budget: Duration) -> (Lane, bool)
 where
     W: FnOnce() -> bool + Send + 'static,
     M: FnOnce() -> bool + Send + 'static,
@@ -1090,12 +1126,12 @@ where
             break;
         };
         match receiver.recv_timeout(left) {
-            Ok((lane, true)) => return lane,
+            Ok((lane, true)) => return (lane, true),
             Ok((_, false)) => failed += 1,
             Err(_) => break,
         }
     }
-    Lane::WireGuard
+    (Lane::WireGuard, false)
 }
 
 fn build_wireguard(
@@ -1118,6 +1154,12 @@ fn build_masque(identity: &Identity, spec: &WarpSpec) -> Result<crate::masque::M
 pub(crate) fn one_tap(path: &str, mode: &str, api: Option<&str>) -> Result<String, String> {
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
+    if path.is_file() {
+        return Err(format!(
+            "warp: identity file {} already exists; refusing to overwrite a working device",
+            path.display()
+        ));
+    }
     let spec = WarpSpec {
         mode,
         register: true,
@@ -1455,7 +1497,7 @@ mod tests {
     fn the_first_answering_half_wins_the_race() {
         // MASQUE cannot answer until released, so WireGuard's answer is first by construction.
         let (release, wait) = mpsc::channel::<()>();
-        let lane = race_probes(
+        let (lane, answered) = race_probes(
             || true,
             move || {
                 let _ = wait.recv();
@@ -1464,13 +1506,14 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(lane, Lane::WireGuard);
+        assert!(answered);
         drop(release);
     }
 
     #[test]
     fn a_failed_probe_does_not_end_the_race() {
         // A false answer must not end the race: the other half may still carry.
-        let lane = race_probes(
+        let (lane, answered) = race_probes(
             || false,
             || {
                 std::thread::sleep(Duration::from_millis(50));
@@ -1479,20 +1522,21 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(lane, Lane::Masque);
+        assert!(answered);
     }
 
     #[test]
     fn two_failed_probes_fall_back_to_wireguard() {
         assert_eq!(
             race_probes(|| false, || false, Duration::from_secs(5)),
-            Lane::WireGuard
+            (Lane::WireGuard, false)
         );
     }
 
     #[test]
     fn a_silent_pair_falls_back_at_the_deadline() {
         let start = Instant::now();
-        let lane = race_probes(
+        let (lane, answered) = race_probes(
             || {
                 std::thread::sleep(Duration::from_secs(30));
                 true
@@ -1504,6 +1548,7 @@ mod tests {
             Duration::from_millis(50),
         );
         assert_eq!(lane, Lane::WireGuard);
+        assert!(!answered);
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the deadline bound the wait"

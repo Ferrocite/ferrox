@@ -27,7 +27,7 @@ s.close()'
 
 matrix_udp_carrier() {
   case "$1" in
-    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*|wireguard-*) return 0 ;;
+    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*|warp-*|wireguard-*) return 0 ;;
     *) return 1 ;;
   esac
 }

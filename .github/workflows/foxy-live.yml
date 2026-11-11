@@ -152,7 +152,7 @@ jobs:
         run: |
           cargo build --locked -p ferrox-app
           cp "$CARGO_BIN" dist/ferrox-app
-          trap 'rm -f dist/ferrox-app ./dist/ferrox-cli.sh down >/dev/null 2>&1 || true' EXIT
+          trap 'rm -f dist/ferrox-app; ./dist/ferrox-cli.sh down >/dev/null 2>&1 || true' EXIT
           ./dist/ferrox-cli.sh down >/dev/null 2>&1 || true
           ./dist/ferrox-cli.sh up --foxy --email "$FOXY_EMAIL" --password "$FOXY_PASS" --country "$FOXY_COUNTRY" --warp
           ./dist/ferrox-cli.sh status

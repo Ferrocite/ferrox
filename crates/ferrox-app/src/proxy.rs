@@ -34793,7 +34793,7 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     if let Some(masque) = find_masque_outbound(root)? {
         return Ok(Some(Outbound::Masque(Arc::new(masque))));
     }
-    if let Some(warp) = find_warp_outbound(root)? {
+    if let Some(warp) = find_warp_outbound(root, test)? {
         return Ok(Some(Outbound::Warp(Arc::new(warp))));
     }
     if let Some(freedom) = find_freedom_outbound(root)? {
@@ -34845,7 +34845,7 @@ fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut
 
 /// The WARP outbound's identity, registration and both halves, built once at
 /// startup so a bad identity or an unusable API refuses the config.
-fn find_warp_outbound(root: &Json) -> Result<Option<crate::warp::WarpOut>, String> {
+fn find_warp_outbound(root: &Json, test: bool) -> Result<Option<crate::warp::WarpOut>, String> {
     let Some(outbound) = root
         .get("outbounds")
         .and_then(Json::as_arr)
@@ -34862,7 +34862,10 @@ fn find_warp_outbound(root: &Json) -> Result<Option<crate::warp::WarpOut>, Strin
     {
         return Ok(None);
     }
-    crate::warp::WarpOut::new(outbound)
+    if dialer_proxy_tag(outbound).is_some() {
+        eprintln!("warp: sockopt.dialerProxy is ignored; the tunnel dials its edge directly");
+    }
+    crate::warp::WarpOut::new(outbound, test)
         .map(Some)
         .map_err(|reason| format!("warp outbound: {reason}"))
 }

@@ -1,5 +1,5 @@
 // The pinned uTLS shapes, GREASE as the 0x0a0a sentinel; generated, never hand-edited.
-use super::{Body, Ext, Profile};
+use super::{Body, Ext, Profile, GREASE};
 
 static P_360: Profile = Profile {
     name: "360",
@@ -2608,6 +2608,17 @@ static P_HELLOSAFARI_26_3: Profile = Profile {
     ],
 };
 
+fn unique_exts(profile: &'static Profile) {
+    for at in 0..profile.exts.len() {
+        let kind = profile.exts[at].kind;
+        debug_assert!(
+            kind == GREASE || !profile.exts[at + 1..].iter().any(|ext| ext.kind == kind),
+            "profile {} repeats extension {kind:#06x}",
+            profile.name
+        );
+    }
+}
+
 pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
     let p = match name {
         "360" | "hello360_7_5" | "hello360_auto" => &P_360,
@@ -2646,10 +2657,15 @@ pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
         "hellosafari_26_3" | "hellosafari_auto" | "safari" => &P_HELLOSAFARI_26_3,
         _ => return None,
     };
+    unique_exts(p);
     Some(p)
 }
 
 /// REALITY's one preset swap: android carries no TLS 1.3 share, so the dial uses the variant.
 pub(crate) fn reality_variant(profile: &'static Profile) -> Option<&'static Profile> {
-    std::ptr::eq(profile, &raw const P_ANDROID).then_some(&P_ANDROID_REALITY)
+    let variant = std::ptr::eq(profile, &raw const P_ANDROID).then_some(&P_ANDROID_REALITY);
+    if let Some(variant) = variant {
+        unique_exts(variant);
+    }
+    variant
 }

@@ -374,7 +374,13 @@ impl Comparison {
     }
 
     fn reference(&self) -> Option<&'static str> {
-        self.by_engine.first().map(|e| e.engine)
+        // The reference is the first external engine that landed a run; none falls back to the pinned order, where the empty-runs check reports the missing data.
+        self.by_engine
+            .iter()
+            .filter(|e| e.engine != "ferrox")
+            .find(|e| !e.runs.is_empty())
+            .or_else(|| self.by_engine.first())
+            .map(|e| e.engine)
     }
 
     fn candidates(&self) -> Vec<&'static str> {

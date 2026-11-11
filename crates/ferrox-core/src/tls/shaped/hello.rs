@@ -644,8 +644,7 @@ impl Hello {
     ) -> Option<Entry<'a>> {
         let (kind, invariant, source) = match &ext.body {
             Body::Grease => {
-                // The first two extensions draw uTLS's slots; a hello with more greases (the
-                // reference's own) draws the later slots, so no two of its greases repeat.
+                // The first two extensions draw uTLS's slots; a hello with more greases draws the later slots, so no two of its greases repeat.
                 let slot = match *grease_exts {
                     0 | 1 => *grease_exts,
                     2 => 3,
@@ -864,17 +863,19 @@ fn share_spec(profile: &Profile) -> (&'static [u16], bool) {
     (&[], false)
 }
 
-/// uTLS moves the second extension off the first when the two draws collide; the four
-/// extension slots each hold a draw of their own, so a hello's greases never repeat.
+/// uTLS moves the second extension off the first when the two draws collide, so a hello's greases never repeat.
 fn distinct_grease(mut grease: [u16; 7]) -> [u16; 7] {
-    if grease_value(&grease, 2) == grease_value(&grease, 3) {
-        grease[3] ^= 0x1010;
-    }
-    for slot in [5, 6] {
-        for other in [2usize, 3, 5] {
-            if other != slot && grease_value(&grease, other) == grease_value(&grease, slot) {
-                grease[slot] ^= 0x1010;
-            }
+    for slot in [3usize, 5, 6] {
+        let earlier: &[usize] = match slot {
+            3 => &[2],
+            5 => &[2, 3],
+            _ => &[2, 3, 5],
+        };
+        while earlier
+            .iter()
+            .any(|other| grease_value(&grease, *other) == grease_value(&grease, slot))
+        {
+            grease[slot] = (grease[slot] & 0xff00) | (grease[slot] + 0x10) & 0xf0;
         }
     }
     grease

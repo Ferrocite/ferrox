@@ -297,28 +297,88 @@ def fake_curl(state: pathlib.Path) -> pathlib.Path:
     tool = bin_dir / "curl"
     shim(
         tool,
-        """#!/bin/sh
-if [ -n "${FERROX_FAKE_CURL_LOG:-}" ]; then
-  {
-    printf 'args:'
-    printf ' %s' "$@"
-    printf '\\n'
-    env | grep -E '^(ALL_PROXY|all_proxy|HTTP_PROXY|http_proxy|HTTPS_PROXY|https_proxy|NO_PROXY|no_proxy)=' |
-      sed -E 's#(=[^/:]+://)[^/@]*@#\\1#' || true
-    printf 'end\\n'
-  } >> "$FERROX_FAKE_CURL_LOG"
-fi
-if [ "${FERROX_FAKE_SYSTEM_FAIL:-}" = 1 ]; then
-  case " $* " in *" --noproxy "*) ;; *) exit 7 ;; esac
-fi
-if [ "${FERROX_FAKE_CLOUDFLARE_BLOCK:-}" = 1 ]; then
-  case " $* " in *cloudflare.com*) exit 7 ;; esac
-fi
-if [ "${FERROX_FAKE_TRACE:-}" = 1 ]; then
-  case " $* " in *example.com*) printf 'Example Domain\\n' ;; *) printf 'ip=203.0.113.9\\nloc=US\\n' ;; esac
-  exit 0
-fi
-exit 7
+        """#!/usr/bin/env python3
+import json, os, socket, sys
+
+args = sys.argv[1:]
+if os.environ.get("FERROX_FAKE_SYSTEM_FAIL") == "1" and "--noproxy" not in args:
+    sys.exit(7)
+if os.environ.get("FERROX_FAKE_CLOUDFLARE_BLOCK") == "1" and any("cloudflare.com" in a for a in args):
+    sys.exit(7)
+if log := os.environ.get("FERROX_FAKE_CURL_LOG"):
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write("args: " + " ".join(args) + "\\n")
+        for key in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+            if os.environ.get(key):
+                handle.write(f"{key}={os.environ[key]}\\n")
+        handle.write("end\\n")
+if os.environ.get("FERROX_FAKE_TRACE") != "1":
+    sys.exit(7)
+target = next((a for a in args if a.startswith("http")), "")
+proxy = ""
+for at, arg in enumerate(args):
+    if arg == "--socks5-hostname" and at + 1 < len(args):
+        proxy = f"socks5h://{args[at + 1]}"
+    elif arg.startswith("--socks5-hostname="):
+        proxy = f"socks5h://{arg.split('=', 1)[1]}"
+    elif arg in ("-x", "--proxy") and at + 1 < len(args):
+        proxy = args[at + 1]
+    elif arg.startswith("--proxy="):
+        proxy = arg.split("=", 1)[1]
+if not proxy:
+    for key in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        if os.environ.get(key):
+            proxy = os.environ[key]
+            break
+ride = os.environ.get("FERROX_FAKE_PROXY_RIDE") == "1" and proxy and target
+if ride:
+    for at, arg in enumerate(args):
+        if arg == "--noproxy" and at + 1 < len(args) and args[at + 1]:
+            ride = False
+        elif arg.startswith("--noproxy=") and arg.split("=", 1)[1]:
+            ride = False
+if ride:
+    # A real ride: the CONNECT through the named proxy is the flow the check asserts.
+    scheme, _, rest = proxy.partition("://")
+    host, _, port = rest.rpartition(":")
+    authority = target.partition("//")[2].partition("/")[0]
+    name = authority.partition(":")[0]
+    connect_port = 80 if target.startswith("http:") else 443
+    try:
+        with socket.create_connection((host, int(port)), timeout=10) as hop:
+            if scheme.startswith("socks"):
+                hop.sendall(b"\\x05\\x01\\x00")
+                if hop.recv(2) != b"\\x05\\x00":
+                    raise OSError("the proxy refused SOCKS5")
+                hop.sendall(
+                    b"\\x05\\x01\\x00\\x03"
+                    + bytes([len(name)])
+                    + name.encode()
+                    + connect_port.to_bytes(2, "big")
+                )
+                head = hop.recv(4)
+                if head[:2] != b"\\x05\\x00":
+                    raise OSError(f"the proxy refused the CONNECT: {head.hex()}")
+                if head[3:4] == b"\\x01":
+                    hop.recv(6)
+                elif head[3:4] == b"\\x03":
+                    hop.recv(1 + hop.recv(1)[0])
+                elif head[3:4] == b"\\x04":
+                    hop.recv(22)
+            else:
+                hop.sendall(f"CONNECT {authority} HTTP/1.1\\r\\nHost: {authority}\\r\\n\\r\\n".encode())
+                if b" 200 " not in hop.recv(512):
+                    raise OSError("the proxy refused the CONNECT")
+        if conf := os.environ.get("FERROX_CONF_DIR"):
+            with open(os.path.join(conf, "fake-socks5-curl.json"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"proxy": proxy, "target": name}) + "\\n")
+    except OSError as error:
+        print(f"curl: the proxy did not carry the request: {error}", file=sys.stderr)
+        sys.exit(7)
+if "example.com" in target:
+    print("Example Domain")
+else:
+    print("ip=203.0.113.9\\nloc=US\\n")
 """,
     )
     return bin_dir
@@ -811,6 +871,61 @@ chained = outbound.get("settings", {}).get("upstreamProxy")
 if outbound["protocol"] != "warp" and not chained:
     print("foxy: the account plane answered 451", file=sys.stderr)
     sys.exit(1)
+
+
+def socks5_exchange(conn, chained):
+    if conn.recv(1)[:1] != b"\\x05":
+        raise OSError("not a SOCKS5 greeting")
+    conn.recv(conn.recv(1)[0])
+    conn.sendall(b"\\x05\\x00")
+    request = conn.recv(4)
+    if request[:1] != b"\\x05" or request[1:2] != b"\\x01":
+        raise OSError("not a SOCKS5 CONNECT")
+    atyp = request[3:4]
+    if atyp == b"\\x01":
+        name = socket.inet_ntoa(conn.recv(4))
+    elif atyp == b"\\x03":
+        name = conn.recv(conn.recv(1)[0]).decode()
+    else:
+        raise OSError("the client named no name the lane reads")
+    far_port = int.from_bytes(conn.recv(2), "big")
+    forwarded = None
+    if chained:
+        hop = chained.split("://", 1)[1]
+        hop_host, _, hop_port = hop.rpartition(":")
+        with socket.create_connection((hop_host, int(hop_port)), timeout=10) as up:
+            up.sendall(b"\\x05\\x01\\x00")
+            if up.recv(2) != b"\\x05\\x00":
+                raise OSError("the hop refused SOCKS5")
+            up.sendall(
+                b"\\x05\\x01\\x00\\x03"
+                + bytes([len(name)])
+                + name.encode()
+                + far_port.to_bytes(2, "big")
+            )
+            answer = up.recv(4)
+            if answer[:2] != b"\\x05\\x00":
+                raise OSError("the hop refused the CONNECT")
+            if answer[3:4] == b"\\x01":
+                up.recv(6)
+            elif answer[3:4] == b"\\x03":
+                up.recv(1 + up.recv(1)[0])
+            elif answer[3:4] == b"\\x04":
+                up.recv(22)
+            forwarded = int(hop_port)
+            conn.sendall(b"\\x05\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00")
+            conn.sendall(b"HTTP/1.0 200 carried\\r\\n\\r\\nExample Domain\\n")
+            up.sendall(b"GET / HTTP/1.0\\r\\nHost: " + name.encode() + b"\\r\\n\\r\\n")
+            up.recv(64)
+    else:
+        conn.sendall(b"\\x05\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00")
+        conn.sendall(b"HTTP/1.0 200 carried\\r\\n\\r\\nExample Domain\\n")
+    with open(os.path.join(state, "fake-socks5.json"), "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"listen": port, "target": name, "forwarded_to": forwarded}) + "\\n"
+        )
+
+
 port = document["inbounds"][0]["port"]
 server = socket.socket()
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -818,7 +933,12 @@ server.bind(("127.0.0.1", port))
 server.listen(16)
 while True:
     conn, _ = server.accept()
-    conn.close()
+    try:
+        socks5_exchange(conn, chained)
+    except Exception as why:
+        print(f"fake lane: the flow did not carry: {why}", file=sys.stderr)
+    finally:
+        conn.close()
 """,
         encoding="utf-8",
     )
@@ -2923,6 +3043,8 @@ def check_warp_ladder(state: pathlib.Path) -> int:
         "networksetup.calls",
         "fake-ladder-configs.json",
         "lane-snapshot.json",
+        "fake-socks5.json",
+        "fake-socks5-curl.json",
     ):
         (state / stale).unlink(missing_ok=True)
     for leftover in state.glob("warp-hop*"):
@@ -2931,6 +3053,7 @@ def check_warp_ladder(state: pathlib.Path) -> int:
     env = env_for(state, curl=True)
     env["FERROX_BIN"] = str(warp_ladder_binary(state))
     env["FERROX_FAKE_TRACE"] = "1"
+    env["FERROX_FAKE_PROXY_RIDE"] = "1"
     run = subprocess.run(
         [*up_argv(port), "--country", "US"],
         stdin=subprocess.DEVNULL,
@@ -3024,6 +3147,35 @@ def check_warp_ladder(state: pathlib.Path) -> int:
         print(
             "check-cli-lane: the retried lane does not chain to the hop's socks port"
             f" (got {chained_to!r})",
+            file=sys.stderr,
+        )
+        return 1
+    rides = state / "fake-socks5-curl.json"
+    records = state / "fake-socks5.json"
+    if not rides.exists() or not records.exists():
+        print(
+            "check-cli-lane: the flow never rode the retried lane's socks port"
+            f" (curl {rides.exists()}, lane {records.exists()}):\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    front = second["inbounds"][0]["port"]
+    hop_port = hop["inbounds"][0]["port"]
+    if not any(
+        int(line["proxy"].rsplit(":", 1)[1]) == front
+        for line in (json.loads(x) for x in rides.read_text(encoding="utf-8").splitlines() if x.strip())
+    ):
+        print(
+            f"check-cli-lane: curl rode no socks front at {front}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if not any(
+        line.get("forwarded_to") == hop_port
+        for line in (json.loads(x) for x in records.read_text(encoding="utf-8").splitlines() if x.strip())
+    ):
+        print(
+            f"check-cli-lane: the lane never handed a flow to the hop at {hop_port}:\n{output}",
             file=sys.stderr,
         )
         return 1

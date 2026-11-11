@@ -1250,9 +1250,7 @@ fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), Strin
         .as_deref()
         .ok_or("masque: the QUIC carrier requires security tls")?;
     if let Some(warp) = &spec.warp {
-        if tls.insecure {
-            return Ok(());
-        }
+        // The enrolled edge key is the verification, independent of CA trust.
         let leaf = conn
             .peer_cert()
             .ok_or("masque warp: the edge sent no certificate")?;
