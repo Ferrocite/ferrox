@@ -71045,6 +71045,9 @@ mod poll_relay {
         stall_budget: Duration,
         /// The first drain that found no room, cleared by the next byte the destination takes.
         stalled: Option<std::time::Instant>,
+        /// When this half closed, so the other half's absent answer is bounded from the same
+        /// moment the lane path bounds it.
+        ended_at: Option<std::time::Instant>,
     }
 
     impl Direction {
@@ -71065,6 +71068,7 @@ mod poll_relay {
                 ended: false,
                 stall_budget,
                 stalled: None,
+                ended_at: None,
             }
         }
 
@@ -71240,8 +71244,19 @@ mod poll_relay {
         fn abandon(&mut self) {
             self.ended = true;
             self.stalled = None;
+            self.ended_at.get_or_insert_with(std::time::Instant::now);
             let _ = self.src.shutdown(Shutdown::Both);
             let _ = self.dst.shutdown(Shutdown::Both);
+        }
+
+        /// A half that closed before the answer arrived refuses it, the same verdict the lane
+        /// path reaches when its idle bound passes: the answer's hook runs once and the wait
+        /// stops holding the flow.
+        fn expire_unanswered(&mut self) {
+            if let Some(hooks) = self.answer.take().and_then(|answer| answer.hooks) {
+                (hooks.refused)();
+            }
+            self.end();
         }
 
         fn end(&mut self) {
@@ -71250,6 +71265,7 @@ mod poll_relay {
             }
             self.ended = true;
             self.stalled = None;
+            self.ended_at.get_or_insert_with(std::time::Instant::now);
             let _ = self.dst.shutdown(Shutdown::Write);
         }
     }
@@ -71270,6 +71286,22 @@ mod poll_relay {
             for direction in &mut self.directions {
                 direction.abandon();
             }
+        }
+
+        /// When this direction's wait on an answer it has not seen began: its sibling closed
+        /// with the answer still asleep, so the grace the lane path gives the reply starts
+        /// here too, and a peer that never answers cannot park the flow.
+        fn answer_since(&self, index: usize) -> Option<std::time::Instant> {
+            let direction = &self.directions[index];
+            if direction.answer.is_none() || direction.ended {
+                return None;
+            }
+            self.directions
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .filter_map(|(_, other)| other.ended_at)
+                .max()
         }
     }
 
@@ -71366,6 +71398,17 @@ mod poll_relay {
                     }
                 }
             }
+            for flow in &mut flows {
+                for index in 0..flow.directions.len() {
+                    let budget = flow.directions[index].stall_budget;
+                    let expired = flow
+                        .answer_since(index)
+                        .is_some_and(|since| since.elapsed() >= budget);
+                    if expired {
+                        flow.directions[index].expire_unanswered();
+                    }
+                }
+            }
             pfds.clear();
             owners.clear();
             pfds.push(libc::pollfd {
@@ -71399,9 +71442,14 @@ mod poll_relay {
             }
             let mut timeout = -1;
             for flow in &flows {
-                for direction in &flow.directions {
-                    if let Some(since) = direction.stalled {
-                        let left = direction.stall_budget.saturating_sub(since.elapsed());
+                for (index, direction) in flow.directions.iter().enumerate() {
+                    let left = match direction.stalled {
+                        Some(since) => Some(direction.stall_budget.saturating_sub(since.elapsed())),
+                        None => flow
+                            .answer_since(index)
+                            .map(|since| direction.stall_budget.saturating_sub(since.elapsed())),
+                    };
+                    if let Some(left) = left {
                         let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
                         timeout = if timeout < 0 {
                             millis
@@ -72374,6 +72422,62 @@ mod relay_tests {
         assert!(
             !succeeded.load(Ordering::SeqCst),
             "a refused answer reported success"
+        );
+    }
+
+    /// A half that closed before the answer arrived must not hold the flow: the lane path hands
+    /// its thread back after the configured grace, and the pipe owes the same verdict on the same
+    /// clock — the answer is refused once and the client's read half sees EOF instead of a wait.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answer_that_never_arrives_ends_the_half_closed_flow() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let target_local = target_local.with_policy(Some(crate::policy::Flow {
+            handshake: None,
+            conn_idle: Some(Duration::from_millis(200)),
+            uplink_only: None,
+            downlink_only: None,
+            buffer: None,
+        }));
+        let success = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&success);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let flag = Arc::clone(&refused);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+        );
+        client.write_all(b"payload").expect("uploads");
+        client.shutdown(Shutdown::Write).expect("half-closes");
+        let mut heard = [0u8; 16];
+        let mut uploaded = 0usize;
+        while uploaded < b"payload".len() {
+            uploaded += peer.read(&mut heard).expect("reads the upload");
+        }
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client timeout");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client
+                .read(&mut byte)
+                .expect("a silent answer must not outlive the grace"),
+            0,
+            "the half-closed flow stayed open past its answer grace"
+        );
+        assert!(
+            refused.load(Ordering::SeqCst),
+            "the silent answer never reported the refusal"
+        );
+        assert!(
+            !success.load(Ordering::SeqCst),
+            "an answer that never arrived reported success"
         );
     }
 
