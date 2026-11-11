@@ -29308,9 +29308,14 @@ pub(crate) mod lane_pool {
                 )
             };
             if polled < 0 {
-                // A socket closed under the poll fails the call for the whole set; the retire list drops it on the next pass.
-                std::thread::sleep(crate::budgets::RELAY_POLL);
-                return Vec::new();
+                // A socket closed under the poll fails the call for the whole set. Hand every parked
+                // lane back instead of waiting on a set that cannot poll: the closed one leaves and
+                // the rest re-arm on their own descriptors.
+                let all = Ready {
+                    read: true,
+                    write: true,
+                };
+                return self.fds.keys().map(|fd| (*fd, all)).collect();
             }
             if polled == 0 {
                 return Vec::new();
@@ -30102,6 +30107,40 @@ pub(crate) mod lane_pool {
                 received.load(Ordering::Relaxed),
                 1,
                 "the peer's byte never woke the parked lane"
+            );
+        }
+
+        /// A poll that fails for the whole set must hand every parked lane back, not leave them
+        /// waiting on a set that can no longer poll.
+        #[cfg(windows)]
+        #[test]
+        fn a_failed_poll_wakes_every_parked_lane() {
+            use std::os::windows::io::AsRawSocket as _;
+
+            let mut reactor = Reactor::new(usize::MAX as WaitFd).expect("a reactor");
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let fd = socket.as_raw_socket();
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd,
+                write: false,
+                finish: None,
+                lane: Mutex::new(None),
+                pool: std::sync::Weak::new(),
+            });
+            let _ = slot.due.set(None);
+            slot.put_lane(Lane {
+                step: Box::new(|| Next::Done),
+                complete: None,
+                idle: 0,
+                relay: false,
+            });
+            assert!(reactor.park(slot).is_none(), "the lane parks");
+            let ready = reactor.wait(Duration::ZERO);
+            assert!(
+                ready.iter().any(|(at, _)| *at == fd),
+                "a failed poll must wake the parked set"
             );
         }
 
