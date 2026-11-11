@@ -24671,7 +24671,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
             addr.ip()
         });
-    let Some(lane) = spawn_udp_lane(out, local) else {
+    let Some(lane) = spawn_udp_lane(out, local, None) else {
         return;
     };
     let mut client_addr: Option<SocketAddr> = None;
@@ -24921,7 +24921,14 @@ fn serve_socks_udp_split(
     let mut process = None;
     let mut process_src = None;
     let mut quiet = Instant::now();
+    let mut checked = Instant::now();
     loop {
+        if checked.elapsed() >= UDP_POLL {
+            checked = Instant::now();
+            if peer_left(&client) {
+                break;
+            }
+        }
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
                 quiet = Instant::now();
@@ -24985,7 +24992,7 @@ fn serve_socks_udp_split(
                             Some(entry.get().address)
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            spawn_udp_lane(&out, local).map(|lane| {
+                            spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
                                 replies.insert(lane.address, entry.key().clone());
                                 let address = lane.address;
                                 entry.insert(lane);
@@ -25002,12 +25009,11 @@ fn serve_socks_udp_split(
                     let _ = relay.send_to(frame, lane_address);
                 }
             }
-            Err(error) if is_timeout(&error) => {
-                if peer_left(&client) || quiet.elapsed() >= budgets::udp_idle() {
+            Err(error) => {
+                if !is_timeout(&error) || quiet.elapsed() >= budgets::udp_idle() {
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
     retire_udp_lanes(relay, lanes);
@@ -25043,11 +25049,18 @@ fn retire_finished_lane(
     None
 }
 
-fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
+fn spawn_udp_lane(
+    out: &Outbound,
+    local: std::net::IpAddr,
+    associate: Option<Connection>,
+) -> Option<UdpLane> {
     let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
     let address = socket.local_addr().ok()?;
     let waker = socket.try_clone().ok()?;
     let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    if let Some(associate) = associate.as_ref() {
+        let _ = associate.set_read_timeout(Some(UDP_POLL));
+    }
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
     let out = out.clone();
@@ -25055,7 +25068,7 @@ fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
         // The lane's own thread starts with the settings the pick left on this one.
         SEND_THROUGH.with(|cell| cell.set(source));
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
-        serve_udp_lane(&socket, &out, None);
+        serve_udp_lane(&socket, &out, associate.as_ref());
     });
     Some(UdpLane {
         address,
@@ -25072,9 +25085,11 @@ fn retire_udp_lanes(relay: UdpSocket, lanes: HashMap<Option<String>, UdpLane>) {
         return;
     }
     thread::spawn(move || {
-        for lane in lanes.into_values() {
+        for lane in lanes.values() {
             let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
             let _ = relay.send_to(&[0u8], lane.address);
+        }
+        for lane in lanes.into_values() {
             let _ = lane.handle.join();
         }
     });
@@ -68819,7 +68834,8 @@ mod tests {
                 }
             });
             let out = Outbound::clone(&lane);
-            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let lane =
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
             let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -68853,7 +68869,7 @@ mod tests {
             }
         });
         let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
-        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
         let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -68889,7 +68905,8 @@ mod tests {
                     let _ = echo.send_to(&buf[..n], peer);
                 }
             });
-            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let lane =
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
             let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
             client
                 .set_read_timeout(Some(Duration::from_secs(1)))
