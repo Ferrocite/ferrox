@@ -230,3 +230,7 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # layout, not in the source of `write_slices`.
 ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47475578 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
 ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# The fused size-line walk over one fixed line: the CRLF scan and the hex parse
+# share a pass, so the probe frame is the walk and nothing else. UNBLESSED until
+# ops.yml measures it and the diff is read; nothing on the wire moves.
+ferrox_app::xhttp::tests::xhttp_line_probe UNBLESSED xhttp::tests::the_chunk_line_costs_one_walk
