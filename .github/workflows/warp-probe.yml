@@ -95,16 +95,18 @@ jobs:
               tls.close()
           EOF
           python3 /tmp/capture.py > /tmp/capture.log 2>&1 &
-          sleep 1
+          disown
+          sleep 2
+          python3 -c "import socket; s=socket.create_connection(('127.0.0.1', 8443), 3); s.close(); print('echo alive')"
           cargo build --locked --release -p ferrox-app
           bin=target/release/ferrox-app
           echo "---- ours over the local echo ----"
           "$bin" warp-register --api https://127.0.0.1:8443/v0a4471 2>&1 | tail -3 || true
           sleep 1
           echo "---- the reference over the local echo ----"
-          /tmp/aether --register masque --masque-config "target/probe/identities2.toml" --api-host 127.0.0.1 --api-sni 127.0.0.1 --api-address 127.0.0.1:8443 2>&1 | tail -6 || true
+          /tmp/aether --register masque --masque-config "target/probe/identities2.toml" --api-host echo.example --api-sni echo.example --api-address 127.0.0.1:8443 2>&1 | tail -6 || true
           sleep 1
           kill %1 2>/dev/null || true
-          grep -c "==== REQUEST ====" /tmp/capture.log
           echo "captured requests:"
-          head -100 /tmp/capture.log
+          head -120 /tmp/capture.log || true
+          grep -c "==== REQUEST ====" /tmp/capture.log || true
