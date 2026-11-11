@@ -69756,6 +69756,71 @@ end
         );
     }
 
+    /// The control close is noticed while datagrams keep arriving, not only on an idle tick: a
+    /// steady stream used to keep the relay alive after the client had gone.
+    #[test]
+    fn a_split_udp_association_ends_under_a_datagram_stream() {
+        let allowed = udp_echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        udp_roundtrip(&udp, relay, &frame, b"ping");
+        drop(client);
+        udp.set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let sending = Arc::clone(&stop);
+        let stream = thread::spawn(move || {
+            let mut back = [0u8; UDP_BUF];
+            while !sending.load(Ordering::Relaxed) {
+                let _ = udp.send_to(&frame, relay);
+                let _ = udp.recv_from(&mut back);
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let ended = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        let _ = stream.join();
+        assert!(
+            ended,
+            "the split association outlived its control under a datagram stream"
+        );
+    }
+
     /// A split association resolves the process from the UDP sender, not the TCP control
     /// connection: the control connection's port names no UDP socket.
     #[cfg(target_os = "linux")]
