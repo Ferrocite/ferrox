@@ -69,7 +69,6 @@ const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 
 /// One client outbound: the conversation it opened, the stack that answers its
 /// inner TCP flows, and the per-lane route table its datagrams return through.
-#[derive(Debug)]
 pub(crate) struct MasqueOut {
     spec: ClientSpec,
     inner: Mutex<Option<Arc<Inner>>>,
@@ -82,6 +81,17 @@ struct Inner {
     to_tunnel: ToTunnel,
     routes: UdpRoutes,
     alive: Arc<AtomicBool>,
+}
+
+/// The lane names its spec; the spec redacts the headers that carry a token and
+/// the key WARP signs with.
+impl std::fmt::Debug for MasqueOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasqueOut")
+            .field("spec", &self.spec)
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 impl MasqueOut {
@@ -404,7 +414,7 @@ struct Lane {
     alive: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ClientSpec {
     address: String,
     port: u16,
@@ -526,6 +536,24 @@ impl ClientSpec {
     }
 }
 
+impl std::fmt::Debug for ClientSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("ClientSpec")
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("path", &self.path)
+            .field("host", &self.host)
+            .field("headers", &headers)
+            .field("remote_dns", &self.remote_dns)
+            .field("warp", &self.warp)
+            .field("keepalive", &self.keepalive)
+            .field("large_segments", &self.large_segments)
+            .finish()
+    }
+}
+
 /// The Basic header xray writes for `user`/`pass`, and the headers it refuses beside them.
 fn credentials(user: &str, pass: &str, headers: &mut Vec<(String, String)>) -> Result<(), String> {
     if user.is_empty() && pass.is_empty() {
@@ -625,12 +653,30 @@ fn remote_dns(settings: &Json) -> Result<Vec<IpAddr>, String> {
 /// pair instead of a password, the client mints its own certificate from that
 /// key, the endpoint authenticates by its public key rather than a chain, and
 /// the static addresses stand in when the proxy assigns none.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Warp {
     public_key: Vec<u8>,
     certificate: Vec<u8>,
     key: Vec<u8>,
     addresses: Vec<IpAddr>,
+}
+
+impl std::fmt::Debug for Warp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Warp")
+            .field("public_key", &self.public_key)
+            .field("certificate", &"<redacted>")
+            .field("key", &"<redacted>")
+            .field("addresses", &self.addresses)
+            .finish()
+    }
+}
+
+impl Drop for Warp {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.key.zeroize();
+    }
 }
 
 impl Warp {
@@ -647,7 +693,8 @@ impl Warp {
             .get("address")
             .and_then(Json::as_arr)
             .ok_or("masque warp has no `address`")?;
-        let private = warp_pkcs8(&warp_key(private)?)?;
+        let private = zeroize::Zeroizing::new(warp_key(private)?);
+        let private = zeroize::Zeroizing::new(warp_pkcs8(&private)?);
         let (certificate, key) = warp_identity(&private)?;
         Ok(Self {
             public_key: warp_key(public)?,
@@ -949,7 +996,8 @@ fn warp_config(warp: &Warp) -> Result<quiche::Config, String> {
         &certificate,
         &quic::der_to_pem(&warp.certificate, "CERTIFICATE"),
     )?;
-    if let Err(reason) = stage_private(&key, &quic::der_to_pem(&warp.key, "PRIVATE KEY")) {
+    let key_pem = zeroize::Zeroizing::new(quic::der_to_pem(&warp.key, "PRIVATE KEY"));
+    if let Err(reason) = stage_private(&key, &key_pem) {
         let _ = std::fs::remove_file(&certificate);
         return Err(reason);
     }
@@ -1847,13 +1895,26 @@ fn serve_cleartext_inbound(
     Ok(local.port())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ServerSpec {
     users: Vec<(String, String)>,
     pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
     pub(crate) warp: bool,
+}
+
+impl std::fmt::Debug for ServerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let users: Vec<&str> = self.users.iter().map(|(email, _)| email.as_str()).collect();
+        f.debug_struct("ServerSpec")
+            .field("users", &users)
+            .field("path", &self.path)
+            .field("pool", &self.pool)
+            .field("mtu", &self.mtu)
+            .field("warp", &self.warp)
+            .finish()
+    }
 }
 
 impl ServerSpec {
@@ -4808,6 +4869,55 @@ mod tests {
             let error = ClientSpec::from(&outbound).expect_err("the refused credentials");
             assert!(error.contains("warp"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_debug_rendering_never_names_a_credential_or_a_key() {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let private = ferrox_core::b64::encode(&key.serialize_der());
+        let public =
+            ferrox_core::b64::encode(&warp_key(&key.public_key_pem()).expect("the public key"));
+        let text = format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":8443}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true}},"masqueSettings":{{"warp":{{"privateKey":"{private}","publicKey":"{public}","address":["172.16.0.2/32"]}}}}}}}}"#
+        );
+        let outbound = crate::json::parse(&text).expect("the warp outbound");
+        let spec = ClientSpec::from(&outbound).expect("the warp spec");
+        let warp = spec.warp.as_ref().expect("the warp block");
+        let key_rendering = format!("{:?}", warp.key());
+        for rendered in [
+            format!("{warp:?}"),
+            format!("{spec:?}"),
+            format!("{:?}", MasqueOut::new(&outbound).expect("the warp lane")),
+        ] {
+            assert!(
+                !rendered.contains(&key_rendering),
+                "the private key is rendered: {rendered}"
+            );
+        }
+
+        let authed = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"user":"alice","pass":"hunter2"}}}"#,
+        )
+        .expect("the authed outbound");
+        let token = ferrox_core::b64::encode(b"alice:hunter2");
+        let spec = ClientSpec::from(&authed).expect("the authed spec");
+        for rendered in [
+            format!("{spec:?}"),
+            format!("{:?}", MasqueOut::new(&authed).expect("the authed lane")),
+        ] {
+            assert!(
+                !rendered.contains(&token) && !rendered.contains("hunter2"),
+                "the credential is rendered: {rendered}"
+            );
+        }
+
+        let inbound = crate::json::parse(
+            r#"{"settings":{"address":["172.16.0.0/24"],"users":[{"email":"a@b","pass":"server-secret"}]},"streamSettings":{"network":"masque"}}"#,
+        )
+        .expect("the inbound");
+        let server = ServerSpec::from(&inbound).expect("the server spec");
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains("server-secret"), "{rendered}");
     }
 
     #[test]
