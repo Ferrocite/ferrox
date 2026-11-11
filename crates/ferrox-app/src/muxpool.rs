@@ -138,7 +138,7 @@ impl std::fmt::Debug for Carrier {
         f.debug_struct("Carrier")
             .field("cap", &self.cap)
             .field("dead", &self.dead())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -323,7 +323,7 @@ impl std::fmt::Debug for Manager {
         f.debug_struct("Manager")
             .field("cap", &self.cap)
             .field("lifetime", &self.lifetime)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -425,14 +425,14 @@ impl Manager {
         Some(UdpFlow { carrier, id })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn carrier_count(&self) -> usize {
         self.carriers.lock().map_or(0, |carriers| carriers.len())
     }
 
     /// The staging header's base and capacity, both unchanged by a push/drain cycle only if the
     /// frame encoder reuses its buffer instead of reallocating it.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn staged_identity(&self) -> (usize, usize) {
         self.carriers.lock().map_or((0, 0), |carriers| {
             carriers

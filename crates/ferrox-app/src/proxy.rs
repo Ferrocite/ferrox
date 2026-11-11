@@ -15722,7 +15722,7 @@ impl TrojanUdpLane {
     }
 }
 
-/// The direct lane a mux's `skip` policy uses for VMess: one plain UDP session per destination,
+/// The direct lane a mux's `skip` policy uses for `VMess`: one plain UDP session per destination,
 /// framed through the same writer the non-mux path uses.
 struct VmessUdpLane {
     vmess: VmessOut,
@@ -16636,7 +16636,7 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     })
 }
 
-/// The VMess carrier as a mux underlayer: the dial names the mux command, so the existing dial
+/// The `VMess` carrier as a mux underlayer: the dial names the mux command, so the existing dial
 /// ladder carries the frames and no second session type exists; a loopback pair hands them over.
 fn open_vmess_mux(vmess: &VmessOut) -> Option<MuxUplink> {
     match &vmess.carrier {
@@ -16683,7 +16683,7 @@ fn vmess_mux_unserved() -> Option<MuxUplink> {
     None
 }
 
-/// The name a VMess mux request carries: the command byte is the mux, and no address follows it.
+/// The name a `VMess` mux request carries: the command byte is the mux, and no address follows it.
 fn vmess_mux_target() -> Destination {
     Destination::Name("v1.mux.cool".to_owned(), TROJAN_MUX_PORT)
 }
@@ -26264,18 +26264,14 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
                 |_| true,
                 |socket, src, dest, buf, at, len| {
                     if lane.is_none() {
-                        match SsUdpLane::open(socket, ss) {
-                            Some(open) => lane = Some(open),
-                            None => {
-                                if !said {
-                                    said = true;
-                                    eprintln!(
-                                        "shadowsocks: udp/443 skip lane unavailable; dropped"
-                                    );
-                                }
-                                return true;
+                        let Some(open) = SsUdpLane::open(socket, ss) else {
+                            if !said {
+                                said = true;
+                                eprintln!("shadowsocks: udp/443 skip lane unavailable; dropped");
                             }
-                        }
+                            return true;
+                        };
+                        lane = Some(open);
                     }
                     lane.as_ref()
                         .is_some_and(|lane| lane.send(src, dest, buf, at, len))
@@ -26514,16 +26510,14 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
                 |_| true,
                 |socket, src, dest, buf, at, len| {
                     if lane.is_none() {
-                        match VmessUdpLane::new(vmess, socket) {
-                            Some(open) => lane = Some(open),
-                            None => {
-                                if !said {
-                                    said = true;
-                                    eprintln!("vmess: udp/443 skip lane unavailable; dropped");
-                                }
-                                return true;
+                        let Some(open) = VmessUdpLane::new(vmess, socket) else {
+                            if !said {
+                                said = true;
+                                eprintln!("vmess: udp/443 skip lane unavailable; dropped");
                             }
-                        }
+                            return true;
+                        };
+                        lane = Some(open);
                     }
                     lane.as_mut()
                         .is_some_and(|lane| lane.send(src, dest, &buf[at..at + len]))
@@ -26785,16 +26779,16 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
                 "trojan",
                 true,
                 |_| true,
-                |socket, src, dest, buf, at, len| match &mut lane {
-                    Some(lane) => lane.send(src, dest, &buf[at..at + len]),
-                    None => {
-                        let Some(mut open) = TrojanUdpLane::new(trojan, socket) else {
-                            return true;
-                        };
-                        let sent = open.send(src, dest, &buf[at..at + len]);
-                        lane = Some(open);
-                        sent
+                |socket, src, dest, buf, at, len| {
+                    if let Some(lane) = lane.as_mut() {
+                        return lane.send(src, dest, &buf[at..at + len]);
                     }
+                    let Some(mut open) = TrojanUdpLane::new(trojan, socket) else {
+                        return true;
+                    };
+                    let sent = open.send(src, dest, &buf[at..at + len]);
+                    lane = Some(open);
+                    sent
                 },
             );
             if let Some(lane) = lane {
@@ -36534,12 +36528,10 @@ fn outbound_mux(outbound: &Json) -> Result<Mux, String> {
                 usize::try_from(concurrency).unwrap_or(usize::MAX)
             }
         }),
-        xudp: if xudp < 0 {
-            Xudp::Off
-        } else if xudp == 0 {
-            Xudp::Shared
-        } else {
-            Xudp::Own(usize::try_from(xudp).unwrap_or(usize::MAX))
+        xudp: match xudp.cmp(&0) {
+            std::cmp::Ordering::Less => Xudp::Off,
+            std::cmp::Ordering::Equal => Xudp::Shared,
+            std::cmp::Ordering::Greater => Xudp::Own(usize::try_from(xudp).unwrap_or(usize::MAX)),
         },
         udp443,
     })
@@ -36847,6 +36839,7 @@ fn find_hysteria_outbound(root: &Json) -> Option<HysteriaOut> {
     None
 }
 
+#[allow(clippy::too_many_lines)]
 fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
     let empty = Vec::new();
     let outbounds = root

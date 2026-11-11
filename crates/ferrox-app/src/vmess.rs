@@ -1370,7 +1370,7 @@ impl<R: Read> Read for Wire<R> {
     }
 }
 
-/// A VMess body read as a plain byte stream: the mux demux's own `Read` over the frames of one
+/// A `VMess` body read as a plain byte stream: the mux demux's own `Read` over the frames of one
 /// session, so the carrier keeps a single session type.
 pub(crate) struct CarriedReader<R> {
     wire: Wire<R>,
@@ -1398,7 +1398,7 @@ impl<R: Read> Read for CarriedReader<R> {
     }
 }
 
-/// A VMess body written as a plain byte stream; one caller write is one sealed frame, and the
+/// A `VMess` body written as a plain byte stream; one caller write is one sealed frame, and the
 /// staging buffer is the writer's own so a frame costs no allocation.
 pub(crate) struct CarriedWriter<W> {
     out: W,
@@ -1655,7 +1655,9 @@ fn read_open_header(
     let head_nonce: [u8; 12] = head_full[..12].try_into().unwrap();
     open_header(&head_key, &head_nonce, &sealed_head, auth_id)
 }
-fn decode_header(header: &[u8]) -> Option<(Option<SocketAddr>, Flow, Flow, Vec<u8>, u8)> {
+type HeaderParts = (Option<SocketAddr>, Flow, Flow, Vec<u8>, u8);
+
+fn decode_header(header: &[u8]) -> Option<HeaderParts> {
     if header.len() < 38 || header[0] != 1 || header[34] & OPT_STREAM == 0 {
         return None;
     }
