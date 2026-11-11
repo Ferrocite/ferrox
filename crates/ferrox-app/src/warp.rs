@@ -234,8 +234,8 @@ impl WarpSpec {
             let saved = match Identity::load(path) {
                 Ok(saved) => saved,
                 Err(_reason) if self.register && reprovision_enabled() => {
-                    quarantine(path);
                     let identity = register(self, self.mode != Mode::WireGuard)?;
+                    quarantine(path);
                     identity.save(path)?;
                     return Ok(identity);
                 }
@@ -243,7 +243,9 @@ impl WarpSpec {
             };
             return match refresh_saved(self, &saved) {
                 Ok(fresh) if fresh != saved => {
-                    fresh.save(path)?;
+                    if let Err(error) = fresh.save(path) {
+                        eprintln!("warp: could not persist the refreshed identity: {error}");
+                    }
                     Ok(fresh)
                 }
                 Ok(_) => Ok(saved),
@@ -700,7 +702,18 @@ fn quarantine(path: &Path) {
         || "warp-identity.json".to_owned(),
         |name| name.to_string_lossy().to_string(),
     );
-    target.set_file_name(format!("{name}.corrupt"));
+    let mut ordinal = 0;
+    loop {
+        target.set_file_name(if ordinal == 0 {
+            format!("{name}.corrupt")
+        } else {
+            format!("{name}.corrupt.{ordinal}")
+        });
+        if !target.exists() {
+            break;
+        }
+        ordinal += 1;
+    }
     if let Err(error) = std::fs::rename(path, &target) {
         eprintln!(
             "warp: the damaged identity at {} could not be moved aside: {error}",
@@ -1542,22 +1555,21 @@ fn provision_kind(
     spec: &WarpSpec,
     kind: KeyKind,
     paths: &KeyPaths,
-) -> Result<Vec<(Slot, PathBuf, Identity)>, String> {
+) -> Result<Vec<(Slot, PathBuf, Identity, bool)>, String> {
     let planned = planned_slots(kind, paths)?;
     let mut ready = Vec::new();
     for (slot, path) in planned {
-        let identity = if path.is_file() {
+        let (identity, replace) = if path.is_file() {
             match Identity::load(&path) {
                 Ok(saved) => match refresh_saved(spec, &saved) {
-                    Ok(fresh) => fresh,
+                    Ok(fresh) => (fresh, false),
                     Err(error) if error.refused && reprovision_enabled() => {
                         eprintln!(
                             "warp-register: the saved {} identity was refused: {}; registering a fresh one",
                             slot.label(),
                             error.reason
                         );
-                        quarantine(&path);
-                        register(spec, slot.enrolls_masque())?
+                        (register(spec, slot.enrolls_masque())?, true)
                     }
                     Err(error) => {
                         eprintln!(
@@ -1565,7 +1577,7 @@ fn provision_kind(
                             slot.label(),
                             error.reason
                         );
-                        saved
+                        (saved, false)
                     }
                 },
                 Err(reason) if reprovision_enabled() => {
@@ -1573,15 +1585,14 @@ fn provision_kind(
                         "warp-register: {reason}; registering a fresh {} identity",
                         slot.label()
                     );
-                    quarantine(&path);
-                    register(spec, slot.enrolls_masque())?
+                    (register(spec, slot.enrolls_masque())?, true)
                 }
                 Err(reason) => return Err(reason),
             }
         } else {
-            register(spec, slot.enrolls_masque())?
+            (register(spec, slot.enrolls_masque())?, false)
         };
-        ready.push((slot, path, identity));
+        ready.push((slot, path, identity, replace));
     }
     Ok(ready)
 }
@@ -1786,7 +1797,10 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
                 masque.as_deref().map(Path::new),
             );
             match provision_kind(&spec, kind, &paths).and_then(|planned| {
-                for (slot, path, identity) in &planned {
+                for (slot, path, identity, replace) in &planned {
+                    if *replace {
+                        quarantine(path);
+                    }
                     identity.save(path)?;
                     println!(
                         "[+] {} identity ready: device={} at {}",
@@ -2387,6 +2401,28 @@ mod tests {
             assert!(KeyKind::parse(alias).is_ok(), "{alias}");
         }
         assert!(KeyKind::parse("other").is_err());
+    }
+
+    #[test]
+    fn a_second_quarantine_keeps_the_first_damaged_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-warp-quarantine-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("warp-identity.json");
+        std::fs::write(&path, b"first").expect("a damaged identity");
+        quarantine(&path);
+        assert!(!path.exists(), "the bad file is moved aside");
+        std::fs::write(&path, b"second").expect("a second damaged identity");
+        quarantine(&path);
+        assert_eq!(
+            std::fs::read(dir.join("warp-identity.json.corrupt")).expect("the first file"),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("warp-identity.json.corrupt.1")).expect("the second file"),
+            b"second"
+        );
+        std::fs::remove_dir_all(&dir).expect("the scratch directory is removed");
     }
 
     #[cfg(unix)]
