@@ -70,6 +70,35 @@ def spki_base64(path):
     return base64.b64encode(spki).decode()
 
 
+def sec1_private_key(der):
+    """The SEC1 ECPrivateKey inside a PKCS #8 or SEC1 key, or None.
+
+    ZeroNet reads an outer key whose version is 1 as SEC1, but PKCS #8 v2
+    carries that version too. The field after the version separates them:
+    an AlgorithmIdentifier opens PKCS #8, an OCTET STRING opens SEC1.
+    """
+    outer = der_next(der, 0)
+    if outer is None or outer[0] != 0x30:
+        return None
+    version = der_next(outer[1], 0)
+    if version is None or version[0] != 0x02 or version[1] not in (b"\x00", b"\x01"):
+        return None
+    follows = der_next(outer[1], version[3])
+    if follows is None:
+        return None
+    if follows[0] == 0x04:
+        return der
+    if follows[0] != 0x30:
+        return None
+    inner = der_next(outer[1], follows[3])
+    if inner is None or inner[0] != 0x04:
+        return None
+    key = der_next(inner[1], 0)
+    if key is None or key[0] != 0x30:
+        return None
+    return inner[1]
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: cert-spki.py <certificate.pem>", file=sys.stderr)

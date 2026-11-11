@@ -120,6 +120,8 @@ selftest_gaps() {
   matrix_engine_skip_reason xray-core warp-masque-down-8 client \
     | grep -q "no WARP carrier" \
     || { echo "selftest: the xray-core WARP client skip lost its reason" >&2; failed=1; }
+  python3 scripts/xray-to-zeronet-warp.py --selftest \
+    || { echo "selftest: the ZeroNet WARP key translation lost its shape" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }

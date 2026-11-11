@@ -5,13 +5,14 @@ The matrix writes ferrox's WARP identity block; ZeroNet's `warp` outbound takes
 the account fields directly and the edge's SPKI as the pin. The certificate the
 cell already mints carries that SPKI, so no second key is introduced here.
 """
+import base64
 import copy
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cert_spki import spki_base64
+from cert_spki import sec1_private_key, spki_base64
 
 
 def fail(message):
@@ -19,9 +20,42 @@ def fail(message):
     raise SystemExit(2)
 
 
+def zeronet_private_key(text):
+    """The identity key as SEC1, the shape ZeroNet's outer version check reads.
+
+    A PKCS #8 v2 key also starts with version 1, so ZeroNet wraps the whole
+    SubjectPublicKeyInfo as if it were SEC1 and the key no longer parses.
+    """
+    try:
+        der = base64.b64decode(text, validate=True)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"the warp private key is not base64: {error}") from error
+    sec1 = sec1_private_key(der)
+    if sec1 is None:
+        raise ValueError("the warp private key is neither PKCS #8 nor SEC1")
+    return base64.b64encode(sec1).decode()
+
+
+def selftest():
+    key = (
+        "MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJC"
+        "QkJCQkJCQkJCQkJCQkJCQkJCQg=="
+    )
+    raw = base64.b64decode(key)
+    assert raw[2:5] == b"\x02\x01\x01" and raw[5] == 0x30, raw.hex()
+    sec1 = base64.b64decode(zeronet_private_key(key))
+    assert sec1[:5] == b"\x30\x25\x02\x01\x01", sec1.hex()
+    assert sec1[5] == 0x04, sec1.hex()
+    assert base64.b64decode(zeronet_private_key(base64.b64encode(sec1).decode())) == sec1
+    print("xray-to-zeronet-warp selftest: PKCS #8 v2 and SEC1 keys")
+
+
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
+        selftest()
+        return
     if len(sys.argv) != 2:
-        fail("usage: xray-to-zeronet-warp.py <client.json>")
+        fail("usage: xray-to-zeronet-warp.py [--selftest]")
     try:
         doc = json.load(open(sys.argv[1], encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -55,6 +89,10 @@ def main():
     addresses = masque.get("address") or wireguard.get("address")
     if not addresses:
         fail("the warp outbound names no tunnel address")
+    try:
+        private_key = zeronet_private_key(masque.get("privateKey") or "")
+    except ValueError as error:
+        fail(str(error))
     translated = copy.deepcopy(doc)
     translated["outbounds"] = [{
         "tag": outbound.get("tag", "proxy"),
@@ -62,7 +100,7 @@ def main():
         "settings": {
             "route": "masque-h3",
             "masque": {
-                "privateKey": masque.get("privateKey"),
+                "privateKey": private_key,
                 "serverPublicKey": server_public_key,
                 "address": addresses,
                 "http3Endpoints": [f"{host}:{port}"],
