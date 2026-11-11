@@ -69648,12 +69648,49 @@ end
         };
         udp.send_to(&frame(blocked, b"drop"), relay).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        assert!(
-            udp.recv_from(&mut back).is_err(),
-            "the blocked lane never answers"
-        );
+        if let Ok((n, from)) = udp.recv_from(&mut back) {
+            panic!("the blocked lane answered from {from} with {:?}", &back[..n]);
+        }
         let source = udp_roundtrip(&udp, relay, &frame(allowed, b"ping"), b"ping");
         assert_eq!(source.port(), allowed);
+    }
+
+    /// A split association lives on its control connection: once the client drops it, the relay
+    /// and its lanes must end, or a lane's late answer can land on the next association's reused
+    /// port.
+    #[test]
+    fn a_split_udp_association_ends_with_its_control_connection() {
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        drop(client);
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the split association outlived its control connection"
+        );
     }
 
     /// A split association resolves the process from the UDP sender, not the TCP control
