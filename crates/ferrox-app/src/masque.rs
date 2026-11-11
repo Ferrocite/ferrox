@@ -29,8 +29,6 @@ use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
-/// A held datagram retries inside one poll grain, so a full queue never waits out a tick.
-const RETRY: Duration = Duration::from_millis(1);
 /// Reconnect schedule: the first dial is immediate, a failure doubles from a second to a
 /// minute, and only a lane that lived past the stable window clears the history.
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
@@ -1877,14 +1875,12 @@ enum Emission {
 
 /// One inner packet on its stream, or the ICMP Packet Too Big it needs instead when the lane cannot carry it: the MTU the answer names is what the inner stack has left after the stream prefix.
 fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> Emission {
-    let mut datagram = Vec::with_capacity(3 + packet.len());
-    connectip::datagram_prefix(stream, &mut datagram);
-    datagram.extend_from_slice(packet);
     let Some(max) = conn.dgram_max_writable_len() else {
         return Emission::Full;
     };
-    if datagram.len() > max {
-        let overhead = frames::quic_varint_len(stream / 4) + 1;
+    // The stream prefix's width decides the fit, so a packet answered with ICMP or refused has never been staged.
+    let overhead = frames::quic_varint_len(stream / 4) + 1;
+    if overhead.saturating_add(packet.len()) > max {
         let Some(icmp) = max
             .checked_sub(overhead)
             .and_then(|mtu| connectip::icmp_too_large(packet, mtu))
@@ -1893,6 +1889,9 @@ fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> E
         };
         return Emission::TooLarge(icmp);
     }
+    let mut datagram = Vec::with_capacity(overhead + packet.len());
+    connectip::datagram_prefix(stream, &mut datagram);
+    datagram.extend_from_slice(packet);
     // Only a full queue asks for the packet back; any other failure is the connection ending, which the loop's own close check ends. The prefixed datagram is handed to quiche's queue, not copied into it.
     match conn.dgram_send_buf(datagram) {
         Err(quiche::Error::Done) => Emission::Full,
@@ -2765,12 +2764,8 @@ fn worker(
         if conn.is_closed() {
             return;
         }
+        // A held datagram waits for the acknowledgement that frees the send queue; it wakes this worker as a datagram of its own, so polling a shorter grain only burns CPU.
         let wait = conn.timeout().unwrap_or(TICK).min(TICK);
-        let wait = if tunnel.unsent.is_some() {
-            wait.min(RETRY)
-        } else {
-            wait
-        };
         match rx.recv_timeout(wait) {
             Ok(Arrival::Datagram(mut bytes, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
@@ -4970,6 +4965,14 @@ mod tests {
         assert_eq!(
             u16::from_be_bytes([icmp[26], icmp[27]]) as usize,
             max - overhead
+        );
+        let (refused, counts) = ferrox_core::alloc_count::measure(|| {
+            send_datagram(&mut lane.conn, lane.stream, &packet)
+        });
+        assert!(matches!(refused, Emission::TooLarge(_)));
+        assert!(
+            counts.bytes < packet.len(),
+            "a packet too wide is answered without staging it: {counts:?}"
         );
         assert!(
             matches!(
