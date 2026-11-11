@@ -1459,7 +1459,6 @@ mod tests {
     use std::io::ErrorKind;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
-    use std::time::Instant;
 
     const SERVER_PRIVATE: [u8; 32] = [
         0x69, 0x20, 0xca, 0xab, 0x2b, 0x4d, 0xe3, 0x7d, 0xfc, 0xfe, 0xbf, 0x60, 0x8b, 0x2a, 0x43,
@@ -1607,8 +1606,7 @@ mod tests {
         // A splice that returned is queued only once the peer's final ack lands, so wait for it.
         let spliced = matches!(answer, Some(RealityAccept::Proxied(_)));
         cover.set_nonblocking(true).expect("nonblocking");
-        let deadline = Instant::now() + COVER_WAIT;
-        loop {
+        for _ in 0..COVER_WAIT.as_millis() / 2 {
             match cover.accept() {
                 Ok((mut site, _)) => {
                     dialled += 1;
@@ -1623,11 +1621,7 @@ mod tests {
                     }
                     break;
                 }
-                Err(error)
-                    if spliced
-                        && error.kind() == ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
+                Err(error) if spliced && error.kind() == ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(_) => break,
