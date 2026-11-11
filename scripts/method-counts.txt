@@ -190,6 +190,8 @@ carrier-websocket early-data-encode-allocations-per-line 0 ferrox-bench-gate-8
 carrier-websocket early-data-encode-buffers-grown-per-2048-byte-line 0 ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else
 carrier-websocket accept-key-allocations-per-connection 0 ferrox-app-ws::tests::the_keys_are_not_allocated
 carrier-websocket fresh-key-allocations-per-dial 0 ferrox-app-ws::tests::the_keys_are_not_allocated
+carrier-websocket pinned-threads-per-silent-vless-request 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_ws_handshake
+carrier-websocket pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_a_ws_vmess_request
 
 carrier-httpupgrade ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
