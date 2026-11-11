@@ -491,6 +491,12 @@ pub(crate) struct Endpoint {
     pub(crate) base: String,
     pub(crate) address: Option<SocketAddr>,
     pub(crate) roots: ferrox_core::tls::Anchors,
+    /// The hop every dial to this origin chains through; the TLS name stays the origin's.
+    pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
+    /// The shaped hello the HTTP/2 dials ride; `None` keeps the plane's own.
+    pub(crate) h2_fingerprint: Option<ferrox_core::tls::shaped::Fingerprint>,
+    /// A dial that reopens the session instead of resuming it, the way a first connection does.
+    pub(crate) no_resumption: bool,
 }
 
 impl Endpoint {
@@ -515,6 +521,9 @@ impl Endpoint {
             // An origin that already is an address is read here, once, so an ask does not build the name and ask the resolver what it means.
             address: edge_peer(host, port),
             roots,
+            upstream: None,
+            h2_fingerprint: None,
+            no_resumption: false,
         })
     }
 
@@ -566,8 +575,28 @@ impl Endpoint {
     fn tls_h2(&self) -> TlsConfig {
         let mut cfg = self.tls();
         cfg.alpn = vec![b"h2".to_vec()].into();
-        cfg.fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148");
+        cfg.fingerprint = self
+            .h2_fingerprint
+            .or_else(|| ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148"));
+        if self.no_resumption {
+            cfg.resumption = false;
+        }
         cfg
+    }
+
+    /// The origin whose HTTP/2 dials ride a named shaped hello, in place of the plane's own.
+    #[must_use]
+    pub(crate) fn with_h2_fingerprint(mut self, name: &str) -> Self {
+        self.h2_fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve(name);
+        self
+    }
+
+    /// A dial that does not resume the plane's session: the reference dials a full
+    /// handshake per call, so its every exchange is the one a first connection makes.
+    #[must_use]
+    pub(crate) fn without_resumption(mut self) -> Self {
+        self.no_resumption = true;
+        self
     }
 
     /// Where an account-plane failure keeps its name instead of flattening to an uninformative "io failed".
@@ -583,16 +612,21 @@ impl Endpoint {
         &self,
         cfg: &TlsConfig,
     ) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
-        let peer = match self.address {
-            Some(address) => address,
-            None => format!("{}:{}", self.host, self.port)
-                .to_socket_addrs()
-                .map_err(|why| format!("resolve {}: {why}", self.host))?
-                .next()
-                .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
+        let stream = if let Some(proxy) = &self.upstream {
+            crate::foxy::tcp_via(proxy, &self.host, self.port)
+                .map_err(|why| format!("connect {} via the hop: {why:?}", self.host))?
+        } else {
+            let peer = match self.address {
+                Some(address) => address,
+                None => format!("{}:{}", self.host, self.port)
+                    .to_socket_addrs()
+                    .map_err(|why| format!("resolve {}: {why}", self.host))?
+                    .next()
+                    .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
+            };
+            crate::conn::dial_tcp(&peer, IO_TIMEOUT)
+                .map_err(|why| format!("connect {peer}: {why}"))?
         };
-        let stream = crate::conn::dial_tcp(&peer, IO_TIMEOUT)
-            .map_err(|why| format!("connect {peer}: {why}"))?;
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         let mut tls = ferrox_core::tls::connect(cfg, stream)
@@ -612,19 +646,18 @@ struct H2Connection {
     decoder: crate::h2::Decoder,
 }
 
-thread_local! {
-    static H2: std::cell::RefCell<Option<(String, H2Connection)>> = const { std::cell::RefCell::new(None) };
-}
-
 impl H2Connection {
     fn connect(endpoint: &Endpoint) -> Result<Self, String> {
-        use crate::h2::{frame_head, MAGIC, S_WINDOW, T_SETTINGS, WINDOW};
+        use crate::h2::{frame_head, MAGIC, S_HEADER_LIST, S_PUSH, T_SETTINGS};
         let mut tls = endpoint.connect_h2()?;
         let mut out = Vec::with_capacity(24 + 9 + 12);
         out.extend_from_slice(MAGIC);
-        let mut settings = Vec::with_capacity(8);
-        settings.extend_from_slice(&S_WINDOW.to_be_bytes());
-        settings.extend_from_slice(&WINDOW.to_be_bytes());
+        // The settings the reference's client sends, its fingerprint carries them: no push and a bounded header list, the per-stream window left at the default.
+        let mut settings = Vec::with_capacity(12);
+        settings.extend_from_slice(&S_PUSH.to_be_bytes());
+        settings.extend_from_slice(&0u32.to_be_bytes());
+        settings.extend_from_slice(&S_HEADER_LIST.to_be_bytes());
+        settings.extend_from_slice(&262_144u32.to_be_bytes());
         out.extend_from_slice(&frame_head(settings.len(), T_SETTINGS, 0, 0));
         out.extend_from_slice(&settings);
         tls.write_all(&out)
@@ -652,15 +685,23 @@ impl H2Connection {
         };
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
-        fields.push((":path".to_owned(), path.to_owned()));
         fields.push((":scheme".to_owned(), "https".to_owned()));
-        fields.push((":authority".to_owned(), endpoint.host.clone()));
+        let authority = if endpoint.port == 443 {
+            endpoint.host.clone()
+        } else {
+            format!("{}:{}", endpoint.host, endpoint.port)
+        };
+        fields.push((":authority".to_owned(), authority));
+        fields.push((":path".to_owned(), path.to_owned()));
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if matches!(lower.as_str(), "connection" | "host") {
                 continue;
             }
             fields.push((lower, (*value).to_owned()));
+        }
+        if !body.is_empty() {
+            fields.push(("content-length".to_owned(), body.len().to_string()));
         }
         let borrowed: Vec<(&str, &str)> = fields
             .iter()
@@ -789,29 +830,22 @@ impl H2Connection {
     }
 }
 
-fn h2_ask(
+pub(crate) fn h2_ask(
     endpoint: &Endpoint,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
+    // One call, one connection: the exchange the reference makes, and nothing kept for the next call to trust.
+    let mut connection = H2Connection::connect(endpoint)?;
     let mut retried = false;
     loop {
-        let result = H2.with(|cached| {
-            let mut cached = cached.borrow_mut();
-            let fresh = !matches!(cached.as_ref(), Some((host, _)) if host == &endpoint.host);
-            if fresh {
-                *cached = Some((endpoint.host.clone(), H2Connection::connect(endpoint)?));
-            }
-            let (_, connection) = cached.as_mut().expect("a connection was just built");
-            connection.request(endpoint, method, path, headers, body)
-        });
-        match result {
+        match connection.request(endpoint, method, path, headers, body) {
             Ok(reply) => return Ok(reply),
             Err(why) if retried => return Err(why),
             Err(_) => {
-                H2.with(|cached| *cached.borrow_mut() = None);
+                connection = H2Connection::connect(endpoint)?;
                 retried = true;
             }
         }

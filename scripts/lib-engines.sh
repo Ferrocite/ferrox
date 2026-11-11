@@ -70,6 +70,9 @@ build() {
   rev="$(pin_of "$name")"
   binary="$engine_dir/$name$(exe_suffix)"
   if cached="$(built "$binary")"; then
+    # A cache hit carries another lane's adapter beside its runtime: the one
+    # script this tree edits is copied over it, or the cell runs the stale one.
+    [[ "$name" != aether ]] || cp scripts/run-aether.py "$binary" || return 1
     echo "$cached"
     return 0
   fi

@@ -1,5 +1,5 @@
 // The pinned uTLS shapes, GREASE as the 0x0a0a sentinel; generated, never hand-edited.
-use super::{Body, Ext, Profile};
+use super::{Body, Ext, Profile, GREASE};
 
 static P_360: Profile = Profile {
     name: "360",
@@ -232,6 +232,84 @@ pub(crate) static P_CHROME: Profile = Profile {
             body: Body::Ech {
                 suites: &[0x0001_0001],
                 payloads: &[128, 160, 192, 224],
+            },
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+    ],
+};
+
+pub(crate) static P_CHROME_PLAIN: Profile = Profile {
+    name: "chrome_plain",
+    ciphers: &[
+        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+        0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+    ],
+    shuffle: true,
+    exts: &[
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x0a0a, 0x0017, 0x001d, 0x0018]),
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
+            ]),
+        },
+        Ext {
+            kind: 0x0010,
+            body: Body::Alpn(&[
+                0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
+            ]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0023,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0a0a, 0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x002d,
+            body: Body::Raw(&[0x01, 0x01]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x0a0a, 0x0017],
+                reuse: false,
             },
         },
         Ext {
@@ -2530,11 +2608,23 @@ static P_HELLOSAFARI_26_3: Profile = Profile {
     ],
 };
 
+fn unique_exts(profile: &'static Profile) {
+    for at in 0..profile.exts.len() {
+        let kind = profile.exts[at].kind;
+        debug_assert!(
+            kind == GREASE || !profile.exts[at + 1..].iter().any(|ext| ext.kind == kind),
+            "profile {} repeats extension {kind:#06x}",
+            profile.name
+        );
+    }
+}
+
 pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
     let p = match name {
         "360" | "hello360_7_5" | "hello360_auto" => &P_360,
         "android" | "helloandroid_11_okhttp" => &P_ANDROID,
         "chrome" | "hellochrome_133" | "hellochrome_auto" => &P_CHROME,
+        "chrome_plain" => &P_CHROME_PLAIN,
         "edge" | "hellochrome_83" | "hellochrome_87" | "helloedge_85" | "helloedge_auto" => &P_EDGE,
         "firefox" | "hellofirefox_148" | "hellofirefox_auto" => &P_FIREFOX,
         "hello360_11_0" => &P_HELLO360_11_0,
@@ -2567,10 +2657,15 @@ pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
         "hellosafari_26_3" | "hellosafari_auto" | "safari" => &P_HELLOSAFARI_26_3,
         _ => return None,
     };
+    unique_exts(p);
     Some(p)
 }
 
 /// REALITY's one preset swap: android carries no TLS 1.3 share, so the dial uses the variant.
 pub(crate) fn reality_variant(profile: &'static Profile) -> Option<&'static Profile> {
-    std::ptr::eq(profile, &raw const P_ANDROID).then_some(&P_ANDROID_REALITY)
+    let variant = std::ptr::eq(profile, &raw const P_ANDROID).then_some(&P_ANDROID_REALITY);
+    if let Some(variant) = variant {
+        unique_exts(variant);
+    }
+    variant
 }

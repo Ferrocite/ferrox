@@ -23,7 +23,7 @@ pub(crate) struct Hello {
     /// The groups a config's `curvePreferences` names, in its order: `None` keeps the profile's
     /// own list and shares, the hello a browser would send.
     groups: Option<Vec<u16>>,
-    grease: [u16; 5],
+    grease: [u16; 7],
     alpn: Option<&'static [&'static [u8]]>,
     /// A stock hello's config-named ALPN list, which Go puts where the preset's table would.
     stock_alpn: Option<Vec<Vec<u8>>>,
@@ -70,12 +70,12 @@ impl Hello {
         curves: &[u16],
         client_random: Option<[u8; 32]>,
     ) -> Result<Self, TlsError> {
-        // One draw for the whole hello: its random, its session id, five GREASE pairs.
-        let mut seed = [0u8; 74];
+        // One draw for the whole hello: its random, its session id, seven GREASE pairs.
+        let mut seed = [0u8; 78];
         getrandom::fill(&mut seed).map_err(entropy)?;
         let (blocks, draws) = seed.as_chunks::<32>();
         let (random, session_id) = (client_random.unwrap_or(blocks[0]), blocks[1]);
-        let mut grease = [0u16; 5];
+        let mut grease = [0u16; 7];
         for (slot, pair) in grease.iter_mut().zip(draws.as_chunks::<2>().0) {
             *slot = u16::from_le_bytes(*pair);
         }
@@ -644,12 +644,17 @@ impl Hello {
     ) -> Option<Entry<'a>> {
         let (kind, invariant, source) = match &ext.body {
             Body::Grease => {
-                let slot = (*grease_exts).min(1);
+                // The first two extensions draw uTLS's slots; a hello with more greases draws the later slots, so no two of its greases repeat.
+                let slot = match *grease_exts {
+                    0 | 1 => *grease_exts,
+                    2 => 3,
+                    _ => 4,
+                };
                 *grease_exts += 1;
                 (
                     grease_value(&self.grease, 2 + slot),
                     true,
-                    Source::Zeros(slot),
+                    Source::Zeros(slot.min(1)),
                 )
             }
             Body::Sni => (0x0000, false, Source::Name(sni?)),
@@ -707,7 +712,7 @@ impl Hello {
             Source::Alpn(list) => alpn_body(out, list),
             Source::StockAlpn(list) => stock_alpn_body(out, list),
             Source::Fixed(body) => out.put(body),
-            Source::Shares => key_share_body(out, shares),
+            Source::Shares => key_share_body(out, shares, &self.grease),
             Source::Cookie(value) => {
                 out.put(&(value.len() as u16).to_be_bytes());
                 out.put(value);
@@ -768,7 +773,7 @@ impl Hello {
             profile,
             ciphers: None,
             groups: None,
-            grease: distinct_grease([0; 5]),
+            grease: distinct_grease([0; 7]),
             alpn: None,
             stock_alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
@@ -858,15 +863,25 @@ fn share_spec(profile: &Profile) -> (&'static [u16], bool) {
     (&[], false)
 }
 
-/// uTLS moves the second extension off the first when the two draws collide.
-fn distinct_grease(mut grease: [u16; 5]) -> [u16; 5] {
-    if grease_value(&grease, 2) == grease_value(&grease, 3) {
-        grease[3] ^= 0x1010;
+/// uTLS moves the second extension off the first when the two draws collide, so a hello's greases never repeat.
+fn distinct_grease(mut grease: [u16; 7]) -> [u16; 7] {
+    for slot in [3usize, 5, 6] {
+        let earlier: &[usize] = match slot {
+            3 => &[2],
+            5 => &[2, 3],
+            _ => &[2, 3, 5],
+        };
+        while earlier
+            .iter()
+            .any(|other| grease_value(&grease, *other) == grease_value(&grease, slot))
+        {
+            grease[slot] = (grease[slot] & 0xff00) | (grease[slot] + 0x10) & 0xf0;
+        }
     }
     grease
 }
 
-fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
+fn grease_or(value: u16, grease: &[u16; 7], slot: usize) -> u16 {
     if value == GREASE {
         grease_value(grease, slot)
     } else {
@@ -874,7 +889,7 @@ fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
     }
 }
 
-fn grease_value(grease: &[u16; 5], slot: usize) -> u16 {
+fn grease_value(grease: &[u16; 7], slot: usize) -> u16 {
     // The masked nibble carries through and the fixed low nibble keeps the value nonzero.
     let value = u16::from((grease[slot] & 0x00f0) as u8 | 0x0a);
     value | (value << 8)
@@ -894,11 +909,13 @@ fn uint8_list<W: Sink>(out: &mut W, values: &[u16], each: impl Fn(u16) -> u16) {
     }
 }
 
-fn key_share_body<W: Sink>(out: &mut W, shares: &[Share]) {
+fn key_share_body<W: Sink>(out: &mut W, shares: &[Share], grease: &[u16; 7]) {
+    // The reference's one GREASE draw serves the groups list and the key share alike.
     let total: usize = shares.iter().map(|share| 4 + share.data.len()).sum();
     out.put(&(total as u16).to_be_bytes());
     for share in shares {
-        out.put(&share.group.to_be_bytes());
+        let group = grease_or(share.group, grease, 1);
+        out.put(&group.to_be_bytes());
         out.put(&(share.data.len() as u16).to_be_bytes());
         out.put(&share.data);
     }

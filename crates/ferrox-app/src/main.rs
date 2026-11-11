@@ -85,6 +85,7 @@ mod tun_system;
 mod veepn;
 mod vision;
 mod vmess;
+mod warp;
 mod webhook;
 mod wg;
 #[cfg(target_os = "linux")]
@@ -133,6 +134,8 @@ fn usage() -> ! {
     );
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
+    eprintln!("  ferrox-app warp-register [-o warp-identity.json] [--mode auto|wireguard|masque] [--api URL]");
+    eprintln!("                                register a WARP device once, save the identity (0600), print the outbound");
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"
     );
@@ -576,6 +579,7 @@ fn main() {
                 no_open,
             );
         }
+        "warp-register" => warp::register_command(&mut args, usage),
         "edges" => {
             let mut ping = false;
             while let Some(arg) = args.next() {

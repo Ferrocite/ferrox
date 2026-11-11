@@ -616,6 +616,10 @@ impl WireGuardOut {
         addrs
     }
 
+    pub(crate) fn probe(&self, host: &str, _port: u16) -> bool {
+        self.query(host).is_some()
+    }
+
     fn query(&self, host: &str) -> Option<(Vec<IpAddr>, u32)> {
         self.query_with(host, &|source, server, name, qtype| {
             self.exchange(source, server, name, qtype)

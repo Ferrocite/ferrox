@@ -126,6 +126,9 @@ impl VeepnOut {
                 base: String::new(),
                 address: None,
                 roots: Arc::clone(&roots),
+                upstream: None,
+                h2_fingerprint: None,
+                no_resumption: false,
             });
         }
         if origins.is_empty() {

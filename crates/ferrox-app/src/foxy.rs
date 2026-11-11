@@ -247,7 +247,7 @@ fn edge_over_hop(
     let mut failure = Failure::Io;
     for attempt in 0..EDGE_ATTEMPTS {
         tried += 1;
-        match tcp_via(proxy, dial).and_then(|stream| finish_tls(dial, stream)) {
+        match tcp_via(proxy, &dial.host, dial.port).and_then(|stream| finish_tls(dial, stream)) {
             Ok(tls) => return Ok(tls),
             Err(lost) => {
                 failure = lost;
@@ -408,17 +408,17 @@ fn hop_connect(stream: &mut Connection, host: &str, port: u16) -> Result<(), Fai
     }
 }
 
-/// TCP to the edge through one upstream hop: the TLS name stays the edge's, so the hop carries bytes it can neither read nor address.
-fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<Connection, Failure> {
+/// TCP to a host through one upstream hop: the TLS name stays the destination's, so the hop carries bytes it can neither read nor address.
+pub(crate) fn tcp_via(proxy: &UpstreamProxy, host: &str, port: u16) -> Result<Connection, Failure> {
     let mut stream = tcp_to_proxy(proxy).ok_or(Failure::Io)?;
     if proxy.http {
-        hop_connect(&mut stream, &dial.host, dial.port)?;
+        hop_connect(&mut stream, host, port)?;
     } else {
         socks_greeting(&mut stream)?;
-        let host_len = u8::try_from(dial.host.len()).map_err(|_| Failure::Io)?;
+        let host_len = u8::try_from(host.len()).map_err(|_| Failure::Io)?;
         let mut request = vec![5, 1, 0, 3, host_len];
-        request.extend_from_slice(dial.host.as_bytes());
-        request.extend_from_slice(&dial.port.to_be_bytes());
+        request.extend_from_slice(host.as_bytes());
+        request.extend_from_slice(&port.to_be_bytes());
         stream.write_all(&request).map_err(|_| Failure::Io)?;
         // The hop's bound address is not the edge's: read past it and drop it, the connection itself is the answer.
         if socks_reply(&mut stream)?.is_none() {
@@ -4508,7 +4508,8 @@ pub(crate) mod loopback {
 
     /// A dial whose hop is the only way to the edge: the name the CONNECT carries is not the name anything resolves, so a dial that reaches the edge has gone through the hop.
     fn hop_stream(proxy: &UpstreamProxy) -> Connection {
-        tcp_via(proxy, &upstream_dial(proxy.clone(), None)).expect("chains through the hop")
+        let dial = upstream_dial(proxy.clone(), None);
+        tcp_via(proxy, &dial.host, dial.port).expect("chains through the hop")
     }
 
     fn upstream_dial(proxy: UpstreamProxy, edge: Option<SocketAddr>) -> FoxyDial {

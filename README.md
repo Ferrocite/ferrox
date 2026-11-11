@@ -314,7 +314,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 
 | # | method | state | notes | supported today by |
 | --- | --- | --- | --- | --- |
-| 144 | WARP: auto-race WireGuard vs MASQUE + one-tap registration | planned | ZeroNet `warp.rs`; LxBox feature 015. Row 74 is the carrier; rows 189 and 190 are the registration and edge-discovery halves. | ZeroNet `warp.rs`; LxBox 015; Aether rows 189, 190 |
+| 144 | WARP: auto-race WireGuard vs MASQUE + one-tap registration | implemented | `protocol: warp` outbound and `warp-register`: three-call registration saved once (0600), both halves built at startup, `mode: auto` races a DNS probe through each tunnel and the first answer carries the flows. Row 74 is the carrier; rows 189 and 190 are the fuller identity-lifecycle and edge-discovery halves. | [warp](docs/function/warp.md); ZeroNet `warp.rs`; LxBox 015 |
 | 145 | AmneziaWG 1.0–3.1 parameter set | planned | LxBox §8.5; ZeroNet `amnezia.rs`; amneziawg-go. Row 75 pointer | LxBox §8.5; ZeroNet `amnezia.rs`; amneziawg-go |
 | 146 | Evasion on TCP/TLS (fragment, keepalive shaping, noise, fake-SNI) | planned | Aether's handshake noise profiles are row 194. | ZeroNet `zero-evasion/`; LxBox 016 |
 | 147 | Detour graph + hop chains with cycle detection | planned (section G engine) | LxBox 006; Xray `dialerProxy`; sing-box `detour`; Leaf `proxy/chain/`. Aether's upstream dial is row 193. | LxBox 006; Xray `dialerProxy`; sing-box `detour`; Leaf `proxy/chain/` |

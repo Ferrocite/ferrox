@@ -133,6 +133,30 @@ jobs:
           ./scripts/watch-test.sh --quiet 600 --out target/ci/foxy-live-connect.log -- \
             cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
               foxy_live::a_second_connect_stream_on_one_session_names_what_the_edge_does
+      # The CLI lane is what users run: a 451 from the account plane makes the
+      # lane itself retry through a WARP hop (--warp makes it the first move),
+      # and a lane that succeeded proves the hop carried a real flow. The hop
+      # registers once into the lane's own identity file; no other test dials
+      # Cloudflare.
+      - name: Live lane, CLI --warp first
+        # A direct edge refusal is a fact about the runner's exit, not about
+        # the lane; the WARP hop dials from a different exit, and this step is
+        # the only check of the CLI lane, so it measures whether the edge
+        # answers the hop even when it answered the runner 502.
+        if: always() && steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
+          CARGO_BIN: target/debug/ferrox-app
+        run: |
+          cargo build --locked -p ferrox-app
+          cp "$CARGO_BIN" dist/ferrox-app
+          trap 'rm -f dist/ferrox-app; ./dist/ferrox-cli.sh down >/dev/null 2>&1 || true' EXIT
+          ./dist/ferrox-cli.sh down >/dev/null 2>&1 || true
+          ./dist/ferrox-cli.sh up --foxy --email "$FOXY_EMAIL" --password "$FOXY_PASS" --country "$FOXY_COUNTRY" --warp
+          ./dist/ferrox-cli.sh status
+          ./dist/ferrox-cli.sh down
       - name: What the account host presents
         if: always() && steps.secrets.outputs.present == 'true'
         continue-on-error: true

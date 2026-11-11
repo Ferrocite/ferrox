@@ -38,6 +38,8 @@ struct Huffman {
     /// Where each length's symbols begin in `symbols`, ordered by length then symbol, so a code is `first[length] + offset`; read only on the rare match.
     base: [u16; MAX_BITS + 1],
     symbols: [u16; 257],
+    /// Each symbol's canonical code, built by the same walk the decode ranges come from, so encode and decode can never disagree.
+    codes: [u32; 257],
     /// One load resolves every symbol of `PEEK` bits or fewer — which is every ASCII byte — as `(symbol << 5) | length`; zero means no code of that length prefixes the window, and the serial probe takes over from the bits already read. Prefix-freeness makes the entry unique, and Kraft makes the table fill below one write per entry.
     primary: [u16; 1 << PEEK],
 }
@@ -49,6 +51,7 @@ fn huffman() -> &'static Huffman {
             probe: [0; MAX_BITS + 1],
             base: [0; MAX_BITS + 1],
             symbols: [0; 257],
+            codes: [0; 257],
             primary: [0; 1 << PEEK],
         };
         let mut next = 0u32;
@@ -68,6 +71,7 @@ fn huffman() -> &'static Huffman {
                     continue;
                 }
                 table.symbols[placed] = symbol as u16;
+                table.codes[symbol] = first + count;
                 count += 1;
                 placed += 1;
                 next += 1;
@@ -156,30 +160,14 @@ pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
     Some(())
 }
 
-/// The code of one symbol, read back out of the table the decoder uses so the encoder cannot be a second source of truth; only tests call it, as a CONNECT request is literals.
-#[cfg(test)]
-fn huffman_code(symbol: usize) -> Option<(u32, usize)> {
-    let bits = usize::from(HUFFMAN_BITS[symbol]);
+/// Encodes one Huffman-coded string: each symbol's canonical code from the same table the decoder derives, written MSB-first, the last byte padded with the EOS prefix.
+pub fn huffman_encode(bytes: &[u8], out: &mut Vec<u8>) {
     let table = huffman();
-    let probe = table.probe[bits];
-    let base = table.base[bits] as usize;
-    let slot = table.symbols[base..base + probe as u32 as usize]
-        .iter()
-        .position(|other| usize::from(*other) == symbol)?;
-    let code = ((probe >> 32) as u32) + slot as u32;
-    Some((code, bits))
-}
-
-#[cfg(test)]
-fn huffman_encode(bytes: &[u8], out: &mut Vec<u8>) {
     let mut acc = 0u64;
     let mut bits = 0u32;
     for byte in bytes {
-        let Some((code, length)) = huffman_code(usize::from(*byte)) else {
-            continue;
-        };
-        let length = length as u32;
-        acc = (acc << length) | u64::from(code);
+        let length = u32::from(HUFFMAN_BITS[usize::from(*byte)]);
+        acc = (acc << length) | u64::from(table.codes[usize::from(*byte)]);
         bits += length;
         while bits >= 8 {
             bits -= 8;
@@ -192,8 +180,17 @@ fn huffman_encode(bytes: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// The octets one string's codes need, so an encoder can refuse Huffman without writing it first.
+pub fn huffman_len(bytes: &[u8]) -> usize {
+    let bits: usize = bytes
+        .iter()
+        .map(|byte| usize::from(HUFFMAN_BITS[usize::from(*byte)]))
+        .sum();
+    bits.div_ceil(8)
+}
+
 /// An integer in one byte carrying `prefix` low bits, continued in base-128.
-pub(crate) fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
+pub fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
     let max = (1usize << prefix) - 1;
     if value < max {
         out.push(mask | value as u8);
@@ -278,6 +275,66 @@ fn string_literal<'a>(block: &'a [u8], at: &mut usize) -> Option<Literal<'a>> {
     let mut out = Vec::with_capacity(decoded_bound(len));
     huffman_decode(raw, &mut out)?;
     Some(Literal::Owned(out))
+}
+
+/// The HPACK static table's names, index-addressed from one: the request encoder names its field lines from here, so a line the edge's decoder expects lands as one byte of prefix.
+const HPACK_NAME: [(&str, u16); 48] = [
+    (":authority", 1),
+    (":method", 2),
+    (":path", 4),
+    (":scheme", 6),
+    ("accept", 19),
+    ("accept-charset", 15),
+    ("accept-encoding", 16),
+    ("accept-language", 17),
+    ("accept-ranges", 18),
+    ("access-control-allow-origin", 20),
+    ("age", 21),
+    ("allow", 22),
+    ("authorization", 23),
+    ("cache-control", 24),
+    ("content-disposition", 25),
+    ("content-encoding", 26),
+    ("content-language", 27),
+    ("content-length", 28),
+    ("content-location", 29),
+    ("content-range", 30),
+    ("content-type", 31),
+    ("cookie", 32),
+    ("date", 33),
+    ("etag", 34),
+    ("expect", 35),
+    ("expires", 36),
+    ("from", 37),
+    ("host", 38),
+    ("if-match", 39),
+    ("if-modified-since", 40),
+    ("if-none-match", 41),
+    ("if-range", 42),
+    ("if-unmodified-since", 43),
+    ("last-modified", 44),
+    ("link", 45),
+    ("location", 46),
+    ("max-forwards", 47),
+    ("proxy-authenticate", 48),
+    ("proxy-authorization", 49),
+    ("range", 50),
+    ("referer", 51),
+    ("refresh", 52),
+    ("retry-after", 53),
+    ("server", 54),
+    ("set-cookie", 55),
+    ("strict-transport-security", 56),
+    ("transfer-encoding", 57),
+    ("user-agent", 58),
+];
+
+/// The static index of one field name, `None` when the name sits outside the table and a literal name is the honest encoding.
+pub fn hpack_name(name: &str) -> Option<u16> {
+    HPACK_NAME
+        .binary_search_by(|(known, _)| (*known).cmp(name))
+        .ok()
+        .and_then(|slot| HPACK_NAME.get(slot).map(|(_, index)| *index))
 }
 
 /// The QPACK static table, index-addressed: the 99 name/value pairs every endpoint knows without dynamic state, so an indexed field line is two bytes.
@@ -918,7 +975,11 @@ mod tests {
             (255, (67_108_846, 26)),
             (256, (1_073_741_823, 30)),
         ] {
-            assert_eq!(huffman_code(symbol), Some(expected), "symbol {symbol}");
+            assert_eq!(
+                (huffman().codes[symbol], usize::from(HUFFMAN_BITS[symbol])),
+                expected,
+                "symbol {symbol}"
+            );
         }
     }
 

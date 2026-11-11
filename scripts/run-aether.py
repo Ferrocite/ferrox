@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Translate the matrix's Xray-dialect client config into Aether's environment."""
+"""Translate the matrix's Xray-dialect client config into Aether's environment: a MASQUE or WARP dial to its masque identity, or a WireGuard dial to its wg one."""
 
 import json
 import os
@@ -154,14 +154,13 @@ def main():
     bind = f"{inbound.get('listen', '127.0.0.1')}:{inbound['port']}"
     outbound = next(
         (item for item in doc.get("outbounds") or []
-         if item.get("protocol") in ("masque", "wireguard")),
+         if item.get("protocol") in ("masque", "wireguard", "warp")),
         None,
     )
     if outbound is None:
-        fail("the config has no MASQUE or WireGuard outbound")
+        fail("the config has no MASQUE, WireGuard or WARP outbound")
     settings = outbound.get("settings") or {}
     stream = outbound.get("streamSettings") or {}
-    peer = endpoint(settings)
     real = pathlib.Path(__file__).resolve().with_name("aether-bin")
     if not real.exists():
         fail(f"the pinned Aether binary is missing at {real}")
@@ -174,9 +173,24 @@ def main():
         "AETHER_WG_NO_DATA_CHECK": "1",
         "AETHER_NOIZE": "off",
     })
-    if outbound.get("protocol") == "masque":
+    if outbound.get("protocol") == "warp":
+        block = settings.get("masque") or {}
+        masque_peer = block.get("address") and f"{block['address']}:{block['port']}"
+        if not masque_peer:
+            fail("the WARP outbound names no MASQUE address and port")
+        tls = stream.get("tlsSettings") or {}
+        sni = block.get("serverName") or tls.get("serverName") or "carrier.test"
+        config = masque_identity(cfg_path, stream)
+        command = [
+            str(real), "--protocol", "masque", "--peer", masque_peer,
+            "--masque-sni", sni, "--bind", bind,
+            "--masque-config", str(config), "--no-data-check",
+            "--no-quic-v2", "--log-level", "warn",
+        ]
+    elif outbound.get("protocol") == "masque":
         tls = stream.get("tlsSettings") or {}
         sni = tls.get("serverName") or "carrier.test"
+        peer = endpoint(settings)
         config = masque_identity(cfg_path, stream)
         command = [
             str(real), "--protocol", "masque", "--peer", peer,
@@ -185,6 +199,7 @@ def main():
             "--no-quic-v2", "--log-level", "warn",
         ]
     else:
+        peer = endpoint(settings)
         config = wireguard_identity(cfg_path, settings)
         command = [
             str(real), "--protocol", "wg", "--wg-peer", peer,

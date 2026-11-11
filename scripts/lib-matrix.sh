@@ -27,7 +27,7 @@ s.close()'
 
 matrix_udp_carrier() {
   case "$1" in
-    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*|wireguard-*) return 0 ;;
+    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*|warp-*|wireguard-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -77,9 +77,9 @@ matrix_engine_skip_reason() {
   fi
   if [[ "$engine" == "aether" ]]; then
     case "$id" in
-      masque-* | wireguard-raw-*) ;;
+      masque-* | wireguard-raw-* | warp-*) ;;
       *)
-        printf '%s\n' "Aether at this pin only speaks MASQUE and WireGuard"
+        printf '%s\n' "Aether at this pin only speaks MASQUE, WireGuard and WARP"
         return 0
         ;;
     esac
@@ -147,6 +147,8 @@ matrix_engine_skip_reason() {
       printf '%s\n' "xray-rust at this pin has no VLESS over Hysteria; its Hysteria outbound is the native proxy protocol" ;;
     xray-core-rust:masque-*|zeronet:masque-*|sing-box:masque-*|xray-rust:masque-*|leaf:masque-*)
       printf '%s\n' "$engine at this pin has no MASQUE CONNECT-IP outbound" ;;
+    xray-core:warp-*|xray-core-rust:warp-*|zeronet:warp-*|sing-box:warp-*|xray-rust:warp-*|leaf:warp-*)
+      printf '%s\n' "$engine at this pin has no WARP carrier" ;;
     *)
       return 1 ;;
   esac
@@ -371,6 +373,14 @@ masque_client_settings() {
   pin="$(matrix_tls_pin "$dir/cert.pem")"
   auth="$(printf '%s' "matrix@carrier.test:$PASSWORD" | base64)"
   echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port, \"largeSegments\": true}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
+# WARP's MASQUE half against this matrix's own server: the outbound is the warp
+# dialect with a pinned mode, a WireGuard half the pinned mode never dials, and
+# a stream TLS fixture the Aether adapter alone reads for its client identity.
+warp_client_settings() {
+  local port="$1" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg=="
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"masque\", \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$key\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$(matrix_tls_dir)/cert.pem\", \"certificates\": [{\"certificateFile\": \"$(matrix_tls_dir)/cert.pem\", \"keyFile\": \"$(matrix_tls_dir)/key.pem\", \"usage\": \"verify\"}]}}"
 }
 
 httpupgrade_settings() {
@@ -684,6 +694,7 @@ scenario_config() {
     vmess-tls-ws-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_ws_client_settings)" "$port" ;;
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
+    warp-masque-*) server_config "$(masque_server_settings)" "$(warp_client_settings "$port")" "$port" ;;
     socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
     http-raw-*) server_config "$(http_server)" "$(http_client "$port")" "$port" ;;
     vmess-*) dispatch_protocol vmess "$1" "$port" "$cover" ;;
@@ -771,6 +782,7 @@ standard_scenarios() {
   echo "vmess-tls-ws-down-8 download 8 256 65536"
   echo "trojan-tls-ws-down-8 download 8 256 65536"
   echo "masque-down-8 download 8 256 65536"
+  echo "warp-masque-down-8 download 8 256 65536"
   echo "vless-ws-ed-down-8 download 8 256 65536"
   echo "vless-tls-ws-ed-down-8 download 8 256 65536"
   echo "vless-httpupgrade-ed-down-8 download 8 256 65536"
@@ -875,6 +887,8 @@ scenarios() {
       echo "hysteria-v1-duplex-8 full-duplex 8 128 65536"
       echo "wireguard-raw-up-1 upload 1 2048 65536"
       echo "wireguard-raw-duplex-8 full-duplex 8 128 65536"
+      echo "warp-masque-up-1 upload 1 2048 65536"
+      echo "warp-masque-duplex-8 full-duplex 8 128 65536"
       echo "wireguard-kernel-raw-up-1 upload 1 2048 65536"
       echo "wireguard-kernel-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-reality-raw-up-1 upload 1 2048 65536"

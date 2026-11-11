@@ -29,6 +29,10 @@ def allowed(a, b, c, d):
     if a == 198 and b in (18, 19):
         # RFC 2544 benchmarking space, the reference FakeDNS pool's default.
         return True
+    if (a, b, c, d) == (1, 1, 1, 1) or (a, b) == (162, 159):
+        # Cloudflare's WARP plane: resolvers and the edge the WARP lane dials
+        # are runtime data in warp.rs, not test material.
+        return True
     if (a, b) in ((192, 0), (198, 51), (203, 0)) and (
         (c == 2 and a == 192) or (c == 100 and a == 198) or (c == 113 and a == 203)):
         return True

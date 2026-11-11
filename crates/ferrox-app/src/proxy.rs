@@ -2119,6 +2119,9 @@ pub(crate) enum Outbound {
     /// The flow rides a MASQUE CONNECT-IP tunnel: one HTTP/3 conversation carries
     /// every destination as inner IP packets over QUIC datagrams.
     Masque(Arc<crate::masque::MasqueOut>),
+    /// WARP's two halves: `WireGuard` and MASQUE, with the first data-plane answer
+    /// in auto mode deciding which one carries the flows.
+    Warp(Arc<crate::warp::WarpOut>),
     /// The metrics app's tag: a flow routed here reaches its own HTTP handler on a loopback lane.
     Metrics {
         address: SocketAddr,
@@ -2140,6 +2143,7 @@ impl Outbound {
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
             Self::Masque(masque) => masque.edge(),
+            Self::Warp(warp) => warp.edge(),
             Self::Psiphon(lane) => Some(lane.endpoint()),
             Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
@@ -22745,6 +22749,10 @@ fn serve_connect_at(
         masque.serve_tcp(client, asked, prefix);
         return;
     }
+    if let Outbound::Warp(warp) = out {
+        warp.serve_tcp(client, asked, prefix);
+        return;
+    }
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
@@ -22925,6 +22933,7 @@ fn dial_socks_outbound(
         | Outbound::ReversePortal(_)
         | Outbound::WireGuard(_)
         | Outbound::Masque(_)
+        | Outbound::Warp(_)
         | Outbound::Metrics { .. }
         | Outbound::Api(_) => {}
     }
@@ -24466,6 +24475,7 @@ fn serve_udp_lane_with(
         },
         Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
         Outbound::Masque(masque) => masque.serve_udp(relay, associate),
+        Outbound::Warp(warp) => warp.serve_udp(relay, associate),
         Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out, source, sockopts),
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
@@ -34783,6 +34793,9 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     if let Some(masque) = find_masque_outbound(root)? {
         return Ok(Some(Outbound::Masque(Arc::new(masque))));
     }
+    if let Some(warp) = find_warp_outbound(root, test)? {
+        return Ok(Some(Outbound::Warp(Arc::new(warp))));
+    }
     if let Some(freedom) = find_freedom_outbound(root)? {
         return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
     }
@@ -34828,6 +34841,33 @@ fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut
     crate::wg::WireGuardOut::new(config)
         .map(Some)
         .map_err(|reason| format!("wireguard outbound: {reason}"))
+}
+
+/// The WARP outbound's identity, registration and both halves, built once at
+/// startup so a bad identity or an unusable API refuses the config.
+fn find_warp_outbound(root: &Json, test: bool) -> Result<Option<crate::warp::WarpOut>, String> {
+    let Some(outbound) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|outbounds| outbounds.first())
+    else {
+        return Ok(None);
+    };
+    if canonical_protocol(
+        outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    ) != "warp"
+    {
+        return Ok(None);
+    }
+    if dialer_proxy_tag(outbound).is_some() {
+        eprintln!("warp: sockopt.dialerProxy is ignored; the tunnel dials its edge directly");
+    }
+    crate::warp::WarpOut::new(outbound, test)
+        .map(Some)
+        .map_err(|reason| format!("warp outbound: {reason}"))
 }
 
 /// The MASQUE outbound's transport and account, built once at startup so a bad
@@ -35697,6 +35737,7 @@ fn foxy_candidates(
     country: &str,
     city: &str,
     roots: ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
 ) -> Vec<ferrox_core::foxy::Candidate> {
     let named = link.host();
     let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
@@ -35712,7 +35753,7 @@ fn foxy_candidates(
     if !configured_edges.is_empty() {
         return configured_edges;
     }
-    crate::foxy_catalog::edges(roots)
+    crate::foxy_catalog::edges_via(roots, upstream)
 }
 
 /// A configured edge address, resolved once for every dial; otherwise catalogue names resolve per dial.
@@ -35870,6 +35911,7 @@ fn foxy_account(
     guardian: &str,
     token_file: &str,
     roots: &ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
 ) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
     let pass = pasted.clone();
     if email.is_empty() && pass.token.is_empty() {
@@ -35879,12 +35921,17 @@ fn foxy_account(
     let session = tokens
         .as_ref()
         .and_then(crate::foxy_account::TokenFile::load);
+    let mut fxa = crate::foxy_account::Endpoint::parse(
+        ferrox_core::foxy::account::FXA_SERVER,
+        std::sync::Arc::clone(roots),
+    )?;
+    let mut guardian =
+        crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?;
+    fxa.upstream = upstream.cloned();
+    guardian.upstream = upstream.cloned();
     let account = std::sync::Arc::new(crate::foxy_account::Account {
-        fxa: crate::foxy_account::Endpoint::parse(
-            ferrox_core::foxy::account::FXA_SERVER,
-            std::sync::Arc::clone(roots),
-        )?,
-        guardian: crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?,
+        fxa,
+        guardian,
         jar: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_challenge::Jar::default())),
         pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_method: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -36144,7 +36191,14 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let roots = ca_roots(settings);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
         let edge_address = foxy_edge_address(settings);
-        let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
+        let candidates = foxy_candidates(
+            outbound,
+            &link,
+            &country,
+            &city,
+            roots.clone(),
+            upstream.as_ref(),
+        );
         let carrier = foxy_carrier(settings, &link);
         // An HTTP hop carries streams not datagrams, so this is a refusal, not a silent carrier switch.
         if foxy_h3_over_http(upstream.as_ref(), carrier) {
@@ -36162,6 +36216,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             link.guardian(),
             &token_file,
             &roots,
+            upstream.as_ref(),
         );
         let pass = account
             .as_ref()

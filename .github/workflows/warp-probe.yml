@@ -1,0 +1,204 @@
+name: warp-register probe
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: warp-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The register runs first, then the reference, so an order artifact stands apart from the bytes
+        run: |
+          set -x
+          mkdir -p upstream/aether target/release
+          cargo build --locked --release -p ferrox-app 2>&1 | tail -1
+          target/release/ferrox-app warp-register 2>&1 | tail -6 || true
+          curl -sSLo upstream/aether/../aether.tgz https://github.com/CluvexStudio/Aether/archive/9ebdcc945af12ea532b32119884f846bdb9c4bfc.tar.gz
+          tar -xzf upstream/aether/../aether.tgz --strip-components=1 -C upstream/aether
+          (cd upstream/aether/aether \
+            && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether 2>&1 | tail -2)
+          mv upstream/aether/aether/target/release/aether /tmp/aether
+          echo "---- the reference adopts the device ours minted ----"
+          if test -f warp-identity.json; then
+            python3 - <<'EOF'
+          import json, os
+          me = json.load(open('warp-identity.json'))
+          wg = me['wireguard']
+          v4 = next((a for a in wg['address'] if ':' not in a), '')
+          v6 = next((a for a in wg['address'] if ':' in a), '')
+          toml = (f'device_id = "{me["deviceId"]}"\n'
+                  f'access_token = "{me["token"]}"\n'
+                  f'ipv4 = "{v4}"\n'
+                  f'ipv6 = "{v6}"\n'
+                  f'wg_private_key = "{wg["privateKey"]}"\n'
+                  f'wg_peer_public_key = "{wg["publicKey"]}"\n')
+          os.makedirs('target/probe', exist_ok=True)
+          open('target/probe/mine-as-aether.toml', 'w').write(toml)
+          print(f"my device {me['deviceId']}, token({len(me['token'])}) -> target/probe/mine-as-aether.toml")
+          EOF
+            /tmp/aether --register masque --masque-config target/probe/mine-as-aether.toml 2>&1 | tail -6 || true
+          else
+            echo "no warp-identity.json was saved; the register died before a device existed"
+          fi
+          /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -6
+          echo "the reference's own token, for length beside ours:"
+          grep -o 'token = "[^"]*"' target/probe/identities.toml | head -1 | wc -c || true
+      - name: The register's request bytes, ours beside the reference's, from a local echo
+        run: |
+          set -x
+          python3 -m pip install --quiet h2
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout /tmp/ca.key -out /tmp/ca.pem -subj "/CN=echo ca" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes -keyout /tmp/key.pem -out /tmp/leaf.csr -subj "/CN=echo.example" >/dev/null 2>&1
+          printf "subjectAltName=IP:127.0.0.1,DNS:echo.example\nextendedKeyUsage=serverAuth\n" > /tmp/ext.cnf
+          openssl x509 -req -in /tmp/leaf.csr -CA /tmp/ca.pem -CAkey /tmp/ca.key -CAcreateserial -days 2 -out /tmp/cert.pem -extfile /tmp/ext.cnf >/dev/null 2>&1
+          sudo cp /tmp/ca.pem /usr/local/share/ca-certificates/echo-ca.crt
+          sudo update-ca-certificates >/dev/null 2>&1
+          echo "the leaf is trusted by the system store"
+          cat > /tmp/capture.py <<'EOF'
+          import ssl, socket, sys, base64, json, urllib.request, urllib.error, subprocess
+          from h2.connection import H2Connection
+          from h2.config import H2Configuration
+          from h2.events import RequestReceived, DataReceived, StreamEnded, RemoteSettingsChanged, WindowUpdated, PingReceived, PriorityUpdated
+
+          class Cap:
+              def __init__(self, conn, sock, tag):
+                  self.conn, self.sock, self.tag = conn, sock, tag
+                  self.bodies = {}
+                  self.heads = {}
+              def handle(self, event):
+                  if isinstance(event, RemoteSettingsChanged):
+                      for cid, cv in event.changed_settings.items():
+                          print(f"[{self.tag}] SETTINGS {cid.name}={cv.new_value}", flush=True)
+                  elif isinstance(event, WindowUpdated):
+                      print(f"[{self.tag}] WINDOW stream={event.stream_id} delta={event.delta}", flush=True)
+                  elif isinstance(event, PingReceived):
+                      print(f"[{self.tag}] PING {event.ping_data.hex()}", flush=True)
+                  elif isinstance(event, PriorityUpdated):
+                      print(f"[{self.tag}] PRIORITY stream={event.stream_id} dep={event.depends_on} weight={event.weight} excl={event.exclusive}", flush=True)
+                  if isinstance(event, RequestReceived):
+                      self.heads[event.stream_id] = event.headers
+                      self.bodies[event.stream_id] = b""
+                  elif isinstance(event, DataReceived):
+                      self.bodies[event.stream_id] += event.data
+                  elif isinstance(event, StreamEnded):
+                      sid = event.stream_id
+                      print("==== REQUEST ====", flush=True)
+                      for name, value in self.heads[sid]:
+                          print(f"{name}: {value}", flush=True)
+                      body = self.bodies[sid]
+                      print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
+                      heads = dict(self.heads[sid])
+                      method = heads.get(b":method", b"").decode()
+                      path = heads.get(b":path", b"").decode()
+                      auth = heads.get(b"authorization", b"")
+                      print(f"auth: len={len(auth)}", flush=True)
+                      fwd = {}
+                      for name, value in self.heads[sid]:
+                          if name.startswith(b":") or name in (b"host", b"content-length", b"connection"):
+                              continue
+                          fwd[name.decode()] = value.decode()
+                      def relay(tag, body_override, reply=True):
+                          url = "https://api.cloudflareclient.com" + path
+                          try:
+                              req = urllib.request.Request(url, data=body_override, method=method, headers=fwd)
+                              with urllib.request.urlopen(req, timeout=30) as r:
+                                  status, payload = r.status, r.read()
+                          except urllib.error.HTTPError as e:
+                              status, payload = e.code, e.read()
+                          except Exception as e:
+                              status, payload = 502, str(e).encode()
+                          print(f"FORWARDED[{tag}] {method} {path} -> {status} ({len(payload)} bytes)", flush=True)
+                          if reply:
+                              self.conn.send_headers(sid, [(":status", str(status)), ("content-type", "application/json")])
+                              self.conn.send_data(sid, payload, True)
+                      relay("orig", body)
+                      if method == "PATCH":
+                          try:
+                              parsed = json.loads(body)
+                              keypem = subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout"], capture_output=True, check=True).stdout
+                              pubpem = subprocess.run(["openssl", "pkey", "-pubout"], input=keypem, capture_output=True, check=True).stdout
+                              fresh = pubpem.decode().splitlines()[1]
+                              parsed["key"] = fresh
+                              relay("mutated-key", json.dumps(parsed, separators=(",", ":")).encode(), reply=False)
+                          except Exception as e:
+                              print(f"mutation failed: {e}", flush=True)
+                  self.flush()
+              def flush(self):
+                  data = self.conn.data_to_send()
+                  if data:
+                      self.sock.sendall(data)
+
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain("/tmp/cert.pem", "/tmp/key.pem")
+          ctx.set_alpn_protocols(["h2"])
+          server = socket.socket()
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("127.0.0.1", 8443))
+          server.listen(4)
+          server.settimeout(300)
+          while True:
+              try:
+                  sock, _ = server.accept()
+              except Exception as e:
+                  print(f"accept failed: {e}", flush=True)
+                  continue
+              try:
+                  sock.settimeout(1)
+                  hello = sock.recv(4096, socket.MSG_PEEK)
+                  sock.settimeout(300)
+                  print(f"HELLO {hello[:900].hex()}", flush=True)
+              except Exception as e:
+                  print(f"hello peek failed: {e}", flush=True)
+              try:
+                  tls = ctx.wrap_socket(sock, server_side=True)
+              except Exception as e:
+                  print(f"TLS accept failed: {e}", flush=True)
+                  try:
+                      sock.close()
+                  except Exception:
+                      pass
+                  continue
+              conn = H2Connection(H2Configuration(client_side=False))
+              conn.initiate_connection()
+              cap = Cap(conn, tls, "conn")
+              cap.flush()
+              try:
+                  while True:
+                      data = tls.recv(65536)
+                      if not data:
+                          print("TLS EOF", flush=True)
+                          break
+                      print(f"frames: {data[:48].hex()}", flush=True)
+                      for event in conn.receive_data(data):
+                          print(f"[conn] EVENT {type(event).__name__}", flush=True)
+                          cap.handle(event)
+              except Exception as e:
+                  print(f"stream ended: {e}", flush=True)
+              tls.close()
+          EOF
+          python3 /tmp/capture.py > /tmp/capture.log 2>&1 &
+          disown
+          sleep 2
+          python3 -c "import socket; s=socket.create_connection(('127.0.0.1', 8443), 3); s.close(); print('echo alive')"
+          cargo build --locked --release -p ferrox-app
+          bin=target/release/ferrox-app
+          echo "---- ours over the local echo ----"
+          "$bin" warp-register --api https://127.0.0.1:8443/v0a4471 2>&1 | tail -3 || true
+          sleep 1
+          echo "---- the reference over the local echo ----"
+          /tmp/aether --register masque --masque-config "target/probe/identities2.toml" --api-host echo.example --api-sni echo.example --api-address 127.0.0.1:8443 2>&1 | tail -6 || true
+          sleep 1
+          kill %1 2>/dev/null || true
+          echo "captured requests:"
+          cat /tmp/capture.log || true
+          grep -c "==== REQUEST ====" /tmp/capture.log || true
