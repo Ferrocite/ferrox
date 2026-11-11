@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
+/// One decompressed asset is written in chunks of this size, never as one buffer.
+const COPY_BUFFER: usize = 64 * 1024;
 const MAX_HEAD_LINE: usize = 8192;
 const MAX_HEADERS: usize = 128;
 const MAX_TRAILERS: usize = 128;
@@ -79,7 +81,7 @@ pub(crate) fn parse(root: &Json, dirs: &[PathBuf]) -> Result<Option<Config>, Str
         None => None,
     };
     for asset in &mut assets {
-        asset.url = https_url(&asset.url)?;
+        asset.url = migrate_url(https_url(&asset.url)?);
     }
     let Some(schedule) = schedule else {
         return Ok(None);
@@ -88,10 +90,7 @@ pub(crate) fn parse(root: &Json, dirs: &[PathBuf]) -> Result<Option<Config>, Str
         return Err("geodata supports at most 100 assets".to_owned());
     }
     for asset in &assets {
-        if !Path::new(&asset.file)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("dat"))
-        {
+        if !asset_extension_ok(&asset.file, &asset.url) {
             return Err("geodata asset file extension must be .dat".to_owned());
         }
         check_asset_file(&asset.file, dirs)?;
@@ -145,6 +144,36 @@ fn asset_config(asset: &Json) -> Result<Asset, String> {
         url: url.to_owned(),
         file: file.to_owned(),
     })
+}
+
+/// The reference rewrites a `.dat` URL under its rules dataset to the `.gz` asset it publishes.
+fn migrate_url(url: String) -> String {
+    if rules_dataset(&url) && url.to_ascii_lowercase().ends_with(".dat") {
+        eprintln!("geodata: {url} is deprecated; use {url}.gz");
+        return format!("{url}.gz");
+    }
+    url
+}
+
+fn rules_dataset(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://github.com/xtls/xray-rules-dat/")
+        || lower.starts_with("https://raw.githubusercontent.com/xtls/xray-rules-dat/")
+}
+
+/// `.dat` anywhere, and the rules dataset's `.dat.gz` form, which is always stored decompressed.
+fn asset_extension_ok(file: &str, url: &str) -> bool {
+    let path = Path::new(file);
+    let extension = |path: &Path, wanted: &str| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(wanted))
+    };
+    extension(path, "dat")
+        || (rules_dataset(url)
+            && extension(path, "gz")
+            && path
+                .file_stem()
+                .is_some_and(|stem| extension(Path::new(stem), "dat")))
 }
 
 /// A local regular file the asset directories can find, as the reference's `ResolveAsset` reads them.
@@ -834,12 +863,7 @@ fn fetch(url: &str, outbound: &Outbound, writer: &mut impl Write) -> Result<(), 
         if !(200..300).contains(&response.status) {
             return Err(format!("unexpected status code: {}", response.status));
         }
-        if response.body.is_empty() {
-            return Err("empty response body".to_owned());
-        }
-        writer
-            .write_all(&response.body)
-            .map_err(|error| error.to_string())?;
+        write_body(&response, writer)?;
         return Ok(());
     }
     Err("stopped after 20 redirects".to_owned())
@@ -971,27 +995,58 @@ fn read_response(reader: &mut impl Read) -> Result<Response, String> {
             return Err("geodata download exceeds 256 MiB".to_owned());
         }
     }
-    let gzip = header("content-encoding").is_some_and(|value| {
-        value
-            .split(',')
-            .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
-    }) || body.starts_with(&[0x1f, 0x8b]);
-    if gzip {
-        let mut decoded = Vec::new();
-        flate2::read::GzDecoder::new(&body[..])
-            .take(MAX_DOWNLOAD + 1)
-            .read_to_end(&mut decoded)
-            .map_err(|error| error.to_string())?;
-        if decoded.len() as u64 > MAX_DOWNLOAD {
-            return Err("geodata download exceeds 256 MiB".to_owned());
-        }
-        body = decoded;
-    }
     Ok(Response {
         status: code,
         headers,
         body,
     })
+}
+
+/// Write the staged asset, decompressing a gzip body as it is read so the whole
+/// decompressed set is never held beside the archive.
+fn write_body(response: &Response, writer: &mut impl Write) -> Result<(), String> {
+    if response.body.is_empty() {
+        return Err("empty response body".to_owned());
+    }
+    let gzip = response.header("content-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
+    }) || response.body.starts_with(&[0x1f, 0x8b]);
+    let written = if gzip {
+        let mut decoder = flate2::read::MultiGzDecoder::new(response.body.as_slice());
+        copied(&mut decoder, writer)?
+    } else {
+        writer
+            .write_all(&response.body)
+            .map_err(|error| error.to_string())?;
+        response.body.len()
+    };
+    if written == 0 {
+        return Err("empty response body".to_owned());
+    }
+    Ok(())
+}
+
+fn copied(reader: &mut impl Read, writer: &mut impl Write) -> Result<usize, String> {
+    let limit = usize::try_from(MAX_DOWNLOAD).unwrap_or(usize::MAX);
+    let mut buffer = vec![0u8; COPY_BUFFER];
+    let mut total = 0usize;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(read);
+        if total > limit {
+            return Err("geodata download exceeds 256 MiB".to_owned());
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+    }
 }
 
 fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), String> {
@@ -1321,9 +1376,122 @@ mod tests {
             response.extend_from_slice(b"\r\n");
         }
         response.extend_from_slice(b"0\r\n\r\n");
-        let parsed = read_response(&mut &response[..]).expect("decodes");
+        let parsed = read_response(&mut &response[..]).expect("reads");
         assert_eq!(parsed.status, 200);
-        assert_eq!(parsed.body, b"geosite");
+        let mut decoded = Vec::new();
+        write_body(&parsed, &mut decoded).expect("decodes");
+        assert_eq!(decoded, b"geosite");
+    }
+
+    struct Recording {
+        bytes: Vec<u8>,
+        largest: usize,
+    }
+
+    impl Write for Recording {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.largest = self.largest.max(buffer.len());
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_gzipped_asset_is_written_while_it_is_decompressed() {
+        let payload = vec![0x5au8; 1024 * 1024 + 7];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&payload).expect("compresses");
+        let response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: encoder.finish().expect("finishes"),
+        };
+        let mut sink = Recording {
+            bytes: Vec::new(),
+            largest: 0,
+        };
+        write_body(&response, &mut sink).expect("streams");
+        assert_eq!(sink.bytes, payload);
+        assert!(
+            sink.largest <= COPY_BUFFER,
+            "the decoded asset was staged whole: a {} byte write",
+            sink.largest
+        );
+    }
+
+    #[test]
+    fn every_member_of_a_concatenated_gzip_asset_is_decoded() {
+        let mut body = Vec::new();
+        for part in [b"geosite".as_slice(), b"geoip".as_slice()] {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(part).expect("compresses");
+            body.extend_from_slice(&encoder.finish().expect("finishes"));
+        }
+        let response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body,
+        };
+        let mut decoded = Vec::new();
+        write_body(&response, &mut decoded).expect("decodes every member");
+        assert_eq!(decoded, b"geositegeoip");
+    }
+
+    #[test]
+    fn a_rules_dataset_url_is_migrated_to_its_gz_form() {
+        for (url, migrated) in [
+            (
+                "https://github.com/xtls/XRAY-rules-dat/a/geosite.dat",
+                "https://github.com/xtls/XRAY-rules-dat/a/geosite.dat.gz",
+            ),
+            (
+                "https://raw.githubusercontent.com/xtls/xray-rules-dat/main/geoip.dat",
+                "https://raw.githubusercontent.com/xtls/xray-rules-dat/main/geoip.dat.gz",
+            ),
+            (
+                "https://example.test/geosite.dat",
+                "https://example.test/geosite.dat",
+            ),
+            (
+                "https://github.com/xtls/xray-rules-dat/a/geosite.dat.gz",
+                "https://github.com/xtls/xray-rules-dat/a/geosite.dat.gz",
+            ),
+        ] {
+            assert_eq!(migrate_url(url.to_owned()), migrated, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_rules_dataset_dat_gz_asset_is_accepted() {
+        let dir = asset_dir();
+        std::fs::write(dir.join("geosite.dat.gz"), b"").expect("writes the asset");
+        let root = config(
+            r#"{"cron": "0 3 * * *", "assets": [{"url": "https://github.com/xtls/xray-rules-dat/releases/download/1.0/geosite.dat", "file": "geosite.dat.gz"}]}"#,
+        );
+        let parsed = parse(&root, std::slice::from_ref(&dir))
+            .expect("the reference accepts a rules dataset asset")
+            .expect("a cron builds the config");
+        assert_eq!(
+            parsed.assets[0].url,
+            "https://github.com/xtls/xray-rules-dat/releases/download/1.0/geosite.dat.gz"
+        );
+        assert_eq!(parsed.assets[0].file, "geosite.dat.gz");
+    }
+
+    #[test]
+    fn a_dat_gz_asset_outside_the_rules_dataset_is_refused() {
+        let dir = asset_dir();
+        std::fs::write(dir.join("geosite.dat.gz"), b"").expect("writes the asset");
+        let root = config(
+            r#"{"cron": "0 3 * * *", "assets": [{"url": "https://example.test/geosite.dat.gz", "file": "geosite.dat.gz"}]}"#,
+        );
+        let error = parse(&root, &[dir]).expect_err("only the rules dataset carries .dat.gz");
+        assert!(error.contains(".dat"), "{error}");
     }
 
     #[test]
