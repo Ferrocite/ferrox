@@ -192,6 +192,9 @@ impl<S: Stream> Session<S> {
         if let Some(padding) = cfg.padding {
             hello.set_padding(usize::from(padding));
         }
+        if cfg.omit_session_id {
+            hello.clear_session_id();
+        }
         if let Some(list) = &cfg.ech_config_list {
             if stock {
                 hello.enable_stock_ech(list)?;

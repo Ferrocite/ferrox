@@ -344,6 +344,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         client_cert: None,
         client_random: None,
         padding: None,
+        ..Default::default()
     }
 }
 

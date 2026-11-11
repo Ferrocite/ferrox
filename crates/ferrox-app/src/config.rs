@@ -1315,6 +1315,7 @@ pub(crate) fn outbound_tls(
         client_cert: tls_client_cert(tls)?,
         client_random: None,
         padding: None,
+        ..Default::default()
     }))
 }
 

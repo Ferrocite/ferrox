@@ -8,6 +8,7 @@ impl<T: std::io::Read + std::io::Write> Stream for T {}
 pub type Anchors = std::sync::Arc<[Vec<u8>]>;
 
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TlsConfig {
     pub server_name: String,
     /// The `ALPN` list a client offers, behind one allocation: a config names it once, and the client's own cache keys on it, so a per-dial copy was a vector of vectors paid on every handshake.
@@ -64,6 +65,9 @@ pub struct TlsConfig {
     /// itself in that field (Psiphon TLS-OSSH). Only the shaped session can carry it; the stock
     /// rustls builder draws its own and cannot be overridden.
     pub client_random: Option<[u8; 32]>,
+    /// Omit the legacy 32-byte session id from a shaped hello, as Psiphon's
+    /// `NoDefaultTLSSessionIDProbability` makes uTLS do for a randomized profile.
+    pub omit_session_id: bool,
     /// An exact RFC 7685 padding extension body length, moved to the front of a shaped hello as
     /// Psiphon's `TLSPadding` does. `None` keeps each preset's own padding rule.
     pub padding: Option<u16>,

@@ -26,10 +26,10 @@ the gap count is complete, not so a client lane should implement them.
 <!-- parity:begin -->
 | class | state | fields |
 | --- | --- | --- |
-| `client-api` | `missing` | `ClientAPILevel`, `DisableApi`, `TargetAPIEncoding`, `TargetAPIProtocol` |
+| `client-api` | `missing` | `ClientAPILevel`, `DisableApi`, `TargetAPIProtocol` |
 | `client-core` | `missing` | `LimitCPUThreads` |
 | `client-packet-tunnel` | `missing` | `PacketTunnelTransparentDNSIPv4Address`, `PacketTunnelTransparentDNSIPv6Address`, `PacketTunnelTunFileDescriptor`, `SSHPacketTunnelChannelWindowSize` |
-| `client-tls` | `missing` | `CustomTLSProfiles`, `DisableFrontingProviderTLSProfiles`, `NoDefaultTLSSessionIDProbability`, `UseOnlyCustomTLSProfiles` |
+| `client-tls` | `missing` | `CustomTLSProfiles`, `DisableFrontingProviderTLSProfiles`, `UseOnlyCustomTLSProfiles` |
 | `client-obfuscation` | `missing` | `ObfuscatedSSHAlgorithms`, `QUICObfuscatedPSKProbability`, `TLSTunnelObfuscatedPSKProbability` |
 | `client-routing` | `missing` | `DSLPrioritizeDialExistingServerEntryProbability`, `DSLPrioritizeDialNewServerEntryProbability`, `DSLPrioritizeDialPlaceholderTTLSeconds`, `DSLPrioritizeDialRetainFailedProbability`, `DisableDSLFetcher`, `EnableDSLFetcher` |
 | `client-transfers` | `missing` | `DisableSystemRootCAs`, `EnableFeedbackUpload`, `EnableUpgradeDownload`, `ExchangeObfuscationKey`, `FeedbackEncryptionPublicKey`, `FeedbackUploadURLs`, `FetchRemoteServerListRetryPeriodMilliseconds`, `FetchUpgradeRetryPeriodMilliseconds`, `ServerEntrySignaturePublicKey`, `TrustedCACertificatesFilename`, `UpgradeDownloadClientVersionHeader`, `UpgradeDownloadURLs`, `UpgradeDownloadUrl`, `UpstreamProxyAllowAllServerEntrySources`, `UpstreamProxyCustomHeaders` |

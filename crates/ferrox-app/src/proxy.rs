@@ -46140,6 +46140,7 @@ mod tests {
             client_cert: None,
             client_random: None,
             padding: None,
+            ..Default::default()
         };
         (server, client)
     }
@@ -46632,6 +46633,7 @@ mod tests {
             client_cert: None,
             client_random: None,
             padding: None,
+            ..Default::default()
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -62793,6 +62795,7 @@ mod tests {
             client_cert: None,
             client_random: None,
             padding: None,
+            ..Default::default()
         };
         let mut session =
             ferrox_core::tls::connect(&config, Connection::Tcp(client)).expect("connects");
