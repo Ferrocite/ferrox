@@ -143,6 +143,7 @@ xtls-vision user-space-copies-per-byte-written-while-framed 0 ferrox-app-vision:
 xtls-vision uuid-bytes-copied-per-link 0 ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame
 xtls-vision framed-staging-buffer-bytes 16384 ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record
 xtls-vision framed-staging-bytes-held-after-the-switch 0 ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record
+xtls-vision parked-prefix-copies-into-the-walk 0 ferrox-app-vision::tests::a_preloaded_prefix_is_the_walk_window_without_a_copy
 xtls-vision command-bytes-validated-per-frame 1 ferrox-app-vision::tests::a_frame_validates_its_command_once
 xtls-vision sealed-write-allocations 0 ferrox-core-vless::tests::a_sliced_record_write_allocates_nothing_after_warmup
 xtls-vision commands-the-validator-accepts 3 ferrox-core-vless::tests::the_command_validator_accepts_three_commands

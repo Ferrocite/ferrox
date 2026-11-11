@@ -18422,7 +18422,7 @@ fn driven_link<S>(
     raw: Option<&Connection>,
     uuid: &[u8; 16],
     grain: Duration,
-    prefix: Vec<u8>,
+    prefix: &mut Vec<u8>,
 ) -> Result<DrivenLink<S>, S>
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + 'static,
@@ -18455,7 +18455,7 @@ where
     let read = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
     let write = DrivenHalf::new(session, cipher, out);
     let (mut read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
-    read.preload(prefix);
+    read.preload(std::mem::take(prefix));
     Ok(Half::split(read, write))
 }
 
@@ -18469,7 +18469,7 @@ fn vision_stream<S>(
 where
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, Vec::new()) {
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, &mut Vec::new()) {
         Ok(vision) => split_stream(vision),
         Err(session) => {
             let transport = session.transport();
@@ -18527,12 +18527,12 @@ fn relay_vision<S, B>(
     uuid: &[u8; 16],
     peer: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
-    prefix: Vec<u8>,
+    mut prefix: Vec<u8>,
 ) where
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
     B: Read + Write + Send + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, prefix.clone()) {
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, &mut prefix) {
         Ok(vision) => relay_shared(vision, peer, close),
         Err(session) => {
             let transport = session.transport();
