@@ -3645,13 +3645,6 @@ impl crate::proxy::CarrierSink for XhttpWriter {
         }
     }
     #[inline]
-    fn settle(&self) -> crate::proxy::Settle {
-        match self.stream.get() {
-            Some(StreamOut::H2(out)) => out.settle(),
-            _ => crate::proxy::Settle::Clear,
-        }
-    }
-    #[inline]
     fn close(&self) {
         self.finish();
     }
