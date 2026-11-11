@@ -293,7 +293,11 @@ fn registration_body(public: &[u8; 32], tos: &str, serial: &str) -> Vec<u8> {
 fn android_serial() -> String {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("the OS entropy");
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut serial = String::with_capacity(16);
+    for byte in bytes {
+        std::fmt::Write::write_fmt(&mut serial, format_args!("{byte:02x}")).expect("a hex pair");
+    }
+    serial
 }
 
 /// The body that enrolls the P-256 key the MASQUE half presents.
