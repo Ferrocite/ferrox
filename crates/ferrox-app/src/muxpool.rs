@@ -56,10 +56,14 @@ impl Flow {
 pub(crate) struct UdpFlow {
     carrier: Arc<Carrier>,
     id: u16,
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl UdpFlow {
     pub(crate) fn send(&self, target: &mux::Target<'_>, data: &[u8]) -> bool {
+        if self.ended.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         self.carrier.frame(
             self.id,
             mux::Status::Keep,
@@ -71,8 +75,10 @@ impl UdpFlow {
     }
 
     pub(crate) fn close(self) {
-        self.carrier
-            .frame(self.id, mux::Status::End, 0, None, None, &[]);
+        if !self.ended.load(std::sync::atomic::Ordering::Relaxed) {
+            self.carrier
+                .frame(self.id, mux::Status::End, 0, None, None, &[]);
+        }
         self.carrier.release(self.id);
     }
 }
@@ -82,7 +88,7 @@ pub(crate) type Deliver = Arc<dyn Fn(&[u8], Option<SocketAddr>) + Send + Sync>;
 #[derive(Clone)]
 enum Sink {
     Tcp(Sender<Msg>),
-    Udp(Deliver),
+    Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
 }
 
 struct Writer {
@@ -201,7 +207,9 @@ impl Carrier {
             let Ok(mut table) = self.table.lock() else {
                 return;
             };
-            table.sinks.remove(&id);
+            if table.sinks.remove(&id).is_none() {
+                return;
+            }
             table.ids.give_back();
             table.full && table.ids.live() == 0
         };
@@ -289,7 +297,12 @@ impl Carrier {
                     end: frame.status == mux::Status::End,
                 });
             }
-            Sink::Udp(deliver) => {
+            Sink::Udp(deliver, ended) => {
+                if frame.status == mux::Status::End {
+                    ended.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.release(frame.id);
+                    return;
+                }
                 if let Some(data) = frame.data {
                     deliver(data, target);
                 }
@@ -399,6 +412,7 @@ impl Manager {
         deliver: Deliver,
     ) -> Option<UdpFlow> {
         let carrier = self.pick()?;
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let id = {
             let mut table = carrier.table.lock().ok()?;
             if table.full || table.ids.live() >= carrier.cap {
@@ -408,7 +422,9 @@ impl Manager {
             if table.ids.opened() as usize >= carrier.lifetime {
                 table.full = true;
             }
-            table.sinks.insert(id, Sink::Udp(deliver));
+            table
+                .sinks
+                .insert(id, Sink::Udp(deliver, Arc::clone(&ended)));
             id
         };
         if !carrier.frame(
@@ -422,7 +438,7 @@ impl Manager {
             carrier.release(id);
             return None;
         }
-        Some(UdpFlow { carrier, id })
+        Some(UdpFlow { carrier, id, ended })
     }
 
     #[cfg(all(test, unix))]
@@ -507,6 +523,58 @@ mod tests {
             manager.carrier_count(),
             2,
             "the retired carrier takes no more"
+        );
+    }
+
+    #[test]
+    fn a_peer_end_frees_a_datagram_session() {
+        let peer = Arc::new(Mutex::new(None));
+        let held = Arc::clone(&peer);
+        let manager = Manager::with_lifetime(1, LIFETIME, move || {
+            let (mine, other) = UnixStream::pair().ok()?;
+            let read = mine.try_clone().ok()?;
+            if let Ok(mut slot) = held.lock() {
+                *slot = Some(other);
+            }
+            Some(Uplink {
+                read: Box::new(read),
+                write: Box::new(mine),
+                close: Arc::new(|| {}),
+            })
+        });
+        let flow = manager
+            .udp(&target(), None, b"first", Arc::new(|_, _| {}))
+            .expect("a session");
+        let mut header = Vec::new();
+        let end = mux::Outgoing {
+            id: 1,
+            status: mux::Status::End,
+            options: 0,
+            target: None,
+            global_id: None,
+        };
+        let at = end.encode_header_into(&mut header);
+        header.truncate(at);
+        {
+            let mut slot = peer.lock().expect("the peer");
+            slot.as_mut()
+                .expect("a peer")
+                .write_all(&header)
+                .expect("the end frame");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while flow.send(&target(), b"later") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !flow.send(&target(), b"later"),
+            "the ended flow refuses a send"
+        );
+        assert!(
+            manager
+                .udp(&target(), None, b"next", Arc::new(|_, _| {}))
+                .is_some(),
+            "the id came back"
         );
     }
 
