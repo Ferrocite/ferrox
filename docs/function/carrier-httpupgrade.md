@@ -12,7 +12,11 @@ The other thing worth writing down is what happens when a served connection ends
 
 That is the whole of the Windows failure this lane used to carry: the bare-path test was red there and green here, because macOS delivers the already-buffered `101` and reports the reset on the *next* read, while Windows discards it. `quiet` drains the pending bytes before the close with one 4 KiB scratch: **one** read when nothing is pending (it ends on the `SESSION_POLL` timeout), at most `HEAD_LIMIT / 4096` = **3** reads when a peer keeps talking, so the close is a FIN and the answer stands. The bound is deliberate — an unbounded drain would let a chatty peer postpone the teardown forever.
 
-The `VMess` opening request behind this head is bounded too: `serve_httpupgrade` arms `RELAY_POLL` and decodes through `accept_request_bounded`, so a peer that takes the `101` and sends no request ends at `budgets::handshake()` instead of pinning the worker. The checker is `a_drained_teardown_ends_the_upgrade_with_a_fin`, witnessed on this machine: with the drain disabled it fails 3/3 with `Os { code: 54, kind: ConnectionReset }`; with it the read ends in EOF. The bare-path test cannot gate this — it passes on macOS either way — so it was retargeted to the teardown production actually has (`quiet`, then drop) rather than a shape only the test uses.
+The checker is `a_drained_teardown_ends_the_upgrade_with_a_fin`, witnessed on this machine: with the drain disabled it fails 3/3 with `Os { code: 54, kind: ConnectionReset }`; with it the read ends in EOF. The bare-path test cannot gate this — it passes on macOS either way — so it was retargeted to the teardown production actually has (`quiet`, then drop) rather than a shape only the test uses.
+
+## The opening request
+
+The `VMess` opening request behind this head is bounded too: `serve_httpupgrade` arms `RELAY_POLL` and decodes through `accept_request_bounded`, so a peer that takes the `101` and sends no request ends at `budgets::handshake()` instead of pinning the worker. `a_silent_peer_cannot_pin_an_httpupgrade_vmess_request` is the witness: it completes the upgrade, sends nothing, and asserts the serve thread returns inside the budget.
 
 ## Request headers
 
