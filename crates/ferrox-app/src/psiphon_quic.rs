@@ -62,32 +62,63 @@ pub(crate) const SUPPORTED_QUIC_VERSIONS: &[&str] = &[
     "DECOY-QUICv1",
 ];
 
+const NOISE_MAX_RANDOM: usize = 1024;
+const NOISE_MAX_PACKET: usize = 1200;
+const NOISE_FIRST_PAUSE: Duration = Duration::from_millis(2);
+const NOISE_LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const NOISE_DIGITS: &[u8] = b"0123456789";
+static NOISE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 struct QuicNoise {
     before: u8,
     after_first: u8,
     junk_min: usize,
     junk_max: usize,
-    first_random: usize,
-    second_random: usize,
+    first: &'static str,
+    second: &'static str,
     interval: Duration,
 }
 
 impl QuicNoise {
     fn lookup(name: &str) -> Option<Self> {
-        let (before, after_first, junk_min, junk_max, first_random, second_random, interval) =
+        let (before, after_first, junk_min, junk_max, first, second, interval) =
             match name.trim().to_ascii_lowercase().as_str() {
                 "" | "off" | "none" => return None,
-                "light" => (1, 0, 32, 96, 16, 0, Duration::from_millis(3)),
-                "gfw" | "aggressive" | "heavy" => (2, 1, 64, 256, 24, 32, Duration::from_millis(5)),
-                _ => (2, 2, 48, 190, 24, 48, Duration::from_millis(4)),
+                "light" => (
+                    1,
+                    0,
+                    32,
+                    96,
+                    "<b 0d0a0d0a><t><r 16>",
+                    "",
+                    Duration::from_millis(3),
+                ),
+                "gfw" | "aggressive" | "heavy" => (
+                    2,
+                    1,
+                    64,
+                    256,
+                    "<b 0d0a0d0a><t><r 24>",
+                    "<r 32>",
+                    Duration::from_millis(5),
+                ),
+                _ => (
+                    2,
+                    2,
+                    48,
+                    190,
+                    "<b 0d0a0d0a><t><r 24>",
+                    "<r 48>",
+                    Duration::from_millis(4),
+                ),
             };
         Some(Self {
             before,
             after_first,
             junk_min,
             junk_max,
-            first_random,
-            second_random,
+            first,
+            second,
             interval,
         })
     }
@@ -97,34 +128,121 @@ impl QuicNoise {
             self.junk(socket)?;
             thread::sleep(self.interval);
         }
-        let mut first = vec![0x0d, 0x0a, 0x0d, 0x0a];
-        first.extend_from_slice(
-            &u32::try_from(std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_secs()))
-                .unwrap_or(0)
-                .to_be_bytes(),
-        );
-        first.resize(first.len() + self.first_random, 0);
-        getrandom::fill(&mut first[8..]).map_err(|_| io::Error::other("psiphon quic noise"))?;
-        send_guarded(socket, &mut first)?;
-        thread::sleep(Duration::from_millis(2));
+        let mut first = noise_expand(self.first);
+        if !first.is_empty() {
+            send_guarded(socket, &mut first)?;
+        }
+        thread::sleep(NOISE_FIRST_PAUSE);
         for _ in 0..self.after_first {
             self.junk(socket)?;
             thread::sleep(self.interval);
         }
-        if self.second_random > 0 {
-            let mut second = vec![0u8; self.second_random];
-            getrandom::fill(&mut second).map_err(|_| io::Error::other("psiphon quic noise"))?;
+        let mut second = noise_expand(self.second);
+        if !second.is_empty() {
             send_guarded(socket, &mut second)?;
         }
         Ok(())
     }
 
     fn junk(&self, socket: &UdpSocket) -> io::Result<()> {
-        let span = self.junk_max.saturating_sub(self.junk_min).max(1);
-        let mut packet = vec![0u8; self.junk_min + bounded_random(span)?];
-        getrandom::fill(&mut packet).map_err(|_| io::Error::other("psiphon quic noise"))?;
+        let (low, high) = if self.junk_max <= self.junk_min || self.junk_min == 0 {
+            (40, 90)
+        } else {
+            (self.junk_min, self.junk_max)
+        };
+        let mut packet = noise_bytes(noise_range(low, high));
         send_guarded(socket, &mut packet)
     }
+}
+
+fn noise_expand(spec: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = spec;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open..].find('>') else {
+            break;
+        };
+        let body = &rest[open + 1..open + close];
+        rest = &rest[open + close + 1..];
+        let mut fields = body.split_whitespace();
+        let Some(kind) = fields.next() else {
+            continue;
+        };
+        let mut arg = String::new();
+        for field in fields {
+            arg.push_str(field);
+        }
+        match kind {
+            "b" => {
+                if let Some(bytes) = crate::psiphon::hex_decode(&arg) {
+                    out.extend_from_slice(&bytes);
+                }
+            }
+            "t" => {
+                let seconds =
+                    u32::try_from(std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_secs()))
+                        .unwrap_or(0);
+                out.extend_from_slice(&seconds.to_be_bytes());
+            }
+            "c" => {
+                let count = NOISE_COUNTER
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1);
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            "n" => out.extend_from_slice(&crate::psiphon_ssh::dial_random::<8>()),
+            "r" => out.extend_from_slice(&noise_bytes(noise_length(&arg))),
+            "rc" => noise_append(&mut out, NOISE_LETTERS, noise_length(&arg)),
+            "rd" => noise_append(&mut out, NOISE_DIGITS, noise_length(&arg)),
+            _ => {}
+        }
+    }
+    out.truncate(NOISE_MAX_PACKET);
+    out
+}
+
+fn noise_length(arg: &str) -> usize {
+    let (low, high) = match arg.split_once('-') {
+        Some((low, high)) => (low, Some(high)),
+        None => (arg, None),
+    };
+    let Ok(mut length) = low.parse::<usize>() else {
+        return 0;
+    };
+    if let Some(high) = high.and_then(|high| high.parse::<usize>().ok()) {
+        if high > length {
+            length = noise_range(length, high);
+        }
+    }
+    length.min(NOISE_MAX_RANDOM)
+}
+
+fn noise_range(low: usize, high: usize) -> usize {
+    if high <= low {
+        return low;
+    }
+    let span = u64::try_from(high - low)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = [0u8; 8];
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    low + usize::try_from(u64::from_le_bytes(bytes) % span).unwrap_or(0)
+}
+
+fn noise_bytes(length: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; length];
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    bytes
+}
+
+fn noise_append(out: &mut Vec<u8>, alphabet: &[u8], length: usize) {
+    let mut draws = vec![0u8; length];
+    crate::psiphon_ssh::dial_fill(&mut draws);
+    out.extend(
+        draws
+            .into_iter()
+            .map(|draw| alphabet[usize::from(draw) % alphabet.len()]),
+    );
 }
 
 fn send_guarded(socket: &UdpSocket, packet: &mut [u8]) -> io::Result<()> {
@@ -248,8 +366,7 @@ impl Clone for QuicStream {
 /// The obfuscation mode, structural randomization, proof key and packet key an entry selects.
 fn quic_parameters(server: &Server) -> Result<(bool, bool, bool, &str, [u8; 32]), String> {
     let version = if server.quic_versions.is_empty() {
-        SUPPORTED_QUIC_VERSIONS
-            [bounded_random(SUPPORTED_QUIC_VERSIONS.len()).map_err(|error| error.to_string())?]
+        SUPPORTED_QUIC_VERSIONS[bounded_random(SUPPORTED_QUIC_VERSIONS.len())]
     } else {
         server
             .quic_versions
@@ -287,21 +404,21 @@ fn packet_io(
     decoy: bool,
     packet_key: [u8; 32],
     shape: &crate::psiphon_ssh::TlsShape,
-) -> Result<Udp, String> {
+) -> Udp {
     if !obfuscated {
-        return Ok(Udp::Plain(io));
+        return Udp::Plain(io);
     }
-    Ok(Udp::Obfuscated(ObfuscatedUdp {
+    Udp::Obfuscated(ObfuscatedUdp {
         io,
         key: packet_key,
         nonce: [0u8; 12],
         nonce_transform: shape.quic_nonce_transform.selected(""),
         decoy: if decoy {
-            Some(u8::try_from(bounded_random(10).map_err(|error| error.to_string())?).unwrap_or(0))
+            Some(u8::try_from(bounded_random(10)).unwrap_or(0))
         } else {
             None
         },
-    }))
+    })
 }
 
 impl QuicStream {
@@ -342,7 +459,7 @@ impl QuicStream {
             decoy,
             packet_key,
             shape,
-        )?;
+        );
         Self::connect_over(
             udp, remote, timeout, proof_key, randomized, obfuscated, false, shape,
         )
@@ -364,7 +481,7 @@ impl QuicStream {
             decoy,
             packet_key,
             shape,
-        )?;
+        );
         Self::connect_over(
             udp, remote, timeout, proof_key, randomized, obfuscated, true, shape,
         )
@@ -745,7 +862,7 @@ impl ObfuscatedUdp {
             )
             .map_err(io::Error::other)?;
             let max_padding = PADDING_LIMIT.saturating_sub(plain.len()).min(255);
-            let padding = bounded_random(max_padding + 1)?;
+            let padding = bounded_random(max_padding + 1);
             framed[..12].copy_from_slice(&self.nonce);
             framed[12] = padding as u8;
             let padding_end = 13 + padding;
@@ -766,9 +883,9 @@ impl ObfuscatedUdp {
         loop {
             let count = self.io.recv(buf)?;
             if let Some(left) = self.decoy.as_mut() {
-                if *left > 0 && bounded_random(2)? == 1 {
+                if *left > 0 && bounded_random(2) == 1 {
                     *left -= 1;
-                    let length = 1 + bounded_random(PADDING_LIMIT)?;
+                    let length = 1 + bounded_random(PADDING_LIMIT);
                     let mut decoy = [0u8; PADDING_LIMIT];
                     getrandom::fill(&mut decoy[..length])
                         .map_err(|_| io::Error::other("psiphon quic decoy"))?;
@@ -799,14 +916,14 @@ impl ObfuscatedUdp {
     }
 }
 
-fn bounded_random(bound: usize) -> io::Result<usize> {
+fn bounded_random(bound: usize) -> usize {
     if bound <= 1 {
-        return Ok(0);
+        return 0;
     }
     let mut bytes = [0u8; 4];
-    getrandom::fill(&mut bytes).map_err(|_| io::Error::other("psiphon quic padding"))?;
+    crate::psiphon_ssh::dial_fill(&mut bytes);
     let value = u64::from(u32::from_le_bytes(bytes));
-    Ok(((value * bound as u64) >> 32) as usize)
+    ((value * bound as u64) >> 32) as usize
 }
 
 fn looks_like_quic_initial(packet: &[u8]) -> bool {
@@ -909,7 +1026,7 @@ impl Engine {
         let config = client_config(randomized, dial_early)?;
         let mut scid = vec![0u8; CID_LEN];
         getrandom::fill(&mut scid).map_err(|error| format!("psiphon quic scid: {error}"))?;
-        let params = transport_params(&scid, randomized)?;
+        let params = transport_params(&scid, randomized);
         let server_name = ServerName::try_from(name.as_str())
             .map_err(|error| format!("psiphon quic server name: {error}"))?
             .to_owned();
@@ -2305,8 +2422,8 @@ fn fail(shared: &Shared, why: impl Into<String>) {
 fn client_config(randomized: bool, early: bool) -> Result<rustls::ClientConfig, String> {
     let mut provider = rustls::crypto::ring::default_provider();
     if randomized {
-        randomize_cipher_suites(&mut provider)?;
-        randomize_kx_groups(&mut provider)?;
+        randomize_cipher_suites(&mut provider);
+        randomize_kx_groups(&mut provider);
     }
     provider.secure_random = &PASSTHROUGH_RANDOM;
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -2401,13 +2518,11 @@ fn coin(probability: f64) -> bool {
     if probability >= 1.0 {
         return true;
     }
-    draw_below(65_536).is_ok_and(|draw| {
-        let draw = u16::try_from(draw).unwrap_or(u16::MAX);
-        f64::from(draw) / 65_536.0 < probability
-    })
+    let draw = u16::try_from(draw_below(65_536)).unwrap_or(u16::MAX);
+    f64::from(draw) / 65_536.0 < probability
 }
 
-fn transport_params(scid: &[u8], randomized: bool) -> Result<Vec<u8>, String> {
+fn transport_params(scid: &[u8], randomized: bool) -> Vec<u8> {
     let mut params = vec![
         (0x01, varint_bytes(60_000)),
         (0x03, varint_bytes(MAX_UDP_PAYLOAD)),
@@ -2420,54 +2535,54 @@ fn transport_params(scid: &[u8], randomized: bool) -> Result<Vec<u8>, String> {
     ];
     if randomized {
         let mut grease = [0u8; 16];
-        let length = draw_below(grease.len())?;
-        getrandom::fill(&mut grease[..length])
-            .map_err(|error| format!("psiphon quic transport parameter: {error}"))?;
-        params.push((27 + 31 * draw_below(100)? as u64, grease[..length].to_vec()));
-        shuffle(&mut params)?;
+        let length = draw_below(grease.len());
+        crate::psiphon_ssh::dial_fill(&mut grease[..length]);
+        params.push((27 + 31 * draw_below(100) as u64, grease[..length].to_vec()));
+        shuffle(&mut params);
     }
     let mut encoded = Vec::new();
     for (id, value) in params {
         put_parameter(&mut encoded, id, &value);
     }
-    Ok(encoded)
+    encoded
 }
 
-/// A uniform draw below `bound`, using the system generator rather than a TLS transcript seed.
-fn draw_below(bound: usize) -> Result<usize, String> {
+/// A uniform draw below `bound` from the replay scope, so a seed reproduces the hello.
+fn draw_below(bound: usize) -> usize {
+    if bound == 0 {
+        return 0;
+    }
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(|error| format!("psiphon quic entropy: {error}"))?;
-    Ok((u64::from_be_bytes(bytes) % bound as u64) as usize)
+    crate::psiphon_ssh::dial_fill(&mut bytes);
+    (u64::from_le_bytes(bytes) % bound as u64) as usize
 }
 
-fn shuffle<T>(items: &mut [T]) -> Result<(), String> {
+fn shuffle<T>(items: &mut [T]) {
     for at in (1..items.len()).rev() {
-        let other = draw_below(at + 1)?;
+        let other = draw_below(at + 1);
         items.swap(at, other);
     }
-    Ok(())
 }
 
-fn randomize_kx_groups(provider: &mut rustls::crypto::CryptoProvider) -> Result<(), String> {
+fn randomize_kx_groups(provider: &mut rustls::crypto::CryptoProvider) {
     let mut groups = std::mem::take(&mut provider.kx_groups);
     let key_share = groups
         .iter()
         .position(|group| u16::from(group.name()) == 0x001d);
     if let Some(at) = key_share {
         let x25519 = groups.remove(at);
-        shuffle(&mut groups)?;
-        while !groups.is_empty() && draw_below(2)? == 0 {
+        shuffle(&mut groups);
+        while !groups.is_empty() && draw_below(2) == 0 {
             groups.pop();
         }
         groups.insert(0, x25519);
     } else {
-        shuffle(&mut groups)?;
+        shuffle(&mut groups);
     }
     provider.kx_groups = groups;
-    Ok(())
 }
 
-fn randomize_cipher_suites(provider: &mut rustls::crypto::CryptoProvider) -> Result<(), String> {
+fn randomize_cipher_suites(provider: &mut rustls::crypto::CryptoProvider) {
     let mut suites: Vec<_> = provider
         .cipher_suites
         .iter()
@@ -2475,14 +2590,13 @@ fn randomize_cipher_suites(provider: &mut rustls::crypto::CryptoProvider) -> Res
         .filter(|suite| suite.tls13().is_some())
         .collect();
     if suites.is_empty() {
-        return Ok(());
+        return;
     }
-    shuffle(&mut suites)?;
-    while suites.len() > 1 && draw_below(2)? == 0 {
+    shuffle(&mut suites);
+    while suites.len() > 1 && draw_below(2) == 0 {
         suites.pop();
     }
     provider.cipher_suites = suites;
-    Ok(())
 }
 
 fn put_parameter(params: &mut Vec<u8>, id: u64, value: &[u8]) {
@@ -2608,7 +2722,7 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        get_varint, get_varint_byte, lock, quic_server_name, randomize_cipher_suites,
+        get_varint, get_varint_byte, lock, noise_expand, quic_server_name, randomize_cipher_suites,
         randomize_kx_groups, sessions, transport_params, Engine, ObfuscatedUdp, PacketIo,
         QuicNoise, SentPacket, Udp, INITIAL_CWND, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
         PMTU_STEP,
@@ -2648,29 +2762,55 @@ mod tests {
         assert!(QuicNoise::lookup("off").is_none());
         let light = QuicNoise::lookup("light").expect("light");
         assert_eq!(
-            (light.before, light.after_first, light.first_random),
-            (1, 0, 16)
+            (
+                light.before,
+                light.after_first,
+                light.junk_min,
+                light.junk_max
+            ),
+            (1, 0, 32, 96)
         );
+        assert_eq!(light.first, "<b 0d0a0d0a><t><r 16>");
+        assert_eq!(light.second, "");
         let gfw = QuicNoise::lookup("AGGRESSIVE").expect("gfw");
         assert_eq!(
-            (
-                gfw.before,
-                gfw.after_first,
-                gfw.first_random,
-                gfw.second_random
-            ),
-            (2, 1, 24, 32)
+            (gfw.before, gfw.after_first, gfw.junk_min, gfw.junk_max),
+            (2, 1, 64, 256)
         );
+        assert_eq!(gfw.second, "<r 32>");
         let firewall = QuicNoise::lookup("anything else").expect("firewall");
         assert_eq!(
             (
                 firewall.before,
                 firewall.after_first,
-                firewall.first_random,
-                firewall.second_random
+                firewall.junk_min,
+                firewall.junk_max
             ),
-            (2, 2, 24, 48)
+            (2, 2, 48, 190)
         );
+        assert_eq!(firewall.second, "<r 48>");
+    }
+
+    #[test]
+    fn quic_noise_expands_the_reference_spec() {
+        let first = noise_expand("<b 0d0a0d0a><t><r 16>");
+        assert_eq!(&first[..4], &[0x0d, 0x0a, 0x0d, 0x0a]);
+        assert_eq!(first.len(), 24);
+        assert_eq!(noise_expand("").len(), 0);
+        assert_eq!(noise_expand("<r 2000>").len(), 1024);
+        assert!(noise_expand("<rc 32>").iter().all(u8::is_ascii_alphabetic));
+        assert!(noise_expand("<rd 32>").iter().all(u8::is_ascii_digit));
+    }
+
+    #[test]
+    fn randomized_transport_parameters_replay_from_the_dial_seed() {
+        let scope = crate::psiphon_ssh::dial_seed_scope([7u8; 32]);
+        let first = transport_params(&[1u8; 16], true);
+        drop(scope);
+        let scope = crate::psiphon_ssh::dial_seed_scope([7u8; 32]);
+        let second = transport_params(&[1u8; 16], true);
+        drop(scope);
+        assert_eq!(first, second);
     }
 
     fn parameter_ids(encoded: &[u8]) -> Vec<u64> {
@@ -2767,12 +2907,12 @@ mod tests {
     #[test]
     fn randomized_transport_parameters_grease_and_shuffle_their_order() {
         assert_eq!(
-            parameter_ids(&transport_params(&[7u8; 16], false).expect("fixed")),
+            parameter_ids(&transport_params(&[7u8; 16], false)),
             vec![0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f]
         );
         let mut orders = std::collections::BTreeSet::new();
         for _ in 0..8 {
-            let encoded = transport_params(&[7u8; 16], true).expect("randomized");
+            let encoded = transport_params(&[7u8; 16], true);
             let ids = parameter_ids(&encoded);
             for wanted in [0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f] {
                 assert!(ids.contains(&wanted), "missing {wanted:#x}");
@@ -2788,7 +2928,7 @@ mod tests {
     #[test]
     fn randomized_cipher_suites_stay_tls13() {
         let mut provider = rustls::crypto::ring::default_provider();
-        randomize_cipher_suites(&mut provider).expect("suite randomization");
+        randomize_cipher_suites(&mut provider);
         let first = provider
             .cipher_suites
             .first()
@@ -2803,7 +2943,7 @@ mod tests {
     #[test]
     fn randomized_key_groups_keep_x25519_as_the_key_share() {
         let mut provider = rustls::crypto::ring::default_provider();
-        randomize_kx_groups(&mut provider).expect("group randomization");
+        randomize_kx_groups(&mut provider);
         let first = provider.kx_groups.first().expect("a group");
         assert_eq!(u16::from(first.name()), 0x001d);
     }
