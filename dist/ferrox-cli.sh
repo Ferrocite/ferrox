@@ -1263,7 +1263,8 @@ def parse_vmess(link, uuid_arg, network_arg):
         head = link[len("vmess://"):].partition("#")[0]
         if "?" in head and "@" in head.partition("?")[0]:
             uuid, host, port, params, network, header = parse_uri(link, "vmess")
-            return uuid, host, port, params, network, header, text(params.get("scy")) or "auto"
+            cipher = text(params.get("encryption")) or text(params.get("scy")) or "auto"
+            return uuid, host, port, params, network, header, cipher
         data = decode_vmess(head)
         for key in ("add", "port", "id"):
             if not text(data.get(key)):

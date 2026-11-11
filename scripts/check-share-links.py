@@ -301,11 +301,12 @@ CASES = [
         "args": [
             "--vmess",
             f"vmess://{ID}@example.com:443?type=ws&security=tls&sni=example.com"
-            "&host=example.com&path=%2Fv#standard",
+            "&host=example.com&path=%2Fv&encryption=aes-128-gcm#standard",
         ],
         "want": {
             "protocol": "vmess",
             "settings.vnext.0.users.0.id": ID,
+            "settings.vnext.0.users.0.security": "aes-128-gcm",
             "streamSettings.network": "ws",
             "streamSettings.wsSettings.path": "/v",
             "streamSettings.security": "tls",
