@@ -2955,7 +2955,7 @@ mod tests {
         serving.join().expect("joins");
     }
 
-    /// A peer that completes the WebSocket head and then sends no VMess request must not pin the carrier thread: the frame reader's own clock ends the decode at the handshake budget.
+    /// A peer that completes the `WebSocket` head and then sends no `VMess` request must not pin the carrier thread: the frame reader's own clock ends the decode at the handshake budget.
     #[test]
     fn a_silent_peer_cannot_pin_a_ws_vmess_request() {
         crate::budgets::apply(&crate::config::Budgets {
