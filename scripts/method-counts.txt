@@ -979,8 +979,8 @@ carrier-psiphon affinity-lookup-allocations 0 ferrox-app-psiphon::tests::an_affi
 carrier-psiphon move-to-front-allocations 0 ferrox-app-psiphon::tests::a_live_server_moves_to_the_front
 carrier-psiphon capability-name-allocations 0 ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed
 carrier-psiphon preresolved-pick-allocations 0 ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap
-carrier-psiphon ss-direct-write-probe-ops 47483770 scripts/count-ops.sh
-carrier-psiphon ss-flatten-write-probe-ops 47621538 scripts/count-ops.sh
+carrier-psiphon ss-direct-write-probe-ops 47475578 scripts/count-ops.sh
+carrier-psiphon ss-flatten-write-probe-ops 47621526 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
 carrier-psiphon rc4-passes-per-byte 1 ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length
