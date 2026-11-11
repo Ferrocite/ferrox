@@ -56539,6 +56539,10 @@ mod tests {
             let _ = session.stop.send(());
             session.done.store(true, Ordering::Relaxed);
         }
+        assert!(
+            join_within(&handles[1], Duration::from_secs(2)),
+            "the replacement reader did not stop"
+        );
         assert_eq!(
             count.load(std::sync::atomic::Ordering::SeqCst),
             2,
