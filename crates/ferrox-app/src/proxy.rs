@@ -20308,18 +20308,20 @@ struct RealityDial<'a> {
 fn reality_session_on(
     uplink: Connection,
     cfg: &ferrox_core::tls::RealityClientConfig,
-) -> Option<
+) -> Result<
     ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>,
+    Kind,
 > {
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
     let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
-    let session = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter).ok()?;
+    let session = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter)
+        .map_err(|_| Kind::Dropped)?;
     session
         .get_ref()
         .get_ref()
         .set_read_timeout(Some(SESSION_POLL))
-        .ok()?;
-    Some(session)
+        .map_err(|_| Kind::Local)?;
+    Ok(session)
 }
 
 fn dial_ss_tls_rung(
@@ -20439,8 +20441,9 @@ fn dial_ss_reality_rung(
     if rung == Rung::Raw && !attempt.explicit {
         return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
-    let Some(session) = reality_session_on(uplink, cfg) else {
-        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+    let session = match reality_session_on(uplink, cfg) {
+        Ok(session) => session,
+        Err(kind) => return climb_or_hold(ladder, rung, Stage::SocketConnected, kind),
     };
     match rung {
         Rung::Raw => {
@@ -20450,6 +20453,7 @@ fn dial_ss_reality_rung(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             });
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             if !ss_client_relay(client, reader, writer, &close, ss, target) {
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
@@ -20470,6 +20474,7 @@ fn dial_ss_reality_rung(
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             if !ss_client_relay(client, reader, writer, &close, ss, target) {
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
@@ -20483,6 +20488,7 @@ fn dial_ss_reality_rung(
             };
             let writer = sink.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sink.clone().close());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             if !ss_client_relay(client, reader, writer, &close, ss, target) {
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
@@ -20499,6 +20505,7 @@ fn dial_ss_reality_rung(
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             if !ss_client_relay(client, reader, writer, &close, ss, target) {
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
@@ -20520,6 +20527,7 @@ fn dial_ss_reality_rung(
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             if !ss_client_relay(client, reader, writer, &close, ss, target) {
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
@@ -47902,15 +47910,23 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("addr"),
         );
+        let ladder: &'static Ladder = Box::leak(Box::new(Ladder::new()));
         thread::spawn(move || {
             let (socket, _) = downstream.accept().expect("accepts");
-            dial_shadowsocks(&socket, &server, &ss, &asked, Ladder::global());
+            dial_shadowsocks(&socket, &server, &ss, &asked, ladder);
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping", "the reality lane echoes");
+        assert_eq!(
+            ladder.attempts(Rung::Raw),
+            1,
+            "the rung counts the connection"
+        );
+        assert_eq!(ladder.current(), Rung::Raw, "the working rung holds");
+        assert_eq!(ladder.climbs(), 0, "a served connection climbs nothing");
     }
 
     /// A REALITY inbound on a carrier the serve path cannot arm is refused before the role starts,
