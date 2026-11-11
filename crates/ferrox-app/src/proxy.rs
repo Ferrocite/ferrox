@@ -14241,6 +14241,30 @@ fn serve_ss_kcp_listener(
     serve_kcp_bound(address, config, &serve)
 }
 
+/// The datagram half a shadowsocks listener owns before it reports served: bound here, refused here, or never asked for.
+enum UdpFront {
+    Unasked,
+    Bound(UdpSocket),
+    Refused,
+}
+
+fn bind_udp_front(address: &str, tcp: bool, wanted: bool, label: &str) -> UdpFront {
+    if !wanted {
+        return UdpFront::Unasked;
+    }
+    match UdpSocket::bind(address) {
+        Ok(socket) => UdpFront::Bound(socket),
+        Err(error) if !tcp => {
+            eprintln!("{label} on {address}: {error}; refused, not served");
+            UdpFront::Refused
+        }
+        Err(error) => {
+            eprintln!("{label} on {address}: {error}; serving tcp only");
+            UdpFront::Unasked
+        }
+    }
+}
+
 fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method: &str) -> bool {
     let relay_dests = inbound_ss_destinations(inbound, method);
     if relay_dests.is_empty() {
@@ -14256,20 +14280,15 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
     };
     let (tcp, udp) = inbound_ss_networks(inbound);
     // Bind the relay's datagram front here, so a caller that reads this true cannot hold a relay whose only requested worker never bound.
-    let udp_front = if udp && !parsed.is_chacha() {
-        match UdpSocket::bind(address) {
-            Ok(clients) => Some(clients),
-            Err(error) if !tcp => {
-                eprintln!("shadowsocks relay udp on {address}: {error}; refused, not served");
-                return false;
-            }
-            Err(error) => {
-                eprintln!("shadowsocks relay udp on {address}: {error}; serving tcp only");
-                None
-            }
-        }
-    } else {
-        None
+    let udp_front = match bind_udp_front(
+        address,
+        tcp,
+        udp && !parsed.is_chacha(),
+        "shadowsocks relay udp",
+    ) {
+        UdpFront::Refused => return false,
+        UdpFront::Unasked => None,
+        UdpFront::Bound(clients) => Some(clients),
     };
     let udp_served = udp_front.is_some();
     let tcp_address = address.to_owned();
@@ -14348,19 +14367,10 @@ fn serve_shadowsocks_inbound(
         return true;
     }
     // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
-    let udp_front = match &udp_accounts {
-        Some(_) => match UdpSocket::bind(address) {
-            Ok(socket) => Some(socket),
-            Err(error) if !tcp => {
-                eprintln!("shadowsocks udp on {address}: {error}; refused, not served");
-                return false;
-            }
-            Err(error) => {
-                eprintln!("shadowsocks udp on {address}: {error}; serving tcp only");
-                None
-            }
-        },
-        None => None,
+    let udp_front = match bind_udp_front(address, tcp, udp_accounts.is_some(), "shadowsocks udp") {
+        UdpFront::Refused => return false,
+        UdpFront::Unasked => None,
+        UdpFront::Bound(socket) => Some(socket),
     };
     if !tcp && !udp {
         return false;
@@ -56048,7 +56058,7 @@ mod tests {
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
         )
         .expect("parses");
-        let (port, address) = (0..64)
+        let address = (0..64)
             .find_map(|_| {
                 let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
                 let port = tcp.local_addr().ok()?.port();
@@ -56066,7 +56076,7 @@ mod tests {
                 }
                 std::net::TcpStream::connect(("127.0.0.1", port))
                     .is_err()
-                    .then_some((port, address))
+                    .then_some(address)
             })
             .expect("a port free for tcp and udp that the udp-only front binds");
         let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
