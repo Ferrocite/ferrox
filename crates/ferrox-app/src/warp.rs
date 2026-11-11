@@ -413,9 +413,10 @@ where
         .map_err(|error| RegisterError::fatal(error.reason))?;
     let server = parse_masque_server(&reply).map_err(|error| {
         // A refusal that may be about the token is told apart from one about the enrollment: the token's own GET answers where the PATCH cannot.
-        let why = call("GET", &path, &headers, b"")
-            .map(|get| format!("the token answers GET {}", get.status))
-            .unwrap_or_else(|get_error| format!("its GET too: {}", get_error.reason));
+        let why = call("GET", &path, &headers, b"").map_or_else(
+            |get_error| format!("its GET too: {}", get_error.reason),
+            |get| format!("the token answers GET {}", get.status),
+        );
         RegisterError::fatal(format!("{} ({})", error.reason, why))
     })?;
 
