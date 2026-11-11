@@ -5,10 +5,11 @@
 The identity comes from an inline `identity` block, a saved `identityFile`, or `register: true` which registers once and saves into `identityFile` — a restart reuses the file and never creates a second device.
 A saved file is read back from the API before it is used: the peer, endpoint, reserved bytes and addresses are refreshed in place, so a device whose edge moved keeps working.
 `ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all] [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR] [--mode auto|wireguard|masque]` is the form.
-Without `--register` it registers one combined device (both halves), saves the identity owner-only (0600), and prints the outbound config that references it.
+Without `--register` it registers one combined device (both halves), saves the identity owner-only (0600 on Unix; on Windows it inherits the directory ACL), and prints the outbound config that references it.
 With `--register` it makes the identities the kind names and prints one readiness line per file: `wg` is the WireGuard file, `masque` the MASQUE file beside it, `gool` is MASQUE plus the WireGuard identity it carries (`<masque>-gool`), `gool-classic` is WireGuard plus its second hop (`<config>-secondary`), `mim` is MASQUE plus its second hop, and `all` is all five in that order.
 `-o`/`--config` names the base identity file (default `warp-identity.json`); `--wg-config` and `--masque-config` move the WireGuard and MASQUE files, and every second hop is derived beside its own first: `<config>-secondary`, `<masque>-secondary`, `<masque>-gool`.
-An identity file already there is kept and refreshed, never replaced; a corrupt file is moved to `<name>.corrupt`, and a refused one is registered afresh unless `AETHER_REPROVISION` is `0`, `off` or `false`.
+An identity file already there is kept and refreshed, never replaced while it works; a corrupt file is moved to `<name>.corrupt`, and a refused one is registered afresh unless `AETHER_REPROVISION` is `0`, `off` or `false`.
+An outbound replaces a refused saved file only when its own `register` is true; without it the file is reported and kept.
 
 Registration is the three calls the pinned clients make: `POST /v0a4471/reg` with a fresh clamped Curve25519 key, `PATCH /reg/{id}` enrolling a P-256 SPKI for a MASQUE identity, and `PATCH /reg/{id}` with `{"warp_enabled":true}`.
 A WireGuard-only identity (the `wg` and `gool` slots, and any outbound pinned to `mode: wireguard`) skips the enrollment and makes two calls.

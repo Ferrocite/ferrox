@@ -141,7 +141,7 @@ fn usage() -> ! {
     );
     eprintln!("        [--mode auto|wireguard|masque]");
     eprintln!(
-        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600), print the outbound"
+        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound"
     );
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"

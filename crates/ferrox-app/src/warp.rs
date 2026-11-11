@@ -247,13 +247,15 @@ impl WarpSpec {
                     Ok(fresh)
                 }
                 Ok(_) => Ok(saved),
-                Err(error) if error.refused && reprovision_enabled() => {
+                Err(error)
+                    if should_reprovision(self.register, error.refused, reprovision_enabled()) =>
+                {
                     let identity = register(self, saved.masque.is_some())?;
                     identity.save(path)?;
                     Ok(identity)
                 }
                 Err(error) => {
-                    eprintln!("warp: the saved identity was not checked: {}", error.reason);
+                    eprintln!("warp: keeping the saved identity: {}", error.reason);
                     Ok(saved)
                 }
             };
@@ -688,6 +690,10 @@ fn reprovision_enabled_for(value: Option<&str>) -> bool {
     !matches!(value, Some("0" | "off" | "false"))
 }
 
+fn should_reprovision(register: bool, refused: bool, enabled: bool) -> bool {
+    register && refused && enabled
+}
+
 fn quarantine(path: &Path) {
     let mut target = path.to_path_buf();
     let name = target.file_name().map_or_else(
@@ -1016,7 +1022,8 @@ impl Identity {
     }
 
     /// Write beside the target and rename over it, so a reader never sees half
-    /// an identity and a failure leaves the old keys in place.
+    /// an identity and a failure leaves the old keys in place; the temporary is
+    /// 0600 on Unix, and on Windows it inherits the directory ACL.
     fn save(&self, path: &Path) -> Result<(), String> {
         let mut text = String::new();
         crate::json::write(&self.to_json(), &mut text);
@@ -1448,7 +1455,7 @@ impl KeyKind {
 
 /// One identity file: a transport's first hop, its second, or the `WireGuard`
 /// identity gool carries inside its MASQUE tunnel.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     WireGuard,
     WireGuardInner,
@@ -1513,6 +1520,22 @@ fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
     base.with_file_name(derived)
 }
 
+fn planned_slots(kind: KeyKind, paths: &KeyPaths) -> Result<Vec<(Slot, PathBuf)>, String> {
+    let mut planned: Vec<(Slot, PathBuf)> = Vec::new();
+    for &slot in kind.slots() {
+        let path = slot.path(paths);
+        if planned.iter().any(|(_, other)| *other == path) {
+            return Err(format!(
+                "warp-register: the {} identity would share {}; give each slot its own file",
+                slot.label(),
+                path.display()
+            ));
+        }
+        planned.push((slot, path));
+    }
+    Ok(planned)
+}
+
 /// Load or make every identity the kind names, all in memory before any save,
 /// so a failed registration leaves the old keys where they are.
 fn provision_kind(
@@ -1520,9 +1543,9 @@ fn provision_kind(
     kind: KeyKind,
     paths: &KeyPaths,
 ) -> Result<Vec<(Slot, PathBuf, Identity)>, String> {
-    let mut planned = Vec::new();
-    for &slot in kind.slots() {
-        let path = slot.path(paths);
+    let planned = planned_slots(kind, paths)?;
+    let mut ready = Vec::new();
+    for (slot, path) in planned {
         let identity = if path.is_file() {
             match Identity::load(&path) {
                 Ok(saved) => match refresh_saved(spec, &saved) {
@@ -1558,9 +1581,9 @@ fn provision_kind(
         } else {
             register(spec, slot.enrolls_masque())?
         };
-        planned.push((slot, path, identity));
+        ready.push((slot, path, identity));
     }
-    Ok(planned)
+    Ok(ready)
 }
 
 /// One-tap registration: create a device, enroll its MASQUE key, enable it,
@@ -2153,6 +2176,25 @@ mod tests {
     }
 
     #[test]
+    fn two_slots_cannot_share_one_identity_file() {
+        let base = Path::new("/tmp/warp-identity.json");
+        let paths = KeyPaths::new(base, Some(base), Some(base));
+        let error = planned_slots(KeyKind::All, &paths).expect_err("the slots collide");
+        assert!(error.contains("share"), "{error}");
+        let distinct = KeyPaths::new(
+            base,
+            Some(Path::new("/tmp/wg.json")),
+            Some(Path::new("/tmp/masque.json")),
+        );
+        assert_eq!(
+            planned_slots(KeyKind::All, &distinct)
+                .expect("distinct slots")
+                .len(),
+            5
+        );
+    }
+
+    #[test]
     fn a_wireguard_slot_registers_without_enrolling_masque() {
         let calls = Mutex::new(Vec::new());
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
@@ -2280,6 +2322,14 @@ mod tests {
         assert!(reprovision_enabled_for(None));
         assert!(reprovision_enabled_for(Some("1")));
         assert!(reprovision_enabled_for(Some("true")));
+    }
+
+    #[test]
+    fn a_refused_identity_is_replaced_only_when_registration_is_allowed() {
+        assert!(should_reprovision(true, true, true));
+        assert!(!should_reprovision(false, true, true));
+        assert!(!should_reprovision(true, false, true));
+        assert!(!should_reprovision(true, true, false));
     }
 
     #[test]
