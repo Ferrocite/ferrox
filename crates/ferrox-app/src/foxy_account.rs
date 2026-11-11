@@ -493,6 +493,8 @@ pub(crate) struct Endpoint {
     pub(crate) roots: ferrox_core::tls::Anchors,
     /// The hop every dial to this origin chains through; the TLS name stays the origin's.
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
+    /// The shaped hello the HTTP/2 dials ride; `None` keeps the plane's own.
+    pub(crate) h2_fingerprint: Option<ferrox_core::tls::shaped::Fingerprint>,
 }
 
 impl Endpoint {
@@ -518,6 +520,7 @@ impl Endpoint {
             address: edge_peer(host, port),
             roots,
             upstream: None,
+            h2_fingerprint: None,
         })
     }
 
@@ -569,8 +572,17 @@ impl Endpoint {
     fn tls_h2(&self) -> TlsConfig {
         let mut cfg = self.tls();
         cfg.alpn = vec![b"h2".to_vec()].into();
-        cfg.fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148");
+        cfg.fingerprint = self
+            .h2_fingerprint
+            .or_else(|| ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148"));
         cfg
+    }
+
+    /// The origin whose HTTP/2 dials ride a named shaped hello, in place of the plane's own.
+    #[must_use]
+    pub(crate) fn with_h2_fingerprint(mut self, name: &str) -> Self {
+        self.h2_fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve(name);
+        self
     }
 
     /// Where an account-plane failure keeps its name instead of flattening to an uninformative "io failed".
