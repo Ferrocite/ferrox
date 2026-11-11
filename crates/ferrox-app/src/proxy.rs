@@ -71382,6 +71382,47 @@ mod poll_relay {
         }
     }
 
+    /// The wake the pump must not sleep through: a drain waiting on room and an answer waiting
+    /// on a sibling's close are both bounded, so `poll` gets the nearer deadline.
+    fn poll_timeout(flows: &[Flow]) -> i32 {
+        let mut timeout = -1;
+        for flow in flows {
+            for (index, direction) in flow.directions.iter().enumerate() {
+                let left = match direction.stalled {
+                    Some(since) => Some(direction.stall_budget.saturating_sub(since.elapsed())),
+                    None => flow
+                        .answer_since(index)
+                        .map(|since| direction.stall_budget.saturating_sub(since.elapsed())),
+                };
+                if let Some(left) = left {
+                    let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+                    timeout = if timeout < 0 {
+                        millis
+                    } else {
+                        timeout.min(millis)
+                    };
+                }
+            }
+        }
+        timeout
+    }
+
+    /// A half still owing an answer whose sibling has closed for the whole grace is refused
+    /// here, the same verdict the lane path reaches when its idle bound passes.
+    fn expire_answers(flows: &mut [Flow]) {
+        for flow in flows {
+            for index in 0..flow.directions.len() {
+                let budget = flow.directions[index].stall_budget;
+                if flow
+                    .answer_since(index)
+                    .is_some_and(|since| since.elapsed() >= budget)
+                {
+                    flow.directions[index].expire_unanswered();
+                }
+            }
+        }
+    }
+
     fn run(worker: &Worker) {
         let mut flows: Vec<Flow> = Vec::new();
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(64);
@@ -71398,17 +71439,7 @@ mod poll_relay {
                     }
                 }
             }
-            for flow in &mut flows {
-                for index in 0..flow.directions.len() {
-                    let budget = flow.directions[index].stall_budget;
-                    let expired = flow
-                        .answer_since(index)
-                        .is_some_and(|since| since.elapsed() >= budget);
-                    if expired {
-                        flow.directions[index].expire_unanswered();
-                    }
-                }
-            }
+            expire_answers(&mut flows);
             pfds.clear();
             owners.clear();
             pfds.push(libc::pollfd {
@@ -71440,25 +71471,7 @@ mod poll_relay {
                     }
                 }
             }
-            let mut timeout = -1;
-            for flow in &flows {
-                for (index, direction) in flow.directions.iter().enumerate() {
-                    let left = match direction.stalled {
-                        Some(since) => Some(direction.stall_budget.saturating_sub(since.elapsed())),
-                        None => flow
-                            .answer_since(index)
-                            .map(|since| direction.stall_budget.saturating_sub(since.elapsed())),
-                    };
-                    if let Some(left) = left {
-                        let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
-                        timeout = if timeout < 0 {
-                            millis
-                        } else {
-                            timeout.min(millis)
-                        };
-                    }
-                }
-            }
+            let timeout = poll_timeout(&flows);
             let answered =
                 unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
             if answered < 0 {
