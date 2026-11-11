@@ -31,6 +31,11 @@ const TICK: Duration = Duration::from_millis(10);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 /// A held datagram retries inside one poll grain, so a full queue never waits out a tick.
 const RETRY: Duration = Duration::from_millis(1);
+/// Reconnect schedule: the first dial is immediate, a failure doubles from a second to a
+/// minute, and only a lane that lived past the stable window clears the history.
+const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+const RECONNECT_STABLE: Duration = Duration::from_secs(10);
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
 const H3_KEEPALIVE: Duration = Duration::from_secs(10);
 const H2_KEEPALIVE: Duration = Duration::from_secs(45);
@@ -71,7 +76,45 @@ const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 /// inner TCP flows, and the per-lane route table its datagrams return through.
 pub(crate) struct MasqueOut {
     spec: ClientSpec,
-    inner: Mutex<Option<Arc<Inner>>>,
+    inner: Mutex<Slot>,
+}
+
+#[derive(Debug)]
+struct Slot {
+    inner: Option<Arc<Inner>>,
+    reconnect: Reconnect,
+}
+
+#[derive(Debug)]
+struct Reconnect {
+    attempts: u32,
+    next_dial: Instant,
+}
+
+impl Reconnect {
+    fn new(now: Instant) -> Self {
+        Self {
+            attempts: 0,
+            next_dial: now,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next_dial
+    }
+
+    fn advance(&mut self, now: Instant) {
+        let delay = RECONNECT_INITIAL
+            .saturating_mul(1 << self.attempts.min(6))
+            .min(RECONNECT_MAX);
+        self.attempts = self.attempts.saturating_add(1);
+        self.next_dial = now + delay;
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.attempts = 0;
+        self.next_dial = now;
+    }
 }
 
 #[derive(Debug)]
@@ -81,6 +124,7 @@ struct Inner {
     to_tunnel: ToTunnel,
     routes: UdpRoutes,
     alive: Arc<AtomicBool>,
+    stable: Arc<AtomicBool>,
 }
 
 /// The lane names its spec; the spec redacts the headers that carry a token and
@@ -99,7 +143,10 @@ impl MasqueOut {
         let spec = ClientSpec::from(outbound)?;
         Ok(Self {
             spec,
-            inner: Mutex::new(None),
+            inner: Mutex::new(Slot {
+                inner: None,
+                reconnect: Reconnect::new(Instant::now()),
+            }),
         })
     }
 
@@ -108,18 +155,47 @@ impl MasqueOut {
     }
 
     fn ensure(&self) -> Result<Arc<Inner>, String> {
+        self.ensure_at(Instant::now(), || open(&self.spec))
+    }
+
+    fn ensure_at(
+        &self,
+        now: Instant,
+        dial: impl FnOnce() -> Result<Inner, String>,
+    ) -> Result<Arc<Inner>, String> {
         let mut slot = self
             .inner
             .lock()
             .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
         if let Some(inner) = slot
+            .inner
             .as_ref()
-            .filter(|inner| inner.alive.load(Ordering::Relaxed))
+            .filter(|inner| inner.alive.load(Ordering::Acquire))
         {
             return Ok(Arc::clone(inner));
         }
-        let inner = Arc::new(open(&self.spec)?);
-        *slot = Some(Arc::clone(&inner));
+        if let Some(dead) = slot.inner.take() {
+            if dead.stable.load(Ordering::Relaxed) {
+                slot.reconnect.reset(now);
+            } else {
+                slot.reconnect.advance(now);
+            }
+        }
+        if !slot.reconnect.due(now) {
+            let wait = slot.reconnect.next_dial.duration_since(now);
+            return Err(format!(
+                "masque: reconnecting in {:.1}s",
+                wait.as_secs_f64()
+            ));
+        }
+        let inner = match dial() {
+            Ok(inner) => Arc::new(inner),
+            Err(reason) => {
+                slot.reconnect.advance(now);
+                return Err(reason);
+            }
+        };
+        slot.inner = Some(Arc::clone(&inner));
         Ok(inner)
     }
 
@@ -404,12 +480,18 @@ fn assemble(
     });
     let io_routes = Arc::clone(&routes);
     let watch = Arc::clone(&alive);
+    let settled = Arc::new(AtomicBool::new(false));
+    let stable = Arc::clone(&settled);
     std::thread::spawn(move || {
+        let opened = Instant::now();
         for packet in initial {
             deliver(&packets_tx, &io_routes, &packet);
         }
         run(from_tunnel, packets_tx, io_routes);
-        watch.store(false, Ordering::Relaxed);
+        if opened.elapsed() >= RECONNECT_STABLE {
+            stable.store(true, Ordering::Relaxed);
+        }
+        watch.store(false, Ordering::Release);
     });
     Inner {
         config,
@@ -417,6 +499,7 @@ fn assemble(
         to_tunnel: to_tunnel.into(),
         routes,
         alive,
+        stable: settled,
     }
 }
 
@@ -3703,6 +3786,109 @@ mod tests {
         assert!(pool.holds("10.14.0.0".parse().expect("an address")));
         assert!(pool.holds("10.14.0.255".parse().expect("an address")));
         assert!(!pool.holds("10.15.0.1".parse().expect("an address")));
+    }
+
+    fn dead_lane(stable: bool) -> Inner {
+        let (flows, _) = mpsc::channel();
+        let (to_tunnel, _) = mpsc::channel::<Vec<u8>>();
+        Inner {
+            config: Arc::new(DeviceConfig {
+                secret: [0u8; 32],
+                addresses: Vec::new(),
+                peers: Vec::new(),
+                mtu: DEFAULT_MTU,
+                reserved: [0u8; 3],
+                is_client: Some(true),
+                no_kernel_tun: true,
+                large_segments: false,
+                dns: Vec::new(),
+            }),
+            flows,
+            to_tunnel: to_tunnel.into(),
+            routes: Arc::default(),
+            alive: Arc::new(AtomicBool::new(false)),
+            stable: Arc::new(AtomicBool::new(stable)),
+        }
+    }
+
+    #[test]
+    fn a_flapping_edge_is_dialled_on_the_backoff_not_per_packet() {
+        let masque = MasqueOut::new(&outbound(0)).expect("outbound");
+        let start = Instant::now();
+        let mut now = start;
+        let mut dials = Vec::new();
+        for _ in 0..2000 {
+            let _ = masque.ensure_at(now, || {
+                dials.push(now);
+                Ok(dead_lane(false))
+            });
+            now += Duration::from_millis(5);
+        }
+        let offsets: Vec<u128> = dials
+            .iter()
+            .map(|at| at.duration_since(start).as_millis())
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![0, 1005, 3010, 7015],
+            "2000 calls over ten seconds dialled {} times",
+            dials.len()
+        );
+    }
+
+    #[test]
+    fn a_tunnel_that_stays_up_clears_the_backoff() {
+        let masque = MasqueOut::new(&outbound(0)).expect("outbound");
+        let start = Instant::now();
+        let mut dials = 0;
+        assert!(masque
+            .ensure_at(start, || {
+                dials += 1;
+                Err("no edge".to_owned())
+            })
+            .is_err());
+        assert!(masque
+            .ensure_at(start + Duration::from_millis(999), || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .is_err());
+        assert_eq!(dials, 1, "the second dial ran before its second");
+        let due = start + Duration::from_secs(1);
+        masque
+            .ensure_at(due, || {
+                dials += 1;
+                Ok(dead_lane(true))
+            })
+            .expect("the second dial");
+        let proven = due + Duration::from_millis(1);
+        masque
+            .ensure_at(proven, || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .expect("a lane that stayed up clears the history");
+        assert_eq!(dials, 3);
+        assert!(masque
+            .ensure_at(proven, || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .is_err());
+        assert!(masque
+            .ensure_at(proven + Duration::from_millis(999), || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .is_err());
+        let retry = proven + Duration::from_secs(1);
+        masque
+            .ensure_at(retry, || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .expect("the reset schedule starts again at one second");
+        assert_eq!(dials, 4);
     }
 
     #[test]
