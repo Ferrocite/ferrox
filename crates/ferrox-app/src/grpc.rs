@@ -3295,6 +3295,32 @@ mod tests {
     }
 
     #[test]
+    fn huffman_encoder_roundtrips_the_rfc_example_and_aether() {
+        let mut coded = Vec::new();
+        ferrox_core::foxy::hpack::huffman_encode(b"www.example.com", &mut coded);
+        assert_eq!(
+            coded,
+            [0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB, 0x90, 0xF4, 0xFF]
+        );
+        let mut plain = Vec::new();
+        ferrox_core::foxy::hpack::huffman_decode(&coded, &mut plain).expect("decodes");
+        assert_eq!(plain, b"www.example.com");
+        for sample in [
+            b"echo.example".as_slice(),
+            b"/v0a4471/reg",
+            b"application/json; charset=UTF-8",
+            b"WARP for Android",
+            b"a-6.35-4471",
+        ] {
+            let mut coded = Vec::new();
+            ferrox_core::foxy::hpack::huffman_encode(sample, &mut coded);
+            let mut plain = Vec::new();
+            ferrox_core::foxy::hpack::huffman_decode(&coded, &mut plain).expect("decodes");
+            assert_eq!(plain, sample);
+        }
+    }
+
+    #[test]
     fn headers_decode_the_rfc_request_example() {
         let first = [
             0x82, 0x86, 0x84, 0x41, 0x8C, 0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB,

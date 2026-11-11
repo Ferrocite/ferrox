@@ -367,8 +367,7 @@ fn register(spec: &WarpSpec) -> Result<Identity, String> {
         };
         match register_with(spec, &|method, path, headers, body| {
             let url = endpoint.url(path);
-            // The API refuses an authenticated PATCH from the HTTP/1.1 stack: every
-            // client the API accepts speaks HTTP/2, so the calls go there first.
+            // The API refuses an authenticated PATCH from the HTTP/1.1 stack, so the calls speak HTTP/2 first.
             crate::foxy_account::ask_h2(&endpoint, method, &url, headers, body)
                 .map_err(RegisterError::retryable)
         }) {

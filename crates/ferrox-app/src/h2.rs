@@ -17,6 +17,8 @@ pub(crate) const F_PADDED: u8 = 0x08;
 pub(crate) const F_PRIORITY: u8 = 0x20;
 pub(crate) const S_MAX_CONCURRENT: u16 = 0x03;
 pub(crate) const S_WINDOW: u16 = 0x04;
+pub(crate) const S_HEADER_LIST: u16 = 0x06;
+pub(crate) const S_PUSH: u16 = 0x02;
 pub(crate) const S_MAX_FRAME: u16 = 0x05;
 pub(crate) const E_PROTOCOL: u32 = 0x01;
 pub(crate) const E_FRAME_SIZE: u32 = 0x06;
@@ -135,11 +137,45 @@ pub(crate) fn block_encode(headers: &[(&str, &str)]) -> Vec<u8> {
     // The block's own length is known before it is written, so the buffer is opened once.
     let mut out = Vec::with_capacity(headers.iter().map(|(n, v)| header_len(n, v)).sum());
     for (name, value) in headers {
-        out.push(0x00);
-        push_str(&mut out, name);
-        push_str(&mut out, value);
+        match (*name, *value) {
+            (":method", "POST") => out.push(0x83),
+            (":method", "GET") => out.push(0x82),
+            (":method", other) => push_named(&mut out, 2, other),
+            (":scheme", "https") => out.push(0x87),
+            (":scheme", "http") => out.push(0x86),
+            (":scheme", other) => push_named(&mut out, 6, other),
+            (":authority", other) => push_named(&mut out, 1, other),
+            (":path", "/") => out.push(0x84),
+            (":path", other) => push_named(&mut out, 4, other),
+            (name, value) => {
+                if let Some(index) = ferrox_core::foxy::hpack::hpack_name(name) {
+                    push_named(&mut out, index, value);
+                } else {
+                    out.push(0x40);
+                    push_value(&mut out, name);
+                    push_value(&mut out, value);
+                }
+            }
+        }
     }
     out
+}
+
+/// One field line named from the static table, incremental-indexing prefix, so the edge's decoder sees the shape its own request encoder emits.
+fn push_named(out: &mut Vec<u8>, index: u16, value: &str) {
+    out.push(0x40 | index as u8);
+    push_value(out, value);
+}
+
+/// One literal string: Huffman when the code is strictly shorter, the plain bytes beside it otherwise.
+fn push_value(out: &mut Vec<u8>, value: &str) {
+    let coded = ferrox_core::foxy::hpack::huffman_len(value.as_bytes());
+    if coded < value.len() {
+        ferrox_core::foxy::hpack::integer(out, 7, 0x80, coded);
+        ferrox_core::foxy::hpack::huffman_encode(value.as_bytes(), out);
+    } else {
+        push_str(out, value);
+    }
 }
 
 pub(crate) fn prefixed(block: &[u8], prefix: u8) -> Option<(usize, &[u8])> {
@@ -350,8 +386,9 @@ mod tests {
         field.as_ptr() as usize - range.start as usize
     }
 
-    /// The header block's own length is known before it is written, so the buffer is
-    /// opened once: the counting allocator is the witness.
+    /// The header block's own buffer is opened once, sized no smaller than the block: the
+    /// counting allocator is the witness. Huffman shrinks lines beneath the plain lengths the
+    /// opening guesses from, so the buffer may hold spare room; what it may never do is grow.
     #[test]
     fn a_header_block_is_opened_once() {
         let headers = [
@@ -361,16 +398,21 @@ mod tests {
         ];
         let (block, counts) = ferrox_core::alloc_count::measure(|| block_encode(&headers));
         assert_eq!(counts.allocs, 1, "the block is one buffer");
-        assert_eq!(
-            counts.bytes,
-            block.len(),
-            "the buffer is the block's own length, not a grown one"
+        assert!(
+            counts.bytes >= block.len(),
+            "the one buffer held the block without growing"
         );
     }
 
     #[test]
     fn a_plain_field_borrows_the_block() {
-        let block = block_encode(&[("x-sid", "mux"), ("x-token", "abc")]);
+        // Two literals the block carries in the open, hand-built: the decoder's borrowing is the subject, not the encoder's choice of representation.
+        let mut block = Vec::new();
+        for (name, value) in [("x-sid", "mux"), ("x-token", "abc")] {
+            block.push(0x00);
+            push_str(&mut block, name);
+            push_str(&mut block, value);
+        }
         let mut fields = Vec::new();
         let mut decoder = Decoder::default();
         decoder
@@ -426,7 +468,11 @@ mod tests {
             decoder.name.capacity(),
             decoder.value.capacity(),
         );
-        let mut block = block_encode(&[("x-sid", "mux")]);
+        let mut block = Vec::new();
+        // The plain literal the block carries in the open: the encoder's Huffman choice is its own, the decoder's borrow is the subject.
+        block.push(0x00);
+        push_str(&mut block, "x-sid");
+        push_str(&mut block, "mux");
         block.push(0x80 | 8);
         let mut fields = 0;
         decoder

@@ -651,13 +651,16 @@ thread_local! {
 
 impl H2Connection {
     fn connect(endpoint: &Endpoint) -> Result<Self, String> {
-        use crate::h2::{frame_head, MAGIC, S_WINDOW, T_SETTINGS, WINDOW};
+        use crate::h2::{frame_head, MAGIC, S_HEADER_LIST, S_PUSH, T_SETTINGS};
         let mut tls = endpoint.connect_h2()?;
         let mut out = Vec::with_capacity(24 + 9 + 12);
         out.extend_from_slice(MAGIC);
-        let mut settings = Vec::with_capacity(8);
-        settings.extend_from_slice(&S_WINDOW.to_be_bytes());
-        settings.extend_from_slice(&WINDOW.to_be_bytes());
+        // The settings the reference's client sends, its fingerprint carries them: no push and a bounded header list, the per-stream window left at the default.
+        let mut settings = Vec::with_capacity(12);
+        settings.extend_from_slice(&S_PUSH.to_be_bytes());
+        settings.extend_from_slice(&0u32.to_be_bytes());
+        settings.extend_from_slice(&S_HEADER_LIST.to_be_bytes());
+        settings.extend_from_slice(&262_144u32.to_be_bytes());
         out.extend_from_slice(&frame_head(settings.len(), T_SETTINGS, 0, 0));
         out.extend_from_slice(&settings);
         tls.write_all(&out)
