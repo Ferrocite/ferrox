@@ -1213,13 +1213,6 @@ fn waited(flow: Option<&crate::proxy::RelayFinish>) -> crate::proxy::lane_pool::
     }
 }
 
-pub(crate) fn serve_udp(address: &str, users: &[SsUser], freedom: bool) {
-    let Ok(clients) = UdpSocket::bind(address) else {
-        return;
-    };
-    serve_udp_on(&clients, users, freedom);
-}
-
 /// The most client sources one AEAD listener carries: each source owns an upstream socket pair, and only a datagram whose tag verifies creates one.
 pub(crate) const SS_UDP_SOURCES: usize = 4096;
 

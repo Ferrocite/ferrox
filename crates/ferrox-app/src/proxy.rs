@@ -14255,6 +14255,23 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
         return false;
     };
     let (tcp, udp) = inbound_ss_networks(inbound);
+    // Bind the relay's datagram front here, so a caller that reads this true cannot hold a relay whose only requested worker never bound.
+    let udp_front = if udp && !parsed.is_chacha() {
+        match UdpSocket::bind(address) {
+            Ok(clients) => Some(clients),
+            Err(error) if !tcp => {
+                eprintln!("shadowsocks relay udp on {address}: {error}; refused, not served");
+                return false;
+            }
+            Err(error) => {
+                eprintln!("shadowsocks relay udp on {address}: {error}; serving tcp only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let udp_served = udp_front.is_some();
     let tcp_address = address.to_owned();
     if tcp {
         let method = method.to_owned();
@@ -14272,18 +14289,14 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
             }
         });
     }
-    if udp && !parsed.is_chacha() {
-        let udp_address = address.to_owned();
+    if let Some(clients) = udp_front {
         let udp_dests = relay_dests.clone();
         let udp_psk = psk.clone();
         thread::spawn(move || {
-            let Ok(clients) = UdpSocket::bind(&udp_address) else {
-                return;
-            };
             crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
         });
     }
-    tcp || (udp && !parsed.is_chacha())
+    tcp || udp_served
 }
 
 /// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
@@ -14334,6 +14347,21 @@ fn serve_shadowsocks_inbound(
     {
         return true;
     }
+    // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
+    let udp_front = match &udp_accounts {
+        Some(_) => match UdpSocket::bind(address) {
+            Ok(socket) => Some(socket),
+            Err(error) if !tcp => {
+                eprintln!("shadowsocks udp on {address}: {error}; refused, not served");
+                return false;
+            }
+            Err(error) => {
+                eprintln!("shadowsocks udp on {address}: {error}; serving tcp only");
+                None
+            }
+        },
+        None => None,
+    };
     if !tcp && !udp {
         return false;
     }
@@ -14403,18 +14431,17 @@ fn serve_shadowsocks_inbound(
             ),
         }
     }
-    if let Some(accounts) = udp_accounts {
-        let udp_address = address.to_owned();
+    if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
         thread::spawn(move || {
             if accounts.is_2022 {
-                crate::shadowsocks2022::serve_udp(
-                    &udp_address,
+                crate::shadowsocks2022::serve_udp_on(
+                    &clients,
                     &accounts.password,
                     &accounts.method,
                     freedom,
                 );
             } else {
-                crate::shadowsocks::serve_udp(&udp_address, &accounts.users, freedom);
+                crate::shadowsocks::serve_udp_on(&clients, &accounts.users, freedom);
             }
         });
     }
@@ -56021,16 +56048,27 @@ mod tests {
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
         )
         .expect("parses");
-        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        let address = format!("127.0.0.1:{port}");
-        serve_shadowsocks_inbound(&address, &inbound, true, &std::collections::HashSet::new());
-        thread::sleep(Duration::from_millis(100));
-        assert!(
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
-            "the udp-only front bound no tcp listener"
-        );
+        let (port, address) = (0..64)
+            .find_map(|_| {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let port = tcp.local_addr().ok()?.port();
+                let udp = UdpSocket::bind(("127.0.0.1", port)).ok()?;
+                drop(udp);
+                drop(tcp);
+                let address = format!("127.0.0.1:{port}");
+                if !serve_shadowsocks_inbound(
+                    &address,
+                    &inbound,
+                    true,
+                    &std::collections::HashSet::new(),
+                ) {
+                    return None;
+                }
+                std::net::TcpStream::connect(("127.0.0.1", port))
+                    .is_err()
+                    .then_some((port, address))
+            })
+            .expect("a port free for tcp and udp that the udp-only front binds");
         let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
         let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
         let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
@@ -56046,8 +56084,8 @@ mod tests {
         dial.set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
         let mut back = vec![0u8; UDP_BUF];
-        // A front still binding reads as a reset from a port nothing owns yet, and a macOS read that finds nothing is a would-block; both mean "not up yet", and the re-send below restarts the wait, so the bound is the wall clock rather than the attempts.
-        let until = Instant::now() + Duration::from_secs(10);
+        // The front binds its udp socket before it returns, so the datagram queues for the worker; a retry only covers a scheduler that has not started it yet.
+        let until = Instant::now() + Duration::from_secs(2);
         let n = loop {
             dial.send_to(&packet, &address).expect("sends");
             match dial.recv_from(&mut back) {
