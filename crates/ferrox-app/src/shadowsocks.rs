@@ -1221,10 +1221,10 @@ fn stream_step<R: Read>(
     (next, Downlink::Stream { read, rc4, buf })
 }
 
-/// A quiet socket is a wait for the lane unless the sibling has ended: then there is nothing left
-/// to read on either side.
-fn waited(flow: Option<&crate::proxy::RelayFinish>) -> crate::proxy::lane_pool::Next {
-    if flow.is_some_and(crate::proxy::RelayFinish::ended) {
+/// A quiet socket is a wait for the lane until the sibling has ended and its reply grace has run out: a chunk still in flight when the other direction ends keeps that window to arrive, which is the clock the shared relay step waits on.
+pub(crate) fn waited(flow: Option<&crate::proxy::RelayFinish>) -> crate::proxy::lane_pool::Next {
+    let expired = flow.is_some_and(|flow| flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE));
+    if expired {
         crate::proxy::lane_pool::Next::Done
     } else {
         crate::proxy::lane_pool::Next::Idle
@@ -3717,5 +3717,31 @@ mod tests {
         );
         drop(held);
         drop(held_first);
+    }
+
+    /// A lane that finds its socket quiet waits out the reply grace after its sibling ends: a chunk still in flight when the other direction finishes keeps that window, where ending on the first poll dropped it.
+    #[test]
+    fn a_quiet_lane_waits_out_the_reply_grace_after_its_sibling_ends() {
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
+        let idle = |flow: Option<&crate::proxy::RelayFinish>| {
+            matches!(waited(flow), crate::proxy::lane_pool::Next::Idle)
+        };
+        assert!(idle(None), "a flowless lane has nothing to end on");
+        assert!(idle(Some(&flow)), "a live sibling is a wait");
+        flow.mark_ended();
+        assert!(
+            idle(Some(&flow)),
+            "the sibling's end dropped the lane at once"
+        );
+        let deadline = std::time::Instant::now()
+            + crate::budgets::RELAY_RESPONSE_IDLE
+            + Duration::from_millis(500);
+        while idle(Some(&flow)) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !idle(Some(&flow)),
+            "a lane that outlived the grace never handed its thread back"
+        );
     }
 }
