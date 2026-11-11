@@ -26,11 +26,85 @@ jobs:
           (cd upstream/aether/aether \
             && env -u CARGO_ENCODED_RUSTFLAGS cargo build --locked --release --bin aether 2>&1 | tail -2)
           mv upstream/aether/aether/target/release/aether /tmp/aether
-          /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -40
-      - name: Our register, by the devices host and by the legacy host
+          /tmp/aether --register masque --masque-config "target/probe/identities.toml" 2>&1 | tail -6
+      - name: The register's request bytes, ours beside the reference's, from a local echo
         run: |
           set -x
+          python3 -m pip install --quiet h2
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout /tmp/key.pem -out /tmp/cert.pem -subj "/CN=127.0.0.1" >/dev/null 2>&1
+          cat > /tmp/capture.py <<'EOF'
+          import ssl, socket, sys
+          from h2.connection import H2Connection
+          from h2.config import H2Configuration
+          from h2.events import RequestReceived, DataReceived, StreamEnded
+
+          class Cap:
+              def __init__(self, conn, sock):
+                  self.conn, self.sock = conn, sock
+                  self.bodies = {}
+                  self.heads = {}
+              def handle(self, event):
+                  if isinstance(event, RequestReceived):
+                      self.heads[event.stream_id] = event.headers
+                      self.bodies[event.stream_id] = b""
+                  elif isinstance(event, DataReceived):
+                      self.bodies[event.stream_id] += event.data
+                  elif isinstance(event, StreamEnded):
+                      sid = event.stream_id
+                      print("==== REQUEST ====", flush=True)
+                      for name, value in self.heads[sid]:
+                          print(f"{name}: {value}", flush=True)
+                      body = self.bodies[sid]
+                      print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
+                      self.conn.send_headers(sid, [(":status", "404"), ("content-type", "application/json")])
+                      self.conn.send_data(sid, b'{"result":null,"success":false,"errors":[{"code":1012,"message":"Not authorized"}],"messages":[]}', True)
+                  self.flush()
+              def flush(self):
+                  data = self.conn.data_to_send()
+                  if data:
+                      self.sock.sendall(data)
+
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain("/tmp/cert.pem", "/tmp/key.pem")
+          ctx.set_alpn_protocols(["h2"])
+          server = socket.socket()
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("127.0.0.1", 8443))
+          server.listen(4)
+          server.settimeout(300)
+          while True:
+              sock, _ = server.accept()
+              try:
+                  tls = ctx.wrap_socket(sock, server_side=True)
+              except Exception as e:
+                  print(f"TLS accept failed: {e}", flush=True)
+                  continue
+              conn = H2Connection(H2Configuration(client_side=False))
+              conn.initiate_connection()
+              cap = Cap(conn, tls)
+              cap.flush()
+              try:
+                  while True:
+                      data = tls.recv(65536)
+                      if not data:
+                          break
+                      for event in conn.receive_data(data):
+                          cap.handle(event)
+              except Exception as e:
+                  print(f"stream ended: {e}", flush=True)
+              tls.close()
+          EOF
+          python3 /tmp/capture.py > /tmp/capture.log 2>&1 &
+          sleep 1
           cargo build --locked --release -p ferrox-app
           bin=target/release/ferrox-app
-          "$bin" warp-register --out /tmp/identity-devices.json 2>&1 | tail -6
-          "$bin" warp-register --api https://api.cloudflareclient.com/v0a4471 --out /tmp/identity-legacy.json 2>&1 | tail -6
+          echo "---- ours over the local echo ----"
+          "$bin" warp-register --api https://127.0.0.1:8443/v0a4471 2>&1 | tail -3 || true
+          sleep 1
+          echo "---- the reference over the local echo ----"
+          /tmp/aether --register masque --masque-config "target/probe/identities2.toml" --api-host 127.0.0.1 --api-sni 127.0.0.1 --api-address 127.0.0.1:8443 2>&1 | tail -6 || true
+          sleep 1
+          kill %1 2>/dev/null || true
+          grep -c "==== REQUEST ====" /tmp/capture.log
+          echo "captured requests:"
+          head -100 /tmp/capture.log
