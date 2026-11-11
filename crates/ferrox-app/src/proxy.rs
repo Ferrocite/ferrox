@@ -29308,9 +29308,7 @@ pub(crate) mod lane_pool {
                 )
             };
             if polled < 0 {
-                // A socket closed under the poll fails the call for the whole set. Hand every parked
-                // lane back instead of waiting on a set that cannot poll: the closed one leaves and
-                // the rest re-arm on their own descriptors.
+                // A failed poll is a dead set: hand every parked lane back so the closed one leaves and the rest re-arm.
                 let all = Ready {
                     read: true,
                     write: true,
