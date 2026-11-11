@@ -24895,6 +24895,7 @@ struct UdpLane {
     waker: UdpSocket,
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_socks_udp_split(
     mut client: Connection,
     plan: &RoutePlan,
