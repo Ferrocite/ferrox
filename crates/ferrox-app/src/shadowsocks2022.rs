@@ -513,16 +513,37 @@ pub(crate) fn serve_xhttp(
     let Ok(read) = stream.try_clone() else {
         return;
     };
-    let Some((mut reader, writer)) =
+    let Some((reader, writer)) =
         crate::xhttp::accept_split_with_settings(read, stream, settings, None)
     else {
         return;
     };
+    // A packet-up GET waits on its reader for a POST queued behind this lane; the wait belongs to the flow.
+    let password = password.to_owned();
+    let method = method.to_owned();
+    let identities = identities.to_vec();
+    crate::proxy::spawn_carried(move || {
+        serve_xhttp_accepted(reader, writer, &password, &method, &identities, freedom);
+    });
+}
+
+fn serve_xhttp_accepted(
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
+    writer: crate::xhttp::XhttpWriter,
+    password: &str,
+    method: &str,
+    identities: &[(String, u32)],
+    freedom: bool,
+) {
+    // The handshake clock: a carrier that answers its head and then goes silent ends the slot at its budget instead of holding it.
+    let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let Some((uplink, response, recv, meter)) =
         accept_on(&mut reader, password, method, identities, freedom)
     else {
+        writer.abort();
         return;
     };
+    reader.disarm();
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
@@ -802,7 +823,8 @@ fn pump_relay_carried_inner<R, W>(
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
     let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
-    let flow = crate::proxy::RelayFinish::new(true, std::sync::Arc::clone(close), None);
+    // The carrier ends once both legs have: an upload that finishes first must not cut a download still sealing.
+    let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut outbound = outbound;
     let mut writer = writer;
     let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
@@ -3462,6 +3484,7 @@ mod tests {
             "h",
             "/share",
             &[],
+            &"X".repeat(500),
         )
         .expect("dials the head");
         let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

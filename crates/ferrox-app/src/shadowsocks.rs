@@ -372,14 +372,31 @@ pub(crate) fn serve_xhttp(
     let Ok(read) = stream.try_clone() else {
         return;
     };
-    let Some((mut reader, mut writer)) =
+    let Some((reader, writer)) =
         crate::xhttp::accept_split_with_settings(read, stream, settings, None)
     else {
         return;
     };
+    // A packet-up GET waits on its reader for a POST queued behind this lane; the wait belongs to the flow.
+    let users = users.to_vec();
+    crate::proxy::spawn_carried(move || {
+        serve_xhttp_accepted(reader, writer, &users, freedom);
+    });
+}
+
+fn serve_xhttp_accepted(
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
+    mut writer: crate::xhttp::XhttpWriter,
+    users: &[SsUser],
+    freedom: bool,
+) {
+    // The handshake clock: a carrier that answers its head and then goes silent ends the slot at its budget instead of holding it.
+    let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+        writer.abort();
         return;
     };
+    reader.disarm();
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
@@ -926,7 +943,8 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
     let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
-    let flow = crate::proxy::RelayFinish::new(true, std::sync::Arc::clone(close), None);
+    // The carrier ends once both legs have: an upload that finishes first must not cut a download still sealing.
+    let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut send = send;
     let mut writer = writer;
     let mut buf = crate::proxy::unfilled(uplink_buffer_len(&send));
@@ -2760,6 +2778,7 @@ mod tests {
             "127.0.0.1",
             "/ss-xhttp",
             &[],
+            &"X".repeat(500),
         )
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
@@ -2771,6 +2790,63 @@ mod tests {
         )
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
+    }
+
+    /// A carrier that answers the xHTTP head and then goes silent ends at the handshake budget instead of holding the slot forever.
+    #[test]
+    fn a_silent_xhttp_handshake_ends_at_its_budget() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(std::time::Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let settings = crate::xhttp::XhttpSettings::stream_one();
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = server.local_addr().expect("addr").port();
+        let users = account("an-example-shared-password", "aes-256-gcm");
+        crate::budgets::spawn(move || {
+            let (stream, _) = server.accept().expect("accepts");
+            serve_xhttp(stream, &users, &settings, true);
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let referer = "http://127.0.0.1?x_padding=".to_owned() + &"X".repeat(500);
+        client
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("writes the head");
+        let began = std::time::Instant::now();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("the slot held the handshake past its budget: {error}"),
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen[..seen.len().min(12)]).starts_with("HTTP/1.1 2"),
+            "the carrier answered {seen:?}"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "the handshake waited {:?}",
+            began.elapsed()
+        );
     }
 
     /// A writer that has `writev`, which is what the relay's own socket is: it counts vectored
@@ -3500,6 +3576,7 @@ mod tests {
             "h",
             "/share",
             &[],
+            &"X".repeat(500),
         )
         .expect("dials the head");
         let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -3549,6 +3626,7 @@ mod tests {
             "h",
             "/share",
             &[],
+            &"X".repeat(500),
         )
         .expect("dials the head");
         let plain: Vec<u8> = (0..READ_CHUNK * 2 + 10).map(|i| (i % 251) as u8).collect();
