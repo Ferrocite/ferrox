@@ -69805,7 +69805,7 @@ end
         let stop = Arc::new(AtomicBool::new(false));
         let sending = Arc::clone(&stop);
         let stream = thread::spawn(move || {
-            let mut back = [0u8; UDP_BUF];
+            let mut back = vec![0u8; UDP_BUF];
             while !sending.load(Ordering::Relaxed) {
                 let _ = udp.send_to(&frame, relay);
                 let _ = udp.recv_from(&mut back);
