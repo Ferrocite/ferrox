@@ -2283,7 +2283,7 @@ pub(crate) fn serve_ws(stream: Connection, path: &str, users: &Users, freedom: b
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, users);
+    let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
     serve_decoded(reader, writer, &close, decoded, freedom);

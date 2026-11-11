@@ -43,7 +43,7 @@ What is *not* removed: `proxy::read_http_head` still answers the `http` front, w
 
 ## The poll it hands back
 
-A relay lane owns the socket's poll quantum, so a read that comes back empty-handed is the lane's turn to move another flow, not an invitation to wait again. `WsReader` keeps a half-parsed frame in `assembling`/`whole`/`filled` and returns the timeout: `frame` does not move the cursor until the whole frame is in `have`, so the next step resumes on the same frame, and nothing compacts the buffer under an assembly. A handshake still in flight waits to its own deadline, and a spent clock is a hard end rather than a timeout `read_exact` would retry forever. The syscall count per frame is unchanged; what moves is one return, earlier. Witnessed by `proxy::tests::production_tls_first_ws_matches_the_seam`, and the frame-atomic parse is the one `ws::tests::frames_round_trip_masked_and_plain` drives. A control frame buffered behind ready data is left for the next call, so a reply cannot hold a completed message behind the shared write lock, and that next call unmasks the control payload before echoing it once — `ws::tests::ready_data_leaves_before_a_buffered_ping_reply` drives the ping and the resumed fragments.
+A relay lane owns the socket's poll quantum, so a read that comes back empty-handed is the lane's turn to move another flow, not an invitation to wait again. The VMess opening request runs under the same arm: `under_handshake` gives the frame reader the socket's poll and its own wall clock, so a peer that completes the `101` and sends no request ends at the handshake budget instead of pinning the carrier thread, and a well-formed request still decodes byte-for-byte. `WsReader` keeps a half-parsed frame in `assembling`/`whole`/`filled` and returns the timeout: `frame` does not move the cursor until the whole frame is in `have`, so the next step resumes on the same frame, and nothing compacts the buffer under an assembly. A handshake still in flight waits to its own deadline, and a spent clock is a hard end rather than a timeout `read_exact` would retry forever. The syscall count per frame is unchanged; what moves is one return, earlier. Witnessed by `proxy::tests::production_tls_first_ws_matches_the_seam`, and the frame-atomic parse is the one `ws::tests::frames_round_trip_masked_and_plain` drives. A control frame buffered behind ready data is left for the next call, so a reply cannot hold a completed message behind the shared write lock, and that next call unmasks the control payload before echoing it once — `ws::tests::ready_data_leaves_before_a_buffered_ping_reply` drives the ping and the resumed fragments.
 
 ## Measured
 
@@ -70,6 +70,8 @@ A relay lane owns the socket's poll quantum, so a read that comes back empty-han
 | early-data-encode-buffers-grown-per-2048-byte-line | 0 | ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else |
 | accept-key-allocations-per-connection | 0 | ferrox-app-ws::tests::the_keys_are_not_allocated |
 | fresh-key-allocations-per-dial | 0 | ferrox-app-ws::tests::the_keys_are_not_allocated |
+| pinned-threads-per-silent-vless-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_ws_handshake |
+| pinned-threads-per-silent-vmess-request | 0 | ferrox-app-vmess::tests::a_silent_peer_cannot_pin_a_ws_vmess_request |
 
 <!-- counts:end -->
 
