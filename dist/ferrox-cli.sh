@@ -1261,7 +1261,7 @@ def decode_vmess(payload):
 def parse_vmess(link, uuid_arg, network_arg):
     if link.lower().startswith("vmess://"):
         head = link[len("vmess://"):].partition("#")[0]
-        if "?" in head and "@" in head.partition("?")[0]:
+        if "@" in head.partition("?")[0]:
             uuid, host, port, params, network, header = parse_uri(link, "vmess")
             cipher = text(params.get("encryption")) or text(params.get("scy")) or "auto"
             return uuid, host, port, params, network, header, cipher

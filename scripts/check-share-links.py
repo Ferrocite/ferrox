@@ -313,6 +313,18 @@ CASES = [
         },
     },
     {
+        "name": "vmess standard uri without a query",
+        "args": ["--vmess", f"vmess://{ID}@192.0.2.18:80#plain"],
+        "want": {
+            "protocol": "vmess",
+            "settings.vnext.0.address": "192.0.2.18",
+            "settings.vnext.0.port": 80,
+            "settings.vnext.0.users.0.security": "auto",
+            "streamSettings.network": "tcp",
+            "streamSettings.security": "none",
+        },
+    },
+    {
         "name": "vmess host and uuid",
         "args": ["--vmess", "example.com:8443", "--uuid", ID, "--network", "ws"],
         "want": {
