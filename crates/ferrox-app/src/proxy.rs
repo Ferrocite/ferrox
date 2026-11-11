@@ -26892,6 +26892,10 @@ fn relay(client: &Connection, target: &Connection) {
     };
     // A descriptor fast path cannot cross the mask, so a masked stream keeps the buffered copy.
     if !target_write.masked() && !client_write.masked() && poll_available() {
+        #[cfg(target_os = "linux")]
+        let (first, second) =
+            poll_handoff(client_read, target_write, target_read, client_write, None);
+        #[cfg(not(target_os = "linux"))]
         let (first, second) = poll_handoff(client_read, target_write, target_read, client_write);
         join(&first);
         join(&second);
@@ -26938,13 +26942,24 @@ fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<A
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    if answer.is_none()
+    // A descriptor fast path cannot cross the mask, and only the Linux pump strips the answer the raw VLESS dial has not seen; every other host and a metered leg keep the lane pool.
+    #[cfg(target_os = "linux")]
+    let fast = !target_write.masked()
+        && !client_write.masked()
+        && !client_read.metered()
+        && !target_read.metered()
+        && poll_available();
+    #[cfg(not(target_os = "linux"))]
+    let fast = answer.is_none()
         && !target_write.masked()
         && !client_write.masked()
         && !client_read.metered()
         && !target_read.metered()
-        && poll_available()
-    {
+        && poll_available();
+    if fast {
+        #[cfg(target_os = "linux")]
+        let _ends = poll_handoff(client_read, target_write, target_read, client_write, answer);
+        #[cfg(not(target_os = "linux"))]
         let _ends = poll_handoff(client_read, target_write, target_read, client_write);
         return;
     }
@@ -27222,8 +27237,9 @@ fn poll_handoff(
     target_write: Connection,
     target_read: Connection,
     client_write: Connection,
+    answer: Option<AnswerHooks>,
 ) -> (RelayEnd, RelayEnd) {
-    poll_relay::handoff(client_read, target_write, target_read, client_write)
+    poll_relay::handoff(client_read, target_write, target_read, client_write, answer)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -30963,6 +30979,16 @@ struct SplicePipe {
     capacity: libc::size_t,
 }
 
+/// Pipes allocated on this host, counted under `cfg(test)` so a test can tell the descriptor
+/// pump from the buffered copy without reading the flow.
+#[cfg(all(target_os = "linux", test))]
+static SPLICE_PIPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn splice_pipes_allocated() -> usize {
+    SPLICE_PIPES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 impl SplicePipe {
     fn new() -> Option<Self> {
@@ -30970,6 +30996,8 @@ impl SplicePipe {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return None;
         }
+        #[cfg(test)]
+        SPLICE_PIPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let asked = unsafe { libc::fcntl(fds[0], libc::F_SETPIPE_SZ, splice_pipe_bytes()) };
         let granted = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
         let capacity = libc::size_t::try_from(if asked > 0 { asked } else { granted }).ok();
@@ -70887,7 +70915,7 @@ mod poll_copy {
 
 #[cfg(target_os = "linux")]
 mod poll_relay {
-    use super::{Connection, Shutdown, SplicePipe};
+    use super::{AnswerHooks, Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -70981,11 +71009,31 @@ mod poll_relay {
         Some(guards)
     }
 
+    /// The VLESS `[version, 0]` answer, held out of the pipe before the first payload byte
+    /// leaves: the lane that would otherwise strip it in user space hands the pipe the job.
+    struct StripAnswer {
+        head: [u8; 2],
+        filled: usize,
+        hooks: Option<AnswerHooks>,
+    }
+
+    impl StripAnswer {
+        fn new(hooks: AnswerHooks) -> Self {
+            Self {
+                head: [0; 2],
+                filled: 0,
+                hooks: Some(hooks),
+            }
+        }
+    }
+
     struct Direction {
         src: Connection,
         dst: Connection,
         pipe: Option<SplicePipe>,
         pending: usize,
+        /// A pending answer the pipe must not drain past.
+        answer: Option<StripAnswer>,
         /// The last ingest splice moved nothing: a pipe ring runs out of slots before it
         /// runs out of byte capacity, so an honest `POLLIN` can still have nowhere to put
         /// what it sees, and a level-triggered one would wake us forever. The drain that
@@ -71011,6 +71059,7 @@ mod poll_relay {
                 dst,
                 pipe,
                 pending: 0,
+                answer: None,
                 ingest_stalled: false,
                 src_at_eof: false,
                 ended: false,
@@ -71032,7 +71081,70 @@ mod poll_relay {
         }
 
         fn can_drain(&self) -> bool {
-            self.pending > 0
+            self.pending > 0 && self.answer.is_none()
+        }
+
+        /// Hand this direction the answer a lane would have stripped before relaying.
+        fn answering(mut self, answer: Option<AnswerHooks>) -> Self {
+            self.answer = answer.map(StripAnswer::new);
+            self
+        }
+
+        /// Strip the answer the pipe holds before the first payload byte drains, a read at a
+        /// time so a pipe carrying half of it never parks a worker. Returns false when the flow
+        /// must stop: the peer closed or refused before its answer was whole.
+        fn strip_answer(&mut self, pipe_read: libc::c_int) -> bool {
+            let Some(mut answer) = self.answer.take() else {
+                return true;
+            };
+            while answer.filled < answer.head.len() && self.pending > 0 {
+                let at = answer.filled;
+                let got = unsafe {
+                    libc::read(
+                        pipe_read,
+                        answer.head[at..].as_mut_ptr().cast(),
+                        answer.head.len() - at,
+                    )
+                };
+                if got <= 0 {
+                    if got < 0 && retryable() {
+                        self.answer = Some(answer);
+                        return true;
+                    }
+                    if let Some(hooks) = answer.hooks.take() {
+                        (hooks.refused)();
+                    }
+                    self.abandon();
+                    return false;
+                }
+                let got = got as usize;
+                self.pending -= got;
+                answer.filled += got;
+            }
+            if answer.filled < answer.head.len() {
+                if !self.src_at_eof {
+                    self.answer = Some(answer);
+                    return true;
+                }
+                if let Some(hooks) = answer.hooks.take() {
+                    (hooks.refused)();
+                }
+                self.abandon();
+                return false;
+            }
+            let valid = ferrox_core::vless::VlessLink::decode_response_header(&answer.head).is_ok();
+            match answer.hooks.take() {
+                None => true,
+                Some(hooks) if valid => {
+                    (hooks.success)();
+                    true
+                }
+                Some(hooks) => {
+                    (hooks.refused)();
+                    self.abandon();
+                    false
+                }
+            }
         }
 
         fn advance(&mut self) {
@@ -71073,6 +71185,9 @@ mod poll_relay {
                         note_idle_ingest(self.pending, capacity);
                         self.ingest_stalled = true;
                     }
+                }
+                if !self.strip_answer(pipe_read) {
+                    return;
                 }
                 while self.can_drain() {
                     let moved = unsafe {
@@ -71352,11 +71467,14 @@ mod poll_relay {
         !workers().is_empty()
     }
 
+    /// Arm both directions on a worker and return their ends. An answer the dial has not seen
+    /// rides the reply direction, which strips it before its first payload byte drains.
     pub(super) fn handoff(
         client_read: Connection,
         target_write: Connection,
         target_read: Connection,
         client_write: Connection,
+        answer: Option<super::AnswerHooks>,
     ) -> (super::RelayEnd, super::RelayEnd) {
         if let (Some(first_pipe), Some(second_pipe)) = (SplicePipe::new(), SplicePipe::new()) {
             if let Some(guards) = arm_flow(&client_read, &target_write, &target_read, &client_write)
@@ -71377,7 +71495,8 @@ mod poll_relay {
                 let first =
                     Direction::new(client_read, target_write, Some(first_pipe), forward_stall);
                 let second =
-                    Direction::new(target_read, client_write, Some(second_pipe), reply_stall);
+                    Direction::new(target_read, client_write, Some(second_pipe), reply_stall)
+                        .answering(answer);
                 worker.push(Flow {
                     directions: vec![first, second],
                     guards: Some(guards),
@@ -71389,7 +71508,7 @@ mod poll_relay {
         let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
         let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
         std::thread::spawn(move || {
-            super::relay_owned(client_read, target_write, target_read, client_write, None);
+            super::relay_owned(client_read, target_write, target_read, client_write, answer);
             let _ = first_tx.send(Ok(()));
             let _ = second_tx.send(Ok(()));
         });
@@ -72064,6 +72183,197 @@ mod relay_tests {
         assert_eq!(
             held, pushed,
             "the trickling flow carried {held} bytes of the {pushed} its client wrote"
+        );
+    }
+
+    /// The two ends of a raw VLESS relay: the client's socket and the server's, each with the
+    /// far end held by the test.
+    #[cfg(target_os = "linux")]
+    fn raw_answer_pair() -> (Connection, Connection, Connection, Connection) {
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("dials the front");
+        let (client_local, _) = front.accept().expect("accepts the client");
+        let peer = Connection::connect(("127.0.0.1", back_port)).expect("dials the back");
+        let (target_local, _) = back.accept().expect("accepts the peer");
+        client
+            .set_read_timeout(Some(PATIENCE))
+            .expect("client timeout");
+        peer.set_read_timeout(Some(PATIENCE)).expect("peer timeout");
+        (client, client_local, target_local, peer)
+    }
+
+    /// A raw VLESS dial hands the pump a reply lane that has not seen its answer, and the pipe
+    /// owns the strip: the client's payload must ride `splice(2)`, not the lane pool's buffer.
+    /// Before that hand-off moved, this was red — the answering lane allocated no splice pipe,
+    /// because every byte of its ``[0, 0]`` and its payload crossed a user-space buffer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_strips_the_answer_on_the_splice_pump() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        let pipes = splice_pipes_allocated();
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let flag = Arc::clone(&refused);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+        );
+        let allocated = splice_pipes_allocated() - pipes;
+        assert!(
+            allocated >= 2,
+            "the answering handoff allocated {allocated} splice pipes: its reply lane is still \
+             copying every byte through a user-space buffer"
+        );
+        peer.write_all(b"\x00\x00hello")
+            .expect("the server answers with payload");
+        let mut down = [0u8; 5];
+        client
+            .read_exact(&mut down)
+            .expect("the client reads the payload");
+        assert_eq!(&down, b"hello", "the answer reached the client as payload");
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "a valid answer never reported success"
+        );
+        assert!(
+            !refused.load(Ordering::SeqCst),
+            "a valid answer reported a refusal"
+        );
+        client.write_all(b"ping").expect("the client uploads");
+        let mut up = [0u8; 4];
+        peer.read_exact(&mut up)
+            .expect("the server reads the upload");
+        assert_eq!(&up, b"ping");
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// A server that withholds its answer until it sees payload must not hold the upload: the
+    /// pump forwards payload while the reply lane is still waiting for ``[0, 0]``.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_relays_the_upload_before_the_answer() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new(|| {}),
+        );
+        client
+            .write_all(b"ping")
+            .expect("the client uploads before any answer");
+        let mut up = [0u8; 4];
+        peer.read_exact(&mut up)
+            .expect("the upload reaches a server that has not answered");
+        assert_eq!(&up, b"ping");
+        peer.write_all(b"\x00\x00pong")
+            .expect("the server answers now");
+        let mut down = [0u8; 4];
+        client
+            .read_exact(&mut down)
+            .expect("the client reads the payload");
+        assert_eq!(&down, b"pong");
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "an answer sent after the upload never reported success"
+        );
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// An answer that arrives in halves must stay out of the payload: the pipe holds the first
+    /// byte and the wake on the second completes the strip before any drain.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_holds_a_half_answer_out_of_the_payload() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new(|| {}),
+        );
+        peer.write_all(b"\x00").expect("half the answer");
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(b"\x00hello")
+            .expect("the rest of the answer and the payload");
+        let mut down = [0u8; 5];
+        client
+            .read_exact(&mut down)
+            .expect("the client reads the payload");
+        assert_eq!(
+            &down, b"hello",
+            "a byte of the split answer reached the client with the payload"
+        );
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "a split answer never reported success"
+        );
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// A refused answer ends the flow on the pump: the client sees the close and the refusal
+    /// reports once, and nothing of the answer reaches the payload.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_refuses_a_bad_answer_on_the_pump() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let flag = Arc::clone(&refused);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+        );
+        peer.write_all(b"\x07\x00nope")
+            .expect("the server answers with a bad version");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let mut byte = [0u8; 1];
+        loop {
+            match client.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => panic!("the refused answer reached the client as payload"),
+                Err(error) if is_timeout(&error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "a refused answer left the client open"
+                ),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            refused.load(Ordering::SeqCst),
+            "a refused answer never reported the refusal"
+        );
+        assert!(
+            !succeeded.load(Ordering::SeqCst),
+            "a refused answer reported success"
         );
     }
 
