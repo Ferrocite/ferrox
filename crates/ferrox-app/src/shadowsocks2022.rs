@@ -11,6 +11,7 @@ use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, T
 use crate::budgets::RELAY_POLL;
 use crate::conn::Connection;
 use crate::proxy::{push_addr, read_exact, under_handshake, write_all_runs};
+use crate::shadowsocks::waited;
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
@@ -1233,16 +1234,6 @@ fn aead_step<R: Read>(
         }
     };
     (next, Downlink::Aead { window, cipher })
-}
-
-/// A quiet socket is a wait for the lane unless the sibling has ended: then there is nothing left
-/// to read on either side.
-fn waited(flow: Option<&crate::proxy::RelayFinish>) -> crate::proxy::lane_pool::Next {
-    if flow.is_some_and(crate::proxy::RelayFinish::ended) {
-        crate::proxy::lane_pool::Next::Done
-    } else {
-        crate::proxy::lane_pool::Next::Idle
-    }
 }
 
 #[cfg(test)]
