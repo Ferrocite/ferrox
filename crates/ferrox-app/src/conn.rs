@@ -2376,6 +2376,121 @@ mod tests {
         );
     }
 
+    /// A config naming `unix:@name` names Linux's abstract namespace, not a file called `@name`:
+    /// a raw client that spells the name the kernel's own way must reach the listener, and the
+    /// seam's own dial must land on it too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unix_abstract_name_is_bound_and_dialed() {
+        use std::os::linux::net::SocketAddrExt;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("ferrox-abstract-{:07}-{:03}", std::process::id(), id);
+        assert_eq!(name.len(), 27, "the witness spells a 27-byte abstract name");
+        let target = parse_target(&format!("unix:@{name}")).expect("the spelling parses");
+        let listener = Listener::bind(&target).expect("binds the abstract name");
+        std::fs::remove_file(format!("@{name}")).ok();
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+            .expect("an abstract address");
+        let mut raw = std::os::unix::net::UnixStream::connect_addr(&address)
+            .expect("a raw abstract client reaches the listener");
+        let (mut server, _) = listener.accept().expect("accepts the raw client");
+        server.write_all(b"r").expect("writes");
+        let mut byte = [0u8; 1];
+        raw.read_exact(&mut byte).expect("reads");
+        assert_eq!(&byte, b"r", "the abstract listener answers the raw client");
+
+        let mut seam =
+            connect(&target, Duration::from_secs(5)).expect("the seam dials the abstract name");
+        let (mut server, _) = listener.accept().expect("accepts the seam's dial");
+        server.write_all(b"s").expect("writes");
+        seam.read_exact(&mut byte).expect("reads the second answer");
+        assert_eq!(&byte, b"s", "the seam's dial lands on the same listener");
+    }
+
+    /// A second `@` asks for the name padded across the kernel's whole `sun_path`, the spelling
+    /// haproxy's sockets use: a peer that fills the field — as the reference's dialer does — must
+    /// find it, where the short spelling would name a different address.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_doubled_unix_at_names_the_padded_abstract_name() {
+        use socket2::{Domain, Socket, Type};
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("ferrox-padded-{:07}-{:03}", std::process::id(), id);
+        let target = parse_target(&format!("unix:@@{name}")).expect("the spelling parses");
+        let listener = Listener::bind(&target).expect("binds the padded abstract name");
+        std::fs::remove_file(format!("@@{name}")).ok();
+        // SAFETY: the storage `try_init` hands over is zeroed and sized for any address; the family, marker, name and length written here describe the `sockaddr_un`.
+        let ((), address) = unsafe {
+            socket2::SockAddr::try_init(|storage, length| {
+                let address = storage.cast::<libc::sockaddr_un>();
+                let field = (*address).sun_path.len();
+                (*address).sun_family = libc::AF_UNIX as libc::sa_family_t;
+                let path = std::ptr::addr_of_mut!((*address).sun_path).cast::<u8>();
+                for (at, byte) in name.as_bytes().iter().enumerate() {
+                    *path.add(at + 1) = *byte;
+                }
+                *length =
+                    (std::mem::offset_of!(libc::sockaddr_un, sun_path) + field) as libc::socklen_t;
+                Ok(())
+            })
+        }
+        .expect("the padded address");
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).expect("a unix socket");
+        socket
+            .connect(&address)
+            .expect("a padded abstract client reaches the listener");
+        let mut raw = UnixStream::from(std::os::fd::OwnedFd::from(socket));
+        let (mut server, _) = listener.accept().expect("accepts the padded client");
+        server.write_all(b"p").expect("writes");
+        let mut byte = [0u8; 1];
+        raw.read_exact(&mut byte).expect("reads");
+        assert_eq!(&byte, b"p", "the padded listener answers the padded client");
+    }
+
+    /// The comma-separated octal mode the references take after a socket path is applied to the
+    /// socket file the listener creates, so a peer that names only the path reaches it under the
+    /// mode the config asked for.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_listener_takes_the_permission_it_names() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-perm-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0770", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds the named path with its mode");
+        let mode = std::fs::metadata(&path)
+            .expect("the socket file the listener created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o770,
+            "the listener applies the mode the address names"
+        );
+        let plain =
+            parse_target(&format!("unix:{}", path.display())).expect("the bare path parses");
+        let mut client = connect(&plain, Duration::from_secs(5))
+            .expect("a client that names only the path reaches the listener");
+        let (mut server, _) = listener.accept().expect("accepts");
+        server.write_all(b"m").expect("writes");
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).expect("reads");
+        assert_eq!(
+            &byte, b"m",
+            "the mode never changed the address the client names"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
     /// is not waited out holds its caller past the budget; the seam spends the budget instead.
     #[cfg(target_os = "linux")]
