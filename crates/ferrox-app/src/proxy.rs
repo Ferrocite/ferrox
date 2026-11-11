@@ -32816,6 +32816,10 @@ impl<R: WindowRead> WindowRead for ReplyReader<R> {
         }
         self.inner.read_window()
     }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.inner.parks_on_timeout()
+    }
 }
 
 fn read_vless_response_body(stream: &mut dyn Read) -> Option<()> {
