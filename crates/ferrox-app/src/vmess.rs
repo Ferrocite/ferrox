@@ -842,8 +842,7 @@ fn request_bytes(
     clear.push(options);
     clear.push((pad_len as u8) << 4 | cipher.code());
     clear.push(0);
-    // The reference names a mux request by its command alone: `v1.mux.cool` carries no address
-    // (`proxy/vmess/encoding/client.go`), and its port is the datagram command's own 666 marker.
+    // A mux request is its command alone: `v1.mux.cool` carries no address (`proxy/vmess/encoding/client.go`).
     let mux = matches!(target, crate::proxy::Destination::Name(host, _) if host == "v1.mux.cool");
     clear.push(if mux { 3 } else { cmd });
     if !mux {
@@ -1675,8 +1674,7 @@ fn decode_header(header: &[u8]) -> Option<(Option<SocketAddr>, Flow, Flow, Vec<u
         return None;
     }
     let mut cursor = 38;
-    // A mux request names the command alone: the reference reads no address for it
-    // (`proxy/vmess/encoding/server.go`) and reports the target as `v1.mux.cool`.
+    // A mux request names the command alone: the reference reads no address for it (`proxy/vmess/encoding/server.go`).
     let target = if cmd == 3 {
         None
     } else {
