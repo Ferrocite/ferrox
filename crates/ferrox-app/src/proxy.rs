@@ -71232,6 +71232,9 @@ mod poll_copy {
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::Duration;
 
+    /// One readiness event can carry many buffers; a bounded loop keeps `poll` off the hot path without starving the flow beside it.
+    const MAX_COPY_ROUNDS: usize = 16;
+
     #[cfg(unix)]
     type Row = libc::pollfd;
     #[cfg(windows)]
@@ -71491,51 +71494,59 @@ mod poll_copy {
             if self.ended {
                 return;
             }
-            if self.off == self.filled {
-                self.off = 0;
-                self.filled = 0;
-            }
-            if self.can_ingest() {
-                match self.src.read(self.bytes.as_mut()) {
-                    Ok(0) => self.src_at_eof = true,
-                    Ok(n) => {
-                        let _ = self.bytes.filled(n);
-                        self.filled = n;
-                    }
-                    Err(error) if would_block(&error) => {}
-                    Err(_) => {
-                        self.end();
-                        return;
+            for _ in 0..MAX_COPY_ROUNDS {
+                if self.off == self.filled {
+                    self.off = 0;
+                    self.filled = 0;
+                }
+                let mut ingested = false;
+                if self.can_ingest() {
+                    match self.src.read(self.bytes.as_mut()) {
+                        Ok(0) => self.src_at_eof = true,
+                        Ok(n) => {
+                            let _ = self.bytes.filled(n);
+                            self.filled = n;
+                            ingested = true;
+                        }
+                        Err(error) if would_block(&error) => {}
+                        Err(_) => {
+                            self.end();
+                            return;
+                        }
                     }
                 }
-            }
-            while self.off < self.filled {
-                match self.dst.write(&self.bytes.prefix(self.filled)[self.off..]) {
-                    Ok(0) => {
-                        self.end();
-                        return;
-                    }
-                    Ok(n) => {
-                        self.off += n;
-                        self.stalled = None;
-                    }
-                    Err(error) if would_block(&error) => {
-                        self.stalled.get_or_insert_with(std::time::Instant::now);
-                        break;
-                    }
-                    Err(_) => {
-                        self.end();
-                        return;
+                while self.off < self.filled {
+                    match self.dst.write(&self.bytes.prefix(self.filled)[self.off..]) {
+                        Ok(0) => {
+                            self.end();
+                            return;
+                        }
+                        Ok(n) => {
+                            self.off += n;
+                            self.stalled = None;
+                        }
+                        Err(error) if would_block(&error) => {
+                            self.stalled.get_or_insert_with(std::time::Instant::now);
+                            break;
+                        }
+                        Err(_) => {
+                            self.end();
+                            return;
+                        }
                     }
                 }
-            }
-            if self.off == self.filled {
-                self.off = 0;
-                self.filled = 0;
-                self.stalled = None;
-            }
-            if self.src_at_eof && self.filled == 0 {
-                self.end();
+                if self.off == self.filled {
+                    self.off = 0;
+                    self.filled = 0;
+                    self.stalled = None;
+                }
+                if self.src_at_eof && self.filled == 0 {
+                    self.end();
+                    return;
+                }
+                if !ingested || self.off < self.filled {
+                    break;
+                }
             }
         }
 
