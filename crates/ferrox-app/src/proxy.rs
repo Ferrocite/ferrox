@@ -24660,6 +24660,8 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
+    let _ = client.set_read_timeout(Some(UDP_POLL));
     let local = relay
         .local_addr()
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
@@ -24668,11 +24670,30 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     let Some(lane) = spawn_udp_lane(out, local, None) else {
         return;
     };
+    let lane_address = lane.address;
+    let mut lanes = HashMap::new();
+    lanes.insert(None, lane);
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if src == lane.address {
+    let mut checked = Instant::now();
+    loop {
+        if checked.elapsed() >= UDP_POLL {
+            checked = Instant::now();
+            if peer_left(&client) {
+                break;
+            }
+        }
+        let (n, src) = match relay.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => continue,
+            Err(error) if is_udp_gone(&error) => {
+                thread::sleep(UDP_POLL);
+                continue;
+            }
+            Err(_) => break,
+        };
+        if src == lane_address {
             if let Some(client) = client_addr {
                 let _ = relay.send_to(&buf[..n], client);
             }
@@ -24694,8 +24715,9 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
             None => &buf[..n],
         };
-        let _ = relay.send_to(frame, lane.address);
+        let _ = relay.send_to(frame, lane_address);
     }
+    retire_udp_lanes(relay, lanes);
 }
 
 /// One lane for the whole association: every datagram reaches the same outbound.
@@ -25071,7 +25093,7 @@ fn spawn_udp_lane(
     })
 }
 
-/// A split association owns its lanes: when it ends, each lane is woken with a datagram that names
+/// An association that owns its lanes: when it ends, each lane is woken with a datagram that names
 /// no destination and its read timeout is shortened, while the relay stays bound until every lane
 /// has joined so a late answer cannot reach a later association on the reused port.
 fn retire_udp_lanes(relay: UdpSocket, lanes: HashMap<Option<String>, UdpLane>) {
