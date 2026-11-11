@@ -71115,9 +71115,7 @@ mod poll_relay {
                         self.answer = Some(answer);
                         return true;
                     }
-                    if let Some(hooks) = answer.hooks.take() {
-                        (hooks.refused)();
-                    }
+                    self.answer = Some(answer);
                     self.abandon();
                     return false;
                 }
@@ -71130,25 +71128,21 @@ mod poll_relay {
                     self.answer = Some(answer);
                     return true;
                 }
-                if let Some(hooks) = answer.hooks.take() {
-                    (hooks.refused)();
-                }
+                self.answer = Some(answer);
                 self.abandon();
                 return false;
             }
-            let valid = ferrox_core::vless::VlessLink::decode_response_header(&answer.head).is_ok();
-            match answer.hooks.take() {
-                None => true,
-                Some(hooks) if valid => {
+            let acceptable = answer.hooks.is_none()
+                || ferrox_core::vless::VlessLink::decode_response_header(&answer.head).is_ok();
+            if acceptable {
+                if let Some(hooks) = answer.hooks.take() {
                     (hooks.success)();
-                    true
                 }
-                Some(hooks) => {
-                    (hooks.refused)();
-                    self.abandon();
-                    false
-                }
+                return true;
             }
+            self.answer = Some(answer);
+            self.abandon();
+            false
         }
 
         fn advance(&mut self) {
@@ -71183,7 +71177,7 @@ mod poll_relay {
                     } else if moved == 0 {
                         self.src_at_eof = true;
                     } else if !retryable() {
-                        self.end();
+                        self.stop();
                         return;
                     } else {
                         note_idle_ingest(self.pending, capacity);
@@ -71212,7 +71206,7 @@ mod poll_relay {
                         continue;
                     }
                     if moved < 0 && !retryable() {
-                        self.end();
+                        self.stop();
                         return;
                     }
                     if moved < 0
@@ -71240,8 +71234,18 @@ mod poll_relay {
                 .is_some_and(|since| since.elapsed() >= self.stall_budget)
         }
 
+        /// An answer the pipe still owes is refused once, whichever way the half ends: the
+        /// lane path reports the failed handshake on every one of its exits, and a reset or a
+        /// closed peer must not be the pump's silent exception.
+        fn refuse_answer(&mut self) {
+            if let Some(hooks) = self.answer.take().and_then(|answer| answer.hooks) {
+                (hooks.refused)();
+            }
+        }
+
         /// The flow has given up: close both halves so neither leg waits on the other.
         fn abandon(&mut self) {
+            self.refuse_answer();
             self.ended = true;
             self.stalled = None;
             self.ended_at.get_or_insert_with(std::time::Instant::now);
@@ -71253,9 +71257,13 @@ mod poll_relay {
         /// path reaches when its idle bound passes: the answer's hook runs once and the wait
         /// stops holding the flow.
         fn expire_unanswered(&mut self) {
-            if let Some(hooks) = self.answer.take().and_then(|answer| answer.hooks) {
-                (hooks.refused)();
-            }
+            self.stop();
+        }
+
+        /// An error that ends one half refuses the answer it still owed, then closes the way
+        /// every other completed half does.
+        fn stop(&mut self) {
+            self.refuse_answer();
             self.end();
         }
 
@@ -72492,6 +72500,68 @@ mod relay_tests {
             !success.load(Ordering::SeqCst),
             "an answer that never arrived reported success"
         );
+    }
+
+    /// A reset can end the reply half after one answer byte, and the rung still has to hear
+    /// that the dial failed: the pipe refuses the answer on its error exit the way the lane
+    /// path refuses it on every exit, once, with no payload served.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_refuses_an_answer_lost_to_a_reset() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let refusals = Arc::new(AtomicUsize::new(0));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let count = Arc::clone(&refusals);
+                move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        peer.write_all(&[0u8]).expect("half an answer");
+        linger_zero(&peer);
+        drop(peer);
+        let mut heard = [0u8; 8];
+        loop {
+            match client.read(&mut heard) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        assert_eq!(
+            refusals.load(Ordering::SeqCst),
+            1,
+            "a reset before the answer completed refused it once"
+        );
+        assert!(
+            !succeeded.load(Ordering::SeqCst),
+            "an answer cut short reported success"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linger_zero(connection: &Connection) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let set = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(connection),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "linger zero is set");
     }
 
     /// The two clones `relay_carried` shares one socket: a finished upload used
