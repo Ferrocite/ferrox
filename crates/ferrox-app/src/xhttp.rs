@@ -12,6 +12,8 @@ use ferrox_core::transport::url_decode_parts;
 pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
 /// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
+/// The upstream read the reference's HTTP writer takes one buffer at a time.
+const REFERENCE_WINDOW: usize = 8 * 1024;
 /// A whole body plus the longest size line that can precede it and both bytes that close the body, so one framing read opens and finishes it.
 const FRAMING_READ: usize = CHUNK + 131;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
