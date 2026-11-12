@@ -304,6 +304,12 @@ impl Device {
     }
 }
 
+/// One packet write, all-or-nothing: a full write is carried, a short or refused write is dropped.
+fn write_packet_to<W: Write>(writer: &mut W, packet: &[u8]) -> io::Result<bool> {
+    writer.write_all(packet)?;
+    Ok(true)
+}
+
 #[cfg(unix)]
 impl AsRawFd for Device {
     fn as_raw_fd(&self) -> RawFd {
@@ -1201,6 +1207,43 @@ mod tests {
             assert_eq!(tail.len(), payload.len());
         });
         assert_eq!(counts.allocs, 0, "the warm head costs no heap buffer");
+    }
+
+    struct RefuseOnce {
+        writes: usize,
+        accepted: Vec<u8>,
+    }
+
+    impl Write for RefuseOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "one packet refused",
+                ));
+            }
+            self.accepted.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_refused_packet_does_not_end_the_flow() {
+        let mut writer = RefuseOnce {
+            writes: 0,
+            accepted: Vec::new(),
+        };
+        assert_eq!(write_packet_to(&mut writer, b"refused"), Ok(false));
+        assert_eq!(write_packet_to(&mut writer, b"carried"), Ok(true));
+        assert_eq!(
+            writer.accepted, b"carried",
+            "the packet after a refusal still reaches the device"
+        );
     }
 
     #[test]
