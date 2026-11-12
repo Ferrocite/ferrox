@@ -34,6 +34,10 @@ const DATA_FRAMES_PER_WRITE: usize = 8;
 
 const NO_PART: &[u8] = &[];
 
+/// Frames one client pump parses before it yields: a relay window of default frames, so the
+/// connection's readers share one locked pass over a run of frames.
+const PUMP_FRAMES: usize = 8;
+
 /// One credit is one 26-byte write holding both `WINDOW_UPDATE` frames, the largest control frame queued, and a batch is one write.
 const CREDIT_FRAME: usize = 26;
 const CONTROL_MAX: usize = CREDIT_FRAME;
@@ -1689,7 +1693,7 @@ impl H2Conn {
     /// A client's frames arrive on the same transport its reader consumes: one frame is parsed on
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
     /// A lane step that cannot finish the frame yields the poll instead of sleeping in it.
-    fn pump_read(&self, ready: impl FnOnce() -> bool, yieldable: bool) -> Pumped {
+    fn pump_read(&self, ready: impl Fn() -> bool, yieldable: bool) -> Pumped {
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
@@ -1697,6 +1701,27 @@ impl H2Conn {
         if ready() {
             return Pumped::Alive;
         }
+        if !yieldable {
+            return self.pump_frame(&mut **read, false);
+        }
+        // A download is a run of frames on one connection, so one pass fills the stream and queues the rest.
+        for _ in 0..PUMP_FRAMES {
+            match self.pump_frame(&mut **read, true) {
+                Pumped::Alive => {
+                    if ready() {
+                        return Pumped::Alive;
+                    }
+                }
+                Pumped::Yield if ready() => return Pumped::Alive,
+                other => return other,
+            }
+        }
+        Pumped::Alive
+    }
+
+    /// Parse and dispatch one frame. The caller holds the read lock so wire order reaches a stream
+    /// in the order the peer wrote it.
+    fn pump_frame(&self, read: &mut dyn Read, yieldable: bool) -> Pumped {
         let mut partial = self
             .client_partial
             .lock()
@@ -1706,7 +1731,7 @@ impl H2Conn {
             let partial = &mut *partial;
             if partial.frame.is_none() {
                 match fill_frame(
-                    &mut **read,
+                    read,
                     &mut partial.head,
                     &mut partial.head_len,
                     since,
@@ -1733,13 +1758,7 @@ impl H2Conn {
             let Some((kind, flags, sid)) = partial.frame else {
                 return Pumped::Dead;
             };
-            match fill_frame(
-                &mut **read,
-                &mut partial.body,
-                &mut partial.body_len,
-                since,
-                yieldable,
-            ) {
+            match fill_frame(read, &mut partial.body, &mut partial.body_len, since, yieldable) {
                 Some(true) => {}
                 Some(false) => return Pumped::Yield,
                 None => {
