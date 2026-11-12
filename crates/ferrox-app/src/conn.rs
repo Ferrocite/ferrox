@@ -1577,9 +1577,9 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// Bind a unix listener from the text a config names: an abstract name on the hosts that serve
 /// one, else a filesystem path after the permission the reference accepts is split off. A stale
 /// socket is replaced and a file that is not a socket is refused, so a typo cannot delete data; a
-/// requested mode is applied to a sibling name the path cannot have been swapped under and then
-/// moved into place, so nothing but our own socket ever takes the permission — or, when the
-/// directory leaves no room for a sibling name, to the path itself.
+/// requested mode is applied inside a private staging directory beside the socket and then
+/// hard-linked into place, so nothing but our own socket ever takes the permission — or, when the
+/// directory leaves no room for a staged name, to the path itself.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -1605,32 +1605,60 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         }
         return UnixListener::bind(path);
     };
-    let staged = staged_name(path);
-    if staged.as_os_str().len() > std::mem::size_of::<libc::sockaddr_un>() - 3 {
-        // The directory leaves no room for a sibling name, so the mode goes on the path itself.
-        if stale {
-            std::fs::remove_file(path)?;
-        }
-        let listener = UnixListener::bind(path)?;
-        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-            let _ = std::fs::remove_file(path);
-            return Err(error);
-        }
+    if let Some(listener) = bind_staged(path, mode, stale)? {
         return Ok(listener);
     }
-    let _ = std::fs::remove_file(&staged);
-    let listener = UnixListener::bind(&staged)?;
-    let moved = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))
-        .and_then(|()| std::fs::rename(&staged, path));
-    if let Err(error) = moved {
-        let _ = std::fs::remove_file(&staged);
+    // The directory leaves no room for a staged name, so the mode goes on the path itself.
+    if stale {
+        std::fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path)?;
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        let _ = std::fs::remove_file(path);
         return Err(error);
     }
     Ok(listener)
 }
 
-/// A sibling name in the socket's own directory — same filesystem, so the rename into place is
-/// atomic — that no configured path can name.
+/// Bind the socket inside a private `0700` directory beside the configured path, so no other writer
+/// can create or swap the entry the mode is applied to, then hard-link it into place, which refuses
+/// to replace whatever another writer left at the path. `None` when the staged name would not fit
+/// the address field, where the caller binds the path itself.
+#[cfg(unix)]
+fn bind_staged(path: &std::path::Path, mode: u32, stale: bool) -> io::Result<Option<UnixListener>> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    for _ in 0..8 {
+        let dir = staged_name(path);
+        let inner = dir.join("s");
+        if inner.as_os_str().len() > std::mem::size_of::<libc::sockaddr_un>() - 3 {
+            return Ok(None);
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        if builder.create(&dir).is_err() {
+            continue;
+        }
+        let published = (|| {
+            let listener = UnixListener::bind(&inner)?;
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
+            if stale {
+                std::fs::remove_file(path)?;
+            }
+            std::fs::hard_link(&inner, path)?;
+            Ok(listener)
+        })();
+        let _ = std::fs::remove_file(&inner);
+        let _ = std::fs::remove_dir(&dir);
+        return published.map(Some);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "a unix listen path left no staged name free",
+    ))
+}
+
+/// A staging directory name in the socket's own directory — same filesystem, so the hard link into
+/// place is atomic — that no configured path can name.
 #[cfg(unix)]
 fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2760,6 +2788,32 @@ mod tests {
         assert_eq!(mode, 0o750, "the mode reaches the path at the field limit");
         drop(listener);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The staging directory the mode is applied in leaves nothing behind: after a bind with a
+    /// mode, the socket's directory holds the socket and no `.ferrox-*` entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_mode_staging_leaves_only_the_socket() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-stage-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds under the staged mode");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the socket directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from("sock")],
+            "the staging directory is removed, so 0 entries are left behind"
+        );
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
