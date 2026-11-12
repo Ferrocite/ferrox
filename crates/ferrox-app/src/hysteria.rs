@@ -2955,6 +2955,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),

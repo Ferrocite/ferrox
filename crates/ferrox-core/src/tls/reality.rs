@@ -157,6 +157,7 @@ impl<S: Stream> RealityServer<S> {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             certs: vec![super::CertEntry {
                 cert_chain: vec![bound_certificate(&auth_key, first_name(cfg))],
                 key_der: ed25519_pkcs8(),
@@ -2458,6 +2459,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             certs: vec![super::super::CertEntry {
                 cert_chain: vec![bound_certificate(&[9u8; 32], SNI)],
                 key_der: ed25519_pkcs8(),
