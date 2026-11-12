@@ -66085,10 +66085,8 @@ mod tests {
         client.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         let got = client.read(&mut back);
-        assert!(
-            got.map_or(true, |n| n == 0),
-            "a blocked source reached the target: {got:?}"
-        );
+        let refused = got.as_ref().map_or(true, |n| *n == 0);
+        assert!(refused, "a blocked source reached the target: {got:?}");
     }
 
     #[test]
@@ -75449,8 +75447,9 @@ mod accept_proxy_protocol_tests {
             .expect("timeout");
         let mut byte = [0u8; 1];
         let got = client.read(&mut byte);
+        let refused = got.as_ref().map_or(true, |n| *n == 0);
         assert!(
-            got.map_or(true, |n| n == 0),
+            refused,
             "the socket peer, not the reported source, was filtered: {got:?}"
         );
     }
