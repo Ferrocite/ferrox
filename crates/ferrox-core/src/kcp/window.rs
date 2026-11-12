@@ -256,6 +256,12 @@ impl AckList {
     }
 
     pub fn add(&mut self, number: u32, timestamp: u32) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.number == number) {
+            entry.timestamp = timestamp;
+            entry.next_flush = 0;
+            self.dirty = true;
+            return;
+        }
         self.entries.push(AckEntry {
             number,
             timestamp,
