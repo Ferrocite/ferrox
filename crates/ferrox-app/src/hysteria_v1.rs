@@ -111,6 +111,7 @@ fn connect(dial: &Dial) -> Option<Session> {
             None => crate::quic::Datagram::plain(sock),
         },
     };
+    let net = crate::quic::network_generation();
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let keep_alive = dial
         .config
@@ -125,9 +126,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         local,
         local_now: Arc::new(Mutex::new(local)),
         peer: Some(peer),
-        net: Arc::new(std::sync::atomic::AtomicU64::new(
-            crate::quic::network_generation(),
-        )),
+        net: Arc::new(std::sync::atomic::AtomicU64::new(net)),
         udp_supported: true,
         driver: None,
         send_wake: None,

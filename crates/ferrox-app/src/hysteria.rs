@@ -349,10 +349,6 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     if !rebind_if_moved(session) {
         return false;
     }
-    let local = session
-        .local_now
-        .lock()
-        .map_or(session.local, |local| *local);
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -377,7 +373,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         match crate::quic::recv_batch(&session.sock, &mut batch) {
             crate::quic::Drain::Read => {
                 batched = true;
-                Some((0, local))
+                Some((0, session.local))
             }
             crate::quic::Drain::Empty => None,
             crate::quic::Drain::Unbatchable => match session.sock.recv_from(room.as_mut()) {
@@ -424,6 +420,10 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     if conn.is_closed() {
         return false;
     }
+    let local = session
+        .local_now
+        .lock()
+        .map_or(session.local, |local| *local);
     #[cfg(target_os = "linux")]
     if batched {
         for at in 0..batch.len() {
@@ -618,6 +618,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             (None, _) => crate::quic::Datagram::plain(sock),
         },
     };
+    let net = crate::quic::network_generation();
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let keep_alive = dial
         .config
@@ -632,7 +633,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         local,
         local_now: Arc::new(Mutex::new(local)),
         peer: Some(peer),
-        net: Arc::new(AtomicU64::new(crate::quic::network_generation())),
+        net: Arc::new(AtomicU64::new(net)),
         udp_supported: false,
         driver: None,
         send_wake: None,

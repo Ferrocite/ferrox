@@ -916,7 +916,7 @@ fn send_gso(
         msg_flags: 0,
     };
     // SAFETY: `message` names `parts`, `storage` and `control`, which outlive the call, and each part points at a slot the caller filled for the same sweep.
-    let sent = unsafe { libc::sendmsg(sock.sock.as_raw_fd(), &raw const message, 0) };
+    let sent = unsafe { libc::sendmsg(sock.as_raw_fd(), &raw const message, 0) };
     if sent == isize::try_from(total).unwrap_or(isize::MAX) {
         return Gso::Sent;
     }
@@ -953,7 +953,7 @@ fn send_mmsg(
         // SAFETY: every header below `want` was written by the caller this iteration, `MaybeUninit` is transparent over the header the call reads, and the buffers each names outlive the caller's frame.
         let sent = unsafe {
             libc::sendmmsg(
-                sock.sock.as_raw_fd(),
+                sock.as_raw_fd(),
                 rest.as_mut_ptr().cast::<libc::mmsghdr>(),
                 rest.len() as libc::c_uint,
                 0,
@@ -1238,7 +1238,7 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     let got = loop {
         let got = unsafe {
             libc::recvmmsg(
-                sock.sock.as_raw_fd(),
+                sock.as_raw_fd(),
                 headers.as_mut_ptr().cast::<libc::mmsghdr>(),
                 RECV_SLOTS as libc::c_uint,
                 libc::MSG_WAITFORONE as _,
@@ -1866,7 +1866,8 @@ pub(crate) fn rebind_path(
     let Ok(fresh) = UdpSocket::bind(at) else {
         return Rebind::Failed;
     };
-    clear_gro(&fresh);
+    #[cfg(target_os = "linux")]
+    set_gro(&fresh, true);
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
     move_socket(conn, sock, fresh)
@@ -2833,11 +2834,7 @@ impl Datagram {
     /// A lane the kernel can speak to in batches: no gecko fragment, no hop, no obfuscation and no relay frame, so the datagram quiche wrote is the datagram on the wire, and Linux is where the batched call exists.
     #[cfg(target_os = "linux")]
     fn batchable(&self) -> bool {
-        self.gecko.is_none()
-            && self.hop.is_none()
-            && self.obfs.is_none()
-            && self.relay.is_none()
-            && !self.moved.load(Ordering::Acquire)
+        self.gecko.is_none() && self.hop.is_none() && self.obfs.is_none() && self.relay.is_none()
     }
 
     /// Send one datagram, or hold it when the kernel refused it for a reason that
@@ -2894,7 +2891,8 @@ impl Datagram {
     /// new path: the old descriptor stays for a reply already in flight, and the
     /// flag keeps a lane that never roams on the direct path.
     pub(crate) fn rebind(&self, sock: UdpSocket) -> std::io::Result<()> {
-        clear_gro(&sock);
+        #[cfg(target_os = "linux")]
+        set_gro(&sock, true);
         if let Ok(armed) = self.armed.lock() {
             if let Some(Some(timeout)) = *armed {
                 sock.set_read_timeout(Some(timeout))?;
@@ -3190,13 +3188,43 @@ pub(crate) fn udp_to_server(
     port: u16,
 ) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
     let peer = crate::proxy::resolve_outbound(address, port)?;
-    let sock = if peer.is_ipv6() {
-        bind_datagram("[::]:0").ok()?
-    } else {
-        bind_datagram("0.0.0.0:0").ok()?
-    };
-    let local = sock.local_addr().ok()?;
+    let (sock, local) = datagram_to(peer)?;
     Some((sock, peer, local))
+}
+
+/// Bind a datagram socket to the source the kernel picks for `peer`, so a later route
+/// event can compare that source with a fresh probe instead of a wildcard.
+pub(crate) fn datagram_to(peer: SocketAddr) -> Option<(UdpSocket, SocketAddr)> {
+    let bind = if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let probe = UdpSocket::bind(bind).ok()?;
+    probe.connect(peer).ok()?;
+    let source = probe.local_addr().ok()?;
+    drop(probe);
+    let at = match source {
+        SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), 0),
+        SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
+            *addr.ip(),
+            0,
+            addr.flowinfo(),
+            addr.scope_id(),
+        )),
+    };
+    let sock = bind_datagram_at(at).or_else(|_| bind_datagram(bind)).ok()?;
+    let local = sock.local_addr().ok()?;
+    Some((sock, local))
+}
+
+fn bind_datagram_at(at: SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(at)?;
+    #[cfg(target_os = "linux")]
+    set_gro(&sock, true);
+    set_receive_buffer(&sock, DATAGRAM_BUFFER);
+    set_send_buffer(&sock, DATAGRAM_BUFFER);
+    Ok(sock)
 }
 
 /// The in-process resumption blobs: one captured session per edge, so a later dial can offer
@@ -6223,7 +6251,7 @@ mod tests {
         }
         assert_eq!(&buf[..got], b"before");
 
-        let fresh = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let (fresh, _) = datagram_to(server.addr).expect("binds");
         let moved = match move_socket(&mut client.conn, &client.sock, fresh) {
             Rebind::Moved(addr) => addr,
             Rebind::Same => panic!("a fresh socket is a new source"),
@@ -6301,6 +6329,16 @@ mod tests {
             Rebind::Same
         ));
         assert_eq!(client.sock.local_addr().expect("addr"), before);
+    }
+
+    /// A dial binds the source the kernel picks for the edge, not the wildcard, so a later
+    /// route event can tell an unchanged path from a moved one.
+    #[test]
+    fn a_dial_binds_the_source_the_kernel_picks() {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let (sock, local) = datagram_to(server.local_addr().expect("addr")).expect("binds");
+        assert!(!local.ip().is_unspecified(), "the dial source is concrete");
+        assert_eq!(sock.local_addr().expect("addr"), local);
     }
 
     /// A first dial leaves a session the store keeps: the second dial to the same edge offers it,

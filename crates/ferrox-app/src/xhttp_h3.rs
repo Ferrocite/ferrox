@@ -1,7 +1,7 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -865,12 +865,8 @@ impl H3Client {
             quic::quiche_config(&tls.roots, None)?
         };
         config.set_initial_max_data(16 * 1024 * 1024);
-        let sock = if peer.is_ipv6() {
-            UdpSocket::bind("[::]:0").ok()?
-        } else {
-            UdpSocket::bind("0.0.0.0:0").ok()?
-        };
-        let local = sock.local_addr().ok()?;
+        let (sock, local) = quic::datagram_to(peer)?;
+        let net = quic::network_generation();
         let sock = Arc::new(Datagram::plain(sock));
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).ok()?;
@@ -897,7 +893,7 @@ impl H3Client {
         let pump_dead = Arc::clone(&dead);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
-            .spawn(move || pump_connection(&pump, &pump_sock, local, peer, &pump_dead))
+            .spawn(move || pump_connection(&pump, &pump_sock, local, peer, net, &pump_dead))
             .ok()?;
         Some(Arc::new(Self {
             conn,
@@ -989,10 +985,11 @@ fn pump_connection(
     sock: &Arc<Datagram>,
     local: SocketAddr,
     peer: SocketAddr,
+    generation: u64,
     dead: &Arc<AtomicBool>,
 ) {
     let mut local = local;
-    let mut generation = quic::network_generation();
+    let mut generation = generation;
     let mut buf = vec![0u8; 65535];
     loop {
         let now = quic::network_generation();
@@ -1002,7 +999,10 @@ fn pump_connection(
                 match quic::rebind_path(&mut conn, sock, peer) {
                     quic::Rebind::Moved(moved) => local = moved,
                     quic::Rebind::Same | quic::Rebind::Unsupported => {}
-                    quic::Rebind::Failed => break,
+                    quic::Rebind::Failed => {
+                        let _ = conn.close(false, 0, b"rebind");
+                        break;
+                    }
                 }
             }
         }

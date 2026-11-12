@@ -312,6 +312,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     }
     let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
         .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
+    let net = quic::network_generation();
     let sock = Datagram::plain(sock);
     let mut lane = establish(spec, &sock, peer, local)?;
     let addresses = lane.addresses.clone();
@@ -331,6 +332,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
                 &sock,
                 local,
                 peer,
+                net,
                 keepalive,
                 from_tunnel,
                 to_stack,
@@ -1757,13 +1759,14 @@ fn io(
     sock: &Datagram,
     local: SocketAddr,
     peer: SocketAddr,
+    net: u64,
     keepalive: Option<Duration>,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: UdpRoutes,
 ) {
     let mut local = local;
-    let mut generation = quic::network_generation();
+    let mut generation = net;
     let Lane {
         mut conn,
         stream,
@@ -1783,7 +1786,10 @@ fn io(
             match quic::rebind_path(&mut conn, sock, peer) {
                 quic::Rebind::Moved(moved) => local = moved,
                 quic::Rebind::Same | quic::Rebind::Unsupported => {}
-                quic::Rebind::Failed => break,
+                quic::Rebind::Failed => {
+                    let _ = conn.close(false, 0, b"rebind");
+                    break;
+                }
             }
         }
         let sent_before = conn.stats().sent;
