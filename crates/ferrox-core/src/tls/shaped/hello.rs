@@ -179,14 +179,15 @@ impl Hello {
             .iter()
             .copied()
             .filter(|&id| {
-                if tls13_suite(id) {
-                    ceiling >= 0x0304
-                } else {
-                    floor <= 0x0303 && ceiling >= 0x0303
-                }
+                id == GREASE
+                    || if tls13_suite(id) {
+                        ceiling >= 0x0304
+                    } else {
+                        floor <= 0x0303 && ceiling >= 0x0303
+                    }
             })
             .collect();
-        if ciphers.is_empty() {
+        if !ciphers.iter().any(|&id| id != GREASE) {
             return Err(TlsError::Other(
                 "tls client version bounds leave no cipher suite".to_owned(),
             ));
@@ -204,13 +205,14 @@ impl Hello {
                 .unwrap_or(&[]);
             let groups = self.groups.as_deref().unwrap_or(profile_groups);
             if groups.iter().any(|&group| hybrid_group(group)) {
-                self.groups = Some(
-                    groups
-                        .iter()
-                        .copied()
-                        .filter(|&group| !hybrid_group(group))
-                        .collect(),
-                );
+                let carried: Vec<u16> = groups
+                    .iter()
+                    .copied()
+                    .filter(|&group| !hybrid_group(group))
+                    .collect();
+                if !carried.is_empty() {
+                    self.groups = Some(carried);
+                }
             }
             self.shares.retain(|share| !hybrid_group(share.group));
         }
@@ -607,11 +609,7 @@ impl Hello {
                 "obfuscated session tickets and ECH cannot share a hello".to_owned(),
             ));
         }
-        let tls13 = self
-            .profile
-            .exts
-            .iter()
-            .any(|ext| matches!(&ext.body, Body::Versions(values) if values.contains(&0x0304)));
+        let tls13 = self.offers_tls13();
         let ems = self.profile.exts.iter().any(|ext| ext.kind == 0x0017);
         if tls13 {
             if !self.profile.offers_psk() {
@@ -1994,6 +1992,46 @@ mod tests {
             hello.cipher_table().iter().any(|&id| !tls13_suite(id)),
             "the TLS 1.2 suites stay"
         );
+        assert!(
+            hello.cipher_table().contains(&GREASE),
+            "the GREASE cipher sentinel stays"
+        );
+    }
+
+    /// A config naming only a hybrid group under a 1.2 ceiling keeps a non-empty
+    /// `supported_groups`, since an empty one is a malformed hello.
+    #[test]
+    fn an_all_hybrid_group_list_stays_valid_under_a_tls12_ceiling() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(
+            profile,
+            "example.com",
+            &[],
+            false,
+            &[keys::X25519_MLKEM768],
+            None,
+        )
+        .expect("a shaped hello");
+        hello
+            .set_version_bounds(Some(0x0303), Some(0x0303))
+            .expect("the ceiling is supported");
+        let exts = extensions(&hello.msg[4..]);
+        let groups = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x000a)
+            .expect("the hello names its groups");
+        assert!(groups.len() > 4, "the group extension keeps its list");
+        assert!(
+            groups.windows(2).any(|pair| pair == [0x11, 0xec]),
+            "the named hybrid group stays offered"
+        );
+        assert!(
+            exts.iter().all(|ext| kind(ext) != 0x0033),
+            "no key share below 1.3"
+        );
     }
 
     /// REALITY refuses a fingerprint with no TLS 1.3 share, so the REALITY dial swaps android for
@@ -2188,6 +2226,27 @@ mod tests {
             .find(|entry| kind(entry) == SESSION_TICKET)
             .expect("the session_ticket extension");
         assert_eq!(&session[4..], ticket.bytes.as_slice());
+    }
+
+    #[test]
+    fn a_tls12_ceiling_makes_a_tls13_profile_mint_a_tls12_ticket() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello
+            .set_version_bounds(Some(0x0303), Some(0x0303))
+            .expect("the ceiling is supported");
+        hello
+            .set_obfuscated_ticket(&[0x77; 32], 0)
+            .expect("the ticket follows the effective window");
+        let ticket = hello.ticket().expect("a ticket");
+        assert!(!ticket.tls13, "a 1.2 ceiling mints a TLS 1.2 ticket");
+        assert!(extensions(&hello.msg[4..])
+            .iter()
+            .any(|entry| kind(entry) == SESSION_TICKET));
     }
 
     #[test]
