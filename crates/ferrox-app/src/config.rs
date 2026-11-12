@@ -1946,8 +1946,10 @@ fn source_filter(conf: Option<&Json>) -> Result<Option<ferrox_core::finalmask::S
     let Some(conf) = conf else {
         return Ok(None);
     };
-    if !matches!(conf, Json::Obj(_)) {
-        return Err(());
+    match conf {
+        Json::Null => return Ok(None),
+        Json::Obj(_) => {}
+        _ => return Err(()),
     }
     let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
     let blocked = filter_list(
@@ -3317,6 +3319,11 @@ mod tests {
         assert!(
             source_filter(not_an_object.get("settings")).is_err(),
             "settings that are not an object refuse the carrier"
+        );
+        let null = crate::json::parse(r#"{"settings":null}"#).expect("parses");
+        assert!(
+            source_filter(null.get("settings")).is_ok_and(|stage| stage.is_none()),
+            "null settings filter nothing, as absent ones do"
         );
     }
 
