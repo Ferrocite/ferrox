@@ -290,9 +290,31 @@ impl Connection {
         }
         #[cfg(not(unix))]
         {
+            // `read_ready` never waits on any platform: a Windows socket has no zero-timeout
+            // receive, so the probe asks for readability and lets `read` answer at once.
+            let _probe = crate::proxy::ProbeEmptyRead::new(true);
             self.read(buf)
         }
     }
+}
+
+/// Whether a Windows socket can be read without waiting. A failed poll counts as readable so the
+/// read itself reports the socket's state.
+#[cfg(windows)]
+fn readable_now(stream: &Connection) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPoll, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, WSAPOLLFD,
+    };
+    let mut row = WSAPOLLFD {
+        fd: stream.as_raw_socket() as SOCKET,
+        events: POLLIN | POLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: `row` is one live poll descriptor naming this connection's own socket.
+    let polled = unsafe { WSAPoll(&raw mut row, 1, 0) };
+    polled < 0
+        || (polled > 0 && row.revents & (POLLIN | POLLRDNORM | POLLERR | POLLHUP | POLLNVAL) != 0)
 }
 
 impl Connection {
@@ -406,6 +428,13 @@ fn recv_ready<S: std::os::fd::AsRawFd>(stream: &S, buf: &mut [u8]) -> io::Result
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A lane that parks on an empty read asks a Windows socket for readability first, so an
+        // empty one answers `WouldBlock` now and the lane waits on the socket, not on the clock.
+        #[cfg(windows)]
+        if crate::proxy::probe_empty_read() && !readable_now(self) {
+            crate::proxy::note_wait_fd(crate::proxy::wait_key(&*self));
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let result = match self {
             Connection::Tcp(stream) => stream.read(buf),
             Connection::Masked(masked) => masked.stream.read(buf),
@@ -2393,6 +2422,54 @@ mod tests {
             began.elapsed() < Duration::from_secs(1),
             "the read waited out its clock instead of handing the lane a park"
         );
+    }
+
+    /// The same contract on Windows, where the socket has no zero-timeout receive: a probed relay
+    /// read on an empty socket answers `WouldBlock` at once and names the socket the lane parks on,
+    /// and one with bytes waiting still delivers them.
+    #[cfg(windows)]
+    #[test]
+    fn a_probed_relay_read_never_waits_out_the_clock() {
+        use std::io::Write;
+        use std::os::windows::io::AsRawSocket;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::net::TcpStream::connect(addr).expect("connects");
+        let (side, _) = listener.accept().expect("accepts");
+        let mut stream = Connection::Tcp(side);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("arms the read clock");
+        let step = crate::proxy::RelayStep::enter();
+        let began = std::time::Instant::now();
+        let error = {
+            let _probe = crate::proxy::ProbeEmptyRead::new(true);
+            stream.read(&mut [0u8; 8]).expect_err("nothing was sent")
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an empty socket is a park, not an end: {error:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "the read waited out its clock instead of handing the lane a park"
+        );
+        assert_eq!(
+            crate::proxy::take_wait_fd(),
+            Some(stream.as_raw_socket()),
+            "the lane must learn the socket it waits on"
+        );
+        drop(step);
+
+        let mut peer = peer;
+        peer.write_all(b"ping").expect("sends");
+        let probe = crate::proxy::ProbeEmptyRead::new(true);
+        let mut buf = [0u8; 8];
+        let read = stream.read(&mut buf).expect("reads the sent bytes");
+        drop(probe);
+        assert_eq!(&buf[..read], b"ping");
     }
 
     /// A full socket answers the relay's offer at once instead of spending a worker in the send

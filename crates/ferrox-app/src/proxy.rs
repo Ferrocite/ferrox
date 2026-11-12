@@ -10921,6 +10921,33 @@ pub(crate) fn relay_step_owns_poll() -> bool {
 }
 
 thread_local! {
+    /// Set while a lane that parks on an empty read runs: a Windows carrier read asks the socket
+    /// for readability first, so an empty one answers `WouldBlock` and parks instead of spending
+    /// the poll quantum in the kernel.
+    static PROBE_EMPTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+pub(crate) fn probe_empty_read() -> bool {
+    PROBE_EMPTY.with(std::cell::Cell::get)
+}
+
+/// Arms the empty-read probe for the reads this value covers, restoring the previous arm on drop.
+pub(crate) struct ProbeEmptyRead(bool);
+
+impl ProbeEmptyRead {
+    pub(crate) fn new(on: bool) -> Self {
+        Self(PROBE_EMPTY.with(|slot| slot.replace(on)))
+    }
+}
+
+impl Drop for ProbeEmptyRead {
+    fn drop(&mut self) {
+        PROBE_EMPTY.with(|slot| slot.set(self.0));
+    }
+}
+
+thread_local! {
     /// The instant a request body must have arrived by: a framed or carrier read that keeps timing out past it ends the body instead of sleeping in an unauthenticated handler.
     static BODY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
@@ -32720,7 +32747,12 @@ where
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
         Box::new(move || {
-            let read = reader.read_window();
+            let read = {
+                // A carrier that parks on an empty read probes for readability on Windows, so the
+                // lane parks on the socket instead of waiting the poll quantum inside the read.
+                let _probe = ProbeEmptyRead::new(reader.parks_on_timeout());
+                reader.read_window()
+            };
             let (next, timed_out) = match read {
                 Ok(window) if !window.is_empty() => {
                     if upload.first {
