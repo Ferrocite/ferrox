@@ -1977,7 +1977,7 @@ fn filter_list(
 ) -> Result<Option<crate::router::IpMatcher>, ()> {
     match value {
         None | Some(Json::Null) => Ok(None),
-        Some(value) if value.as_arr().is_some_and(|items| items.is_empty()) => Ok(None),
+        Some(value) if value.as_arr().is_some_and(<[Json]>::is_empty) => Ok(None),
         Some(value) => crate::router::ip_matcher(value, assets, field)
             .map(Some)
             .map_err(|_| ()),
