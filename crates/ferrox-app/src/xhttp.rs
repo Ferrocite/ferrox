@@ -10,8 +10,10 @@ use base64::Engine as _;
 use ferrox_core::transport::url_decode_parts;
 
 pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
-/// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
+/// One relay window: a promoted read leaves in one framed offer, cut into the peer's chunk size.
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
+/// The chunk a response frames: the reference's HTTP writer hands its reader one `buf.Size` buffer at a time.
+const WIRE_CHUNK: usize = 8 * 1024;
 /// A whole body plus the longest size line that can precede it and both bytes that close the body, so one framing read opens and finishes it.
 const FRAMING_READ: usize = CHUNK + 131;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -1042,13 +1044,22 @@ impl XhttpWriter {
         let Ok(mut stream) = stream.lock() else {
             return false;
         };
-        for piece in data.chunks(CHUNK) {
-            if piece.is_empty() {
+        const PER_WINDOW: usize = CHUNK.div_ceil(WIRE_CHUNK);
+        for window in data.chunks(CHUNK) {
+            if window.is_empty() {
                 continue;
             }
-            let mut line = [0u8; 7];
-            let len = size_line(piece.len(), &mut line);
-            if !stream.write_slices(&[&line[..len], piece, b"\r\n"]) {
+            let mut lines = [[0u8; 7]; PER_WINDOW];
+            let mut parts: [&[u8]; PER_WINDOW * 3] = [&[]; PER_WINDOW * 3];
+            let mut kept = 0usize;
+            for (piece, line) in window.chunks(WIRE_CHUNK).zip(&mut lines) {
+                let len = size_line(piece.len(), line);
+                parts[kept] = &line[..len];
+                parts[kept + 1] = piece;
+                parts[kept + 2] = b"\r\n";
+                kept += 3;
+            }
+            if !stream.write_slices(&parts[..kept]) {
                 return false;
             }
         }
@@ -3911,9 +3922,9 @@ mod tests {
         }
     }
 
-    /// The sink frames one relay window once: `one_window_is_one_chunked_frame` counts the `write_slices` calls and reassembles their bytes, because a socket sees the bytes and not how many calls carried them.
+    /// The sink frames one relay window in one call: `one_window_is_one_framed_offer` counts the `write_slices` calls and reassembles their bytes, because a socket sees the bytes and not how many calls carried them.
     #[test]
-    fn one_window_is_one_chunked_frame() {
+    fn one_window_is_one_framed_offer() {
         #[derive(Default)]
         struct Frames {
             calls: usize,
@@ -3946,14 +3957,23 @@ mod tests {
         let seen = log.lock().expect("sink");
         assert_eq!(
             seen.calls, 1,
-            "a promoted window left as {} chunked frames",
+            "a promoted window left as {} framed offers",
             seen.calls
         );
-        let head = format!("{CHUNK:X}\r\n");
-        assert_eq!(seen.bytes.len(), head.len() + CHUNK + 2);
-        assert_eq!(&seen.bytes[..head.len()], head.as_bytes());
-        assert_eq!(&seen.bytes[head.len()..head.len() + CHUNK], &payload[..]);
-        assert_eq!(&seen.bytes[head.len() + CHUNK..], b"\r\n");
+        let head = format!("{WIRE_CHUNK:X}\r\n");
+        assert_eq!(
+            seen.bytes.len(),
+            (head.len() + WIRE_CHUNK + 2) * CHUNK.div_ceil(WIRE_CHUNK)
+        );
+        for (frame, payload) in seen
+            .bytes
+            .chunks(head.len() + WIRE_CHUNK + 2)
+            .zip(payload.chunks(WIRE_CHUNK))
+        {
+            assert_eq!(&frame[..head.len()], head.as_bytes());
+            assert_eq!(&frame[head.len()..head.len() + WIRE_CHUNK], payload);
+            assert_eq!(&frame[head.len() + WIRE_CHUNK..], b"\r\n");
+        }
     }
 
     #[test]
