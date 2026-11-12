@@ -80,8 +80,7 @@ pub(crate) struct H3Reader {
     wire: Wire,
     buf: Vec<u8>,
     room: Vec<u8>,
-    payload: Vec<u8>,
-    at: usize,
+    buf_at: usize,
     head: Option<Vec<u8>>,
     status: Option<u16>,
     frame_left: usize,
@@ -101,8 +100,7 @@ impl H3Reader {
             wire,
             buf: Vec::new(),
             room: Vec::new(),
-            payload: Vec::new(),
-            at: 0,
+            buf_at: 0,
             head: None,
             status: None,
             frame_left: 0,
@@ -169,12 +167,60 @@ impl H3Reader {
         }
     }
 
+    /// The buffered bytes an open DATA frame can hand out without a copy.
+    fn data_available(&self) -> bool {
+        self.frame_left > 0 && self.buf_at < self.buf.len()
+    }
+
+    /// Drop the consumed prefix, keeping an incomplete frame's header for the next read.
+    fn compact(&mut self) {
+        if self.buf_at == 0 {
+            return;
+        }
+        if self.buf_at == self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.buf.drain(..self.buf_at);
+        }
+        self.buf_at = 0;
+    }
+
+    /// Take one transport read into the framing buffer.
+    fn fill_room(&mut self) -> std::io::Result<()> {
+        self.compact();
+        self.reserve_room();
+        match self.wire.read(&mut self.room) {
+            Ok(0) => self.ended = true,
+            Ok(n) => {
+                self.buf.extend_from_slice(&self.room[..n]);
+                self.idle_since = None;
+            }
+            Err(error) if crate::proxy::is_timeout(&error) => {
+                if crate::proxy::body_deadline().is_some_and(|until| Instant::now() >= until) {
+                    return Err(error);
+                }
+                let since = *self.idle_since.get_or_insert_with(Instant::now);
+                if self.idle_expired(since) {
+                    return Err(std::io::Error::other("h3 request stalled"));
+                }
+                if crate::proxy::relay_step_owns_poll()
+                    && since.elapsed() >= crate::budgets::RELAY_POLL
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
     /// Parse the frames already buffered, then take one datagram's worth when nothing completes.
     fn step(&mut self) -> std::io::Result<()> {
         loop {
             if self.frame_left > 0 {
                 self.fill_data()?;
-                if !self.payload.is_empty() {
+                if self.data_available() {
                     self.idle_since = None;
                     return Ok(());
                 }
@@ -189,7 +235,7 @@ impl H3Reader {
             }
             if self.frame_left > 0 {
                 self.fill_data()?;
-                if !self.payload.is_empty() {
+                if self.data_available() {
                     self.idle_since = None;
                     return Ok(());
                 }
@@ -198,43 +244,16 @@ impl H3Reader {
                 }
                 continue;
             }
-            if self.ended || self.head.is_some() {
+            if self.ended {
                 return Ok(());
             }
-            self.reserve_room();
-            match self.wire.read(&mut self.room) {
-                Ok(0) => {
-                    self.ended = true;
-                    return Ok(());
-                }
-                Ok(n) => {
-                    self.buf.extend_from_slice(&self.room[..n]);
-                    self.idle_since = None;
-                }
-                Err(error) if crate::proxy::is_timeout(&error) => {
-                    if crate::proxy::body_deadline().is_some_and(|until| Instant::now() >= until) {
-                        return Err(error);
-                    }
-                    let since = *self.idle_since.get_or_insert_with(Instant::now);
-                    if self.idle_expired(since) {
-                        return Err(std::io::Error::other("h3 request stalled"));
-                    }
-                    if crate::proxy::relay_step_owns_poll()
-                        && since.elapsed() >= crate::budgets::RELAY_POLL
-                    {
-                        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-                    }
-                    std::thread::sleep(POLL);
-                }
-                Err(error) => return Err(error),
-            }
+            self.fill_room()?;
         }
     }
 
     /// Consume every complete frame in the buffer, leaving an incomplete one's header in place.
     fn parse(&mut self) -> std::io::Result<()> {
-        let mut at = 0usize;
-        let mut took = false;
+        let mut at = self.buf_at;
         loop {
             let start = at;
             let Some(frame) = frames::h3_frame(&self.buf, &mut at) else {
@@ -260,11 +279,9 @@ impl H3Reader {
                         "h3 data before headers",
                     ));
                 }
-                self.buf.drain(..at);
                 self.frame_left = length;
+                self.buf_at = at;
                 if length == 0 {
-                    at = 0;
-                    took = false;
                     continue;
                 }
                 return Ok(());
@@ -297,61 +314,27 @@ impl H3Reader {
                 frames::H3_RESET => self.ended = true,
                 _ => {}
             }
-            took = true;
+            self.buf_at = at;
         }
-        if took {
-            self.buf.drain(..at);
-        }
+        self.buf_at = at;
         Ok(())
     }
 
-    /// Take the next piece of the DATA frame now open, reading only that frame's remaining bytes.
+    /// Make the next piece of the open DATA frame available, reading only its remaining bytes.
     fn fill_data(&mut self) -> std::io::Result<()> {
+        if self.frame_left == 0 {
+            return Ok(());
+        }
         loop {
-            if self.frame_left == 0 {
+            if self.data_available() {
                 return Ok(());
             }
-            if !self.buf.is_empty() {
-                let take = self.frame_left.min(self.buf.len());
-                self.payload.extend_from_slice(&self.buf[..take]);
-                self.buf.drain(..take);
-                self.frame_left -= take;
-                return Ok(());
-            }
-            self.reserve_room();
-            match self.wire.read(&mut self.room) {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "h3 data frame ended early",
-                    ));
-                }
-                Ok(n) => {
-                    let take = n.min(self.frame_left);
-                    self.payload.extend_from_slice(&self.room[..take]);
-                    if n > take {
-                        self.buf.extend_from_slice(&self.room[take..n]);
-                    }
-                    self.frame_left -= take;
-                    self.idle_since = None;
-                    return Ok(());
-                }
-                Err(error) if crate::proxy::is_timeout(&error) => {
-                    if crate::proxy::body_deadline().is_some_and(|until| Instant::now() >= until) {
-                        return Err(error);
-                    }
-                    let since = *self.idle_since.get_or_insert_with(Instant::now);
-                    if self.idle_expired(since) {
-                        return Err(std::io::Error::other("h3 request stalled"));
-                    }
-                    if crate::proxy::relay_step_owns_poll()
-                        && since.elapsed() >= crate::budgets::RELAY_POLL
-                    {
-                        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-                    }
-                    std::thread::sleep(POLL);
-                }
-                Err(error) => return Err(error),
+            self.fill_room()?;
+            if self.ended {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "h3 data frame ended early",
+                ));
             }
         }
     }
@@ -360,20 +343,18 @@ impl H3Reader {
         if self.expired() {
             return Err(std::io::Error::other("h3 request stalled"));
         }
-        if self.at < self.payload.len() {
+        if self.data_available() {
             return Ok(true);
         }
-        self.payload.clear();
-        self.at = 0;
         if self.ended {
             return Ok(false);
         }
         if self.frame_left > 0 {
             self.fill_data()?;
-            return Ok(!self.payload.is_empty());
+            return Ok(self.data_available());
         }
         self.step()?;
-        Ok(self.at < self.payload.len())
+        Ok(self.data_available())
     }
 }
 
@@ -397,9 +378,10 @@ impl Read for H3Reader {
         if !more {
             return Ok(0);
         }
-        let n = (self.payload.len() - self.at).min(buf.len());
-        buf[..n].copy_from_slice(&self.payload[self.at..self.at + n]);
-        self.at += n;
+        let n = self.frame_left.min(self.buf.len() - self.buf_at).min(buf.len());
+        buf[..n].copy_from_slice(&self.buf[self.buf_at..self.buf_at + n]);
+        self.buf_at += n;
+        self.frame_left -= n;
         Ok(n)
     }
 }
@@ -411,9 +393,12 @@ impl crate::proxy::WindowRead for H3Reader {
         if !more {
             return Ok(crate::proxy::Window::empty());
         }
-        let start = self.at;
-        self.at = self.payload.len();
-        Ok(crate::proxy::Window::one(&self.payload[start..]))
+        let start = self.buf_at;
+        let n = (self.buf.len() - start).min(self.frame_left);
+        let end = start + n;
+        self.buf_at = end;
+        self.frame_left -= n;
+        Ok(crate::proxy::Window::one(&self.buf[start..end]))
     }
 }
 
@@ -1339,6 +1324,36 @@ mod tests {
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("the answer reads");
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn a_data_frame_window_is_the_readers_own_buffer() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let tls = ferrox_core::tls::TlsConfig {
+            server_name: "localhost".to_owned(),
+            roots: roots.into(),
+            ..Default::default()
+        };
+        let (mut reader, writer) = connect_split("127.0.0.1", port, "localhost", &settings, &tls)
+            .expect("the h3 stream opens");
+        let payload: Vec<u8> = (0..16 * 1024).map(|byte| (byte % 251) as u8).collect();
+        assert!(writer.send(&payload));
+        writer.finish();
+        let (ptr, len) = {
+            let window =
+                crate::proxy::WindowRead::read_window(&mut reader).expect("the answer window");
+            assert!(!window.is_empty(), "the answer has a body");
+            (window.bytes().as_ptr() as usize, window.bytes().len())
+        };
+        let base = reader.buf.as_ptr() as usize;
+        let cap = reader.buf.capacity();
+        assert!(
+            ptr >= base && ptr + len <= base + cap,
+            "the window is the reader's own buffer"
+        );
     }
 
     #[test]
