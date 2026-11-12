@@ -3339,7 +3339,7 @@ mod tests {
         let Carrier::Kcp(config) = stream_carrier(Some(&udp)) else {
             panic!("a filtered kcp carrier");
         };
-        assert!(!config.filters.is_empty());
+        assert!(matches!(config.filters.as_slice(), [_, ..]));
         assert!(config.mask.is_empty(), "the filter writes no byte");
         let malformed = crate::json::parse(
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"filter","settings":{"blockedSourceIPs":["192.0.2.0/33"]}}]}}"#,
