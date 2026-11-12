@@ -1003,10 +1003,7 @@ fn serve_vless_inbound(
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
-            thread::spawn(move || {
-                serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
-            });
-            true
+            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path),
         "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
@@ -1067,19 +1064,34 @@ fn serve_hysteria_thread(
     identity: &ferrox_core::tls::TlsServerConfig,
     masq: &ferrox_core::hysteria::Masquerade,
     serve: &crate::hysteria::Serve,
-) {
-    crate::hysteria::serve_loop(
+) -> bool {
+    let Some(prepared) = crate::hysteria::prepare(
         address,
-        std::slice::from_ref(&config.auth),
         identity,
         config.cc,
         &config.obfs_password,
-        masq,
-        serve,
-        std::time::Duration::from_secs(config.udp_idle),
         config.quic.as_ref(),
-        config.realm.as_deref(),
-    );
+    ) else {
+        return false;
+    };
+    let auth = config.auth.clone();
+    let udp_idle = std::time::Duration::from_secs(config.udp_idle);
+    let quic = config.quic;
+    let realm = config.realm.clone();
+    let masq = masq.clone();
+    let serve = Arc::clone(serve);
+    thread::spawn(move || {
+        crate::hysteria::serve_prepared(
+            prepared,
+            std::slice::from_ref(&auth),
+            &masq,
+            &serve,
+            udp_idle,
+            quic.as_ref(),
+            realm.as_deref(),
+        );
+    });
+    true
 }
 
 thread_local! {
@@ -4177,6 +4189,7 @@ pub(crate) struct ShadowsocksOut {
     pool: Pools,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
+    hysteria_roots: Option<ferrox_core::tls::Anchors>,
 }
 
 impl VmessOut {
@@ -12695,6 +12708,58 @@ fn dial_ss_kcp(
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
 }
 
+fn ss_hysteria_dial(ss: &ShadowsocksOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &ss.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: ss.host.clone(),
+        address: ss.address.clone(),
+        port: ss.port,
+        config: config.clone(),
+        roots: ss.hysteria_roots.clone(),
+    })
+}
+
+fn dial_ss_hysteria(
+    client: &Connection,
+    dial: &crate::hysteria::Dial,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+) {
+    let mut head = Vec::with_capacity(128);
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut head,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let Some(flow) = crate::hysteria::open(dial, &head, 0) else {
+            return;
+        };
+        let reader = crate::hysteria::FlowRead::new(flow.clone());
+        let closer = flow.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        crate::shadowsocks2022::pump_relay_carried(client, reader, flow, &close, send, recv);
+        return;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut head, &ss.password, &ss.method, target)
+    else {
+        return;
+    };
+    let Some(flow) = crate::hysteria::open(dial, &head, 0) else {
+        return;
+    };
+    let reader = crate::hysteria::FlowRead::new(flow.clone());
+    let closer = flow.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    crate::shadowsocks::pump_relay_carried(client, reader, flow, &close, send, recv);
+}
+
 fn serve_ss_kcp_tls(
     conn: &Arc<ferrox_core::kcp::Connection>,
     accounts: &crate::shadowsocks::SsAccounts,
@@ -13478,10 +13543,9 @@ fn serve_trojan_transport_inbound(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
     });
-    thread::spawn(move || {
-        serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
-    });
-    Some(true)
+    Some(serve_hysteria_thread(
+        &owned, &config, &identity, &masq, &serve,
+    ))
 }
 
 fn serve_trojan_quic_inbound(
@@ -13583,6 +13647,33 @@ fn serve_trojan_quic_tcp(stream: crate::quic::QuicStream, target: &SocketAddr) {
             let _ = fin.fin();
         },
     );
+}
+
+fn serve_ss_hysteria(
+    io: crate::hysteria::Flow,
+    accounts: &crate::shadowsocks::SsAccounts,
+    freedom: bool,
+) {
+    if !freedom {
+        io.close();
+        return;
+    }
+    let reader = crate::hysteria::FlowRead::new(io.clone());
+    let closer = io.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    if accounts.is_2022 {
+        crate::shadowsocks2022::serve_kcp(
+            reader,
+            io,
+            &accounts.password,
+            &accounts.method,
+            &accounts.identities,
+            freedom,
+            &close,
+        );
+    } else {
+        crate::shadowsocks::serve_kcp(reader, io, &accounts.users, freedom, &close);
+    }
 }
 
 fn serve_trojan_hysteria(mut io: crate::hysteria::Flow, key: &[[u8; 56]], freedom: bool) {
@@ -14591,9 +14682,16 @@ fn serve_ss_relay_inbound(
 fn serve_ss_relay_front(
     address: &str,
     inbound: &Json,
-    accounts: &crate::shadowsocks::SsAccounts,
+    accounts: &Arc<crate::shadowsocks::SsAccounts>,
     carrier: &Carrier,
+    freedom: bool,
 ) -> Option<bool> {
+    if let Carrier::Hysteria(config) = carrier {
+        let tcp = inbound_ss_networks(inbound).0;
+        return Some(serve_ss_hysteria_front(
+            config, address, inbound, accounts, tcp, freedom,
+        ));
+    }
     if !matches!(carrier, Carrier::Raw(_)) {
         return None;
     }
@@ -14633,6 +14731,44 @@ fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
     (tcp, udp)
 }
 
+/// Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+fn serve_ss_hysteria_front(
+    config: &ferrox_core::hysteria::Config,
+    address: &str,
+    inbound: &Json,
+    accounts: &Arc<crate::shadowsocks::SsAccounts>,
+    tcp: bool,
+    freedom: bool,
+) -> bool {
+    if !tcp {
+        return false;
+    }
+    if config.version != 2 {
+        eprintln!(
+            "hysteria v{} carrier in shadowsocks is not the v2 serve `hysteria` names: serves nothing",
+            config.version
+        );
+        return false;
+    }
+    let Some(settings) = inbound.get("streamSettings") else {
+        eprintln!("unreadable hysteria identity in shadowsocks: serves nothing");
+        return false;
+    };
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+        eprintln!("unreadable hysteria identity in shadowsocks: serves nothing");
+        return false;
+    };
+    let masq = crate::config::masquerade_from_stream(Some(settings));
+    let config = config.clone();
+    let accounts = Arc::clone(accounts);
+    let owned = address.to_owned();
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_ss_hysteria(flow.with_meter(meter.clone()), &accounts, freedom);
+    });
+    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+}
+
 fn serve_shadowsocks_inbound(
     address: &str,
     inbound: &Json,
@@ -14647,7 +14783,7 @@ fn serve_shadowsocks_inbound(
     let accounts = ss_accounts(inbound, address, password, method, configured);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
-    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier) {
+    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom) {
         return served;
     }
     // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
@@ -23211,6 +23347,12 @@ fn serve_connect_at(
         if matches!(ss.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
                 dial_ss_kcp(&client, &session, ss, asked);
+            }
+            return;
+        }
+        if matches!(ss.carrier, Carrier::Hysteria(_)) {
+            if let Some(dial) = ss_hysteria_dial(ss) {
+                dial_ss_hysteria(&client, &dial, ss, asked);
             }
             return;
         }
@@ -35052,7 +35194,7 @@ fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
             | "mkcp"
     );
     match (security, network) {
-        ("tls", "xdrive") => None,
+        ("tls", "xdrive" | "hysteria") => None,
         ("tls", _) if tls_carried => outbound_tls(
             outbound,
             server
@@ -36276,6 +36418,7 @@ fn loopback_shadowsocks(
         pool: Pools::default(),
         tls: None,
         reality: None,
+        hysteria_roots: None,
         headers,
         heartbeat,
     }))
@@ -37241,6 +37384,8 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 continue;
             }
         };
+        // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+        let hysteria_tls = hysteria_transport(outbound) && stream_security(outbound) == "tls";
         // The store's own lanes speak the handshake, so a tls xdrive row adds no second one and keeps the row.
         if let Some((carrier, host)) = xdrive_carried(outbound, &address) {
             return Some(ShadowsocksOut {
@@ -37254,6 +37399,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 pool: Pools::default(),
                 tls: None,
                 reality: None,
+                hysteria_roots: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
@@ -37288,6 +37434,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 pool: Pools::default(),
                 tls: None,
                 reality: Some(reality),
+                hysteria_roots: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
@@ -37295,6 +37442,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
         let (carrier, host) = outbound_carrier(outbound, &address);
         let tls = match stream_security(outbound) {
             "" | "none" => None,
+            "tls" if hysteria_tls => None,
             "tls" => {
                 let Ok(tls) = outbound_tls(outbound, &address) else {
                     continue;
@@ -37302,6 +37450,10 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 Some(tls)
             }
             _ => continue,
+        };
+        let hysteria_roots = match &carrier {
+            Carrier::Hysteria(_) => tls_ca_roots(outbound),
+            _ => None,
         };
         return Some(ShadowsocksOut {
             address,
@@ -37314,6 +37466,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             pool: Pools::default(),
             tls,
             reality: None,
+            hysteria_roots,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
@@ -51776,6 +51929,7 @@ mod tests {
             reality: None,
             headers: Vec::new(),
             heartbeat: 0,
+            hysteria_roots: None,
         };
         let conn = ferrox_core::kcp::dial(
             format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -51866,6 +52020,7 @@ mod tests {
                 reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
+                hysteria_roots: None,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -54724,6 +54879,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -56574,6 +56730,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -56637,6 +56794,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -56715,6 +56873,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -56799,6 +56958,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         };
@@ -57027,6 +57187,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -57107,6 +57268,7 @@ mod tests {
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         });
@@ -70746,6 +70908,7 @@ end
             pool: Pools::default(),
             tls: None,
             reality: None,
+            hysteria_roots: None,
             headers: Vec::new(),
             heartbeat: 0,
         }));
