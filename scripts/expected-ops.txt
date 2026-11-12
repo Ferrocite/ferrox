@@ -221,7 +221,7 @@ ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_
 ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
 # The four-slice SSH packet sealed 4096 times through the direct write reports
 # 47475578; flattening the same slices into one and sealing that reports
-# 47621526 on the current base. The direct probe is 145948 (0.31%) lower, a net
+# 47621538 on the current base. The direct probe is 145960 (0.31%) lower, a net
 # that includes the flatten copy and the four-slices-versus-one effect, not the
 # previous writer's framing loop. The bytes and their order are unchanged; the
 # direct row moved by 8192 (two instructions per write) when removing the udp
