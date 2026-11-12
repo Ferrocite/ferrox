@@ -244,7 +244,7 @@ impl H3Reader {
                 }
                 continue;
             }
-            if self.ended {
+            if self.ended || self.head.is_some() {
                 return Ok(());
             }
             self.fill_room()?;
