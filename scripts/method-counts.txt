@@ -695,6 +695,9 @@ unix unix-stream-bytes-preserved 65536 ferrox-app-conn::tests::a_unix_connection
 unix unix-head-not-vector-multiple 1501 ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split
 unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout_arms_the_way_the_tcp_one_does
 unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
+unix unix-abstract-name-served 27 ferrox-app-conn::tests::a_unix_abstract_name_is_bound_and_dialed
+unix unix-abstract-padded-field 108 ferrox-app-conn::tests::a_doubled_unix_at_names_the_padded_abstract_name
+unix unix-permission-mode 504 ferrox-app-conn::tests::a_unix_listener_takes_the_permission_it_names
 
 # --- tun device inbound -----------------------------------------------------
 front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh

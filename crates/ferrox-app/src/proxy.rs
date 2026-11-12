@@ -6682,50 +6682,11 @@ fn family_addr(family: u8, host: &str, port: u16) -> Option<SocketAddr> {
     })
 }
 
-/// The unix path the row's dest spells, as the abstract name behind an `@` where the host
-/// serves one and the filesystem path behind everything else. A host without the family's
-/// own takes, the text a dialect like `@@`'s, dials the path it spells.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn unix_peer(path: &str) -> Option<Connection> {
-    use std::os::linux::net::SocketAddrExt;
-
-    if let Some(name) = path.strip_prefix('@') {
-        let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()) else {
-            return None;
-        };
-        let Ok(stream) = std::os::unix::net::UnixStream::connect_addr(&addr) else {
-            return None;
-        };
-        return Some(Connection::from(stream));
-    }
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(path) else {
-        return None;
-    };
-    Some(Connection::from(stream))
-}
-
-/// A cygwin host whose std has no abstract-name arm: the text dials the path it spells.
-#[cfg(target_os = "cygwin")]
-fn unix_peer(path: &str) -> Option<Connection> {
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(path) else {
-        return None;
-    };
-    Some(Connection::from(stream))
-}
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android", target_os = "cygwin"))
-))]
-fn unix_peer(path: &str) -> Option<Connection> {
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(path) else {
-        return None;
-    };
-    Some(Connection::from(stream))
-}
-
-/// A windows host whose std keeps the family behind a feature: the seam's own dial serves it.
-#[cfg(windows)]
+/// The unix path the row's dest spells, dialed through the seam so the `@` and `@@` abstract
+/// spellings and the filesystem path are read in the one place the inbound that serves the row
+/// binds them. A dest that names no usable address, or a dial that fails, leaves the row
+/// undialable rather than taking a second path of its own.
+#[cfg(any(unix, windows))]
 fn unix_peer(path: &str) -> Option<Connection> {
     crate::conn::connect(&crate::conn::Target::Unix(path.into()), budgets::dial()).ok()
 }

@@ -1331,19 +1331,17 @@ pub(crate) enum Listener {
 }
 
 impl Listener {
-    /// Bind a listener for the target's family. A Unix path left from a previous run is unlinked
-    /// first: binding over an existing socket file fails `EADDRINUSE`, and a stale socket nobody
-    /// owns is exactly that — the same unlink-then-bind recovery the references do.
+    /// Bind a listener for the target's family. A unix target is read the way the reference's
+    /// listener reads it: an `@` name is Linux's abstract namespace, a second `@` pads it across
+    /// the kernel's whole `sun_path`, and a path may carry one comma-separated octal mode applied
+    /// after binding. A path left from a previous run is unlinked first: binding over an existing
+    /// socket file fails `EADDRINUSE`, and a stale socket nobody owns is exactly that — the same
+    /// unlink-then-bind recovery the references do.
     pub(crate) fn bind(target: &Target) -> io::Result<Listener> {
         match target {
             Target::Ip(addr) => std::net::TcpListener::bind(addr).map(Listener::Tcp),
             #[cfg(any(unix, windows))]
-            Target::Unix(path) => {
-                if std::fs::symlink_metadata(path).is_ok() {
-                    std::fs::remove_file(path)?;
-                }
-                UnixListener::bind(path).map(Listener::Unix)
-            }
+            Target::Unix(path) => bind_unix(path).map(Listener::Unix),
         }
     }
 
@@ -1538,14 +1536,102 @@ pub(crate) fn connect(target: &Target, timeout: Duration) -> io::Result<Connecti
     }
 }
 
+/// The abstract-namespace name a unix target text names, on the hosts whose kernel serves one: a
+/// leading `@` marks it, and a second `@` asks for the name padded across the kernel's whole
+/// `sun_path` — the spelling haproxy's sockets use, which the reference's listener reads the same
+/// way. Any other text, and any text on a host with no abstract namespace, is a filesystem path.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn abstract_name(path: &std::path::Path) -> Option<(&[u8], bool)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let rest = path.as_os_str().as_bytes().strip_prefix(b"@")?;
+    Some(match rest.strip_prefix(b"@") {
+        Some(name) => (name, true),
+        None => (rest, false),
+    })
+}
+
+/// The one comma-separated octal permission the reference's listener takes after a socket path,
+/// split before anything touches the filesystem. Exactly one comma is the spelling; another count
+/// stays part of the path, which is what the reference's own split leaves behind.
+#[cfg(unix)]
+fn split_permission(path: &std::path::Path) -> io::Result<(&std::path::Path, Option<u32>)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_os_str().as_bytes();
+    let Some(comma) = bytes.iter().position(|byte| *byte == b',') else {
+        return Ok((path, None));
+    };
+    if bytes[comma + 1..].contains(&b',') {
+        return Ok((path, None));
+    }
+    let text = std::str::from_utf8(&bytes[comma + 1..]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a unix permission is not octal",
+        )
+    })?;
+    let mode = u32::from_str_radix(text, 8).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a unix permission is not octal",
+        )
+    })?;
+    let head = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..comma]));
+    Ok((head, Some(mode)))
+}
+
+/// Bind a unix listener from the text a config names: an abstract name on the hosts that serve
+/// one, else a filesystem path after the permission the reference accepts is split off, the stale
+/// socket removed, and the requested mode applied once the socket exists.
+#[cfg(unix)]
+fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some((name, padded)) = abstract_name(path) {
+        return abstract_listener(name, padded);
+    }
+    let (path, perm) = split_permission(path)?;
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path)?;
+    if let Some(mode) = perm {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(listener)
+}
+
+#[cfg(windows)]
+fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path)?;
+    Ok(listener)
+}
+
 /// One nonblocking `connect` waited out with `poll`, so a full backlog costs the budget and not the
 /// flow's thread, and a listener that answers at once still does.
 #[cfg(unix)]
 fn unix_connect(path: &std::path::Path, timeout: Duration) -> io::Result<Connection> {
     use socket2::{Domain, SockAddr, Socket, Type};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some((name, padded)) = abstract_name(path) {
+        return abstract_connect(name, padded, timeout);
+    }
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-    connect_bounded(&socket, &SockAddr::unix(path)?, timeout)?;
+    connect_bounded(&socket, &SockAddr::unix(unix_dial_path(path))?, timeout)?;
     Ok(unix_connection(socket))
+}
+
+/// The path a dial reads from the same text a listener takes: an octal mode suffix belongs to the
+/// listener, not the name, so it is split off here too. A suffix that is not octal names a file
+/// literally, which is the only such text a peer outside this tree could have bound.
+#[cfg(unix)]
+fn unix_dial_path(path: &std::path::Path) -> &std::path::Path {
+    match split_permission(path) {
+        Ok((head, Some(_))) => head,
+        _ => path,
+    }
 }
 
 /// `connect_timeout`, with a peer that accepts and closes at once taken as connected: the kernel wakes the connect's poll with a hangup and no error set, which socket2 reports as `Other`. Linux's full `AF_UNIX` queue is named here too — the same hangup with no error set, which is a refusal rather than a connection.
@@ -1575,13 +1661,15 @@ fn unix_connection(socket: socket2::Socket) -> Connection {
     Connection::Unix(UnixStream::from(std::os::fd::OwnedFd::from(socket)))
 }
 
-/// Connect Linux's abstract namespace, whose address is bytes rather than a path, under the same
-/// budget the named arm spends.
-#[cfg(target_os = "linux")]
-pub(crate) fn connect_abstract(name: &[u8], timeout: Duration) -> io::Result<Connection> {
-    use socket2::{Domain, SockAddr, Socket, Type};
-    // SAFETY: `try_init` hands over zeroed storage sized for any address, and the family and length written into it describe the `sockaddr_un` filled here.
-    let ((), address) = unsafe {
+/// The `sockaddr_un` an abstract name fills: the leading zero is the namespace's marker, as
+/// `from_abstract_name` writes it, and a padded name declares itself through the kernel's whole
+/// `sun_path` so it meets a peer that spelled it the haproxy way. The tail past a short name
+/// stays zero, which `try_init` hands over.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn abstract_address(name: &[u8], padded: bool) -> io::Result<socket2::SockAddr> {
+    use socket2::SockAddr;
+    // SAFETY: `try_init` hands over zeroed storage sized for any address, and the family, marker and length written into it describe the `sockaddr_un` filled here; no byte past `sun_path` is addressed.
+    unsafe {
         SockAddr::try_init(|storage, length| {
             let address = storage.cast::<libc::sockaddr_un>();
             let field = (*address).sun_path.len();
@@ -1593,18 +1681,48 @@ pub(crate) fn connect_abstract(name: &[u8], timeout: Duration) -> io::Result<Con
             }
             (*address).sun_family = libc::AF_UNIX as libc::sa_family_t;
             let path = std::ptr::addr_of_mut!((*address).sun_path).cast::<u8>();
-            // The leading zero is the abstract namespace's marker, as `from_abstract_name` writes it.
             for (at, byte) in name.iter().enumerate() {
                 *path.add(at + 1) = *byte;
             }
-            *length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len())
-                as libc::socklen_t;
+            let base = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            *length = if padded {
+                base + field
+            } else {
+                base + 1 + name.len()
+            } as libc::socklen_t;
             Ok(())
         })
-    }?;
+        .map(|((), address)| address)
+    }
+}
+
+/// Bind the abstract name and listen on it. Nothing on disk names it, so there is no stale entry
+/// to unlink, and the name leaves with the socket's last descriptor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn abstract_listener(name: &[u8], padded: bool) -> io::Result<UnixListener> {
+    use socket2::{Domain, Socket, Type};
+    let address = abstract_address(name, padded)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.bind(&address)?;
+    socket.listen(128)?;
+    Ok(UnixListener::from(std::os::fd::OwnedFd::from(socket)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn abstract_connect(name: &[u8], padded: bool, timeout: Duration) -> io::Result<Connection> {
+    use socket2::{Domain, Socket, Type};
+    let address = abstract_address(name, padded)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     connect_bounded(&socket, &address, timeout)?;
     Ok(unix_connection(socket))
+}
+
+/// Connect Linux's abstract namespace, whose address is bytes rather than a path, under the same
+/// budget the named arm spends. This is the route a webhook's `@name` URL takes, which names the
+/// namespace without the `unix:` spelling the config reader takes.
+#[cfg(target_os = "linux")]
+pub(crate) fn connect_abstract(name: &[u8], timeout: Duration) -> io::Result<Connection> {
+    abstract_connect(name, false, timeout)
 }
 
 /// The seam's `AF_UNIX` arm on the host whose `std` keeps `UnixStream` behind the unstable
@@ -2374,6 +2492,132 @@ mod tests {
             Listener::bind(&Target::Unix(long)).is_err(),
             "a path past the socket address field is refused, not truncated and bound"
         );
+    }
+
+    /// A config naming `unix:@name` names Linux's abstract namespace, not a file called `@name`:
+    /// a raw client that spells the name the kernel's own way must reach the listener, and the
+    /// seam's own dial must land on it too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unix_abstract_name_is_bound_and_dialed() {
+        use std::os::linux::net::SocketAddrExt;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("ferrox-abstract-{:07}-{:03}", std::process::id(), id);
+        assert_eq!(name.len(), 27, "the witness spells a 27-byte abstract name");
+        let target = parse_target(&format!("unix:@{name}")).expect("the spelling parses");
+        let listener = Listener::bind(&target).expect("binds the abstract name");
+        std::fs::remove_file(format!("@{name}")).ok();
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+            .expect("an abstract address");
+        let mut raw = std::os::unix::net::UnixStream::connect_addr(&address)
+            .expect("a raw abstract client reaches the listener");
+        let (mut server, _) = listener.accept().expect("accepts the raw client");
+        server.write_all(b"r").expect("writes");
+        let mut byte = [0u8; 1];
+        raw.read_exact(&mut byte).expect("reads");
+        assert_eq!(&byte, b"r", "the abstract listener answers the raw client");
+
+        let mut seam =
+            connect(&target, Duration::from_secs(5)).expect("the seam dials the abstract name");
+        let (mut server, _) = listener.accept().expect("accepts the seam's dial");
+        server.write_all(b"s").expect("writes");
+        seam.read_exact(&mut byte).expect("reads the second answer");
+        assert_eq!(&byte, b"s", "the seam's dial lands on the same listener");
+    }
+
+    /// A second `@` asks for the name padded across the kernel's whole `sun_path`, the spelling
+    /// haproxy's sockets use: a peer that fills the field — as the reference's dialer does — must
+    /// find it, where the short spelling would name a different address.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_doubled_unix_at_names_the_padded_abstract_name() {
+        use socket2::{Domain, Socket, Type};
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("ferrox-padded-{:07}-{:03}", std::process::id(), id);
+        let target = parse_target(&format!("unix:@@{name}")).expect("the spelling parses");
+        let listener = Listener::bind(&target).expect("binds the padded abstract name");
+        std::fs::remove_file(format!("@@{name}")).ok();
+        // SAFETY: the storage `try_init` hands over is zeroed and sized for any address; the family, marker, name and length written here describe the `sockaddr_un`.
+        let ((), address) = unsafe {
+            socket2::SockAddr::try_init(|storage, length| {
+                let address = storage.cast::<libc::sockaddr_un>();
+                let field = (*address).sun_path.len();
+                (*address).sun_family = libc::AF_UNIX as libc::sa_family_t;
+                let path = std::ptr::addr_of_mut!((*address).sun_path).cast::<u8>();
+                for (at, byte) in name.as_bytes().iter().enumerate() {
+                    *path.add(at + 1) = *byte;
+                }
+                *length =
+                    (std::mem::offset_of!(libc::sockaddr_un, sun_path) + field) as libc::socklen_t;
+                Ok(())
+            })
+        }
+        .expect("the padded address");
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).expect("a unix socket");
+        socket
+            .connect(&address)
+            .expect("a padded abstract client reaches the listener");
+        let mut raw = UnixStream::from(std::os::fd::OwnedFd::from(socket));
+        let (mut server, _) = listener.accept().expect("accepts the padded client");
+        server.write_all(b"p").expect("writes");
+        let mut byte = [0u8; 1];
+        raw.read_exact(&mut byte).expect("reads");
+        assert_eq!(&byte, b"p", "the padded listener answers the padded client");
+    }
+
+    /// The comma-separated octal mode the references take after a socket path is applied to the
+    /// socket file the listener creates, so a peer that names only the path reaches it under the
+    /// mode the config asked for.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_listener_takes_the_permission_it_names() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-perm-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0770", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds the named path with its mode");
+        let mode = std::fs::metadata(&path)
+            .expect("the socket file the listener created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o770,
+            "the listener applies the mode the address names"
+        );
+        let plain =
+            parse_target(&format!("unix:{}", path.display())).expect("the bare path parses");
+        let mut client = connect(&plain, Duration::from_secs(5))
+            .expect("a client that names only the path reaches the listener");
+        let (mut server, _) = listener.accept().expect("accepts");
+        server.write_all(b"m").expect("writes");
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).expect("reads");
+        assert_eq!(
+            &byte, b"m",
+            "the mode never changed the address the client names"
+        );
+        let mut spelled = connect(&target, Duration::from_secs(5))
+            .expect("the seam dials the same mode-suffixed text the listener took");
+        let (mut server, _) = listener.accept().expect("accepts the spelled dial");
+        server.write_all(b"s").expect("writes");
+        spelled
+            .read_exact(&mut byte)
+            .expect("reads the second answer");
+        assert_eq!(
+            &byte, b"s",
+            "the mode is a listener spelling, never part of the dialed name"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
