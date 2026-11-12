@@ -110,6 +110,19 @@ selftest_gaps() {
   scenario_kept vless-raw-down-16 || { echo "selftest: --exclude took the down-16 neighbour" >&2; failed=1; }
   scenario_kept vless-raw-down-1 && { echo "selftest: --exclude kept its own rung" >&2; failed=1; }
   only=(); exclude=()
+  matrix_warp_needs_external_reference warp-masque-down-8 \
+    || { echo "selftest: a WARP cell no longer needs an external reference" >&2; failed=1; }
+  matrix_warp_needs_external_reference masque-down-8 \
+    && { echo "selftest: a plain MASQUE cell was taken for a WARP cell" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core warp-masque-down-8 server \
+    | grep -q "CONNECT-IP" \
+    || { echo "selftest: the xray-core WARP server skip lost its reason" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core warp-masque-down-8 client \
+    | grep -q "no WARP carrier" \
+    || { echo "selftest: the xray-core WARP client skip lost its reason" >&2; failed=1; }
+  matrix_engine_skip_reason zeronet warp-masque-down-8 client \
+    | grep -q "ADDRESS_ASSIGN" \
+    || { echo "selftest: the ZeroNet WARP client skip lost its reason" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
@@ -466,6 +479,12 @@ while read -r id traffic connections iterations payload duration_ms; do
   if [[ "$id" == hysteria-v1-* ]] && ! engine_path sing-box >/dev/null; then
     note "skipping $id: Hysteria v1 needs sing-box as its reference"
     echo "# $id: skipped, Hysteria v1 needs sing-box as its reference" >>"$out/commands.sh"
+    continue
+  fi
+  if matrix_warp_needs_external_reference "$id" \
+    && ! engine_path aether >/dev/null; then
+    note "skipping $id: no external WARP reference on this host"
+    echo "# $id: skipped, no external WARP reference on this host" >>"$out/commands.sh"
     continue
   fi
   if matrix_udp_carrier "$id"; then

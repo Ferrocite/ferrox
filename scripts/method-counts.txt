@@ -1016,8 +1016,14 @@ carrier-foxy connect-udp-path-forms-witnessed 8 ferrox-app-masque::tests::a_udp_
 carrier-foxy connect-udp-auth-schemes-witnessed 5 ferrox-app-masque::tests::a_udp_pass_is_a_bearer_secret_or_a_basic_credential
 warp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 warp registration-api-calls 3 ferrox-app-warp::tests::a_registration_is_register_enroll_enable
+warp registration-api-calls-wg 2 ferrox-app-warp::tests::a_wireguard_slot_registers_without_enrolling_masque
+warp register-kinds 6 ferrox-app-warp::tests::six_register_kinds_parse
+warp identity-files-all 5 ferrox-app-warp::tests::every_slot_derives_beside_its_own_first_hop
 warp tunnel-halves-built 2 ferrox-app-warp::tests::a_registered_identity_builds_both_tunnels
 warp identity-file-mode 600 ferrox-app-warp::tests::an_identity_survives_a_save_and_load
+warp api-address-dial-port 8443 ferrox-app-warp::tests::an_api_address_moves_the_dial_not_the_name
+warp refused-statuses 3 ferrox-app-warp::tests::a_refused_read_back_is_told_apart_from_an_outage
+warp reprovision-off-spellings 3 ferrox-app-warp::tests::three_spellings_turn_reprovisioning_off
 warp race-first-winner wireguard ferrox-app-warp::tests::the_first_answering_half_wins_the_race
 warp race-surviving-lane masque ferrox-app-warp::tests::a_failed_probe_does_not_end_the_race
 warp race-fallback-lane wireguard ferrox-app-warp::tests::two_failed_probes_fall_back_to_wireguard

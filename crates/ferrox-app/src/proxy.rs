@@ -388,7 +388,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         .any(|seam| std::env::var_os(seam).is_some())
     {
         // The startup record both pinned interop harnesses scan the server log for; not this binary's name.
-        println!("ferrox-app serving; harness readiness token: core: Xray 26.10.21 started");
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.11.9 started");
     }
     loop {
         thread::park();
@@ -22836,16 +22836,17 @@ fn serve_connect_freedom(
     if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
         return;
     }
-    if !prefix.is_empty() {
+    if !prefix.is_empty() && !http_head_has_body(prefix) {
         loop {
-            let Some(mut head) =
-                read_http_head(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+            let Some((mut head, at)) =
+                read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
             else {
                 return;
             };
+            let tail = head.split_off(at);
             let interim = http_head_is_interim(&head);
             drop_invalid_header_names(&mut head);
-            if client.write_all(&head).is_err() {
+            if client.write_all(&head).is_err() || client.write_all(&tail).is_err() {
                 return;
             }
             if !interim {
@@ -22854,6 +22855,21 @@ fn serve_connect_freedom(
         }
     }
     relay_handoff(client, &upstream);
+}
+
+/// A request head that carries a body: the origin answers only after it arrives, so the direct leg
+/// must relay before reading the response head or the two sides wait on each other.
+fn http_head_has_body(head: &[u8]) -> bool {
+    head.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let (name, value) = line.split_at(colon);
+        name.eq_ignore_ascii_case(b"transfer-encoding")
+            || (name.eq_ignore_ascii_case(b"content-length")
+                && value.iter().any(|byte| (b'1'..=b'9').contains(byte)))
+    })
 }
 
 /// The reference's blocked target: the client is drained until the rule's wait ends, then closed.
@@ -27591,6 +27607,24 @@ fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<A
     let Ok(client_write) = client.try_clone() else {
         return;
     };
+    // Windows' readiness wakeup costs more than the copy: two blocking legs match the comparator and park in the kernel instead of polling.
+    #[cfg(windows)]
+    if answer.is_none()
+        && !target_write.masked()
+        && !client_write.masked()
+        && !client_read.metered()
+        && !target_read.metered()
+    {
+        relay_owned_with(
+            client_read,
+            target_write,
+            target_read,
+            client_write,
+            None,
+            false,
+        );
+        return;
+    }
     // A descriptor fast path cannot cross the mask, and only the Linux pump strips the answer the raw VLESS dial has not seen; every other host and a metered leg keep the lane pool.
     #[cfg(target_os = "linux")]
     let fast = !target_write.masked()
@@ -27908,9 +27942,28 @@ fn relay_owned(
     client_write: Connection,
     answer: Option<AnswerHooks>,
 ) {
+    relay_owned_with(
+        client_read,
+        target_write,
+        target_read,
+        client_write,
+        answer,
+        true,
+    );
+}
+
+fn relay_owned_with(
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
+    answer: Option<AnswerHooks>,
+    timeouts: bool,
+) {
     for connection in [&client_read, &target_read, &target_write, &client_write] {
-        let _ = connection.set_read_timeout(Some(RELAY_POLL));
-        let _ = connection.set_write_timeout(Some(RELAY_POLL));
+        let wait = timeouts.then_some(RELAY_POLL);
+        let _ = connection.set_read_timeout(wait);
+        let _ = connection.set_write_timeout(wait);
     }
     let forward_stall = client_read
         .policy()
@@ -27926,7 +27979,11 @@ fn relay_owned(
     let flow = RelayFinish::new(false, close, None);
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
-    forward.stall = forward_stall;
+    forward.stall = if timeouts {
+        forward_stall
+    } else {
+        std::time::Duration::MAX
+    };
     let done = RelayPool::global().run(move || {
         while forward.step(&first) != Next::Done {}
         first.mark_ended();
@@ -27934,7 +27991,11 @@ fn relay_owned(
     });
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
-    reply.stall = reply_stall;
+    reply.stall = if timeouts {
+        reply_stall
+    } else {
+        std::time::Duration::MAX
+    };
     if let Some(answer) = answer {
         // An answer wait owns the configured grace; a plain idle sibling still hands back after one second.
         reply.reply_idle = reply_stall;
@@ -37042,7 +37103,7 @@ fn outbound_mux(outbound: &Json) -> Result<Mux, String> {
     let udp443 = match mux.get("xudpProxyUDP443") {
         None => Udp443::Reject,
         Some(Json::Str(policy)) => match policy.as_str() {
-            "reject" => Udp443::Reject,
+            "" | "reject" => Udp443::Reject,
             "allow" => Udp443::Allow,
             "skip" => Udp443::Skip,
             _ => return Err(format!("unknown \"xudpProxyUDP443\": {policy}")),
@@ -52094,6 +52155,16 @@ mod tests {
             out.mux.udp_443("192.0.2.1:443".parse().expect("addr")),
             Udp443::Reject,
             "xray's default refuses udp/443"
+        );
+        let empty = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpProxyUDP443": ""}}]}"#,
+        )
+        .expect("parses");
+        let empty = find_shadowsocks_outbound(&empty).expect("finds");
+        assert_eq!(
+            empty.mux.udp443,
+            Udp443::Reject,
+            "an empty policy is xray's default"
         );
         let direct = crate::json::parse(
             r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpConcurrency": -1, "xudpProxyUDP443": "skip"}}]}"#,
@@ -71232,7 +71303,8 @@ mod poll_copy {
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::Duration;
 
-    const WINDOW: usize = 64 * 1024;
+    /// One readiness event can carry many buffers; a bounded loop keeps `poll` off the hot path without starving the flow beside it.
+    const MAX_COPY_ROUNDS: usize = 16;
 
     #[cfg(unix)]
     type Row = libc::pollfd;
@@ -71455,7 +71527,7 @@ mod poll_copy {
     struct Direction {
         src: Connection,
         dst: Connection,
-        bytes: Vec<u8>,
+        bytes: RelayBuf,
         filled: usize,
         off: usize,
         src_at_eof: bool,
@@ -71471,7 +71543,7 @@ mod poll_copy {
             Self {
                 src,
                 dst,
-                bytes: RelayBuf::with_len(WINDOW).into_vec(),
+                bytes: RelayBuf::new(),
                 filled: 0,
                 off: 0,
                 src_at_eof: false,
@@ -71482,7 +71554,7 @@ mod poll_copy {
         }
 
         fn can_ingest(&self) -> bool {
-            !self.ended && !self.src_at_eof && self.filled < self.bytes.len()
+            !self.ended && !self.src_at_eof && self.filled == 0
         }
 
         fn can_drain(&self) -> bool {
@@ -71493,52 +71565,59 @@ mod poll_copy {
             if self.ended {
                 return;
             }
-            if self.off == self.filled {
-                self.off = 0;
-                self.filled = 0;
-            } else if self.off > 0 && self.filled == self.bytes.len() {
-                self.bytes.copy_within(self.off..self.filled, 0);
-                self.filled -= self.off;
-                self.off = 0;
-            }
-            if self.can_ingest() {
-                match self.src.read(&mut self.bytes[self.filled..]) {
-                    Ok(0) => self.src_at_eof = true,
-                    Ok(n) => self.filled += n,
-                    Err(error) if would_block(&error) => {}
-                    Err(_) => {
-                        self.end();
-                        return;
+            for _ in 0..MAX_COPY_ROUNDS {
+                if self.off == self.filled {
+                    self.off = 0;
+                    self.filled = 0;
+                }
+                let mut ingested = false;
+                if self.can_ingest() {
+                    match self.src.read(self.bytes.as_mut()) {
+                        Ok(0) => self.src_at_eof = true,
+                        Ok(n) => {
+                            let _ = self.bytes.filled(n);
+                            self.filled = n;
+                            ingested = true;
+                        }
+                        Err(error) if would_block(&error) => {}
+                        Err(_) => {
+                            self.end();
+                            return;
+                        }
                     }
                 }
-            }
-            while self.off < self.filled {
-                match self.dst.write(&self.bytes[self.off..self.filled]) {
-                    Ok(0) => {
-                        self.end();
-                        return;
-                    }
-                    Ok(n) => {
-                        self.off += n;
-                        self.stalled = None;
-                    }
-                    Err(error) if would_block(&error) => {
-                        self.stalled.get_or_insert_with(std::time::Instant::now);
-                        break;
-                    }
-                    Err(_) => {
-                        self.end();
-                        return;
+                while self.off < self.filled {
+                    match self.dst.write(&self.bytes.prefix(self.filled)[self.off..]) {
+                        Ok(0) => {
+                            self.end();
+                            return;
+                        }
+                        Ok(n) => {
+                            self.off += n;
+                            self.stalled = None;
+                        }
+                        Err(error) if would_block(&error) => {
+                            self.stalled.get_or_insert_with(std::time::Instant::now);
+                            break;
+                        }
+                        Err(_) => {
+                            self.end();
+                            return;
+                        }
                     }
                 }
-            }
-            if self.off == self.filled {
-                self.off = 0;
-                self.filled = 0;
-                self.stalled = None;
-            }
-            if self.src_at_eof && self.filled == 0 {
-                self.end();
+                if self.off == self.filled {
+                    self.off = 0;
+                    self.filled = 0;
+                    self.stalled = None;
+                }
+                if self.src_at_eof && self.filled == 0 {
+                    self.end();
+                    return;
+                }
+                if !ingested || self.off < self.filled {
+                    break;
+                }
             }
         }
 
@@ -71723,9 +71802,17 @@ mod poll_copy {
     }
 
     pub(super) fn available() -> bool {
-        !workers().is_empty()
+        #[cfg(windows)]
+        {
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            !workers().is_empty()
+        }
     }
 
+    /// Windows keeps the lane pool: `WSAPoll` costs more per wake than a timed read, and the pool already runs both directions.
     pub(super) fn handoff(
         client_read: Connection,
         target_write: Connection,
@@ -72625,10 +72712,19 @@ mod relay_tests {
         let body: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
         let mut written = 0usize;
         for _ in 0..rounds {
-            if stream.write_all(&body).is_err() {
+            let mut off = 0;
+            while off < body.len() {
+                match stream.write(&body[off..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        off += n;
+                        written += n;
+                    }
+                }
+            }
+            if off < body.len() {
                 break;
             }
-            written += body.len();
         }
         let _ = stream.shutdown(Shutdown::Write);
         written
@@ -72636,6 +72732,7 @@ mod relay_tests {
 
     /// The destination of the stalled flow: it reads none of the flow until the
     /// neighbours have been collected, then reports how much of it reached it.
+    #[cfg(not(target_os = "windows"))]
     fn hold_then_read(listener: &Listener, release: &mpsc::Receiver<()>) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
@@ -72666,6 +72763,7 @@ mod relay_tests {
     }
 
     /// One neighbour peer: one chunk, a half-close, and the same bytes back.
+    #[cfg(not(target_os = "windows"))]
     fn write_then_read_back(stream: &mut Connection) -> usize {
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
@@ -72678,6 +72776,7 @@ mod relay_tests {
     }
 
     /// One neighbour origin: it reads the whole body and echoes it back.
+    #[cfg(not(target_os = "windows"))]
     fn read_then_echo_back(stream: &mut Connection) {
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
@@ -72700,6 +72799,7 @@ mod relay_tests {
     /// itself. The fallback copy path gives every direction its own thread and
     /// cannot be poisoned, so the witness is the Linux job. Loopback only, dials
     /// nothing.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_stalled_destination_does_not_freeze_the_flows_behind_it() {
         const ROUNDS: usize = 512;

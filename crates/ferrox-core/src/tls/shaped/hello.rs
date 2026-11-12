@@ -2021,4 +2021,23 @@ mod tests {
             .expect("the session_ticket extension");
         assert_eq!(&session[4..], ticket.bytes.as_slice());
     }
+
+    #[test]
+    fn a_grease_collision_at_the_mask_edge_does_not_overflow() {
+        let grease = distinct_grease([0xffff; 7]);
+        for slot in [3usize, 5, 6] {
+            let earlier: &[usize] = match slot {
+                3 => &[2],
+                5 => &[2, 3],
+                _ => &[2, 3, 5],
+            };
+            for other in earlier {
+                assert_ne!(
+                    grease_value(&grease, *other),
+                    grease_value(&grease, slot),
+                    "slot {slot} still repeats slot {other}"
+                );
+            }
+        }
+    }
 }
