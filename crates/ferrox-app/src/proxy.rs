@@ -72654,12 +72654,11 @@ mod relay_tests {
             let mut off = 0;
             while off < body.len() {
                 match stream.write(&body[off..]) {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         off += n;
                         written += n;
                     }
-                    Err(_) => break,
                 }
             }
             if off < body.len() {
