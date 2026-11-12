@@ -504,23 +504,31 @@ fn body_wait_timeout() -> std::io::Error {
     }
 }
 
+impl H2StreamReader {
+    /// Move the current frame into the caller's buffer from the last offset read, and report the new fill.
+    fn take_cur(&mut self, buf: &mut [u8], filled: usize) -> usize {
+        let n = (self.cur.len() - self.at).min(buf.len() - filled);
+        buf[filled..filled + n].copy_from_slice(&self.cur[self.at..self.at + n]);
+        self.at += n;
+        if self.at == self.cur.len() {
+            self.cur.clear();
+            self.at = 0;
+        }
+        self.idle_since = None;
+        filled + n
+    }
+}
+
 impl Read for H2StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         let mut filled = 0;
+        let mut tried_extra = false;
         loop {
             if self.at < self.cur.len() {
-                let n = (self.cur.len() - self.at).min(buf.len() - filled);
-                buf[filled..filled + n].copy_from_slice(&self.cur[self.at..self.at + n]);
-                self.at += n;
-                filled += n;
-                if self.at == self.cur.len() {
-                    self.cur.clear();
-                    self.at = 0;
-                }
-                self.idle_since = None;
+                filled = self.take_cur(buf, filled);
                 if filled == buf.len() {
                     return Ok(filled);
                 }
@@ -552,6 +560,31 @@ impl Read for H2StreamReader {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             if filled > 0 {
+                // A chunk still short of its frame is worth one more poll: the lane would wait on the
+                // next read anyway, and the two frames leave in one write instead of two.
+                if !tried_extra
+                    && filled >= 8_192
+                    && buf.len() - filled >= 8_192
+                    && self.conn.client_read.is_some()
+                    && crate::proxy::relay_step_owns_poll()
+                {
+                    tried_extra = true;
+                    drop(st);
+                    match self.conn.pump_read(
+                        || {
+                            let st = self
+                                .stream
+                                .state
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            !st.body.is_empty() || st.read_ended() || st.dead
+                        },
+                        true,
+                    ) {
+                        Pumped::Alive => continue,
+                        Pumped::Yield | Pumped::Dead => return Ok(filled),
+                    }
+                }
                 drop(st);
                 return Ok(filled);
             }
