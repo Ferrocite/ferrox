@@ -54584,6 +54584,7 @@ mod tests {
         thread::spawn(move || {
             for _ in 0..FLOWS {
                 let (stream, _) = listener.accept().expect("accepts");
+                stream.set_read_timeout(Some(RELAY_POLL)).expect("poll");
                 let settings = server_settings.clone();
                 let keys = keys.clone();
                 let server_config = Arc::clone(&server_config);
