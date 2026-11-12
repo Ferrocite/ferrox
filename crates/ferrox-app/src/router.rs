@@ -2769,6 +2769,14 @@ impl IpMatcher {
             .any(|(set, reverse)| set.matches(ip, *reverse))
     }
 
+    /// The parsed sets as inclusive address ranges, for a consumer outside this module.
+    pub(crate) fn ranges(&self) -> Vec<(Vec<(IpAddr, IpAddr)>, bool)> {
+        self.sets
+            .iter()
+            .map(|(set, reverse)| (set.ranges(), *reverse))
+            .collect()
+    }
+
     pub(crate) fn set_reverse(&mut self, reverse: bool) {
         for (_, current) in &mut self.sets {
             *current = reverse;
@@ -2826,6 +2834,24 @@ impl RangeSet {
         self.v4 = merge(&self.v4);
         self.v6.sort_unstable();
         self.v6 = merge(&self.v6);
+    }
+
+    fn ranges(&self) -> Vec<(IpAddr, IpAddr)> {
+        self.v4
+            .iter()
+            .map(|(start, end)| {
+                (
+                    IpAddr::V4(std::net::Ipv4Addr::from(*start)),
+                    IpAddr::V4(std::net::Ipv4Addr::from(*end)),
+                )
+            })
+            .chain(self.v6.iter().map(|(start, end)| {
+                (
+                    IpAddr::V6(std::net::Ipv6Addr::from(*start)),
+                    IpAddr::V6(std::net::Ipv6Addr::from(*end)),
+                )
+            }))
+            .collect()
     }
 
     fn matches(&self, ip: IpAddr, reverse: bool) -> bool {
