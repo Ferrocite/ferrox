@@ -514,7 +514,6 @@ impl Read for H2StreamReader {
                     self.at = 0;
                 }
                 self.idle_since = None;
-                self.conn.replenish(self.id, n);
                 return Ok(n);
             }
             let mut st = self
@@ -604,7 +603,6 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 let start = self.at;
                 self.at = self.cur.len();
                 self.idle_since = None;
-                self.conn.replenish(self.id, self.cur.len() - start);
                 return Ok(crate::proxy::Window::one(&self.cur[start..]));
             }
             let mut st = self
@@ -2938,6 +2936,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         state.cv.notify_all();
         st.both_ended()
     };
+    // The frame grants its credit once, when it is queued; the reader hands the bytes out without a second grant.
     conn.replenish(sid, wire_len);
     if done {
         conn.retire(sid);
@@ -5470,6 +5469,29 @@ mod tests {
             );
             at += 13;
         }
+    }
+
+    /// A DATA frame grants its windows when it is queued, and reading the queued bytes grants them no
+    /// second time: the peer's credit is returned once per frame, not twice.
+    #[test]
+    fn a_queued_frame_grants_its_credit_once() {
+        let (conn, _written, slices) = bare_conn();
+        let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        let payload = vec![0x5Au8; 32];
+        assert!(queue_data(&conn, 0, 1, payload.clone()));
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "the queue returns the frame's credit"
+        );
+        let mut got = [0u8; 32];
+        assert_eq!(reader.read(&mut got).expect("reads"), payload.len());
+        assert_eq!(&got[..], &payload[..]);
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "the reader does not return the same bytes again"
+        );
     }
 
     /// A writer whose first `write_slices` holds the lock until the test releases it, so a second
