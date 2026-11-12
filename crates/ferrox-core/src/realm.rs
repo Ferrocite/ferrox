@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(walked, expected, "the first sixty-four in sorted order");
         let predictable: Vec<SocketAddr> = (0..100u16)
             .flat_map(|i| {
-                let ip = format!("10.0.{}.1", i);
+                let ip = format!("10.0.{i}.1");
                 [
                     format!("{ip}:30000").parse().unwrap(),
                     format!("{ip}:30002").parse().unwrap(),
