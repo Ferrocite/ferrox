@@ -46,6 +46,8 @@ pub(crate) struct Hello {
     psk: Option<Ticket>,
     /// The transcript a retry's binder hashes ahead of the second hello.
     binder_prefix: Vec<u8>,
+    /// The wall-clock second this hello's ticket age is measured from.
+    ticket_now: u64,
     /// A fixture build: fixed entropy, table order, and a fixed ECH payload length.
     canonical: bool,
 }
@@ -118,6 +120,7 @@ impl Hello {
             offer: None,
             psk: None,
             binder_prefix: Vec::new(),
+            ticket_now: 0,
             canonical: false,
         };
         hello.msg = hello.encode(None);
@@ -328,7 +331,12 @@ impl Hello {
 
     /// The second hello a `HelloRetryRequest` asks for: one fresh share for the group
     /// the server named, and its cookie echoed when one came.
-    pub(crate) fn retry(&mut self, group: u16, cookie: Option<&[u8]>) -> Result<Self, TlsError> {
+    pub(crate) fn retry(
+        &mut self,
+        group: u16,
+        cookie: Option<&[u8]>,
+        now: u64,
+    ) -> Result<Self, TlsError> {
         if !self.offers(group) {
             return Err(TlsError::Other(format!(
                 "server asked for an unoffered retry group {group:#06x}"
@@ -340,6 +348,7 @@ impl Hello {
             )));
         }
         let shares = keys::generate(&[group], false).map_err(TlsError::Other)?;
+        self.ticket_now = now;
         let (msg, offer) = match self.offer.take() {
             Some(mut offer) => (
                 self.seal_offer(&mut offer, &shares, cookie, true)?,
@@ -366,6 +375,7 @@ impl Hello {
             offer,
             psk: self.psk.take(),
             binder_prefix: self.binder_prefix.clone(),
+            ticket_now: self.ticket_now,
             canonical: self.canonical,
         })
     }
@@ -486,7 +496,11 @@ impl Hello {
 
     /// Carries a client-made obfuscated ticket: TLS 1.2 as the session-ticket extension, TLS 1.3
     /// as a PSK the server may select.
-    pub(crate) fn set_obfuscated_ticket(&mut self, shared: &[u8; 32]) -> Result<(), TlsError> {
+    pub(crate) fn set_obfuscated_ticket(
+        &mut self,
+        shared: &[u8; 32],
+        now: u64,
+    ) -> Result<(), TlsError> {
         if self.offer.is_some() || self.ech_slot {
             return Err(TlsError::Other(
                 "obfuscated session tickets and ECH cannot share a hello".to_owned(),
@@ -512,7 +526,8 @@ impl Hello {
                 "obfuscated session ticket cipher suite is missing".to_owned(),
             ));
         }
-        self.psk = Some(Ticket::new(shared, tls13, ems)?);
+        self.ticket_now = now;
+        self.psk = Some(Ticket::new(shared, tls13, ems, now)?);
         self.msg = self.encode(None);
         Ok(())
     }
@@ -842,7 +857,7 @@ impl Hello {
                 out.put(&(identities as u16).to_be_bytes());
                 out.put(&(ticket.bytes.len() as u16).to_be_bytes());
                 out.put(&ticket.bytes);
-                out.put(&ticket.age().to_be_bytes());
+                out.put(&ticket.age(self.ticket_now).to_be_bytes());
                 out.put(&33u16.to_be_bytes());
                 out.put(&[32]);
                 out.zeros(32);
@@ -919,6 +934,7 @@ impl Hello {
             offer: None,
             psk: None,
             binder_prefix: Vec::new(),
+            ticket_now: 0,
             canonical: true,
         };
         hello.msg = hello.encode(None);
@@ -1557,7 +1573,7 @@ mod tests {
         );
         let inner_random = hello.ech_inner_random().expect("inner random");
         let retry = hello
-            .retry(crate::tls::shaped::keys::P256, None)
+            .retry(crate::tls::shaped::keys::P256, None, 0)
             .expect("retries");
         assert!(retry.ech_inner().is_some(), "a retry re-seals the offer");
         assert_eq!(
@@ -1583,7 +1599,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[], false, &[keys::X25519], None)
             .expect("a shaped dial hello");
         assert!(
-            hello.retry(keys::P256, None).is_err(),
+            hello.retry(keys::P256, None, 0).is_err(),
             "a retry for a group curvePreferences does not name"
         );
     }
@@ -1597,7 +1613,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
             .expect("a shaped dial hello");
         assert!(
-            hello.retry(keys::X25519, None).is_err(),
+            hello.retry(keys::X25519, None, 0).is_err(),
             "a retry for a group the first hello already sent"
         );
     }
@@ -1875,7 +1891,7 @@ mod tests {
         )
         .expect("a shaped dial hello");
         let retry = hello
-            .retry(keys::P256, Some(&[7, 6, 5]))
+            .retry(keys::P256, Some(&[7, 6, 5]), 0)
             .expect("a retry hello");
         let exts = extensions(&retry.msg[4..]);
         let cookie = exts
@@ -1929,7 +1945,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
             .expect("a shaped dial hello");
         hello
-            .set_obfuscated_ticket(&[0x33; 32])
+            .set_obfuscated_ticket(&[0x33; 32], 0)
             .expect("a hello without ECH carries a ticket");
         assert!(hello.ticket().expect("a ticket").tls13);
         let entries = extensions(&hello.msg[4..]);
@@ -1960,7 +1976,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
             .expect("a shaped dial hello");
         hello
-            .set_obfuscated_ticket(&[0x66; 32])
+            .set_obfuscated_ticket(&[0x66; 32], 0)
             .expect("a hello without ECH carries a ticket");
         assert!(hello.ticket().expect("a ticket").tls13);
         assert!(extensions(&hello.msg[4..])
@@ -1977,7 +1993,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
             .expect("a shaped dial hello");
         hello
-            .set_obfuscated_ticket(&[0x44; 32])
+            .set_obfuscated_ticket(&[0x44; 32], 0)
             .expect("the reference drops the ticket quietly");
         assert!(hello.ticket().is_none());
         assert!(!extensions(&hello.msg[4..])
@@ -1994,7 +2010,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
             .expect("a shaped dial hello");
         hello
-            .set_obfuscated_ticket(&[0x55; 32])
+            .set_obfuscated_ticket(&[0x55; 32], 0)
             .expect("a hello without ECH carries a ticket");
         let ticket = hello.ticket().expect("a ticket");
         assert!(!ticket.tls13);

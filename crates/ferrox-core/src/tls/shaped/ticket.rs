@@ -4,7 +4,6 @@ use crate::tls::TlsError;
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit as _, StreamCipher as _};
 use ring::hmac;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
@@ -26,13 +25,17 @@ pub(crate) struct Ticket {
 
 impl Ticket {
     /// Builds and encrypts the state `NewObfuscatedClientSessionState` makes for one dial.
-    pub(crate) fn new(shared: &[u8; 32], tls13: bool, ems: bool) -> Result<Self, TlsError> {
+    pub(crate) fn new(
+        shared: &[u8; 32],
+        tls13: bool,
+        ems: bool,
+        created: u64,
+    ) -> Result<Self, TlsError> {
         let mut secret = [0u8; 48];
         random(&mut secret)?;
         let mut age = [0u8; 4];
         random(&mut age)?;
         let age_add = u32::from_le_bytes(age);
-        let created = now_secs();
         let (version, suite) = if tls13 {
             (0x0304u16, TLS13_SUITE)
         } else {
@@ -71,8 +74,8 @@ impl Ticket {
 
     /// The `obfuscated_ticket_age` a PSK identity carries: whole seconds since creation, plus the
     /// observable random offset the server subtracts.
-    pub(crate) fn age(&self) -> u32 {
-        let elapsed = now_secs().saturating_sub(self.created);
+    pub(crate) fn age(&self, now: u64) -> u32 {
+        let elapsed = now.saturating_sub(self.created);
         u32::try_from(elapsed)
             .unwrap_or(u32::MAX)
             .wrapping_mul(1000)
@@ -142,12 +145,6 @@ fn binder_span(msg: &[u8]) -> Option<(usize, std::ops::Range<usize>)> {
     None
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
-
 fn random<const N: usize>(out: &mut [u8; N]) -> Result<(), TlsError> {
     getrandom::fill(out).map_err(|e| TlsError::Other(format!("ticket entropy: {e}")))
 }
@@ -173,7 +170,7 @@ mod tests {
     #[test]
     fn a_tls13_state_is_the_go_layout_and_padding() {
         let shared = [0x11; 32];
-        let ticket = Ticket::new(&shared, true, true).expect("entropy");
+        let ticket = Ticket::new(&shared, true, true, 1_000).expect("entropy");
         let state = open(&shared, &ticket.bytes);
         assert_eq!(&state[0..2], &[0x03, 0x04]);
         assert_eq!(state[2], 1, "a server state");
@@ -197,7 +194,7 @@ mod tests {
     #[test]
     fn a_tls12_state_carries_the_x25519_curve() {
         let shared = [0x22; 32];
-        let ticket = Ticket::new(&shared, false, false).expect("entropy");
+        let ticket = Ticket::new(&shared, false, false, 1_000).expect("entropy");
         let state = open(&shared, &ticket.bytes);
         assert_eq!(&state[0..2], &[0x03, 0x03]);
         assert_eq!(&state[3..5], &[0xc0, 0x2f]);

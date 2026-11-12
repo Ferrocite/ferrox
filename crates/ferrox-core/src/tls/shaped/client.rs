@@ -8,7 +8,7 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const HANDSHAKE: u8 = 22;
 const ALERT: u8 = 21;
@@ -24,6 +24,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The one deadline a shaped handshake runs under, on either side.
 pub(crate) fn handshake_deadline() -> Instant {
     Instant::now() + HANDSHAKE_TIMEOUT
+}
+
+/// The second a ticket's age is measured against, the one wall-clock read a hello needs.
+fn ticket_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// How long an immediate `WouldBlock` waits before the handshake asks again; a transport with a read timeout has already waited, a nonblocking one has not.
@@ -203,7 +210,7 @@ impl<S: Stream> Session<S> {
             }
         }
         if let Some(key) = &cfg.obfuscated_ticket {
-            hello.set_obfuscated_ticket(&key.0)?;
+            hello.set_obfuscated_ticket(&key.0, ticket_now())?;
         }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
@@ -350,7 +357,7 @@ impl<S: Stream> Session<S> {
                 hello.set_binder_prefix(self.transcript.clone());
             }
             self.send_ccs()?;
-            hello = hello.retry(group, sh.cookie.as_deref())?;
+            hello = hello.retry(group, sh.cookie.as_deref(), ticket_now())?;
             self.send_plain(HANDSHAKE, &hello.msg, [0x03, 0x03])?;
             self.transcript.extend_from_slice(if ech {
                 hello.ech_inner().expect("retry keeps the offer")
