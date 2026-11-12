@@ -515,8 +515,7 @@ impl<W: Write> Write for Pipe<'_, W> {
         drive(self.stages, &mut *self.raw, buf)
     }
 
-    // A stage reads one `&[u8]`, so a gathered write must reach it as one run or its write
-    // count lands on the header and body separately and a later `tlshello` cannot cut.
+    // A stage reads one `&[u8]`, so a gathered write reaches it as one run or its count lands on the header and body separately.
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         match bufs {
             [] => Ok(0),
