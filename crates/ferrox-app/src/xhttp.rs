@@ -3766,7 +3766,7 @@ impl crate::proxy::CarrierSink for XhttpWriter {
             return usize::try_from(out.room()).ok().filter(|room| *room > 0);
         }
         match self.shared.body {
-            Body::Stream(_) => Some(WIRE_CHUNK),
+            Body::Stream(_) => Some(REFERENCE_WINDOW),
             Body::Packets(_) => None,
         }
     }
