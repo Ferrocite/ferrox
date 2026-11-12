@@ -164,9 +164,12 @@ append_pem 562
 # Re-blessed 51893400 by p2-socks: the SOCKS4 request writer and its witness test
 # join ferrox-core, shifting this probe's thin-LTO frame; dns.rs is untouched and
 # the five decisions still walk 4096 times.
+# The 51893400 is not reproduced on main 675c21a3d: the same tree measures
+# 51893352 twice, and 48 is not a multiple of the 4096-turn walk, so the five
+# decisions are unchanged and the move is in the frame's setup.
 # Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893400 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893352 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -224,7 +227,7 @@ ferrox_app::wg::tests::route_table_once 585 wg::tests::a_prefix_table_picks_the_
 ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::the_word_varint_read_costs_the_load_and_nothing_else
 # The four-slice SSH packet sealed 4096 times through the direct write reports
 # 47483770; flattening the same slices into one and sealing that reports
-# 47621538 on the current base. The direct probe is 137768 (0.29%) lower, a net
+# 47621526 on the current base. The direct probe is 137756 (0.29%) lower, a net
 # that includes the flatten copy and the four-slices-versus-one effect, not the
 # previous writer's framing loop. The bytes and their order are unchanged; the
 # direct row moved by 8192 (two instructions per write) when removing the udp
