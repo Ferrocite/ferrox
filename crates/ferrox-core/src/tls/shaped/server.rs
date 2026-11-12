@@ -17,6 +17,22 @@ use std::io::{Read, Write};
 /// TLS 1.3 only and cannot fill a TLS 1.2 point.
 const CURVES: [u16; 4] = [0x001d, 0x0017, 0x0018, 0x0019];
 
+/// The group a listener picks: its configured order restricted to the TLS 1.2 curves this engine
+/// carries and to what the hello offered, or the stock order when the config names none it carries.
+fn server_group(curves: &[u16], offered: &[u16]) -> Option<u16> {
+    let wants = |group: &u16| offered.is_empty() || offered.contains(group);
+    let named: Vec<u16> = curves
+        .iter()
+        .copied()
+        .filter(|group| CURVES.contains(group))
+        .collect();
+    if named.is_empty() {
+        CURVES.iter().find(|group| wants(group)).copied()
+    } else {
+        named.into_iter().find(|group| wants(group))
+    }
+}
+
 /// A parsed `ClientHello`: the fields a TLS 1.2 full handshake reads.
 #[allow(clippy::struct_excessive_bools)]
 struct Hello {
@@ -346,11 +362,8 @@ impl<S: Stream> Server<S> {
         let share = if suite.is_rsa() {
             None
         } else {
-            let group = CURVES
-                .iter()
-                .copied()
-                .find(|group| hello.groups.is_empty() || hello.groups.contains(group))
-                .ok_or(TlsError::NoSharedCipher)?;
+            let group =
+                server_group(&self.cfg.curves, &hello.groups).ok_or(TlsError::NoSharedCipher)?;
             let mut shares = keys::generate(&[group], false)
                 .map_err(|why| TlsError::Other(format!("server share: {why}")))?;
             Some(shares.pop().ok_or(TlsError::NoSharedCipher)?)
@@ -1114,6 +1127,30 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_server_curve_is_the_one_the_listener_picks() {
+        assert_eq!(
+            server_group(&[0x0017], &[0x001d, 0x0017]),
+            Some(0x0017),
+            "the named curve wins over the stock order"
+        );
+        assert_eq!(
+            server_group(&[0x0017], &[0x001d]),
+            None,
+            "a curve the hello did not offer is not picked"
+        );
+        assert_eq!(
+            server_group(&[], &[0x0017]),
+            Some(0x0017),
+            "no configured list keeps the stock walk"
+        );
+        assert_eq!(
+            server_group(&[0x9999], &[0x001d, 0x0017]),
+            Some(0x001d),
+            "a list this engine carries none of keeps the stock walk"
+        );
+    }
+
+    #[test]
     fn a_grease_version_does_not_delegate_a_tls12_hello() {
         let mut io = std::io::Cursor::new(client_hello(&[0x0a0a, 0x0303]));
         let (_, delegate) = peek_hello(&mut io).expect("peek");
@@ -1180,6 +1217,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),

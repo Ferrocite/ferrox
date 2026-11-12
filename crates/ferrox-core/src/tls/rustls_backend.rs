@@ -553,6 +553,9 @@ struct ConfigKey {
     resumption: bool,
     /// The ECH config list, which rustls bakes into the built config rather than reading per connection.
     ech: Option<std::sync::Arc<[u8]>>,
+    /// The protocol window rustls bakes into the built config.
+    min_version: Option<u16>,
+    max_version: Option<u16>,
     /// The `masterKeyLog` handle rustls bakes into the config: two configs naming different files must not share a build, so the handle's identity is what the key holds.
     master_key_log: Option<Arc<super::MasterKeyLog>>,
     /// The client identity rustls bakes into the config's resolver, swapped by value when the bytes differ.
@@ -566,6 +569,8 @@ impl PartialEq for ConfigKey {
             && self.insecure == other.insecure
             && self.resumption == other.resumption
             && self.ech == other.ech
+            && self.min_version == other.min_version
+            && self.max_version == other.max_version
             && match (&self.master_key_log, &other.master_key_log) {
                 (None, None) => true,
                 (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
@@ -590,6 +595,11 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&built.provider));
     let builder = match cfg.ech_config_list.as_ref() {
         Some(list) => {
+            if cfg.max_version.is_some_and(|version| version < 0x0304) {
+                return Err(TlsError::Other(
+                    "ech: a client maximum below TLS 1.3 cannot carry ECH".to_owned(),
+                ));
+            }
             let ech = rustls::client::EchConfig::new(
                 rustls::pki_types::EchConfigListBytes::from(list.as_ref()),
                 &super::hpke::SUITES,
@@ -599,9 +609,11 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
                 .with_ech(rustls::client::EchMode::Enable(ech))
                 .map_err(|e| TlsError::Other(format!("ech: {e}")))?
         }
-        None => builder
-            .with_safe_default_protocol_versions()
-            .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?,
+        None => match protocol_versions(cfg.min_version, cfg.max_version, "client")? {
+            Some(versions) => builder.with_protocol_versions(&versions),
+            None => builder.with_safe_default_protocol_versions(),
+        }
+        .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?,
     };
     let roots = builder.with_root_certificates(Arc::clone(&built.roots));
     let mut config = match &cfg.client_cert {
@@ -711,6 +723,8 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
         insecure: cfg.insecure,
         resumption: cfg.resumption,
         ech: cfg.ech_config_list.clone(),
+        min_version: cfg.min_version,
+        max_version: cfg.max_version,
         master_key_log: cfg.master_key_log.clone(),
         client_cert: cfg.client_cert.clone(),
     };
@@ -1497,6 +1511,9 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     if !cfg.cipher_suites.is_empty() {
         order_cipher_suites(&mut ordered, &cfg.cipher_suites);
     }
+    if !cfg.curves.is_empty() {
+        order_kx_groups(&mut ordered, &cfg.curves);
+    }
     let versions = server_versions(cfg.min_version, cfg.max_version)?;
     let builder = rustls::ServerConfig::builder_with_provider(Arc::new(ordered));
     let builder = match versions.as_deref() {
@@ -1558,12 +1575,13 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     Ok(config)
 }
 
-/// The protocol versions a listener may negotiate: xray clamps Go's versions onto
+/// The protocol versions a session may negotiate: xray clamps Go's versions onto
 /// what this backend carries, so a floor below 1.2 starts at 1.2 and a ceiling
 /// above 1.3 stops at 1.3. No bounds keeps the backend's default pair.
-fn server_versions(
+fn protocol_versions(
     min: Option<u16>,
     max: Option<u16>,
+    role: &str,
 ) -> Result<Option<Vec<&'static rustls::SupportedProtocolVersion>>, TlsError> {
     if min.is_none() && max.is_none() {
         return Ok(None);
@@ -1571,9 +1589,9 @@ fn server_versions(
     let floor = min.unwrap_or(0x0303).max(0x0303);
     let ceiling = max.unwrap_or(0x0304).min(0x0304);
     if floor > ceiling {
-        return Err(TlsError::Other(
-            "tls server version bounds name no supported protocol".to_owned(),
-        ));
+        return Err(TlsError::Other(format!(
+            "tls {role} version bounds name no supported protocol"
+        )));
     }
     let mut versions = Vec::with_capacity(2);
     if floor == 0x0303 {
@@ -1583,6 +1601,13 @@ fn server_versions(
         versions.push(&rustls::version::TLS13);
     }
     Ok(Some(versions))
+}
+
+fn server_versions(
+    min: Option<u16>,
+    max: Option<u16>,
+) -> Result<Option<Vec<&'static rustls::SupportedProtocolVersion>>, TlsError> {
+    protocol_versions(min, max, "server")
 }
 
 pub(crate) fn cached_server_config(
@@ -2159,6 +2184,12 @@ fn server_settings(
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_3))
         .map_err(|error| boring_error(&error))?;
+    let curves = crate::tls::legacy::curve_list(&cfg.curves);
+    if !curves.is_empty() {
+        builder
+            .set_curves_list(&curves)
+            .map_err(|error| boring_error(&error))?;
+    }
     if !cfg.send_tickets {
         builder.set_options(boring::ssl::SslOptions::NO_TICKET);
     }
@@ -3521,6 +3552,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: vec![0xc02b],
+            curves: Vec::new(),
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
@@ -4082,6 +4114,48 @@ mod tests {
                 "a listener with maxVersion 1.2 must refuse a TLS 1.3 client"
             );
         });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_client_version_ceiling_refuses_a_newer_listener() {
+        let mut identity = plain_identity();
+        identity.min_version = Some(0x0304);
+        let server_config = identity.server_config().expect("server config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut server = rustls::ServerConnection::new(server_config).expect("session");
+                let _ = server.complete_io(&mut stream);
+            });
+            let mut cfg = client("tls.test", &[]);
+            cfg.max_version = Some(0x0303);
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+            assert!(
+                session.handshake().is_err(),
+                "a client with maxVersion 1.2 must refuse a TLS 1.3 listener"
+            );
+        });
+    }
+
+    #[test]
+    fn a_configured_server_curve_orders_the_listener_provider() {
+        let mut identity = plain_identity();
+        identity.curves = vec![0x0017];
+        let config = identity.server_config().expect("server config");
+        let groups: Vec<u16> = config
+            .crypto_provider()
+            .kx_groups
+            .iter()
+            .map(|group| u16::from(group.name()))
+            .collect();
+        assert_eq!(groups, vec![0x0017], "the named curve is the only group");
     }
 
     #[cfg_attr(
@@ -4759,6 +4833,7 @@ mod tests {
             min_version: Some(0x0303),
             max_version: Some(0x0303),
             cipher_suites: vec![0x003c, 0xc012, 0x0005, 0xc007, 0xc011],
+            curves: Vec::new(),
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
@@ -4819,6 +4894,7 @@ mod tests {
             min_version: Some(0x0303),
             max_version: Some(0x0304),
             cipher_suites: vec![0x003c, 0xc012, 0x0005, 0xc007, 0xc011],
+            curves: Vec::new(),
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
@@ -4876,6 +4952,7 @@ mod tests {
             min_version: Some(0x0303),
             max_version: Some(0x0303),
             cipher_suites: vec![0x002f],
+            curves: Vec::new(),
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),

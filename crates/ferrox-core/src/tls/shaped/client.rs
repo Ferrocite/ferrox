@@ -167,10 +167,12 @@ impl<S: Stream> Session<S> {
     /// The stock hello a config's `cipherSuites` rides when ring and `BoringSSL` carry none of it:
     /// Go's own extension table, with the config's list in place of a preset's.
     pub(crate) fn connect_stock(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
-        let profile = if crate::tls::cipher_suites::offers_tls13(&cfg.cipher_suites) {
-            &super::GO_STOCK
-        } else {
+        let profile = if cfg.max_version.is_some_and(|version| version < 0x0304)
+            || !crate::tls::cipher_suites::offers_tls13(&cfg.cipher_suites)
+        {
             &super::GO_STOCK_12
+        } else {
+            &super::GO_STOCK
         };
         Self::with_profile(profile, cfg, io, true)
     }
@@ -196,6 +198,7 @@ impl<S: Stream> Session<S> {
             }
             hello.set_alpn(&cfg.alpn);
         }
+        hello.set_version_bounds(cfg.min_version, cfg.max_version)?;
         if let Some(padding) = cfg.padding {
             hello.set_padding(usize::from(padding));
         }
@@ -203,6 +206,11 @@ impl<S: Stream> Session<S> {
             hello.clear_session_id();
         }
         if let Some(list) = &cfg.ech_config_list {
+            if cfg.max_version.is_some_and(|version| version < 0x0304) {
+                return Err(TlsError::Other(
+                    "ech: a client maximum below TLS 1.3 cannot carry ECH".to_owned(),
+                ));
+            }
             if stock {
                 hello.enable_stock_ech(list)?;
             } else {
