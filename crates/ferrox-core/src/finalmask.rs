@@ -515,6 +515,22 @@ impl<W: Write> Write for Pipe<'_, W> {
         drive(self.stages, &mut *self.raw, buf)
     }
 
+    // A stage reads one `&[u8]`, so a gathered write must reach it as one run or its write
+    // count lands on the header and body separately and a later `tlshello` cannot cut.
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match bufs {
+            [] => Ok(0),
+            [one] => self.write(one),
+            _ => {
+                let mut whole = Vec::with_capacity(bufs.iter().map(|part| part.len()).sum());
+                for part in bufs {
+                    whole.extend_from_slice(part);
+                }
+                self.write(&whole)
+            }
+        }
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.raw.flush()
     }
@@ -930,6 +946,31 @@ mod tests {
         let (widths, message) = records(&wire.bytes);
         assert_eq!(widths, vec![1; 96]);
         assert_eq!(message, whole[HEADER..], "the batching loses no octet");
+    }
+
+    #[test]
+    fn a_second_tlshello_stage_sees_the_merged_records_whole() {
+        let outer = Fragment::new(0, 1, vec![range(11, 11)], vec![range(0, 0)], range(0, 0))
+            .expect("valid");
+        let inner =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut chain = Chain::default();
+        chain.push(outer);
+        chain.push(inner);
+        let whole = hello(30);
+        let mut wire = Wire::default();
+        assert_eq!(chain.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(
+            chain.stages[1].count, 1,
+            "the gathered run reaches the next stage as one write, not one per slice"
+        );
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(
+            widths,
+            vec![3, 3, 3, 2, 11, 8],
+            "the second stage cut the first outer body to its width and passed the rest through"
+        );
+        assert_eq!(message, whole[HEADER..], "the two stages lose no octet");
     }
 
     #[test]
