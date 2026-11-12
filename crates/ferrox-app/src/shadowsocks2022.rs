@@ -626,6 +626,7 @@ pub(crate) fn serve_kcp<R, W>(
         identities,
         freedom,
     ) else {
+        close();
         return;
     };
     let reader = crate::proxy::metered(reader, meter.clone());
@@ -2795,7 +2796,7 @@ mod tests {
 
     impl Write for HalfClosedFlow {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             self.wire
@@ -2850,7 +2851,7 @@ mod tests {
         };
         let flag = std::sync::Arc::clone(&closed);
         let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            flag.store(true, std::sync::atomic::Ordering::Release);
             let _ = closed_tx.send(());
         });
         thread::spawn(move || {
@@ -2882,6 +2883,25 @@ mod tests {
             back == body,
             "the reply outlives the request's FIN (closed before the reply: {early}, ended: {ended})"
         );
+    }
+
+    #[test]
+    fn a_refused_carrier_closes_its_stream() {
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&closed);
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        serve_kcp(
+            std::io::Cursor::new(Vec::new()),
+            std::io::sink(),
+            "x",
+            "2022-blake3-aes-256-gcm",
+            &[],
+            false,
+            &close,
+        );
+        assert!(closed.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// Served traffic meters the generated and configured identities apart, even when a foreign inbound reserves the name the generated one would have taken.

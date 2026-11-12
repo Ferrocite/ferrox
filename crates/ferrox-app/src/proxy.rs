@@ -1003,10 +1003,7 @@ fn serve_vless_inbound(
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
-            thread::spawn(move || {
-                serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
-            });
-            true
+            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path),
         "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
@@ -1067,19 +1064,34 @@ fn serve_hysteria_thread(
     identity: &ferrox_core::tls::TlsServerConfig,
     masq: &ferrox_core::hysteria::Masquerade,
     serve: &crate::hysteria::Serve,
-) {
-    crate::hysteria::serve_loop(
+) -> bool {
+    let Some(prepared) = crate::hysteria::prepare(
         address,
-        std::slice::from_ref(&config.auth),
         identity,
         config.cc,
         &config.obfs_password,
-        masq,
-        serve,
-        std::time::Duration::from_secs(config.udp_idle),
         config.quic.as_ref(),
-        config.realm.as_deref(),
-    );
+    ) else {
+        return false;
+    };
+    let auth = config.auth.clone();
+    let udp_idle = std::time::Duration::from_secs(config.udp_idle);
+    let quic = config.quic;
+    let realm = config.realm.clone();
+    let masq = masq.clone();
+    let serve = Arc::clone(serve);
+    thread::spawn(move || {
+        crate::hysteria::serve_prepared(
+            prepared,
+            std::slice::from_ref(&auth),
+            &masq,
+            &serve,
+            udp_idle,
+            quic.as_ref(),
+            realm.as_deref(),
+        );
+    });
+    true
 }
 
 thread_local! {
@@ -13531,10 +13543,9 @@ fn serve_trojan_transport_inbound(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
     });
-    thread::spawn(move || {
-        serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
-    });
-    Some(true)
+    Some(serve_hysteria_thread(
+        &owned, &config, &identity, &masq, &serve,
+    ))
 }
 
 fn serve_trojan_quic_inbound(
@@ -14755,10 +14766,7 @@ fn serve_ss_hysteria_front(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_ss_hysteria(flow.with_meter(meter.clone()), &accounts, freedom);
     });
-    thread::spawn(move || {
-        serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
-    });
-    true
+    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
 }
 
 fn serve_shadowsocks_inbound(
