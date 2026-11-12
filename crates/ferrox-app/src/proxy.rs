@@ -30501,6 +30501,7 @@ pub(crate) mod lane_pool {
         }
     }
 
+    #[cfg(test)]
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
         let _ = submit_to_with(pool, step, complete, true);
     }
@@ -31016,6 +31017,7 @@ pub(crate) mod lane_pool {
                 complete: None,
                 idle: 0,
                 relay: false,
+                tag: "test",
             });
             assert!(reactor.park(slot).is_none(), "the lane parks");
             let ready = reactor.wait(Duration::ZERO);
@@ -31083,6 +31085,7 @@ pub(crate) mod lane_pool {
                     complete: Some(Box::new(|| {})),
                     idle: 0,
                     relay: true,
+                    tag: "test",
                 });
                 slot
             };
@@ -31163,6 +31166,7 @@ pub(crate) mod lane_pool {
                 complete: Some(Box::new(|| {})),
                 idle: 0,
                 relay: true,
+                tag: "test",
             });
             let park = std::time::Instant::now();
             assert!(
@@ -31208,6 +31212,7 @@ pub(crate) mod lane_pool {
                     complete: Some(Box::new(|| {})),
                     idle: 0,
                     relay: true,
+                    tag: "test",
                 });
                 slot
             };
@@ -31480,6 +31485,7 @@ pub(crate) mod lane_pool {
                 complete: Some(Box::new(|| {})),
                 idle: 0,
                 relay: true,
+                tag: "test",
             }
         }
 
