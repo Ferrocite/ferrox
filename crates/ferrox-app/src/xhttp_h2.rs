@@ -518,6 +518,13 @@ impl H2StreamReader {
         filled + n
     }
 
+    /// Whether another pump already holds the connection's read half.
+    fn read_busy(&self) -> bool {
+        self.client_read
+            .as_ref()
+            .is_some_and(|read| read.try_lock().is_err())
+    }
+
     /// Pump one frame from the connection, yielding or parking according to the lane that owns the call.
     fn pump(&self, yieldable: bool) -> Pumped {
         self.conn.pump_read(
@@ -581,6 +588,7 @@ impl Read for H2StreamReader {
                     && filled >= 8_192
                     && buf.len() - filled >= 8_192
                     && self.conn.client_read.is_some()
+                    && !self.conn.read_busy()
                     && crate::proxy::relay_step_owns_poll()
                 {
                     tried_extra = true;
@@ -1685,15 +1693,7 @@ impl H2Conn {
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
-        let mut read = if yieldable {
-            match read.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Pumped::Yield,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            }
-        } else {
-            read.lock().unwrap_or_else(PoisonError::into_inner)
-        };
+        let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
         if ready() {
             return Pumped::Alive;
         }
