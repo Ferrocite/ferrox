@@ -24997,8 +24997,6 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         return;
     };
     let lane_address = lane.address;
-    let mut lanes = HashMap::new();
-    lanes.insert(DEFAULT_UDP_LANE.to_owned(), lane);
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
@@ -25047,7 +25045,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         };
         let _ = relay.send_to(frame, lane_address);
     }
-    retire_udp_lanes(relay, lanes);
+    retire_udp_lanes(relay, HashMap::new(), Some(lane));
 }
 
 /// One lane for the whole association: every datagram reaches the same outbound.
@@ -25246,9 +25244,6 @@ struct UdpLane {
     waker: UdpSocket,
 }
 
-/// The default lane's key: no outbound tag can spell it.
-const DEFAULT_UDP_LANE: &str = "\0";
-
 #[allow(clippy::too_many_lines)]
 fn serve_socks_udp_split(
     mut client: Connection,
@@ -25268,6 +25263,7 @@ fn serve_socks_udp_split(
             addr.ip()
         });
     let mut lanes: HashMap<String, UdpLane> = HashMap::new();
+    let mut default_lane: Option<UdpLane> = None;
     let mut replies: HashSet<SocketAddr> = HashSet::new();
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
@@ -25341,15 +25337,24 @@ fn serve_socks_udp_split(
                 if matches!(&*out, Outbound::Block(_)) {
                     continue;
                 }
-                let key = key.as_deref().unwrap_or(DEFAULT_UDP_LANE);
-                let lane_address = match retire_finished_lane(&mut lanes, &mut replies, key) {
-                    Some(address) => Some(address),
-                    None => spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
-                        replies.insert(lane.address);
-                        let address = lane.address;
-                        lanes.insert(key.to_owned(), lane);
-                        address
-                    }),
+                let lane_address = if let Some(tag) = key.as_deref() {
+                    match retire_finished_lane(&mut lanes, &mut replies, tag) {
+                        Some(address) => Some(address),
+                        None => spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
+                            replies.insert(lane.address);
+                            let address = lane.address;
+                            lanes.insert(tag.to_owned(), lane);
+                            address
+                        }),
+                    }
+                } else {
+                    default_udp_lane(
+                        &mut default_lane,
+                        &mut replies,
+                        &out,
+                        local,
+                        client.try_clone().ok(),
+                    )
                 };
                 if let Some(lane_address) = lane_address {
                     let frame = match dial {
@@ -25366,7 +25371,7 @@ fn serve_socks_udp_split(
             }
         }
     }
-    retire_udp_lanes(relay, lanes);
+    retire_udp_lanes(relay, lanes, default_lane);
 }
 
 /// The upstream socket's family follows the relay's: an IPv4 relay gets an unspecified IPv4 bind, an IPv6 relay an unspecified IPv6 bind.
@@ -25396,6 +25401,28 @@ fn retire_finished_lane(
         replies.remove(&lane.address);
     }
     None
+}
+
+/// The untagged lane is not a map key: an outbound tag may be any string, so the default lives
+/// beside the tag map and only a real tag can own a named lane.
+fn default_udp_lane(
+    lane: &mut Option<UdpLane>,
+    replies: &mut HashSet<SocketAddr>,
+    out: &Outbound,
+    local: std::net::IpAddr,
+    associate: Option<Connection>,
+) -> Option<SocketAddr> {
+    if let Some(running) = lane.as_ref().filter(|lane| !lane.handle.is_finished()) {
+        return Some(running.address);
+    }
+    if let Some(finished) = lane.take() {
+        replies.remove(&finished.address);
+    }
+    let spawned = spawn_udp_lane(out, local, associate)?;
+    replies.insert(spawned.address);
+    let address = spawned.address;
+    *lane = Some(spawned);
+    Some(address)
 }
 
 fn arm_control(associate: Option<&Connection>) {
@@ -25433,16 +25460,20 @@ fn spawn_udp_lane(
 /// An association that owns its lanes: when it ends, each lane is woken with a datagram that names
 /// no destination and its read timeout is shortened, while the relay stays bound until every lane
 /// has joined so a late answer cannot reach a later association on the reused port.
-fn retire_udp_lanes(relay: UdpSocket, lanes: HashMap<String, UdpLane>) {
-    if lanes.is_empty() {
+fn retire_udp_lanes(
+    relay: UdpSocket,
+    lanes: HashMap<String, UdpLane>,
+    default_lane: Option<UdpLane>,
+) {
+    if lanes.is_empty() && default_lane.is_none() {
         return;
     }
     thread::spawn(move || {
-        for lane in lanes.values() {
+        for lane in lanes.values().chain(default_lane.iter()) {
             let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
             let _ = relay.send_to(&[0u8], lane.address);
         }
-        for lane in lanes.into_values() {
+        for lane in lanes.into_values().chain(default_lane) {
             let _ = lane.handle.join();
         }
     });
