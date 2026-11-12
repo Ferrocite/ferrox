@@ -27591,6 +27591,24 @@ fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<A
     let Ok(client_write) = client.try_clone() else {
         return;
     };
+    // Windows' readiness wakeup costs more than the copy: two blocking legs match the comparator and park in the kernel instead of polling.
+    #[cfg(windows)]
+    if answer.is_none()
+        && !target_write.masked()
+        && !client_write.masked()
+        && !client_read.metered()
+        && !target_read.metered()
+    {
+        relay_owned_with(
+            client_read,
+            target_write,
+            target_read,
+            client_write,
+            None,
+            false,
+        );
+        return;
+    }
     // A descriptor fast path cannot cross the mask, and only the Linux pump strips the answer the raw VLESS dial has not seen; every other host and a metered leg keep the lane pool.
     #[cfg(target_os = "linux")]
     let fast = !target_write.masked()
@@ -27908,9 +27926,28 @@ fn relay_owned(
     client_write: Connection,
     answer: Option<AnswerHooks>,
 ) {
+    relay_owned_with(
+        client_read,
+        target_write,
+        target_read,
+        client_write,
+        answer,
+        true,
+    );
+}
+
+fn relay_owned_with(
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
+    answer: Option<AnswerHooks>,
+    timeouts: bool,
+) {
     for connection in [&client_read, &target_read, &target_write, &client_write] {
-        let _ = connection.set_read_timeout(Some(RELAY_POLL));
-        let _ = connection.set_write_timeout(Some(RELAY_POLL));
+        let wait = timeouts.then_some(RELAY_POLL);
+        let _ = connection.set_read_timeout(wait);
+        let _ = connection.set_write_timeout(wait);
     }
     let forward_stall = client_read
         .policy()
@@ -27926,7 +27963,11 @@ fn relay_owned(
     let flow = RelayFinish::new(false, close, None);
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
-    forward.stall = forward_stall;
+    forward.stall = if timeouts {
+        forward_stall
+    } else {
+        std::time::Duration::MAX
+    };
     let done = RelayPool::global().run(move || {
         while forward.step(&first) != Next::Done {}
         first.mark_ended();
@@ -27934,7 +27975,11 @@ fn relay_owned(
     });
     let second = Arc::clone(&flow);
     let mut reply = TcpCopy::new(target_read, client_write);
-    reply.stall = reply_stall;
+    reply.stall = if timeouts {
+        reply_stall
+    } else {
+        std::time::Duration::MAX
+    };
     if let Some(answer) = answer {
         // An answer wait owns the configured grace; a plain idle sibling still hands back after one second.
         reply.reply_idle = reply_stall;
