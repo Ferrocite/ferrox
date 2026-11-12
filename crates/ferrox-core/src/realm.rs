@@ -60,6 +60,9 @@ pub const NAT_EXTRA_PORTS: u16 = 4;
 /// New candidates one symmetric-NAT host may contribute past those already observed.
 pub const NAT_MAX_PORTS_PER_HOST: usize = 32;
 
+/// The most candidates one punch attempt walks, however many the rendezvous names.
+pub const MAX_PUNCH_CANDIDATES: usize = 64;
+
 /// The two punch types: the initiator's hello and the responder's ack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -493,6 +496,20 @@ pub fn expand_symmetric(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
     out
 }
 
+/// The candidates one punch attempt walks: the family-filtered peers, the symmetric-NAT expansion,
+/// and then the first [`MAX_PUNCH_CANDIDATES`] in sorted order. A rendezvous that names thousands of
+/// addresses cannot turn one attempt into thousands of destinations.
+#[must_use]
+pub fn punch_candidates(
+    locals: &[SocketAddr],
+    peers: &[SocketAddr],
+    family: Family,
+) -> Vec<SocketAddr> {
+    let mut out = expand_symmetric(&candidate_addrs(locals, peers, family));
+    out.truncate(MAX_PUNCH_CANDIDATES);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +821,40 @@ mod tests {
         assert!(
             expanded.windows(2).all(|w| w[0] != w[1]),
             "one of each port"
+        );
+    }
+
+    /// A rendezvous that names a thousand peers still walks only the first sixty-four sorted
+    /// candidates, and a predictable host cannot grow the walk past that bound either.
+    #[test]
+    fn a_punch_walks_at_most_sixty_four_candidates() {
+        let local: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mut peers: Vec<SocketAddr> = (0..1000u16)
+            .map(|i| {
+                format!("10.{}.{}.1:5000", i / 256, i % 256)
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        peers.reverse();
+        let mut expected = candidate_addrs(&[local], &peers, Family::Dual);
+        expected.truncate(MAX_PUNCH_CANDIDATES);
+        let walked = punch_candidates(&[local], &peers, Family::Dual);
+        assert_eq!(walked.len(), MAX_PUNCH_CANDIDATES);
+        assert_eq!(walked, expected, "the first sixty-four in sorted order");
+        let predictable: Vec<SocketAddr> = (0..100u16)
+            .flat_map(|i| {
+                let ip = format!("10.0.{}.1", i);
+                [
+                    format!("{ip}:30000").parse().unwrap(),
+                    format!("{ip}:30002").parse().unwrap(),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            punch_candidates(&[local], &predictable, Family::Dual).len(),
+            MAX_PUNCH_CANDIDATES,
+            "the expansion is bounded too"
         );
     }
 }

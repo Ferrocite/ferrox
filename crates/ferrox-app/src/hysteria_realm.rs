@@ -565,8 +565,7 @@ pub(crate) fn dial_peer(socket: &UdpSocket, config: &Config) -> Option<SocketAdd
     let meta = realm::Metadata::new_random()?;
     let client = Client::new(config);
     let (raw_peers, peer_meta) = client.connect(&config.id, &locals, &meta)?;
-    let filtered = realm::candidate_addrs(&locals, &raw_peers, config.family);
-    let peers = realm::expand_symmetric(&filtered);
+    let peers = realm::punch_candidates(&locals, &raw_peers, config.family);
     punch(socket, &peer_meta, &peers)
 }
 
@@ -868,8 +867,7 @@ pub(crate) fn serve_registration(
                 .lock()
                 .ok()
                 .map_or_else(|| locals.clone(), |guard| guard.clone());
-            let filtered = realm::candidate_addrs(&current_locals, &peer_addresses, config.family);
-            let expanded = realm::expand_symmetric(&filtered);
+            let expanded = realm::punch_candidates(&current_locals, &peer_addresses, config.family);
             if expanded.is_empty() {
                 continue;
             }
@@ -1135,6 +1133,20 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// A malformed peer is dropped before the walk, so it can never become a punch destination;
+    /// the valid peers the same response names still reach the candidate list.
+    #[test]
+    fn a_malformed_peer_never_joins_the_punch_walk() {
+        let body = r#"{"addresses":["192.0.2.1:5000","192.0.2.2:notaport","[2001:db8::1]:6000"]}"#;
+        assert_eq!(
+            json_addr_list(body, "addresses"),
+            vec![
+                "192.0.2.1:5000".parse().expect("address"),
+                "[2001:db8::1]:6000".parse().expect("address"),
+            ]
+        );
+    }
 
     /// A loopback gateway that names a `WANIPConnection` control URL, maps the internal port to
     /// 4100 and answers its external address as the TEST-NET the fixture uses. The mapping the
