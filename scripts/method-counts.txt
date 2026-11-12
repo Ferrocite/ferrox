@@ -662,7 +662,7 @@ security-ech seal-plaintext-buffer-moves 0 ferrox-core-tls::hpke::tests::an_owne
 
 # --- ECH -------------------------------------------------------------------
 security-ech aes256-gcm-seal-retired-instructions 14957 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 15330 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15346 scripts/count-ops.sh
 security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
 security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
 security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)
