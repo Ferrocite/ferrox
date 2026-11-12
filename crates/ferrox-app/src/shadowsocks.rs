@@ -1192,6 +1192,36 @@ fn aead_step<R: Read>(
     if opened.forged {
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
     }
+    // An empty frame cannot hold a lane open: once the sibling has ended and its reply grace has run out, drain the frames already in the window before ending, so a payload that arrived behind the empties still reaches its target.
+    if opened.chunks > 0
+        && !batch[..opened.chunks].iter().any(|&(_, len)| len > 0)
+        && flow.is_some_and(|flow| flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE))
+    {
+        loop {
+            let rest = window.open_ready(&mut cipher, &mut batch);
+            if rest.chunks > 0
+                && write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..rest.chunks])
+                    .is_err()
+            {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            }
+            let moved = batch[..rest.chunks].iter().any(|&(_, len)| len > 0);
+            if moved {
+                if let Some(flow) = flow {
+                    flow.mark_progress();
+                }
+            }
+            if rest.forged {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            }
+            if moved {
+                break;
+            }
+            if rest.chunks == 0 {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            }
+        }
+    }
     let next = if opened.chunks > 0 {
         crate::proxy::lane_pool::Next::More
     } else {
@@ -3880,9 +3910,9 @@ mod tests {
         );
     }
 
-    /// An authenticated empty frame restarts nothing: the grace runs from bytes that moved, so a peer cannot hold a finished lane open with chunks that carry none.
+    /// An authenticated empty frame restarts nothing and keeps nothing after the grace: the clock runs from bytes that moved, so a peer cannot hold a finished lane open with chunks that carry none.
     #[test]
-    fn an_empty_frame_does_not_restart_the_reply_grace() {
+    fn an_empty_frame_cannot_hold_a_lane_past_the_reply_grace() {
         let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
         let idle = crate::budgets::RELAY_RESPONSE_IDLE;
         let salt = [7u8; SALT_LEN];
@@ -3896,6 +3926,17 @@ mod tests {
         wire.extend_from_slice(&length);
         wire.extend_from_slice(&length_tag);
         wire.extend_from_slice(&tag);
+        let mut window = ChunkReader::new(std::io::Cursor::new(&wire[..]));
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
+        assert_eq!(
+            crate::proxy::lane_pool::Next::More,
+            next,
+            "an empty frame keeps a live lane"
+        );
+        assert!(out.is_empty(), "an empty frame forwards nothing");
         flow.mark_ended();
         let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
         while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
@@ -3911,14 +3952,63 @@ mod tests {
         let mut out = Vec::new();
         let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
         assert_eq!(
-            crate::proxy::lane_pool::Next::More,
+            crate::proxy::lane_pool::Next::Done,
             next,
-            "the frame opened"
+            "an empty frame cannot hold a lane past its grace"
         );
         assert!(out.is_empty(), "an empty frame forwards nothing");
         assert!(
             flow.ended_and_idle(idle),
             "an empty frame must not restart the grace"
+        );
+    }
+
+    /// Empty frames ahead of a payload in the same window do not end the lane: the payload arrived before the grace ran out and still reaches its target.
+    #[test]
+    fn a_buffered_payload_behind_empty_frames_is_forwarded() {
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
+        let idle = crate::budgets::RELAY_RESPONSE_IDLE;
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut seal = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut wire = Vec::new();
+        for _ in 0..=CHUNKS_PER_BATCH {
+            let mut length = [0u8; LENGTH_LEN];
+            let length_tag = seal.seal_piece_in_place(&mut length).expect("tags");
+            let mut body: [u8; 0] = [];
+            let tag = seal.seal_piece_in_place(&mut body).expect("tags");
+            wire.extend_from_slice(&length);
+            wire.extend_from_slice(&length_tag);
+            wire.extend_from_slice(&tag);
+        }
+        let msg = b"behind the empties";
+        let mut length = (msg.len() as u16).to_be_bytes();
+        let length_tag = seal.seal_piece_in_place(&mut length).expect("tags");
+        let mut body = msg.to_vec();
+        let tag = seal.seal_piece_in_place(&mut body).expect("tags");
+        wire.extend_from_slice(&length);
+        wire.extend_from_slice(&length_tag);
+        wire.extend_from_slice(&body);
+        wire.extend_from_slice(&tag);
+        flow.mark_ended();
+        let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
+        while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            flow.ended_and_idle(idle),
+            "the grace did not run from the sibling's end"
+        );
+        let mut window = ChunkReader::new(std::io::Cursor::new(&wire[..]));
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
+        assert_eq!(crate::proxy::lane_pool::Next::More, next);
+        assert_eq!(&msg[..], &out[..], "the payload reached its target");
+        assert!(
+            !flow.ended_and_idle(idle),
+            "the forwarded payload restarted the grace"
         );
     }
 

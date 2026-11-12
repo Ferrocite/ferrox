@@ -31,8 +31,13 @@ pub struct Profile {
 
 impl Profile {
     /// uTLS's PSK profiles carry a `PreSharedKeyExtension` slot; a TLS 1.3 ticket rides only those.
+    /// A custom profile's name is the config's, not uTLS's, so only its extension table can open the slot.
     fn offers_psk(&self) -> bool {
-        self.name.contains("_psk") || self.exts.iter().any(|ext| ext.kind == 0x0029)
+        self.exts.iter().any(|ext| ext.kind == 0x0029)
+            || (self.name.contains("_psk")
+                && Fingerprint::resolve(self.name)
+                    .and_then(Fingerprint::profile)
+                    .is_some_and(|stock| std::ptr::eq(stock, self)))
     }
 }
 
@@ -664,6 +669,34 @@ mod tests {
         assert_ne!(
             Fingerprint::resolve("chrome_pq"),
             Fingerprint::resolve("hellochrome_120_pq")
+        );
+    }
+
+    /// A custom profile's name is the config's, not uTLS's: only its extension table opens the PSK slot.
+    #[test]
+    fn a_custom_psk_name_without_the_extension_has_no_slot() {
+        static SLOTS: [Ext; 1] = [Ext {
+            kind: 0x0029,
+            body: Body::Raw(&[]),
+        }];
+        let named = Profile {
+            name: "fixture_psk",
+            ciphers: &[],
+            shuffle: false,
+            exts: &[],
+        };
+        assert!(!named.offers_psk(), "a custom name alone opens nothing");
+        let slotted = Profile {
+            exts: &SLOTS,
+            ..named
+        };
+        assert!(slotted.offers_psk(), "the extension table opens the slot");
+        let stock = Fingerprint::resolve("hellochrome_112_psk_shuf")
+            .and_then(Fingerprint::profile)
+            .expect("a shaped preset");
+        assert!(
+            stock.offers_psk(),
+            "uTLS's PSK parrots carry the slot by name"
         );
     }
 

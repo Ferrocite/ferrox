@@ -596,7 +596,7 @@ fn profile_enabled(profile: Fingerprint, disabled: &[String]) -> bool {
 
 impl TlsShape {
     /// The browser hello one dial presents: a configured parrot drawn uniformly, the
-    /// reference's randomized shape when its coin lands, or Chrome when nothing is named.
+    /// reference's randomized shape when its coin lands, or the unshaped hello when nothing is allowed.
     pub(crate) fn fingerprint(&self, fronted: bool, provider: Option<&str>) -> Fingerprint {
         if let Some(profile) = self.forced_profile {
             return profile;
@@ -612,6 +612,11 @@ impl TlsShape {
         } else {
             &[]
         };
+        let fallback = if profile_enabled(Fingerprint::default(), disabled) {
+            Fingerprint::default()
+        } else {
+            Fingerprint::stock()
+        };
         let custom: Vec<Fingerprint> = self
             .custom_profiles
             .iter()
@@ -621,7 +626,7 @@ impl TlsShape {
         let mut stock: Vec<Fingerprint> = if self.use_only_custom_profiles && !custom.is_empty() {
             Vec::new()
         } else if self.profiles.is_empty() {
-            vec![Fingerprint::default()]
+            vec![fallback]
         } else {
             self.profiles
                 .iter()
@@ -630,7 +635,7 @@ impl TlsShape {
                 .collect()
         };
         if stock.is_empty() && custom.is_empty() {
-            stock.push(Fingerprint::default());
+            stock.push(fallback);
         }
 
         let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
@@ -5736,6 +5741,27 @@ mod tests {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
         assert!(random_hostname(r"(a|b)+").is_none());
+    }
+
+    /// A provider that disables every named hello gets the reference's unshaped fallback, not the one it disabled.
+    #[test]
+    fn a_disabled_profile_falls_back_to_the_stock_hello() {
+        let chrome = Fingerprint::default();
+        let name = chrome.name().expect("chrome is shaped").to_owned();
+        let mut shape = TlsShape {
+            disable_fronting_profiles: vec![("fronted".to_owned(), vec![name])],
+            ..TlsShape::default()
+        };
+        assert_eq!(
+            Fingerprint::stock(),
+            shape.fingerprint(true, Some("fronted"))
+        );
+        shape.profiles = vec![chrome];
+        assert_eq!(
+            Fingerprint::stock(),
+            shape.fingerprint(true, Some("fronted"))
+        );
+        assert_eq!(chrome, shape.fingerprint(false, None));
     }
 
     #[test]
