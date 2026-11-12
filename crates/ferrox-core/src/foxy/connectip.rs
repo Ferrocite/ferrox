@@ -326,6 +326,15 @@ pub enum Capsule<'a> {
     Other(u64),
 }
 
+/// The type and declared body length of the capsule at the front of `buf`, read even when the body is not all there yet, so a caller can refuse a capsule too large to buffer instead of waiting for it.
+#[must_use]
+pub fn capsule_header(buf: &[u8]) -> Option<(u64, u64)> {
+    let mut at = 0usize;
+    let kind = quic_read(buf, &mut at)?;
+    let length = quic_read(buf, &mut at)?;
+    Some((kind, length))
+}
+
 /// The first complete capsule in a stream buffer: bytes consumed and what it was, or `None` while the capsule is not whole; a capsule this lane does not read is *answered* and stepping over it is the caller's, because an advertised extension must not cost the tunnel its packets.
 #[must_use]
 pub fn capsule_split(buf: &[u8]) -> Option<(usize, Capsule<'_>)> {
