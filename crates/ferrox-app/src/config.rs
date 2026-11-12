@@ -1941,8 +1941,10 @@ fn kcp_mask(
 
 /// The source-address lists one `filter` stage carries. An absent or empty list is no list; a
 /// malformed rule refuses the carrier rather than silently serving every source.
-fn source_filter(conf: Option<&Json>) -> Option<ferrox_core::finalmask::SourceFilter> {
-    let conf = conf?;
+fn source_filter(conf: Option<&Json>) -> Result<Option<ferrox_core::finalmask::SourceFilter>, ()> {
+    let Some(conf) = conf else {
+        return Ok(None);
+    };
     let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
     let blocked = filter_list(
         conf.get("blockedSourceIPs"),
@@ -1955,29 +1957,29 @@ fn source_filter(conf: Option<&Json>) -> Option<ferrox_core::finalmask::SourceFi
         "allowedSourceIPs",
     )?;
     if blocked.is_none() && allowed.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(ferrox_core::finalmask::SourceFilter::new(
+    Ok(Some(ferrox_core::finalmask::SourceFilter::new(
         blocked.map_or_else(ferrox_core::finalmask::IpSets::default, |matcher| {
             ferrox_core::finalmask::IpSets::new(matcher.ranges())
         }),
         allowed.map_or_else(ferrox_core::finalmask::IpSets::default, |matcher| {
             ferrox_core::finalmask::IpSets::new(matcher.ranges())
         }),
-    ))
+    )))
 }
 
 fn filter_list(
     value: Option<&Json>,
     assets: &mut crate::router::Assets,
     field: &str,
-) -> Option<Option<crate::router::IpMatcher>> {
+) -> Result<Option<crate::router::IpMatcher>, ()> {
     match value {
-        None | Some(Json::Null) => Some(None),
-        Some(value) if value.as_arr().is_some_and(<[Json]>::is_empty) => Some(None),
+        None | Some(Json::Null) => Ok(None),
+        Some(value) if value.as_arr().is_some_and(|items| items.is_empty()) => Ok(None),
         Some(value) => crate::router::ip_matcher(value, assets, field)
-            .ok()
-            .map(Some),
+            .map(Some)
+            .map_err(|_| ()),
     }
 }
 
