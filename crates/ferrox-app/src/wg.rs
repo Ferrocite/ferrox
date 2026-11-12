@@ -537,7 +537,6 @@ impl WireGuardOut {
                         }
                         let out = crate::proxy::socks_udp_frame(
                             &mut framed,
-                            None,
                             &target,
                             &back[..read],
                         );
