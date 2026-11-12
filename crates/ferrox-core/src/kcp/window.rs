@@ -257,7 +257,9 @@ impl AckList {
 
     pub fn add(&mut self, number: u32, timestamp: u32) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.number == number) {
-            entry.timestamp = timestamp;
+            if timestamp.wrapping_sub(entry.timestamp) < 0x7FFF_FFFF {
+                entry.timestamp = timestamp;
+            }
             entry.next_flush = 0;
             self.dirty = true;
             return;
@@ -600,6 +602,11 @@ mod tests {
             "a repeated segment added a second entry"
         );
         assert_eq!(l.entries[0].timestamp, 200);
+        l.add(7, 100);
+        assert_eq!(
+            l.entries[0].timestamp, 200,
+            "a late older retransmission rewound the timestamp"
+        );
         assert_eq!(
             l.entries[0].next_flush, 0,
             "a repeated segment is due again"
