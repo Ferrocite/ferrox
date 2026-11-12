@@ -1882,10 +1882,12 @@ fn move_socket(conn: &mut quiche::Connection, sock: &Datagram, fresh: UdpSocket)
         || conn.migrate_source(new_local).is_err()
     {
         let _ = conn.close(false, 0, b"rebind");
+        flush_egress(conn, sock);
         return Rebind::Failed;
     }
     if sock.rebind(fresh).is_err() {
         let _ = conn.close(false, 0, b"rebind");
+        flush_egress(conn, sock);
         return Rebind::Failed;
     }
     flush_egress(conn, sock);
@@ -6283,7 +6285,10 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "a failed move must not wait on the old path"
         );
-        assert!(client.conn.is_closed(), "the failed move closes the lane");
+        assert!(
+            client.conn.close(false, 0, b"again").is_err(),
+            "the failed move already closed the lane"
+        );
     }
 
     /// A route change that still picks the source this lane already holds must not churn the
