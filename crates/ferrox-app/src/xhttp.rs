@@ -15,7 +15,7 @@ const CHUNK: usize = crate::proxy::RELAY_BUFFER;
 /// The chunk a response frames: the reference's HTTP writer hands its reader one `buf.Size` buffer at a time.
 const WIRE_CHUNK: usize = 8 * 1024;
 /// The chunks one relay window leaves as.
-const FRAMES_FRAMES_PER_WINDOW: usize = CHUNK.div_ceil(WIRE_CHUNK);
+const FRAMES_PER_WINDOW: usize = CHUNK.div_ceil(WIRE_CHUNK);
 /// A whole body plus the longest size line that can precede it and both bytes that close the body, so one framing read opens and finishes it.
 const FRAMING_READ: usize = CHUNK + 131;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
