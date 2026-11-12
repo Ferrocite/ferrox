@@ -3,6 +3,10 @@
 # base|leg|ratio|issue|basis, where basis is raw (default) or ceiling.
 vless-hysteria-down-8|server|0.04|670
 masque-down-8|server|0.15|861
+# The WARP server leg's xray client is bimodal on arm: 69/74/74/75/192 MiB/s in run 43155796255 and
+# 74/189/190/192/194 in run 43127254767, against a ferrox server that held 208-213. The writer's own
+# evidence is the 1.03x median when the client does not collapse; the cell median is the client's.
+wireguard-raw-down-8|server|0.18|861|ceiling
 masque-down-8|server-threads|1.40|861
 shadowsocks-raw-duplex-8|client|0.84|696
 # Serving the xray client's shared gRPC connection reveals the cost the single-stream row never produced: one control thread per connection and the xray client's small stream window, both #696.
