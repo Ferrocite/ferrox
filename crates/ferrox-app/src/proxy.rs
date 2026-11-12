@@ -32626,6 +32626,21 @@ fn forward_finished(
     }
 }
 
+/// The turn a lane takes after an empty carrier read: one that parks on its socket retakes the turn
+/// a bounded number of times, so a frame a hair behind the last one costs a step and not a reactor
+/// round-trip; a reader whose credit arrives on another read keeps the turn every time.
+fn empty_read_next(empty: &mut u8, parks: bool) -> Next {
+    if !parks {
+        return Next::More;
+    }
+    *empty = empty.saturating_add(1);
+    if *empty <= budgets::RELAY_RETAKE {
+        Next::More
+    } else {
+        Next::Idle
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn relay_ordered<R, W, F, E, const CLOSE_FIRST: bool, const DRAIN_REQUEST: bool>(
     reader: R,
@@ -32716,6 +32731,9 @@ where
     let upload_flow = Arc::clone(&flow);
     let upload_writer = writer.clone();
     let mut upload = Upload::new();
+    // Empty reads this lane retakes before it parks, so a frame a hair behind the last one costs a
+    // step instead of a reactor round-trip.
+    let mut empty = 0u8;
     // Every wait of this shape carries the named stall, armed once outside the byte loop.
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
@@ -32723,6 +32741,7 @@ where
             let read = reader.read_window();
             let (next, timed_out) = match read {
                 Ok(window) if !window.is_empty() => {
+                    empty = 0;
                     if upload.first {
                         echo_trace("relay bwd first read");
                         echo_trace("relay bwd forwarding");
@@ -32775,10 +32794,8 @@ where
                     && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
                 {
                     Next::Done
-                } else if reader.parks_on_timeout() {
-                    Next::Idle
                 } else {
-                    Next::More
+                    empty_read_next(&mut empty, reader.parks_on_timeout())
                 }
             } else {
                 next
@@ -38487,6 +38504,20 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carrier that parks on an empty read retakes its turn once, so the frame a hair behind the
+    /// last one is a step; the second empty read parks, and a reader whose credit arrives on another
+    /// read keeps the turn every time.
+    #[test]
+    fn an_empty_carrier_read_retakes_its_turn_once() {
+        let mut empty = 0;
+        assert_eq!(empty_read_next(&mut empty, true), Next::More);
+        assert_eq!(empty_read_next(&mut empty, true), Next::Idle);
+        let mut empty = 0;
+        for _ in 0..4 {
+            assert_eq!(empty_read_next(&mut empty, false), Next::More);
+        }
+    }
 
     impl Mux {
         /// The mux a config with only `enabled: true` folds to: the 128 concurrency floor and the shared datagram carrier.

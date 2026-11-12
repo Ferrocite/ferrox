@@ -29,6 +29,9 @@ pub(crate) const SESSION_POLL: Duration = Duration::from_millis(1);
 /// Empty shared reads a flow may keep the short grain for: a pause between two writes must not cost the second the long grain.
 pub(crate) const RELAY_MOVING_READS: u32 = 64;
 
+/// Empty carrier reads a lane retakes before it parks: a frame a hair behind the last one costs a step, not a reactor round-trip, while an idle flow still hands its thread back.
+pub(crate) const RELAY_RETAKE: u8 = 1;
+
 pub(crate) const RELAY_HANDOFF_SPINS: u32 = 64;
 
 /// One leg's wait for its partner after the flow has ended: a partner still missing past the relay's own idle bound is starved rather than draining, and a thread that waits forever turns one stalled peer into a pile-up of held sessions.
