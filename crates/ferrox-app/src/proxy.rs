@@ -24152,7 +24152,7 @@ fn http_head_is_interim(head: &[u8]) -> bool {
     let mut parts = line.split(|byte| *byte == b' ');
     let _version = parts.next();
     let code = parts.next().unwrap_or(&[]);
-    code.len() == 3 && code[0] == b'1' && code.iter().all(u8::is_ascii_digit)
+    code.len() == 3 && code[0] == b'1' && code != b"101" && code.iter().all(u8::is_ascii_digit)
 }
 
 /// Whether every header line's name is an HTTP token, so a head that needs no rewrite can be forwarded as it landed.
@@ -24190,6 +24190,7 @@ fn header_names_are_tokens(head: &[u8]) -> bool {
 /// frame differently from the bytes this side relays is a request-smuggling desync, not a header.
 fn drop_invalid_header_names(head: &mut Vec<u8>) {
     let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    let mut dropped = false;
     while at < head.len() {
         let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
             return;
@@ -24203,7 +24204,12 @@ fn drop_invalid_header_names(head: &mut Vec<u8>) {
             .first()
             .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
         {
-            at = end + 1;
+            if !dropped {
+                at = end + 1;
+                continue;
+            }
+            head.copy_within(end + 1.., at);
+            head.truncate(head.len() - (end + 1 - at));
             continue;
         }
         let valid = line
@@ -24211,9 +24217,11 @@ fn drop_invalid_header_names(head: &mut Vec<u8>) {
             .position(|byte| *byte == b':')
             .is_some_and(|colon| header_name_is_token(&line[..colon]));
         if valid {
+            dropped = false;
             at = end + 1;
             continue;
         }
+        dropped = true;
         head.copy_within(end + 1.., at);
         head.truncate(head.len() - (end + 1 - at));
     }
@@ -66856,6 +66864,16 @@ mod tests {
     }
 
     #[test]
+    fn an_upgrade_head_is_final_not_interim() {
+        assert!(http_head_is_interim(b"HTTP/1.1 100 Continue\r\n\r\n"));
+        assert!(http_head_is_interim(b"HTTP/1.1 103 Early Hints\r\n\r\n"));
+        assert!(!http_head_is_interim(
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
+        ));
+        assert!(!http_head_is_interim(b"HTTP/1.1 200 OK\r\n\r\n"));
+    }
+
+    #[test]
     fn an_http_forward_drops_header_names_that_are_not_tokens() {
         let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let origin_port = origin.local_addr().expect("addr").port();
@@ -66873,12 +66891,16 @@ mod tests {
                 "a spaced content-length reached the origin: {text}"
             );
             assert!(
+                !text.contains("folded-request"),
+                "a folded line of a dropped header reached the origin: {text}"
+            );
+            assert!(
                 text.contains("x-kept: 1"),
                 "a legal header did not reach the origin: {text}"
             );
             stream
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\nhello",
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n folded-response\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\nhello",
                 )
                 .expect("answers");
         });
@@ -66890,7 +66912,7 @@ mod tests {
         client
             .write_all(
                 format!(
-                    "GET http://127.0.0.1:{origin_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nTransfer-Encoding : chunked\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\n"
+                    "GET http://127.0.0.1:{origin_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nTransfer-Encoding : chunked\r\n folded-request\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -66904,6 +66926,10 @@ mod tests {
         assert!(
             !text.contains("content-length"),
             "a spaced content-length reached the client: {text}"
+        );
+        assert!(
+            !text.contains("folded-response"),
+            "a folded line of a dropped response header reached the client: {text}"
         );
         assert!(
             text.contains("x-kept: 1"),
