@@ -22836,7 +22836,7 @@ fn serve_connect_freedom(
     if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
         return;
     }
-    if !prefix.is_empty() {
+    if !prefix.is_empty() && !http_head_has_body(prefix) {
         loop {
             let Some((mut head, at)) =
                 read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
@@ -22855,6 +22855,21 @@ fn serve_connect_freedom(
         }
     }
     relay_handoff(client, &upstream);
+}
+
+/// A request head that carries a body: the origin answers only after it arrives, so the direct leg
+/// must relay before reading the response head or the two sides wait on each other.
+fn http_head_has_body(head: &[u8]) -> bool {
+    head.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let (name, value) = line.split_at(colon);
+        name.eq_ignore_ascii_case(b"transfer-encoding")
+            || (name.eq_ignore_ascii_case(b"content-length")
+                && value.iter().any(|byte| (b'1'..=b'9').contains(byte)))
+    })
 }
 
 /// The reference's blocked target: the client is drained until the rule's wait ends, then closed.
