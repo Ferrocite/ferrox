@@ -283,7 +283,7 @@ carrier-grpc decoder-buffer-writes-per-borrowed-field 0 ferrox-app-h2::tests::a_
 carrier-grpc header-field-allocations-per-inserted-field 2 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
 carrier-grpc header-block-allocations-per-frame 1 ferrox-app-h2::tests::a_header_block_is_opened_once
 
-carrier-xhttp ops-retired-instructions 68114 scripts/count-ops.sh
+carrier-xhttp ops-retired-instructions 33046 scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
 carrier-xhttp framing-read-syscalls-per-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp read-syscalls-per-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three

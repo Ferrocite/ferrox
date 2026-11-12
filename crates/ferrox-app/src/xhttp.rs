@@ -131,50 +131,60 @@ enum ChunkLine {
     Need,
 }
 
-/// One walk from the size line's first byte to the CRLF that ends it: find the
-/// terminator, parse the hex, and leave `at` past the pair. The caller's prefix is
-/// read in place, so the line crosses no stack buffer. `Need` says the CRLF has
-/// not arrived, `Invalid` a line that can never be a size.
+/// One walk from the size line's first byte to the CRLF that ends it: parse the
+/// hex, and leave `at` past the pair. The caller's prefix is read in place, so the
+/// line crosses no stack buffer. `Need` says the CRLF has not arrived, `Invalid` a
+/// line that can never be a size.
 fn xhttp_chunk_line(prefix: &[u8], at: &mut usize) -> ChunkLine {
     let start = *at;
     let window = &prefix[start..(start + 130).min(prefix.len())];
     let mut size = 0usize;
     let mut digits = 0usize;
-    let mut ended = false;
-    let mut invalid = false;
+    let mut valid = false;
     let mut i = 0;
+    // The size line is hex digits closed by CRLF: parse the run, then let only a non-closing terminator defer.
     while i < window.len() {
         let b = window[i];
-        if !invalid && !ended {
-            let v = CHUNK_LINE_LUT[b as usize];
-            match v {
-                0..=15 => {
-                    if digits == 16 {
-                        invalid = true;
-                    } else {
-                        size = (size << 4) | v as usize;
-                        digits += 1;
-                    }
-                }
-                16 => {
-                    if digits == 0 {
-                        invalid = true;
-                    } else {
-                        ended = true;
-                    }
-                }
-                _ => invalid = true,
+        let v = CHUNK_LINE_LUT[b as usize];
+        if v <= 15 {
+            if digits == 16 {
+                break;
             }
+            size = (size << 4) | v as usize;
+            digits += 1;
+            i += 1;
+            continue;
         }
-        if b == b'\r' && window.get(i + 1) == Some(&b'\n') {
+        if v == 16 {
+            if b == b'\r' && window.get(i + 1) == Some(&b'\n') {
+                if i > 127 {
+                    return ChunkLine::Need;
+                }
+                *at = start + i + 2;
+                return if digits == 0 {
+                    ChunkLine::Invalid
+                } else {
+                    ChunkLine::Size(size)
+                };
+            }
+            valid = digits > 0;
+        }
+        break;
+    }
+    if i == window.len() {
+        return ChunkLine::Need;
+    }
+    // A non-closing terminator, a byte that is neither, or a seventeenth digit leaves only the closing CRLF to find.
+    while i < window.len() {
+        if window[i] == b'\r' && window.get(i + 1) == Some(&b'\n') {
             if i > 127 {
                 return ChunkLine::Need;
             }
             *at = start + i + 2;
-            return if invalid || digits == 0 {
-                ChunkLine::Invalid
-            } else {
+            return if valid {
                 ChunkLine::Size(size)
+            } else {
+                ChunkLine::Invalid
             };
         }
         i += 1;
