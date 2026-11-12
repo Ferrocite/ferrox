@@ -1578,7 +1578,8 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// one, else a filesystem path after the permission the reference accepts is split off. A stale
 /// socket is replaced and a file that is not a socket is refused, so a typo cannot delete data; a
 /// requested mode is applied to a sibling name the path cannot have been swapped under and then
-/// moved into place, so nothing but our own socket ever takes the permission.
+/// moved into place, so nothing but our own socket ever takes the permission — or, when the path
+/// already fills the address field and leaves no room for a longer sibling, to the path itself.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -1605,6 +1606,18 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         return UnixListener::bind(path);
     };
     let staged = staged_name(path);
+    if staged.as_os_str().len() > path.as_os_str().len() {
+        // A field-filling path has no room for a longer sibling, so the mode goes on the path itself.
+        if stale {
+            std::fs::remove_file(path)?;
+        }
+        let listener = UnixListener::bind(path)?;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        return Ok(listener);
+    }
     let _ = std::fs::remove_file(&staged);
     let listener = UnixListener::bind(&staged)?;
     let moved = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))
@@ -2726,9 +2739,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("ferrox-unix-limit-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&root).expect("scratch dir");
-        let room = limit - 3 - root.as_os_str().len();
-        assert!(room > 8, "the temp dir leaves room for a deep name");
-        let dir = root.join("d".repeat(room));
+        let fill = limit - 3 - root.as_os_str().len();
+        assert!(fill > 8, "the temp dir leaves room for a deep name");
+        let dir = root.join("d".repeat(fill));
         std::fs::create_dir_all(&dir).expect("the deep dir");
         let path = dir.join("s");
         assert_eq!(
