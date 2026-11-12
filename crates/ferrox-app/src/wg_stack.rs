@@ -374,7 +374,8 @@ impl Readiness {
 }
 
 /// One TCP flow and the local stream on the other side of it. `pending_up`
-/// holds bytes the TCP window has not accepted.
+/// holds bytes the TCP window has not accepted; `pending_down` holds the tail a
+/// full local stream refused, pulled off the ring so the window stays open.
 #[allow(clippy::struct_excessive_bools)]
 struct Flow {
     handle: SocketHandle,
