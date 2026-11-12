@@ -3758,7 +3758,54 @@ impl crate::proxy::CarrierSink for XhttpWriter {
                 None => crate::proxy::Push::Took(0),
             };
         }
+        if self.stream.get().is_none() {
+            if let Body::Stream(stream) = &self.shared.body {
+                let Ok(mut stream) = stream.lock() else {
+                    return crate::proxy::Push::Lost;
+                };
+                let mut took = 0usize;
+                for piece in bytes.chunks(CHUNK) {
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    let mut line = [0u8; 7];
+                    let len = size_line(piece.len(), &mut line);
+                    match stream.offer_slices(&[&line[..len], piece, b"\r\n"]) {
+                        crate::proxy::Accepted::All => took += piece.len(),
+                        crate::proxy::Accepted::Full => break,
+                        crate::proxy::Accepted::Lost => return crate::proxy::Push::Lost,
+                    }
+                }
+                return crate::proxy::Push::Took(took);
+            }
+        }
         self.push(bytes)
+    }
+    #[inline]
+    fn pace(&self) -> bool {
+        if self.stream.get().is_some() {
+            return false;
+        }
+        let Body::Stream(stream) = &self.shared.body else {
+            return false;
+        };
+        stream
+            .lock()
+            .map(|mut stream| stream.pace())
+            .unwrap_or(false)
+    }
+    #[inline]
+    fn settle(&self) -> crate::proxy::Settle {
+        if self.stream.get().is_some() {
+            return crate::proxy::Settle::Clear;
+        }
+        let Body::Stream(stream) = &self.shared.body else {
+            return crate::proxy::Settle::Clear;
+        };
+        stream
+            .lock()
+            .map(|mut stream| stream.settle())
+            .unwrap_or(crate::proxy::Settle::Lost)
     }
     #[inline]
     fn read_window(&self) -> Option<usize> {
@@ -3954,6 +4001,60 @@ mod tests {
         assert_eq!(&seen.bytes[..head.len()], head.as_bytes());
         assert_eq!(&seen.bytes[head.len()..head.len() + CHUNK], &payload[..]);
         assert_eq!(&seen.bytes[head.len() + CHUNK..], b"\r\n");
+    }
+
+    /// A paced H1 sink owns the tail: once its window is full the relay gets a zero-byte take and a
+    /// parked settle instead of the worker blocking in `write_slices`.
+    #[test]
+    fn a_paced_h1_write_parks_instead_of_blocking() {
+        struct Paced {
+            room: usize,
+        }
+        impl Write for Paced {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("the relay took the blocking write")
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Paced {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                panic!("the relay took the blocking write")
+            }
+            fn pace(&mut self) -> bool {
+                true
+            }
+            fn offer_slices(&mut self, parts: &[&[u8]]) -> crate::proxy::Accepted {
+                let n: usize = parts.iter().map(|part| part.len()).sum();
+                if n > self.room {
+                    return crate::proxy::Accepted::Full;
+                }
+                self.room -= n;
+                crate::proxy::Accepted::All
+            }
+            fn settle(&mut self) -> crate::proxy::Settle {
+                if self.room == 0 {
+                    crate::proxy::Settle::Parked
+                } else {
+                    crate::proxy::Settle::Clear
+                }
+            }
+        }
+        let writer = XhttpWriter::new(Paced {
+            room: CHUNK + 7 + 2,
+        });
+        assert!(writer.pace(), "the sink owns a paced tail");
+        let payload = vec![0x5Au8; CHUNK];
+        assert!(matches!(
+            writer.push_ready(&payload),
+            crate::proxy::Push::Took(n) if n == CHUNK
+        ));
+        assert!(matches!(
+            writer.push_ready(&payload),
+            crate::proxy::Push::Took(0)
+        ));
+        assert!(matches!(writer.settle(), crate::proxy::Settle::Parked));
     }
 
     #[test]

@@ -32105,6 +32105,10 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn push_ready(&self, bytes: &[u8]) -> Push {
         self.push(bytes)
     }
+    /// Take a paced tail when the carrier owns one, so a full write parks the lane instead of the worker.
+    fn pace(&self) -> bool {
+        false
+    }
     /// Bytes a parked push accepted but the socket did not take yet: a lane that owes none still
     /// drains them, so a stalled record is not stranded behind an idle read.
     fn settle(&self) -> Settle {
@@ -32148,6 +32152,12 @@ pub(crate) trait FrameWrite: Write + Send {
     /// masked frame), whose caller keeps the blocking `write_slices`.
     fn write_ready(&mut self, _parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
         None
+    }
+
+    /// Take ownership of a paced tail so `offer_slices` can park a full carrier instead of
+    /// blocking the worker. `false` leaves the writer on its blocking path.
+    fn pace(&mut self) -> bool {
+        false
     }
 
     /// Every byte is taken, but a transport with a paced tail may not have put it on the wire yet:
@@ -32308,6 +32318,11 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
             let _ = timeout;
             out.paced = true;
         }
+    }
+
+    fn pace(&mut self) -> bool {
+        self.arm_write(crate::budgets::RELAY_POLL);
+        true
     }
 }
 
@@ -32698,6 +32713,7 @@ where
     let flow = RelayFinish::new(false, Arc::new(|| {}), then);
 
     let uplink = writer.clone();
+    uplink.pace();
     let forward_flow = Arc::clone(&flow);
     let mut peer_read = peer_read;
     let mut buffer = uplink
