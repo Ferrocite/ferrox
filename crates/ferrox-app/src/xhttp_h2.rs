@@ -34,7 +34,7 @@ const CREDIT_TEMPLATE: [u8; 26] = {
 const DATA_FRAMES_PER_WRITE: usize = 8;
 
 fn initial_settings() -> Vec<u8> {
-    let mut out = Vec::with_capacity(18);
+    let mut out = Vec::with_capacity(12);
     out.extend_from_slice(&S_WINDOW.to_be_bytes());
     out.extend_from_slice(&WINDOW.to_be_bytes());
     out.extend_from_slice(&S_MAX_FRAME.to_be_bytes());
@@ -5364,7 +5364,7 @@ mod tests {
     #[test]
     fn the_initial_settings_advertise_one_relay_window() {
         let settings = initial_settings();
-        assert_eq!(settings.len(), 18, "two settings before the frame size");
+        assert_eq!(settings.len(), 12, "two settings before the frame size");
         assert_eq!(
             u16::from_be_bytes([settings[6], settings[7]]),
             S_MAX_FRAME,
