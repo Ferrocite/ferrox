@@ -179,15 +179,15 @@ jobs:
       - name: install the QUIC build tool
         shell: bash
         run: choco install nasm -y --no-progress || { choco list --local-only 2>/dev/null | grep -iq nasm; }
-      - name: run the test alone, five times
+      - name: run the ferrox-app suite, three times
         shell: bash
         env:
           FERROX_ECHO_TRACE: "1"
           RUST_TEST_THREADS: "1"
         run: |
-          for i in 1 2 3 4 5; do
+          for i in 1 2 3; do
             echo "=== run $i ==="
-            cargo test -p ferrox-app --locked eight_packet_up_trojan_h2_downloads_complete -- --nocapture || echo "RUN $i FAILED"
+            cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
           done
 
   test:
