@@ -63,7 +63,7 @@ graph TD
 | move-to-front-allocations | 0 | ferrox-app-psiphon::tests::a_live_server_moves_to_the_front |
 | capability-name-allocations | 0 | ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed |
 | preresolved-pick-allocations | 0 | ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap |
-| ss-direct-write-probe-ops | 47475578 | scripts/count-ops.sh |
+| ss-direct-write-probe-ops | 47483770 | scripts/count-ops.sh |
 | ss-flatten-write-probe-ops | 47621538 | scripts/count-ops.sh |
 | quic-varint-probe-ops | 131079 | scripts/count-ops.sh |
 | seconds-per-live-transfer | UNBLESSED | .github/workflows/psiphon-live.yml |
