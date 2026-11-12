@@ -28888,9 +28888,8 @@ pub(crate) mod lane_pool {
     static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// A server's flow parks one leg on the peer's window, so eight download lanes carry the widest
-    /// standard cell and leave room for the accept path and the parking reaper under the reference's
-    /// ten-thread server peak. A worker starts only when a lane is queued and no worker is idle, so
-    /// this is the ceiling, not the shape.
+    /// standard cell. The h2 demux runs on its own pool with its own reaper, so this caps the relay
+    /// workers, not the process. A worker starts only when a lane is queued and no worker is idle.
     #[cfg(target_os = "linux")]
     pub(crate) const RELAY_LANES: usize = 8;
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
