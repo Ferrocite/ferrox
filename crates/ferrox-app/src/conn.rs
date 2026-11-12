@@ -1578,8 +1578,8 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// one, else a filesystem path after the permission the reference accepts is split off. A stale
 /// socket is replaced and a file that is not a socket is refused, so a typo cannot delete data; a
 /// requested mode is applied to a sibling name the path cannot have been swapped under and then
-/// moved into place, so nothing but our own socket ever takes the permission — or, when the path
-/// already fills the address field and leaves no room for a longer sibling, to the path itself.
+/// moved into place, so nothing but our own socket ever takes the permission — or, when the
+/// directory leaves no room for a sibling name, to the path itself.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -1606,8 +1606,8 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         return UnixListener::bind(path);
     };
     let staged = staged_name(path);
-    if staged.as_os_str().len() > path.as_os_str().len() {
-        // A field-filling path has no room for a longer sibling, so the mode goes on the path itself.
+    if staged.as_os_str().len() > std::mem::size_of::<libc::sockaddr_un>() - 3 {
+        // The directory leaves no room for a sibling name, so the mode goes on the path itself.
         if stale {
             std::fs::remove_file(path)?;
         }
