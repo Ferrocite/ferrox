@@ -378,10 +378,11 @@ const REFUSED_WRITES: [i32; 2] = [10022, 10040];
 #[cfg(not(any(unix, windows)))]
 const REFUSED_WRITES: [i32; 0] = [];
 
-fn refused(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .is_some_and(|code| REFUSED_WRITES.contains(&code))
+pub(crate) fn refused(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidInput
+        || error
+            .raw_os_error()
+            .is_some_and(|code| REFUSED_WRITES.contains(&code))
 }
 
 fn send_packets<W>(

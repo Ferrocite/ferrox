@@ -291,7 +291,7 @@ impl Device {
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        self.handle.write_all(packet)
+        write_packet_to(&mut self.handle, packet).map(|_| ())
     }
 
     fn clone_writer(&self) -> io::Result<std::fs::File> {
@@ -301,6 +301,19 @@ impl Device {
     #[cfg(all(test, unix))]
     fn from_handle(handle: std::fs::File, mtu: usize) -> Self {
         Self { handle, mtu }
+    }
+}
+
+/// One packet write, all-or-nothing: a full write is carried, a short or refused write is dropped.
+fn write_packet_to<W: Write>(writer: &mut W, packet: &[u8]) -> io::Result<bool> {
+    loop {
+        match writer.write(packet) {
+            Ok(written) if written == packet.len() => return Ok(true),
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if crate::tun_stack::refused(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -822,7 +835,7 @@ impl Handler {
                         };
                     }
                     Ok(n) => {
-                        let seq = snd_nxt.fetch_add(n as u32, Relaxed);
+                        let seq = snd_nxt.load(Relaxed);
                         render_tcp_packet(
                             (local_ip, local_port),
                             (remote_ip, remote_port),
@@ -833,8 +846,12 @@ impl Handler {
                             &buf[..n],
                             &mut pkt,
                         );
-                        if dev_writer.write_all(&pkt).is_err() {
-                            break FLAG_RST | FLAG_ACK;
+                        match write_packet_to(&mut dev_writer, &pkt) {
+                            Ok(true) => {
+                                snd_nxt.fetch_add(n as u32, Relaxed);
+                            }
+                            Ok(false) => {}
+                            Err(_) => break FLAG_RST | FLAG_ACK,
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -863,7 +880,7 @@ impl Handler {
                     &[],
                     &mut pkt,
                 );
-                let _ = dev_writer.write_all(&pkt);
+                let _ = write_packet_to(&mut dev_writer, &pkt);
             }
             // Queue the entry's removal before the shutdown that wakes the relay leg, so a caller that sees the leg end can reap the entry at its next dispatch.
             let _ = ended_tx.send(Ended::Stream(key));
@@ -959,7 +976,7 @@ fn open_leg(
             if !udp_datagram(&datagram, &mut out) {
                 continue;
             }
-            if dev_writer.write_all(&out).is_err() {
+            if write_packet_to(&mut dev_writer, &out).is_err() {
                 break;
             }
         }
@@ -1201,6 +1218,82 @@ mod tests {
             assert_eq!(tail.len(), payload.len());
         });
         assert_eq!(counts.allocs, 0, "the warm head costs no heap buffer");
+    }
+
+    struct RefuseOnce {
+        writes: usize,
+        accepted: Vec<u8>,
+    }
+
+    impl Write for RefuseOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "one packet refused",
+                ));
+            }
+            self.accepted.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_refused_packet_does_not_end_the_flow() {
+        let mut writer = RefuseOnce {
+            writes: 0,
+            accepted: Vec::new(),
+        };
+        assert!(
+            !write_packet_to(&mut writer, b"refused").expect("the refusal is reported"),
+            "a refused packet is dropped"
+        );
+        assert!(
+            write_packet_to(&mut writer, b"carried").expect("the next packet is written"),
+            "the next packet is carried"
+        );
+        assert_eq!(
+            writer.accepted, b"carried",
+            "the packet after a refusal still reaches the device"
+        );
+    }
+
+    struct InterruptOnce {
+        writes: usize,
+        accepted: Vec<u8>,
+    }
+
+    impl Write for InterruptOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.accepted.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_packet_write_is_retried() {
+        let mut writer = InterruptOnce {
+            writes: 0,
+            accepted: Vec::new(),
+        };
+        assert!(
+            write_packet_to(&mut writer, b"retried").expect("the retry carries the packet"),
+            "a transient signal is retried, not treated as a refusal"
+        );
+        assert_eq!(writer.accepted, b"retried");
     }
 
     #[test]
