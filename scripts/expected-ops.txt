@@ -161,9 +161,12 @@ append_pem 562
 # probe still walks its five decisions 4096 times, so the eight instructions are
 # not a multiple of that walk -- the loop that decides is unchanged and the move
 # is in the frame's setup, measured in the pinned userspace below.
+# Re-blessed 51893400 by p2-socks: the SOCKS4 request writer and its witness test
+# join ferrox-core, shifting this probe's thin-LTO frame; dns.rs is untouched and
+# the five decisions still walk 4096 times.
 # Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892686 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893400 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -235,7 +238,10 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shad
 # Re-blessed 47621538: the xhttp size-line probe adds one test to the same
 # ferrox-app bin, and the release layout puts the 12 Ir back that removing the
 # udp serve wrappers took out; psiphon_shadowsocks.rs is untouched.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47621526 by p2-socks: the SOCKS front's borrowed account and the
+# client datagram's two-part send change the same ferrox-app bin's layout;
+# psiphon_shadowsocks.rs is untouched.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The CRLF scan and the hex parse
 # share a pass and the line is never copied. Nothing on the wire moves.
