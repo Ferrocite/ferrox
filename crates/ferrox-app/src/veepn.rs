@@ -129,6 +129,7 @@ impl VeepnOut {
                 upstream: None,
                 h2_fingerprint: None,
                 no_resumption: false,
+                insecure: false,
             });
         }
         if origins.is_empty() {

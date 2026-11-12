@@ -497,6 +497,8 @@ pub(crate) struct Endpoint {
     pub(crate) h2_fingerprint: Option<ferrox_core::tls::shaped::Fingerprint>,
     /// A dial that reopens the session instead of resuming it, the way a first connection does.
     pub(crate) no_resumption: bool,
+    /// A dial that accepts any certificate, for the reference's `DisableSystemRootCAs`.
+    pub(crate) insecure: bool,
 }
 
 impl Endpoint {
@@ -524,7 +526,16 @@ impl Endpoint {
             upstream: None,
             h2_fingerprint: None,
             no_resumption: false,
+            insecure: false,
         })
+    }
+
+    /// The reference skips verification when system roots are disabled; an untunneled
+    /// download under that setting accepts any certificate.
+    #[must_use]
+    pub(crate) fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
     }
 
     #[must_use]
@@ -559,7 +570,7 @@ impl Endpoint {
             verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
             curves: std::sync::Arc::default(),
-            insecure: false,
+            insecure: self.insecure,
             resumption: true,
             fingerprint: None,
             ech_config_list: None,

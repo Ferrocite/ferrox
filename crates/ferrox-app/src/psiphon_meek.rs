@@ -386,11 +386,22 @@ pub(crate) fn connect_inproxy(
         let fragment = server_name.parse::<IpAddr>().is_err()
             && meek.shape.fragment_client_hello(meek.protocol);
         let verify = !meek.verify_server_names.is_empty() || !meek.verify_pins.is_empty();
+        if verify && meek.shape.disable_system_root_cas {
+            return Err(
+                "psiphon meek: DisableSystemRootCAs cannot be combined with verification"
+                    .to_owned(),
+            );
+        }
+        let roots = if verify {
+            meek.shape.roots.load()?
+        } else {
+            Vec::new().into()
+        };
         let fingerprint = meek.shape.fingerprint();
         let config = TlsConfig {
             server_name,
             alpn: vec![b"http/1.1".to_vec()].into(),
-            roots: crate::quic::system_roots(),
+            roots,
             insecure: !verify,
             verify_names: if verify {
                 std::sync::Arc::from(meek.verify_server_names.clone())
@@ -402,6 +413,9 @@ pub(crate) fn connect_inproxy(
             fingerprint: Some(fingerprint),
             omit_session_id: meek.shape.omit_session_id(fingerprint),
             padding: meek.shape.padding(),
+            obfuscated_ticket: meek
+                .shape
+                .obfuscated_ticket(meek.protocol, &meek.obfuscated_key)?,
             ..TlsConfig::default()
         };
         let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
@@ -1056,11 +1070,22 @@ impl MeekHttp {
         let fragment = server_name.parse::<IpAddr>().is_err()
             && self.meek.shape.fragment_client_hello(self.meek.protocol);
         let verify = !self.meek.verify_server_names.is_empty() || !self.meek.verify_pins.is_empty();
+        if verify && self.meek.shape.disable_system_root_cas {
+            return Err(
+                "psiphon meek: DisableSystemRootCAs cannot be combined with verification"
+                    .to_owned(),
+            );
+        }
+        let roots = if verify {
+            self.meek.shape.roots.load()?
+        } else {
+            Vec::new().into()
+        };
         let fingerprint = self.meek.shape.fingerprint();
         let config = TlsConfig {
             server_name,
             alpn: alpn.into(),
-            roots: crate::quic::system_roots(),
+            roots,
             insecure: !verify,
             verify_names: if verify {
                 std::sync::Arc::from(self.meek.verify_server_names.clone())
@@ -1072,6 +1097,10 @@ impl MeekHttp {
             fingerprint: Some(fingerprint),
             omit_session_id: self.meek.shape.omit_session_id(fingerprint),
             padding: self.meek.shape.padding(),
+            obfuscated_ticket: self
+                .meek
+                .shape
+                .obfuscated_ticket(self.meek.protocol, &self.meek.obfuscated_key)?,
             ..TlsConfig::default()
         };
         match stream {

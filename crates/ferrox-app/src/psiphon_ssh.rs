@@ -429,6 +429,42 @@ pub(crate) struct OsshPrefixBytes {
     pub(crate) split_max: Duration,
 }
 
+/// The trust anchors a Psiphon TLS dial verifies with, or none when the reference skips
+/// verification. A named file is read when a dial needs it, as the reference reads it per dial;
+/// its `Debug` never prints certificate bytes.
+#[derive(Clone, Default)]
+pub(crate) enum TlsRoots {
+    #[default]
+    System,
+    Empty,
+    File(String),
+}
+
+impl TlsRoots {
+    /// The anchors this dial verifies with, reading a named file at the point the reference does.
+    pub(crate) fn load(&self) -> Result<ferrox_core::tls::Anchors, String> {
+        match self {
+            Self::System => Ok(crate::quic::system_roots()),
+            Self::Empty => Ok(Vec::new().into()),
+            Self::File(path) => {
+                let pem = std::fs::read(path)
+                    .map_err(|error| format!("psiphon: trusted CA file {path}: {error}"))?;
+                Ok(crate::quic::parse_ca_pem(&pem).into())
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TlsRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => f.write_str("TlsRoots(system)"),
+            Self::Empty => f.write_str("TlsRoots(empty)"),
+            Self::File(path) => f.debug_tuple("TlsRootsFile").field(path).finish(),
+        }
+    }
+}
+
 /// The TLS shape a config can impose on the shaped `TLS-OSSH` hello: an exact padding
 /// extension body and a host name chosen from a list or generated from a regex.
 #[derive(Clone, Debug)]
@@ -474,6 +510,12 @@ pub(crate) struct TlsShape {
     pub(crate) meek_payload_padding_max: usize,
     /// The chance a randomized TLS 1.3 dial omits the legacy session id.
     pub(crate) no_default_tls_session_id_probability: f64,
+    /// The chance a TLS-OSSH dial carries a client-made obfuscated ticket.
+    pub(crate) obfuscated_ticket_probability: f64,
+    /// The anchors a verified TLS dial uses: the system store, or the config's own file.
+    pub(crate) roots: TlsRoots,
+    /// The reference's `DisableSystemRootCAs`, which skips verification and forbids verify fields.
+    pub(crate) disable_system_root_cas: bool,
     /// The chance a TLS dial splits its `ClientHello` at the SNI.
     pub(crate) tls_fragment_client_hello: f64,
     /// The protocols that admit `ClientHello` fragmentation; empty admits all.
@@ -519,6 +561,9 @@ impl Default for TlsShape {
             meek_payload_padding_min: 0,
             meek_payload_padding_max: 65_533,
             no_default_tls_session_id_probability: 0.5,
+            obfuscated_ticket_probability: 0.5,
+            roots: TlsRoots::default(),
+            disable_system_root_cas: false,
             tls_fragment_client_hello: 0.0,
             tls_fragment_client_hello_protocols: Vec::new(),
             user_agent_probability: 0.5,
@@ -641,6 +686,30 @@ impl TlsShape {
         }
         let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
         draw < self.no_default_tls_session_id_probability
+    }
+
+    /// The shared key one dial's obfuscated ticket uses: the session-ticket feature always when the
+    /// protocol names it, a TLS-OSSH dial when its coin lands, and nothing for every other lane.
+    pub(crate) fn obfuscated_ticket(
+        &self,
+        protocol: &str,
+        key: &str,
+    ) -> Result<Option<ferrox_core::tls::ObfuscatedTicket>, String> {
+        let upper = protocol.to_ascii_uppercase();
+        let enabled = if upper.contains("UNFRONTED-MEEK-SESSION-TICKET") {
+            true
+        } else if upper == "TLS-OSSH" {
+            let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
+            draw < self.obfuscated_ticket_probability
+        } else {
+            false
+        };
+        if !enabled || key.is_empty() {
+            return Ok(None);
+        }
+        ferrox_core::realm::hex_decode::<32>(key)
+            .map(|key| Some(ferrox_core::tls::ObfuscatedTicket::new(key)))
+            .ok_or_else(|| "psiphon tls: invalid obfuscated session ticket key".to_owned())
     }
 
     /// Whether this TLS dial splits its `ClientHello` at the SNI, when the
@@ -1533,6 +1602,7 @@ impl Session {
                         Stream::WebRtc(stream),
                         &server.host,
                         tls_passthrough_key(server),
+                        server.meek_obfuscated_key.as_deref().unwrap_or(""),
                         timeout,
                         shape,
                         base,
@@ -2634,6 +2704,7 @@ fn direct_stream(
                 base,
                 &server.host,
                 tls_passthrough_key(server),
+                server.meek_obfuscated_key.as_deref().unwrap_or(""),
                 timeout,
                 shape,
                 protocol,
@@ -2675,6 +2746,7 @@ fn tls_tunnel(
     stream: Stream,
     server_name: &str,
     passthrough_key: &str,
+    obfuscated_key: &str,
     timeout: Duration,
     shape: &TlsShape,
     protocol: &str,
@@ -2688,12 +2760,13 @@ fn tls_tunnel(
     let fingerprint = shape.fingerprint();
     let config = TlsConfig {
         server_name: name.clone(),
-        roots: crate::quic::system_roots(),
+        roots: Vec::new().into(),
         insecure: true,
         fingerprint: Some(fingerprint),
         client_random: Some(tls_passthrough(passthrough_key)?),
         omit_session_id: shape.omit_session_id(fingerprint),
         padding: shape.padding(),
+        obfuscated_ticket: shape.obfuscated_ticket(protocol, obfuscated_key)?,
         ..TlsConfig::default()
     };
     let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
@@ -5593,6 +5666,34 @@ mod tests {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
         assert!(random_hostname(r"(a|b)+").is_none());
+    }
+
+    #[test]
+    fn an_obfuscated_ticket_needs_the_coin_a_named_protocol_and_a_hex_key() {
+        let key = "11".repeat(32);
+        let mut shape = TlsShape {
+            obfuscated_ticket_probability: 0.0,
+            ..TlsShape::default()
+        };
+        assert_eq!(shape.obfuscated_ticket("TLS-OSSH", &key).unwrap(), None);
+        assert_eq!(shape.obfuscated_ticket("TLS-OSSH", "").unwrap(), None);
+        shape.obfuscated_ticket_probability = 1.0;
+        assert_eq!(
+            shape.obfuscated_ticket("TLS-OSSH", &key).unwrap(),
+            Some(ferrox_core::tls::ObfuscatedTicket::new([0x11; 32]))
+        );
+        assert!(shape.obfuscated_ticket("TLS-OSSH", "zz").is_err());
+        assert_eq!(
+            shape.obfuscated_ticket("FRONTED-MEEK-OSSH", &key).unwrap(),
+            None
+        );
+        shape.obfuscated_ticket_probability = 0.0;
+        assert_eq!(
+            shape
+                .obfuscated_ticket("INPROXY-WEBRTC-UNFRONTED-MEEK-SESSION-TICKET-OSSH", &key)
+                .unwrap(),
+            Some(ferrox_core::tls::ObfuscatedTicket::new([0x11; 32]))
+        );
     }
 
     #[test]

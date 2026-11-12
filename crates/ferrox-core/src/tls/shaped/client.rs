@@ -8,7 +8,7 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const HANDSHAKE: u8 = 22;
 const ALERT: u8 = 21;
@@ -24,6 +24,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The one deadline a shaped handshake runs under, on either side.
 pub(crate) fn handshake_deadline() -> Instant {
     Instant::now() + HANDSHAKE_TIMEOUT
+}
+
+/// The second a ticket's age is measured against, the one wall-clock read a hello needs.
+fn ticket_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// How long an immediate `WouldBlock` waits before the handshake asks again; a transport with a read timeout has already waited, a nonblocking one has not.
@@ -202,6 +209,9 @@ impl<S: Stream> Session<S> {
                 hello.enable_ech(list)?;
             }
         }
+        if let Some(key) = &cfg.obfuscated_ticket {
+            hello.set_obfuscated_ticket(&key.0, ticket_now())?;
+        }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
         session.set_key_log(cfg.master_key_log.clone());
@@ -343,8 +353,11 @@ impl<S: Stream> Session<S> {
             let group = sh
                 .hrr_group
                 .ok_or_else(|| TlsError::Other("retry request names no group".to_owned()))?;
+            if hello.ticket().is_some_and(|ticket| ticket.tls13) {
+                hello.set_binder_prefix(self.transcript.clone());
+            }
             self.send_ccs()?;
-            hello = hello.retry(group, sh.cookie.as_deref())?;
+            hello = hello.retry(group, sh.cookie.as_deref(), ticket_now())?;
             self.send_plain(HANDSHAKE, &hello.msg, [0x03, 0x03])?;
             self.transcript.extend_from_slice(if ech {
                 hello.ech_inner().expect("retry keeps the offer")
@@ -467,7 +480,15 @@ impl<S: Stream> Session<S> {
         let shared = hello.agree(*group, peer)?;
         let hash = suite.hash();
         let zeros = vec![0u8; hash.len()];
-        let early = kdf::extract(hash, &zeros, &zeros);
+        let psk = hello
+            .ticket()
+            .filter(|ticket| ticket.tls13 && sh.psk && hash == Hash::Sha256)
+            .map(|ticket| ticket.secret);
+        let early = kdf::extract(
+            hash,
+            &zeros,
+            psk.as_ref().map_or(&zeros[..], |psk| &psk[..]),
+        );
         let derived = kdf::derive(hash, &early, b"derived", &[]);
         let handshake_secret = kdf::extract(hash, &derived, &shared);
         let client_hs = kdf::derive(hash, &handshake_secret, b"c hs traffic", &self.transcript);
@@ -485,28 +506,33 @@ impl<S: Stream> Session<S> {
         self.transcript.extend_from_slice(&msg);
         sh.alpn = encrypted_extensions(&msg[4..])?;
 
-        // A TLS 1.3 server interleaves its CertificateRequest ahead of its own Certificate.
+        // A PSK handshake authenticates without a certificate; otherwise CertificateRequest, Certificate and CertificateVerify come first.
         let mut asked = None;
         let mut msg = self.next_handshake()?;
-        if msg[0] == 13 {
-            asked = Some(certificate_request13(&msg[4..])?);
+        if psk.is_none() {
+            if msg[0] == 13 {
+                asked = Some(certificate_request13(&msg[4..])?);
+                self.transcript.extend_from_slice(&msg);
+                msg = self.next_expect(11)?;
+            } else if msg[0] != 11 {
+                return Err(unexpected(msg[0]));
+            }
+            let chain = certificates13(&msg[4..])?;
             self.transcript.extend_from_slice(&msg);
-            msg = self.next_expect(11)?;
-        } else if msg[0] != 11 {
+            let ocsp = leaf_ocsp(&msg[4..])?;
+            self.verify_chain(&chain, &ocsp)?;
+
+            msg = self.next_expect(15)?;
+            let signed = std::mem::take(&mut self.transcript);
+            self.verify_certificate_verify(&msg[4..], &signed, true)?;
+            self.transcript = signed;
+            self.transcript.extend_from_slice(&msg);
+
+            msg = self.next_expect(20)?;
+        }
+        if msg[0] != 20 {
             return Err(unexpected(msg[0]));
         }
-        let chain = certificates13(&msg[4..])?;
-        self.transcript.extend_from_slice(&msg);
-        let ocsp = leaf_ocsp(&msg[4..])?;
-        self.verify_chain(&chain, &ocsp)?;
-
-        let msg = self.next_expect(15)?;
-        let signed = std::mem::take(&mut self.transcript);
-        self.verify_certificate_verify(&msg[4..], &signed, true)?;
-        self.transcript = signed;
-        self.transcript.extend_from_slice(&msg);
-
-        let msg = self.next_expect(20)?;
         let expected =
             kdf::verify_data(hash, &kdf::finished_key(hash, &server_hs), &self.transcript);
         if msg[4..] != expected[..] {
@@ -555,7 +581,49 @@ impl<S: Stream> Session<S> {
         let suite = Suite::from_id(sh.suite)
             .filter(|suite| !suite.is_tls13())
             .ok_or(TlsError::NoSharedCipher)?;
-        let msg = self.next_expect(11)?;
+        let mut pending = None;
+        if let Some(secret) = hello
+            .ticket()
+            .filter(|ticket| !ticket.tls13)
+            .map(|ticket| ticket.secret)
+        {
+            let directions =
+                super::tls12::directions(suite, &secret, &self.client_random, &sh.random);
+            self.client12 = Some(directions.client);
+            self.server12 = Some(directions.server);
+            let mut msg = self.next_handshake()?;
+            while msg[0] == 4 {
+                self.transcript.extend_from_slice(&msg);
+                msg = self.next_handshake()?;
+            }
+            if msg[0] == 20 {
+                let expected =
+                    super::tls12::finished(suite, &secret, b"server finished", &self.transcript);
+                if msg[4..] != expected[..] {
+                    return Err(TlsError::Other("server Finished did not verify".to_owned()));
+                }
+                self.transcript.extend_from_slice(&msg);
+                self.log_secrets(&[("CLIENT_RANDOM", &secret)]);
+                let verify =
+                    super::tls12::finished(suite, &secret, b"client finished", &self.transcript);
+                let finished = message(20, &verify);
+                self.send_ccs()?;
+                self.write_key = self.client12.take();
+                self.send_encrypted(HANDSHAKE, &finished)?;
+                self.transcript.extend_from_slice(&finished);
+                return Ok(());
+            }
+            self.server12 = None;
+            self.client12 = None;
+            pending = Some(msg);
+        }
+        let msg = match pending {
+            Some(msg) => msg,
+            None => self.next_expect(11)?,
+        };
+        if msg[0] != 11 {
+            return Err(unexpected(msg[0]));
+        }
         let chain = certificates12(&msg[4..])?;
         self.transcript.extend_from_slice(&msg);
         // A stapled chain answers with a `CertificateStatus` first: consume and verify it.
@@ -1441,6 +1509,7 @@ struct ServerHello {
     alpn: Option<Vec<u8>>,
     ech: Option<Vec<u8>>,
     ems: bool,
+    psk: bool,
     hrr: bool,
 }
 
@@ -1466,6 +1535,7 @@ impl ServerHello {
             alpn: None,
             ech: None,
             ems: false,
+            psk: false,
             hrr,
         };
         if r.done() {
@@ -1490,6 +1560,7 @@ impl ServerHello {
                         out.share = Some((group, v.vec16()?.to_vec()));
                     }
                 }
+                0x0029 => out.psk = true,
                 0x002c => {
                     let mut v = Reader::new(value);
                     out.cookie = Some(v.vec16()?.to_vec());
