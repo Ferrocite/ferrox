@@ -29443,6 +29443,7 @@ pub(crate) mod lane_pool {
             .name("ferrox-relay-lane".into())
             .spawn(move || worker_loop(&worker));
         let Ok(worker) = spawned else {
+            echo_trace("lane spawn failed");
             pool.workers.fetch_sub(1, Relaxed);
             return false;
         };
@@ -30365,6 +30366,7 @@ pub(crate) mod lane_pool {
     }
 
     fn run_to_end(mut lane: Lane) {
+        echo_trace("lane inline");
         loop {
             let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
             match stepped {
@@ -30522,6 +30524,40 @@ pub(crate) mod lane_pool {
         drop(ready);
         pool.notify.notify_one();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot() -> String {
+        let p = pool();
+        let d = demux_pool();
+        let len = |queue: &std::sync::Mutex<std::collections::VecDeque<Lane>>| {
+            queue.lock().unwrap_or_else(PoisonError::into_inner).len()
+        };
+        format!(
+            "relay workers={} idle={} ready={} parked={} waiting={} parks={} timer={} ready_parks={} | demux workers={} idle={} ready={} waiting={}",
+            p.workers.load(std::sync::atomic::Ordering::Relaxed),
+            p.idle.load(std::sync::atomic::Ordering::Relaxed),
+            len(&p.ready),
+            p.parked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lanes
+                .len(),
+            p.waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+            p.parks.load(std::sync::atomic::Ordering::Relaxed),
+            p.timer_parks.load(std::sync::atomic::Ordering::Relaxed),
+            p.ready_parks.load(std::sync::atomic::Ordering::Relaxed),
+            d.workers.load(std::sync::atomic::Ordering::Relaxed),
+            d.idle.load(std::sync::atomic::Ordering::Relaxed),
+            len(&d.ready),
+            d.waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+        )
     }
 
     #[cfg(test)]
@@ -54642,7 +54678,12 @@ mod tests {
                 let mut got = 0usize;
                 let mut buf = vec![0u8; 65536];
                 while got < BULK {
-                    let n = sock.read(&mut buf).expect("the download must not stall");
+                    let n = sock.read(&mut buf).unwrap_or_else(|error| {
+                        panic!(
+                            "the download must not stall at {got}: {error}; {}",
+                            lane_pool::snapshot()
+                        )
+                    });
                     assert!(n > 0, "a flow ended early at {got} of {BULK}");
                     if got == 0 {
                         echo_trace("flow read first");
