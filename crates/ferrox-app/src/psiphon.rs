@@ -7072,10 +7072,7 @@ fn select_protocols_with(
                 server.meek = Some(unfronted);
                 return true;
             }
-            if fronted_fallback && server.meek.as_ref().is_some_and(|meek| meek.fronted) {
-                return true;
-            }
-            false
+            fronted_fallback && server.meek.as_ref().is_some_and(|meek| meek.fronted)
         });
     }
     if quic_named {

@@ -2936,10 +2936,7 @@ fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> O
                 conn.refuse(E_FRAME_SIZE);
                 return Some(false);
             }
-            if flags & F_ACK == 0 && !conn.apply_settings(body) {
-                return Some(false);
-            }
-            Some(true)
+            Some(flags & F_ACK != 0 || conn.apply_settings(body))
         }
         T_PING => {
             if flags & F_ACK == 0 && body.len() == 8 {
