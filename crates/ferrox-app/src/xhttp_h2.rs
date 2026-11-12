@@ -2504,7 +2504,7 @@ fn open_stream(
     };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
-    crate::budgets::spawn(move || {
+    crate::proxy::lane_pool::submit_stream_setup(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
