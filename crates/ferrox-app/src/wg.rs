@@ -535,11 +535,8 @@ impl WireGuardOut {
                         if !chosen {
                             continue;
                         }
-                        let out = crate::proxy::socks_udp_frame(
-                            &mut framed,
-                            &target,
-                            &back[..read],
-                        );
+                        let out =
+                            crate::proxy::socks_udp_frame(&mut framed, &target, &back[..read]);
                         if relay_write.send_to(out, app).is_err() {
                             break;
                         }
