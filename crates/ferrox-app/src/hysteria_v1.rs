@@ -127,6 +127,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         local_now: Arc::new(Mutex::new(local)),
         peer: Some(peer),
         net: Arc::new(std::sync::atomic::AtomicU64::new(net)),
+        migrated: Arc::default(),
         udp_supported: true,
         driver: None,
         send_wake: None,

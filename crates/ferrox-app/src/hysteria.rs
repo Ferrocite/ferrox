@@ -50,6 +50,9 @@ pub(crate) struct Session {
     pub(crate) peer: Option<SocketAddr>,
     /// The route generation this session last acted on.
     pub(crate) net: Arc<AtomicU64>,
+    /// Set once a move hands the lane a new socket, so a later failed validation
+    /// ends the carrier instead of waiting for the idle timer.
+    pub(crate) migrated: Arc<AtomicBool>,
     // Written once by `connect` from the auth response and read by the UDP dial that follows: a server that skips the lane header still carries TCP flows, so the flag gates datagrams only, never the connection.
     pub(crate) udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
@@ -311,9 +314,9 @@ fn send_all_metered(
 
 /// Move this session when the route generation changed: a moved source updates the shared
 /// local for every clone, and a failed move ends the turn so the carrier redials.
-fn rebind_if_moved(session: &Session) -> Option<bool> {
+fn rebind_if_moved(session: &Session) -> bool {
     let Some(peer) = session.peer else {
-        return Some(false);
+        return true;
     };
     let now = crate::quic::network_generation();
     let seen = session.net.load(Ordering::Relaxed);
@@ -323,32 +326,38 @@ fn rebind_if_moved(session: &Session) -> Option<bool> {
             .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
-        return Some(false);
+        return true;
     }
     let Ok(mut conn) = session.shared.lock() else {
-        return None;
+        return false;
     };
     match crate::quic::rebind_path(&mut conn, &session.sock, peer) {
         crate::quic::Rebind::Moved(moved) => {
             if let Ok(mut local) = session.local_now.lock() {
                 *local = moved;
             }
-            Some(true)
+            session.migrated.store(true, Ordering::Release);
         }
-        crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => Some(false),
+        crate::quic::Rebind::Retry => {
+            let _ = session
+                .net
+                .compare_exchange(now, seen, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => {}
         crate::quic::Rebind::Failed => {
             let _ = conn.close(false, 0, b"rebind");
-            None
+            return false;
         }
     }
+    true
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
-    let Some(moved) = rebind_if_moved(session) else {
+    if !rebind_if_moved(session) {
         return false;
-    };
+    }
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -435,7 +444,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         }
         take_queued(&mut conn, session);
         crate::quic::flush_egress(&mut conn, &session.sock);
-        if moved && crate::quic::path_failed(&mut conn, local) {
+        if session.migrated.load(Ordering::Acquire) && crate::quic::path_failed(&mut conn, local) {
             let _ = conn.close(false, 0, b"rebind");
             return false;
         }
@@ -450,7 +459,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         None => conn.on_timeout(),
     }
     crate::quic::flush_egress(&mut conn, &session.sock);
-    if moved && crate::quic::path_failed(&mut conn, local) {
+    if session.migrated.load(Ordering::Acquire) && crate::quic::path_failed(&mut conn, local) {
         let _ = conn.close(false, 0, b"rebind");
         return false;
     }
@@ -642,6 +651,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         local_now: Arc::new(Mutex::new(local)),
         peer: Some(peer),
         net: Arc::new(AtomicU64::new(net)),
+        migrated: Arc::default(),
         udp_supported: false,
         driver: None,
         send_wake: None,
@@ -701,6 +711,7 @@ impl Flow {
         self.session.local_now = Arc::clone(&session.local_now);
         self.session.peer = session.peer;
         self.session.net = Arc::clone(&session.net);
+        self.session.migrated = Arc::clone(&session.migrated);
         self
     }
 
@@ -721,6 +732,7 @@ impl Flow {
                 local_now: Arc::new(Mutex::new(local)),
                 peer: None,
                 net: Arc::new(AtomicU64::new(crate::quic::network_generation())),
+                migrated: Arc::default(),
                 udp_supported: false,
                 driver: None,
                 send_wake: None,
@@ -3457,6 +3469,7 @@ mod tests {
             local_now: Arc::new(Mutex::new(local)),
             peer: None,
             net: Arc::new(AtomicU64::new(crate::quic::network_generation())),
+            migrated: Arc::default(),
             udp_supported: false,
             driver: None,
             send_wake: None,

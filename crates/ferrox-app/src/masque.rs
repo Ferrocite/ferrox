@@ -1783,13 +1783,14 @@ fn io(
     loop {
         let now = quic::network_generation();
         if now != generation {
-            generation = now;
             match quic::rebind_path(&mut conn, sock, peer) {
                 quic::Rebind::Moved(at) => {
                     local = at;
                     moved = true;
+                    generation = now;
                 }
-                quic::Rebind::Same | quic::Rebind::Unsupported => {}
+                quic::Rebind::Same | quic::Rebind::Unsupported => generation = now,
+                quic::Rebind::Retry => {}
                 quic::Rebind::Failed => {
                     let _ = conn.close(false, 0, b"rebind");
                     break;

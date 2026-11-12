@@ -1784,20 +1784,29 @@ pub(crate) fn bind_datagram_plain(address: &str) -> std::io::Result<UdpSocket> {
 pub(crate) enum Rebind {
     Moved(SocketAddr),
     Same,
+    Retry,
     Unsupported,
     Failed,
 }
 
 /// The route table's generation, bumped by a listener thread on every route add,
-/// delete or change: a QUIC carrier compares it on a tick and moves its socket
-/// when the default path has moved under it. A platform without a listener leaves
-/// the generation at one, and the carrier keeps the path it dialled.
+/// delete or change and polled for address-only changes: a QUIC carrier compares
+/// it on a tick and moves its socket when the default path has moved under it. A
+/// platform without a listener leaves the generation at one, and the carrier keeps
+/// the path it dialled.
 pub(crate) fn network_generation() -> u64 {
     static NETWORK: OnceLock<Arc<AtomicU64>> = OnceLock::new();
     NETWORK
         .get_or_init(|| {
             let generation = Arc::new(AtomicU64::new(1));
             let bump = Arc::clone(&generation);
+            let poll = Arc::clone(&generation);
+            let _ = std::thread::Builder::new()
+                .name("ferrox-routes-poll".to_owned())
+                .spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(10));
+                    poll.fetch_add(1, Ordering::Relaxed);
+                });
             let _ = std::thread::Builder::new()
                 .name("ferrox-routes".to_owned())
                 .spawn(move || loop {
@@ -1827,7 +1836,7 @@ pub(crate) fn rebind_path(
         return Rebind::Unsupported;
     }
     let Ok(bound) = sock.local_addr() else {
-        return Rebind::Failed;
+        return Rebind::Retry;
     };
     let current = if bound.ip().is_unspecified() {
         sock.source
@@ -1839,7 +1848,7 @@ pub(crate) fn rebind_path(
         bound
     };
     let Some(source) = probe_source(peer) else {
-        return Rebind::Failed;
+        return Rebind::Retry;
     };
     let same = match (source, current) {
         (SocketAddr::V4(found), SocketAddr::V4(now)) => found.ip() == now.ip(),
@@ -1861,7 +1870,7 @@ pub(crate) fn rebind_path(
         )),
     };
     let Ok(fresh) = UdpSocket::bind(at) else {
-        return Rebind::Failed;
+        return Rebind::Retry;
     };
     #[cfg(target_os = "linux")]
     set_gro(&fresh, true);
@@ -2138,7 +2147,7 @@ pub(crate) struct Datagram {
     /// The socket a network change moved this lane to, and the flag a send reads
     /// before it pays the lock: a lane that never roams keeps the direct descriptor.
     moved: Arc<AtomicBool>,
-    rebound: Arc<Mutex<Option<UdpSocket>>>,
+    rebound: Arc<Mutex<Option<Arc<UdpSocket>>>>,
     /// The source the kernel picked when this lane dialled, kept for a wildcard
     /// socket so a later route event compares against that source rather than the
     /// unspecified address the socket was bound to.
@@ -2920,6 +2929,15 @@ impl Datagram {
         self.hop.is_none() && self.gecko.is_none()
     }
 
+    /// The socket a move installed, cloned under the lock so a blocking read never
+    /// holds the lock a writer or the next move needs.
+    fn rebound(&self) -> Option<Arc<UdpSocket>> {
+        if !self.moved.load(Ordering::Acquire) {
+            return None;
+        }
+        self.rebound.lock().ok()?.as_ref().cloned()
+    }
+
     /// Move every write and read after this call to `sock`, which is bound to the
     /// new path: the old descriptor stays for a reply already in flight, and the
     /// flag keeps a lane that never roams on the direct path.
@@ -2935,29 +2953,21 @@ impl Datagram {
             .rebound
             .lock()
             .map_err(|_| std::io::Error::other("datagram rebound lock poisoned"))?;
-        *rebound = Some(sock);
+        *rebound = Some(Arc::new(sock));
         self.moved.store(true, Ordering::Release);
         Ok(())
     }
 
     fn send_on(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
-        if self.moved.load(Ordering::Acquire) {
-            if let Ok(rebound) = self.rebound.lock() {
-                if let Some(sock) = rebound.as_ref() {
-                    return sock.send_to(buf, to);
-                }
-            }
+        if let Some(sock) = self.rebound() {
+            return sock.send_to(buf, to);
         }
         self.sock.send_to(buf, to)
     }
 
     fn recv_on(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        if self.moved.load(Ordering::Acquire) {
-            if let Ok(rebound) = self.rebound.lock() {
-                if let Some(sock) = rebound.as_ref() {
-                    return sock.recv_from(buf);
-                }
-            }
+        if let Some(sock) = self.rebound() {
+            return sock.recv_from(buf);
         }
         self.sock.recv_from(buf)
     }
@@ -3026,12 +3036,8 @@ impl Datagram {
         if let Some(hop) = self.hop.as_ref() {
             return hop.local_addr();
         }
-        if self.moved.load(Ordering::Acquire) {
-            if let Ok(rebound) = self.rebound.lock() {
-                if let Some(sock) = rebound.as_ref() {
-                    return sock.local_addr();
-                }
-            }
+        if let Some(sock) = self.rebound() {
+            return sock.local_addr();
         }
         self.sock.local_addr()
     }
@@ -3057,10 +3063,8 @@ impl Datagram {
         let result = if let Some(hop) = self.hop.as_ref() {
             hop.set_read_timeout(timeout)
         } else {
-            if let Ok(rebound) = self.rebound.lock() {
-                if let Some(sock) = rebound.as_ref() {
-                    let _ = sock.set_read_timeout(timeout);
-                }
+            if let Some(sock) = self.rebound() {
+                let _ = sock.set_read_timeout(timeout);
             }
             self.sock.set_read_timeout(timeout)
         };
@@ -3142,12 +3146,8 @@ impl Datagram {
 impl std::os::fd::AsRawFd for Datagram {
     /// The descriptor `recv_from` reads, which is not one for a hopped dial — see [`Datagram::waits_here`].
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        if self.moved.load(Ordering::Acquire) {
-            if let Ok(rebound) = self.rebound.lock() {
-                if let Some(sock) = rebound.as_ref() {
-                    return sock.as_raw_fd();
-                }
-            }
+        if let Some(sock) = self.rebound() {
+            return sock.as_raw_fd();
         }
         self.sock.as_raw_fd()
     }
@@ -3157,12 +3157,8 @@ impl std::os::fd::AsRawFd for Datagram {
 impl std::os::windows::io::AsRawSocket for Datagram {
     /// The handle `recv_from` reads, which is not one for a hopped dial — see [`Datagram::waits_here`].
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
-        if self.moved.load(Ordering::Acquire) {
-            if let Ok(rebound) = self.rebound.lock() {
-                if let Some(sock) = rebound.as_ref() {
-                    return sock.as_raw_socket();
-                }
-            }
+        if let Some(sock) = self.rebound() {
+            return sock.as_raw_socket();
         }
         self.sock.as_raw_socket()
     }
@@ -6296,7 +6292,7 @@ mod tests {
         let (fresh, _) = datagram_to(server.addr).expect("binds");
         let moved = match move_socket(&mut client.conn, &client.sock, fresh) {
             Rebind::Moved(addr) => addr,
-            Rebind::Same => panic!("a fresh socket is a new source"),
+            Rebind::Same | Rebind::Retry => panic!("a fresh socket is a new source"),
             Rebind::Unsupported => panic!("a plain lane must be movable"),
             Rebind::Failed => panic!("the fresh socket did not swap"),
         };
