@@ -373,7 +373,10 @@ impl SourceFilter {
     /// A blocked match rejects; when an allowlist is present, an address outside it — or a source
     /// the transport cannot name — is rejected.
     pub fn rejects(&self, source: Option<IpAddr>) -> bool {
-        let _ = (self, source);
+        let Some(source) = source else {
+            return !self.allowed.is_empty();
+        };
+        let _ = (self.blocked.matches(source), self.allowed.matches(source));
         false
     }
 }
