@@ -538,9 +538,12 @@ where
     let headers = borrow_headers(&headers);
     let reply = call("POST", "/reg", &headers, &body)
         .map_err(|error| RegisterError::retryable(error.reason))?;
-    // A 2xx the API shaped has already minted the device: another host's POST would mint a second.
+    // A 2xx that names the device it made is not posted again: another host would mint a second.
     let registered = parse_registration(&reply).map_err(|error| {
-        if (200..300).contains(&reply.status) && is_api_envelope(&reply.body) {
+        let minted = (200..300).contains(&reply.status)
+            && crate::json::parse(&String::from_utf8_lossy(&reply.body))
+                .is_ok_and(|root| root.get("id").is_some() || root.get("token").is_some());
+        if minted {
             RegisterError::fatal(error.reason)
         } else {
             error
@@ -645,12 +648,12 @@ fn refuses_identity(reply: &Reply) -> bool {
     matches!(reply.status, 401 | 410) || (reply.status == 404 && is_api_envelope(&reply.body))
 }
 
-/// Cloudflare's JSON envelope, rather than a page of another server that fronts
-/// the name: a 404 page says nothing about the identity.
+/// Cloudflare's JSON error envelope, rather than a page of another server that
+/// fronts the name: a 404 page says nothing about the identity.
 fn is_api_envelope(body: &[u8]) -> bool {
     crate::json::parse(&String::from_utf8_lossy(body)).is_ok_and(|root| {
-        matches!(root.get("success"), Some(crate::json::Json::Bool(_)))
-            && matches!(root.get("errors"), Some(crate::json::Json::Arr(_)))
+        matches!(root.get("success"), Some(crate::json::Json::Bool(false)))
+            && matches!(root.get("errors"), Some(crate::json::Json::Arr(errors)) if !errors.is_empty())
     })
 }
 
@@ -2378,7 +2381,12 @@ mod tests {
         for (status, body, refused) in [
             (401, &b"{\"error\":\"x\"}"[..], true),
             (404, &b"{\"error\":\"x\"}"[..], false),
-            (404, &b"{\"success\":false,\"errors\":[]}"[..], true),
+            (
+                404,
+                &b"{\"success\":false,\"errors\":[{\"code\":1000}]}"[..],
+                true,
+            ),
+            (404, &b"{\"success\":true,\"errors\":[]}"[..], false),
             (410, &b"{\"error\":\"x\"}"[..], true),
             (503, &b"{\"error\":\"x\"}"[..], false),
         ] {
@@ -2462,7 +2470,7 @@ mod tests {
             Ok::<_, RegisterError>(Reply {
                 status: 404,
                 headers: Vec::new(),
-                body: b"{\"success\":false,\"errors\":[]}".to_vec(),
+                body: b"{\"success\":false,\"errors\":[{\"code\":1000}]}".to_vec(),
             })
         };
         let error = refresh(&spec, &saved, &envelope).expect_err("a refusal");
@@ -2476,10 +2484,10 @@ mod tests {
             Ok::<_, RegisterError>(Reply {
                 status: 200,
                 headers: Vec::new(),
-                body: b"{\"success\":true,\"errors\":[]}".to_vec(),
+                body: b"{\"id\":\"a-device\",\"token\":\"a-token\"}".to_vec(),
             })
         };
-        let error = register_with(&spec, false, &shaped).expect_err("no device id");
+        let error = register_with(&spec, false, &shaped).expect_err("no config");
         assert!(error.fatal, "{}", error.reason);
         let page = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
             Ok::<_, RegisterError>(Reply {
