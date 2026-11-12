@@ -311,9 +311,9 @@ fn send_all_metered(
 
 /// Move this session when the route generation changed: a moved source updates the shared
 /// local for every clone, and a failed move ends the turn so the carrier redials.
-fn rebind_if_moved(session: &Session) -> bool {
+fn rebind_if_moved(session: &Session) -> Option<bool> {
     let Some(peer) = session.peer else {
-        return true;
+        return Some(false);
     };
     let now = crate::quic::network_generation();
     let seen = session.net.load(Ordering::Relaxed);
@@ -323,32 +323,33 @@ fn rebind_if_moved(session: &Session) -> bool {
             .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
-        return true;
+        return Some(false);
     }
     let Ok(mut conn) = session.shared.lock() else {
-        return false;
+        return None;
     };
     match crate::quic::rebind_path(&mut conn, &session.sock, peer) {
         crate::quic::Rebind::Moved(moved) => {
             if let Ok(mut local) = session.local_now.lock() {
                 *local = moved;
             }
+            Some(true)
         }
-        crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => {}
+        crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => Some(false),
         crate::quic::Rebind::Failed => {
             let _ = conn.close(false, 0, b"rebind");
-            return false;
+            None
         }
     }
-    true
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
-    if !rebind_if_moved(session) {
-        return false;
-    }
+    let moved = match rebind_if_moved(session) {
+        Some(moved) => moved,
+        None => return false,
+    };
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -435,7 +436,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         }
         take_queued(&mut conn, session);
         crate::quic::flush_egress(&mut conn, &session.sock);
-        if crate::quic::path_failed(&mut conn, local) {
+        if moved && crate::quic::path_failed(&mut conn, local) {
             let _ = conn.close(false, 0, b"rebind");
             return false;
         }
@@ -450,7 +451,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         None => conn.on_timeout(),
     }
     crate::quic::flush_egress(&mut conn, &session.sock);
-    if crate::quic::path_failed(&mut conn, local) {
+    if moved && crate::quic::path_failed(&mut conn, local) {
         let _ = conn.close(false, 0, b"rebind");
         return false;
     }

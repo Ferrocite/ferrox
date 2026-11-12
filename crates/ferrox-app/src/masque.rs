@@ -1767,6 +1767,7 @@ fn io(
 ) {
     let mut local = local;
     let mut generation = net;
+    let mut moved = false;
     let Lane {
         mut conn,
         stream,
@@ -1784,7 +1785,10 @@ fn io(
         if now != generation {
             generation = now;
             match quic::rebind_path(&mut conn, sock, peer) {
-                quic::Rebind::Moved(moved) => local = moved,
+                quic::Rebind::Moved(at) => {
+                    local = at;
+                    moved = true;
+                }
                 quic::Rebind::Same | quic::Rebind::Unsupported => {}
                 quic::Rebind::Failed => {
                     let _ = conn.close(false, 0, b"rebind");
@@ -1813,7 +1817,7 @@ fn io(
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
             break;
         }
-        if quic::path_failed(&mut conn, local) {
+        if moved && quic::path_failed(&mut conn, local) {
             let _ = conn.close(false, 0, b"rebind");
             break;
         }

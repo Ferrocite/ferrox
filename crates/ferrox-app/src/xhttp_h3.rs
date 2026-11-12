@@ -990,6 +990,7 @@ fn pump_connection(
 ) {
     let mut local = local;
     let mut generation = generation;
+    let mut moved = false;
     let mut buf = vec![0u8; 65535];
     loop {
         let now = quic::network_generation();
@@ -997,7 +998,10 @@ fn pump_connection(
             generation = now;
             if let Ok(mut conn) = conn.lock() {
                 match quic::rebind_path(&mut conn, sock, peer) {
-                    quic::Rebind::Moved(moved) => local = moved,
+                    quic::Rebind::Moved(at) => {
+                        local = at;
+                        moved = true;
+                    }
                     quic::Rebind::Same | quic::Rebind::Unsupported => {}
                     quic::Rebind::Failed => {
                         let _ = conn.close(false, 0, b"rebind");
@@ -1033,7 +1037,7 @@ fn pump_connection(
         }
         conn.on_timeout();
         quic::flush_egress(&mut conn, sock);
-        if quic::path_failed(&mut conn, local) {
+        if moved && quic::path_failed(&mut conn, local) {
             let _ = conn.close(false, 0, b"rebind");
             break;
         }
