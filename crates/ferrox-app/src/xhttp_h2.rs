@@ -1347,13 +1347,20 @@ impl H2Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&stream);
-        if let Some(state) = state {
+        let pending = if let Some(state) = state {
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.dead = true;
+            let pending = std::mem::take(&mut st.pending_credit);
             state.cv.notify_all();
-        }
+            pending
+        } else {
+            0
+        };
         self.wake.notify_all();
         drop(credit);
+        if pending > 0 {
+            self.replenish_connection(pending as usize);
+        }
     }
 
     fn end_stream(&self, stream: u32) {
@@ -1678,7 +1685,15 @@ impl H2Conn {
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
-        let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut read = if yieldable {
+            match read.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Pumped::Yield,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            }
+        } else {
+            read.lock().unwrap_or_else(PoisonError::into_inner)
+        };
         if ready() {
             return Pumped::Alive;
         }
@@ -5635,12 +5650,58 @@ mod tests {
             1,
             "four frames and the end go out as one credit"
         );
+        assert!(
+            conn.control.drained(Duration::from_secs(1)),
+            "the credit write finishes before its bytes are read"
+        );
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(bytes.len(), 26, "the pair is 26 bytes and nothing else");
         assert_eq!(
             u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
             CREDIT_BATCH_BYTES as u32,
             "the batch carries every queued byte"
+        );
+    }
+
+    /// A peer reset frees the stream's stream window but must hand its deferred connection credit
+    /// back: otherwise repeated resets spend the shared window and stall unrelated streams.
+    #[test]
+    fn a_failed_stream_returns_its_deferred_credit() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::clone(&written),
+                slices: Arc::clone(&slices),
+            }),
+            true,
+        );
+        let (_reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        for _ in 0..3 {
+            assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_384]));
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "three frames are below the batch and grant nothing yet"
+        );
+        conn.fail_stream(1);
+        assert!(
+            conn.control.drained(Duration::from_secs(1)),
+            "the returned credit writes before it is read"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 13, "one connection credit and nothing else");
+        let (len, kind, flags, sid) = read_head(&mut &bytes[..]).expect("head");
+        assert_eq!(
+            (len, kind, flags, sid),
+            (4, T_WINDOW, 0, 0),
+            "the reset returns the connection window"
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
+            3 * 16_384,
+            "the reset returns every deferred byte"
         );
     }
 
