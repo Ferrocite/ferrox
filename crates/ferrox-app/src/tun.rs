@@ -1238,8 +1238,14 @@ mod tests {
             writes: 0,
             accepted: Vec::new(),
         };
-        assert_eq!(write_packet_to(&mut writer, b"refused"), Ok(false));
-        assert_eq!(write_packet_to(&mut writer, b"carried"), Ok(true));
+        assert!(
+            !write_packet_to(&mut writer, b"refused").expect("the refusal is reported"),
+            "a refused packet is dropped"
+        );
+        assert!(
+            write_packet_to(&mut writer, b"carried").expect("the next packet is written"),
+            "the next packet is carried"
+        );
         assert_eq!(
             writer.accepted, b"carried",
             "the packet after a refusal still reaches the device"
