@@ -29443,7 +29443,7 @@ pub(crate) mod lane_pool {
             .name("ferrox-relay-lane".into())
             .spawn(move || worker_loop(&worker));
         let Ok(worker) = spawned else {
-            echo_trace("lane spawn failed");
+            crate::proxy::echo_trace("lane spawn failed");
             pool.workers.fetch_sub(1, Relaxed);
             return false;
         };
@@ -30366,7 +30366,7 @@ pub(crate) mod lane_pool {
     }
 
     fn run_to_end(mut lane: Lane) {
-        echo_trace("lane inline");
+        crate::proxy::echo_trace("lane inline");
         loop {
             let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
             match stepped {
