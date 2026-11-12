@@ -152,7 +152,7 @@ impl Client {
         let tls = TlsConfig {
             server_name: sni.clone(),
             insecure: true,
-            fingerprint: Some(self.config.tls_shape.fingerprint()),
+            fingerprint: Some(self.config.tls_shape.fingerprint(false, None)),
             client_random: Some(passthrough),
             ..TlsConfig::default()
         };

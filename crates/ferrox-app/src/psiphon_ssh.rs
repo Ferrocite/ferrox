@@ -476,6 +476,14 @@ pub(crate) struct TlsShape {
     pub(crate) hostname_patterns: Vec<String>,
     pub(crate) limit_protocols: Vec<String>,
     pub(crate) profiles: Vec<Fingerprint>,
+    /// `CustomTLSProfiles`: each accepted spec becomes one immutable profile.
+    pub(crate) custom_profiles: Vec<Fingerprint>,
+    /// `UseOnlyCustomTLSProfiles`, ignored when no custom profile survives a provider filter.
+    pub(crate) use_only_custom_profiles: bool,
+    /// `DisableFrontingProviderTLSProfiles`, keyed by fronting provider ID.
+    pub(crate) disable_fronting_profiles: Vec<(String, Vec<String>)>,
+    /// A `FrontedMeekDialOverrides` or `TLSProfile` choice that bypasses the draw.
+    pub(crate) forced_profile: Option<Fingerprint>,
     pub(crate) randomized_probability: f64,
     pub(crate) shadowsocks_prefix: ShadowsocksPrefix,
     pub(crate) ossh_prefix: OsshPrefix,
@@ -526,6 +534,8 @@ pub(crate) struct TlsShape {
     pub(crate) quic_dial_early: f64,
     /// The chance a QUIC dial disables path-MTU discovery.
     pub(crate) quic_disable_path_mtu: f64,
+    /// The chance a non-fronted QUIC dial carries a client-made obfuscated PSK.
+    pub(crate) quic_obfuscated_psk: f64,
 }
 
 /// The reference defaults for one lane's TLS shape.
@@ -539,6 +549,10 @@ impl Default for TlsShape {
             hostname_patterns: Vec::new(),
             limit_protocols: Vec::new(),
             profiles: Vec::new(),
+            custom_profiles: Vec::new(),
+            use_only_custom_profiles: false,
+            disable_fronting_profiles: Vec::new(),
+            forced_profile: None,
             randomized_probability: 0.0,
             shadowsocks_prefix: ShadowsocksPrefix::default(),
             ossh_prefix: OsshPrefix::default(),
@@ -569,25 +583,81 @@ impl Default for TlsShape {
             user_agent_probability: 0.5,
             quic_dial_early: 1.0,
             quic_disable_path_mtu: 0.0,
+            quic_obfuscated_psk: 0.5,
         }
     }
+}
+
+fn profile_enabled(profile: Fingerprint, disabled: &[String]) -> bool {
+    profile
+        .name()
+        .is_none_or(|name| !disabled.iter().any(|disabled| disabled == name))
 }
 
 impl TlsShape {
     /// The browser hello one dial presents: a configured parrot drawn uniformly, the
     /// reference's randomized shape when its coin lands, or Chrome when nothing is named.
-    pub(crate) fn fingerprint(&self) -> Fingerprint {
+    pub(crate) fn fingerprint(&self, fronted: bool, provider: Option<&str>) -> Fingerprint {
+        if let Some(profile) = self.forced_profile {
+            return profile;
+        }
+        let disabled: &[String] = if fronted {
+            provider
+                .and_then(|provider| {
+                    self.disable_fronting_profiles
+                        .iter()
+                        .find(|(key, _)| key == provider)
+                })
+                .map_or(&[], |(_, names)| names.as_slice())
+        } else {
+            &[]
+        };
+        let custom: Vec<Fingerprint> = self
+            .custom_profiles
+            .iter()
+            .copied()
+            .filter(|profile| profile_enabled(*profile, disabled))
+            .collect();
+        let mut stock: Vec<Fingerprint> = if self.use_only_custom_profiles && !custom.is_empty() {
+            Vec::new()
+        } else if self.profiles.is_empty() {
+            vec![Fingerprint::default()]
+        } else {
+            self.profiles
+                .iter()
+                .copied()
+                .filter(|profile| profile_enabled(*profile, disabled))
+                .collect()
+        };
+        if stock.is_empty() && custom.is_empty() {
+            stock.push(Fingerprint::default());
+        }
+
         let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
-        if self.randomized_probability > 0.0 && draw < self.randomized_probability {
-            if let Some(profile) = Fingerprint::resolve("randomized") {
+        if !stock.is_empty()
+            && self.randomized_probability > 0.0
+            && draw < self.randomized_probability
+        {
+            if let Some(profile) = Fingerprint::resolve("randomized")
+                .filter(|profile| profile_enabled(*profile, disabled))
+            {
                 return profile;
             }
         }
-        if self.profiles.is_empty() {
-            return Fingerprint::default();
-        }
-        let index = usize::from(dial_random::<1>()[0]) % self.profiles.len();
-        self.profiles[index]
+
+        let mut candidates = custom;
+        candidates.extend(stock);
+        let index = usize::from(dial_random::<1>()[0]) % candidates.len();
+        candidates[index]
+    }
+
+    /// A configured profile by name, for a `FrontedMeekDialOverrides` or `TLSProfile` choice.
+    pub(crate) fn named_profile(&self, name: &str) -> Option<Fingerprint> {
+        self.custom_profiles
+            .iter()
+            .copied()
+            .find(|profile| profile.name().is_some_and(|candidate| candidate == name))
+            .or_else(|| Fingerprint::resolve(name))
     }
 
     /// The prefix one Shadowsocks salt starts with, or `None` to keep the salt random.
@@ -2757,7 +2827,7 @@ fn tls_tunnel(
     // An IP literal omits SNI, matching the reference's default; a host name is sent as the SNI it is.
     let name = shape.sni(protocol, server_name);
     let fragment = name.parse::<IpAddr>().is_err() && shape.fragment_client_hello(protocol);
-    let fingerprint = shape.fingerprint();
+    let fingerprint = shape.fingerprint(false, None);
     let config = TlsConfig {
         server_name: name.clone(),
         roots: Vec::new().into(),

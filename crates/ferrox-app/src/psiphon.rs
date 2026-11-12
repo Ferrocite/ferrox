@@ -7,6 +7,7 @@ use crate::psiphon_ssh::{
     MAX_PADDING, MIN_PADDING,
 };
 use crate::socks::{Credential, Destination, Version};
+use ferrox_core::tls::shaped::{Body, Ext, Profile};
 use ferrox_core::tls::Fingerprint;
 use flate2::read::ZlibDecoder;
 use ring::signature;
@@ -3115,6 +3116,13 @@ impl Settings {
             hostname_patterns: string_list(settings, "CustomHostNameRegexes"),
             limit_protocols: protocol_list_named(settings, "CustomHostNameLimitProtocols"),
             profiles: tls_profiles(settings),
+            custom_profiles: custom_tls_profiles(settings),
+            use_only_custom_profiles: settings
+                .and_then(|settings| settings.get("UseOnlyCustomTLSProfiles"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            disable_fronting_profiles: disable_fronting_profiles(settings),
+            forced_profile: None,
             randomized_probability: decimal(settings, "SelectRandomizedTLSProfileProbability")
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
@@ -3209,6 +3217,9 @@ impl Settings {
             quic_disable_path_mtu: decimal(settings, "QUICDisablePathMTUDiscoveryProbability")
                 .or_else(|| decimal(settings, "QUICDisableClientPathMTUDiscoveryProbability"))
                 .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            quic_obfuscated_psk: decimal(settings, "QUICObfuscatedPSKProbability")
+                .unwrap_or(0.5)
                 .clamp(0.0, 1.0),
             fragmentor: crate::psiphon_fragment::Fragmentor::new(
                 decimal(settings, "FragmentorProbability").unwrap_or(0.5),
@@ -4520,6 +4531,290 @@ fn tls_profiles(settings: Option<&Json>) -> Vec<Fingerprint> {
         .collect()
 }
 
+/// `CustomTLSProfiles`: an array of named uTLS specs, each accepted profile immutable for the process.
+fn custom_tls_profiles(settings: Option<&Json>) -> Vec<Fingerprint> {
+    let Some(items) = settings
+        .and_then(|settings| settings.get("CustomTLSProfiles"))
+        .and_then(Json::as_arr)
+    else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut profiles = Vec::new();
+    for item in items {
+        let Some(name) = text_in(item, "Name") else {
+            eprintln!("psiphon: CustomTLSProfiles entry missing Name; ignoring it");
+            continue;
+        };
+        if Fingerprint::resolve(&name).is_some() || !seen.insert(name.clone()) {
+            eprintln!("psiphon: invalid or duplicate CustomTLSProfiles name {name:?}; ignoring it");
+            continue;
+        }
+        let Some(spec) = item.get("UTLSSpec") else {
+            eprintln!("psiphon: CustomTLSProfiles entry {name:?} missing UTLSSpec; ignoring it");
+            continue;
+        };
+        let ciphers = u16_list(spec.get("CipherSuites"));
+        if ciphers.is_empty() {
+            eprintln!(
+                "psiphon: CustomTLSProfiles entry {name:?} has no cipher suites; ignoring it"
+            );
+            continue;
+        }
+        let mut extensions = Vec::new();
+        let mut valid = true;
+        if let Some(items) = spec.get("Extensions").and_then(Json::as_arr) {
+            for item in items {
+                if let Some(extension) = custom_extension(item) {
+                    extensions.push(extension);
+                } else {
+                    eprintln!(
+                        "psiphon: CustomTLSProfiles entry {name:?} has an unknown extension; ignoring the profile"
+                    );
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        let ciphers: &'static [u16] = Box::leak(ciphers.into_boxed_slice());
+        let extensions: Vec<Ext> = extensions
+            .into_iter()
+            .map(|extension| Ext {
+                kind: extension.kind,
+                body: extension.body.leak(),
+            })
+            .collect();
+        let extensions: &'static [Ext] = Box::leak(extensions.into_boxed_slice());
+        let profile: &'static Profile = Box::leak(Box::new(Profile {
+            name,
+            ciphers,
+            shuffle: false,
+            exts: extensions,
+        }));
+        profiles.push(Fingerprint::custom(profile));
+    }
+    profiles
+}
+
+#[derive(Debug)]
+struct CustomExtension {
+    kind: u16,
+    body: CustomBody,
+}
+
+#[derive(Debug)]
+enum CustomBody {
+    Grease,
+    Sni,
+    Pad,
+    Groups(Vec<u16>),
+    Sigalgs(Vec<u16>),
+    Alpn(Vec<u8>),
+    Versions(Vec<u16>),
+    KeyShare(Vec<u16>),
+    Raw(Vec<u8>),
+}
+
+impl CustomBody {
+    fn leak(self) -> Body {
+        match self {
+            Self::Grease => Body::Grease,
+            Self::Sni => Body::Sni,
+            Self::Pad => Body::Pad,
+            Self::Groups(groups) => Body::Groups(Box::leak(groups.into_boxed_slice())),
+            Self::Sigalgs(sigalgs) => Body::Sigalgs(Box::leak(sigalgs.into_boxed_slice())),
+            Self::Alpn(alpn) => Body::Alpn(Box::leak(alpn.into_boxed_slice())),
+            Self::Versions(versions) => Body::Versions(Box::leak(versions.into_boxed_slice())),
+            Self::KeyShare(groups) => Body::KeyShare {
+                groups: Box::leak(groups.into_boxed_slice()),
+                reuse: false,
+            },
+            Self::Raw(bytes) => Body::Raw(Box::leak(bytes.into_boxed_slice())),
+        }
+    }
+}
+
+fn custom_extension(item: &Json) -> Option<CustomExtension> {
+    let name = item.get("Name")?.as_str()?;
+    let data = item.get("Data");
+    let (kind, body) = match name {
+        "NPN" => (0x3374, CustomBody::Raw(Vec::new())),
+        "SNI" => (0x0000, CustomBody::Sni),
+        "StatusRequest" => (0x0005, CustomBody::Raw(vec![1, 0, 0, 0, 0])),
+        "SupportedCurves" => (0x000a, CustomBody::Groups(u16_list(data?.get("Curves")))),
+        "SupportedPoints" => {
+            let points = u8_list(data?.get("SupportedPoints"));
+            let mut body = Vec::with_capacity(1 + points.len());
+            body.push(u8::try_from(points.len()).ok()?);
+            body.extend_from_slice(&points);
+            (0x000b, CustomBody::Raw(body))
+        }
+        "SignatureAlgorithms" => (
+            0x000d,
+            CustomBody::Sigalgs(u16_list(data?.get("SupportedSignatureAlgorithms"))),
+        ),
+        "RenegotiationInfo" => (0xff01, CustomBody::Raw(vec![0])),
+        "ALPN" => (0x0010, CustomBody::Alpn(alpn_body(data?, "AlpnProtocols"))),
+        "SCT" => (0x0012, CustomBody::Raw(Vec::new())),
+        "SessionTicket" => (0x0023, CustomBody::Raw(Vec::new())),
+        "Generic" => (
+            u16::try_from(data?.get("Id")?.as_u32()?).ok()?,
+            CustomBody::Raw(u8_list(data?.get("Data"))),
+        ),
+        "ExtendedMasterSecret" => (0x0017, CustomBody::Raw(Vec::new())),
+        "GREASE" => (0x0a0a, CustomBody::Grease),
+        "BoringPadding" => (0x0015, CustomBody::Pad),
+        "KeyShare" => {
+            let groups = data?
+                .get("KeyShares")?
+                .as_arr()?
+                .iter()
+                .filter_map(|share| share.get("Group").and_then(Json::as_u32))
+                .filter_map(|group| u16::try_from(group).ok())
+                .collect();
+            (0x0033, CustomBody::KeyShare(groups))
+        }
+        "PSKKeyExchangeModes" => {
+            let modes = u8_list(data?.get("Modes"));
+            let mut body = Vec::with_capacity(1 + modes.len());
+            body.push(u8::try_from(modes.len()).ok()?);
+            body.extend_from_slice(&modes);
+            (0x002d, CustomBody::Raw(body))
+        }
+        "SupportedVersions" => (
+            0x002b,
+            CustomBody::Versions(u16_list(data?.get("Versions"))),
+        ),
+        "ChannelID" => (
+            if data
+                .and_then(|data| data.get("OldExtensionID"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false)
+            {
+                0x754f
+            } else {
+                0x7550
+            },
+            CustomBody::Raw(Vec::new()),
+        ),
+        "CertCompressionAlgs" => {
+            let algorithms = u16_list(data?.get("Algorithms"));
+            let mut body = Vec::with_capacity(1 + 2 * algorithms.len());
+            body.push(u8::try_from(2 * algorithms.len()).ok()?);
+            for algorithm in algorithms {
+                body.extend_from_slice(&algorithm.to_be_bytes());
+            }
+            (0x001b, CustomBody::Raw(body))
+        }
+        "RecordSizeLimit" => {
+            let limit = u16::try_from(data?.get("Limit")?.as_u32()?).ok()?;
+            (0x001c, CustomBody::Raw(limit.to_be_bytes().to_vec()))
+        }
+        "ALPS" => (
+            0x4469,
+            CustomBody::Alpn(alpn_body_either(
+                data?,
+                "supported_protocols",
+                "SupportedProtocols",
+            )),
+        ),
+        "DelegatedCredentials" => {
+            let algorithms = u16_list_either(
+                data?,
+                "supported_signature_algorithms",
+                "SupportedSignatureAlgorithms",
+            );
+            let mut body = Vec::with_capacity(2 + 2 * algorithms.len());
+            body.extend_from_slice(&u16::try_from(2 * algorithms.len()).ok()?.to_be_bytes());
+            for algorithm in algorithms {
+                body.extend_from_slice(&algorithm.to_be_bytes());
+            }
+            (0x0022, CustomBody::Raw(body))
+        }
+        _ => return None,
+    };
+    Some(CustomExtension { kind, body })
+}
+
+fn alpn_body(item: &Json, key: &str) -> Vec<u8> {
+    let mut list = Vec::new();
+    for protocol in string_list_in(item, key) {
+        if let Ok(length) = u8::try_from(protocol.len()) {
+            list.push(length);
+            list.extend_from_slice(protocol.as_bytes());
+        }
+    }
+    let mut body = Vec::with_capacity(2 + list.len());
+    body.extend_from_slice(&u16::try_from(list.len()).unwrap_or(0).to_be_bytes());
+    body.extend_from_slice(&list);
+    body
+}
+
+fn alpn_body_either(item: &Json, first: &str, second: &str) -> Vec<u8> {
+    if item.get(first).is_some() {
+        alpn_body(item, first)
+    } else {
+        alpn_body(item, second)
+    }
+}
+
+fn u16_list_either(item: &Json, first: &str, second: &str) -> Vec<u16> {
+    u16_list(item.get(first).or_else(|| item.get(second)))
+}
+
+fn u16_list(value: Option<&Json>) -> Vec<u16> {
+    value
+        .and_then(Json::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Json::as_u32)
+        .filter_map(|value| u16::try_from(value).ok())
+        .collect()
+}
+
+fn u8_list(value: Option<&Json>) -> Vec<u8> {
+    value
+        .and_then(Json::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Json::as_u32)
+        .filter_map(|value| u8::try_from(value).ok())
+        .collect()
+}
+
+fn disable_fronting_profiles(settings: Option<&Json>) -> Vec<(String, Vec<String>)> {
+    let Some(block) =
+        settings.and_then(|settings| settings.get("DisableFrontingProviderTLSProfiles"))
+    else {
+        return Vec::new();
+    };
+    let Json::Obj(pairs) = block else {
+        return Vec::new();
+    };
+    pairs
+        .iter()
+        .filter_map(|(provider, profiles)| {
+            let profiles = profiles
+                .as_arr()?
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+                .map(|profile| {
+                    Fingerprint::resolve(profile)
+                        .and_then(Fingerprint::name)
+                        .map_or_else(|| profile.to_owned(), str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            (!profiles.is_empty()).then(|| (provider.clone(), profiles))
+        })
+        .collect()
+}
+
 fn protocol_list_named(settings: Option<&Json>, key: &str) -> Vec<String> {
     string_list(settings, key)
         .into_iter()
@@ -4917,6 +5212,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "LimitQUICVersions",
     "LimitTLSProfiles",
     "TLSProfile",
+    "CustomTLSProfiles",
+    "UseOnlyCustomTLSProfiles",
+    "DisableFrontingProviderTLSProfiles",
     "QUICNoiseProfile",
     "InproxyRejectProxyCIDRs",
     "TLSTunnelMinTLSPadding",
@@ -4946,6 +5244,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "QUICDialEarlyProbability",
     "QUICDisablePathMTUDiscoveryProbability",
     "QUICDisableClientPathMTUDiscoveryProbability",
+    "QUICObfuscatedPSKProbability",
     "SelectRandomizedTLSProfileProbability",
     "TLSOSSHSNIServerName",
     "TLSOSSHSNIServerNames",
@@ -6608,7 +6907,8 @@ fn push_fronted_variant(
         verify_pins.to_vec()
     };
     if let Some(profile) = tls_profile.filter(|_| meek.https && !meek.quic) {
-        if let Some(fingerprint) = Fingerprint::resolve(profile) {
+        if let Some(fingerprint) = meek.shape.named_profile(profile) {
+            meek.shape.forced_profile = Some(fingerprint);
             meek.shape.profiles = vec![fingerprint];
             meek.shape.randomized_probability = 0.0;
         } else {
@@ -11954,6 +12254,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn custom_tls_profiles_become_named_fingerprints() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"CustomTLSProfiles":[{"Name":"tactic","UTLSSpec":{"CipherSuites":[4865],"Extensions":[{"Name":"SNI"},{"Name":"SupportedVersions","Data":{"Versions":[772]}}]}}],"UseOnlyCustomTLSProfiles":true}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.tls_shape.custom_profiles.len(), 1);
+        assert!(settings.tls_shape.use_only_custom_profiles);
+        let profile = settings.tls_shape.fingerprint(false, None);
+        assert_eq!(profile.name(), Some("tactic"));
+        assert_eq!(settings.tls_shape.named_profile("tactic"), Some(profile));
+    }
+
+    #[test]
+    fn a_disabled_fronting_profile_is_not_drawn_for_that_provider() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"LimitTLSProfiles":["chrome_120","firefox_105"],"DisableFrontingProviderTLSProfiles":{"F1":["firefox_105"]}}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let firefox = Fingerprint::resolve("firefox_105").expect("firefox");
+        for _ in 0..64 {
+            assert_ne!(settings.tls_shape.fingerprint(true, Some("F1")), firefox);
+        }
+        assert_eq!(
+            settings
+                .tls_shape
+                .named_profile("firefox_105")
+                .expect("firefox"),
+            firefox
+        );
+    }
+
     /// Limited TLS profiles and meek padding reach every TLS shape.
     #[test]
     fn a_limited_tls_profile_reaches_every_tls_shape() {
@@ -12482,7 +12820,7 @@ mod tests {
     fn the_tls_fragment_and_user_agent_settings_reach_the_shape() {
         let settings = Settings::from_json(Some(
             &json::parse(
-                r#"{"TLSFragmentClientHelloProbability":0.25,"TLSFragmentClientHelloLimitProtocols":["tls-ossh"],"PickUserAgentProbability":0.0,"QUICDialEarlyProbability":0.25,"QUICDisableClientPathMTUDiscoveryProbability":0.75}"#,
+                r#"{"TLSFragmentClientHelloProbability":0.25,"TLSFragmentClientHelloLimitProtocols":["tls-ossh"],"PickUserAgentProbability":0.0,"QUICDialEarlyProbability":0.25,"QUICDisableClientPathMTUDiscoveryProbability":0.75,"QUICObfuscatedPSKProbability":0.4}"#,
             )
             .expect("settings"),
         ))
@@ -12495,6 +12833,7 @@ mod tests {
         assert_eq!(settings.tls_shape.user_agent_probability, 0.0);
         assert_eq!(settings.tls_shape.quic_dial_early, 0.25);
         assert_eq!(settings.tls_shape.quic_disable_path_mtu, 0.75);
+        assert_eq!(settings.tls_shape.quic_obfuscated_psk, 0.4);
         assert!(!settings.tls_shape.fragment_client_hello("SSH"));
         let always = Settings::from_json(Some(
             &json::parse(
