@@ -14,6 +14,10 @@ That is the whole of the Windows failure this lane used to carry: the bare-path 
 
 The checker is `a_drained_teardown_ends_the_upgrade_with_a_fin`, witnessed on this machine: with the drain disabled it fails 3/3 with `Os { code: 54, kind: ConnectionReset }`; with it the read ends in EOF. The bare-path test cannot gate this — it passes on macOS either way — so it was retargeted to the teardown production actually has (`quiet`, then drop) rather than a shape only the test uses.
 
+## The opening request
+
+The `VMess` opening request behind this head is bounded too: `serve_httpupgrade` arms `RELAY_POLL` and decodes through `accept_request_bounded`, so a peer that takes the `101` and sends no request ends at `budgets::handshake()` instead of pinning the worker. `a_silent_peer_cannot_pin_an_httpupgrade_vmess_request` is the witness: it completes the upgrade, sends nothing, and asserts the serve thread returns inside the budget.
+
 ## Request headers
 
 The upgrade request writes the configured `httpupgradeSettings.headers` under the same `crate::headers::masked` merge the WebSocket dial uses, with the `ws` default set when the config names none of those names. `httpupgrade::tests::a_configured_header_reaches_the_upgrade_request` holds a configured `X-Custom` and `Sec-Fetch-Mode: websocket` in the head. The configured `Host` is not written twice: it reaches the request line's single `Host` through `outbound_carrier`'s precedence, and the shared merge leaves it to the builder. The header list is a slice borrowed from the parsed settings; the request is still one gathered write.
@@ -63,6 +67,7 @@ graph TD
 | sweep-dialled-payload-orders-that-differ | 1 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
 | sweep-dialled-payload-bytes-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
 | sweep-request-header-lines-the-reference-adds-per-dial | 3 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
+| pinned-threads-per-silent-vmess-request | 0 | ferrox-app-vmess::tests::a_silent_peer_cannot_pin_an_httpupgrade_vmess_request |
 <!-- counts:end -->
 
 `round-trips-per-upgraded-dial` is witnessed on an in-memory carrier that models the reference's server: it reads exactly the request's octets, answers only a read that finds nothing behind it, and then writes the switch. The dial's 50 ms read must time out first, and only after the switch does it write its payload; a dial that wrote the payload early would have it swallowed. `writes-per-upgraded-dial-with-a-payload` is the same dial's `plain` log: the request and then the payload, two writes, nothing vectored; `writes-per-upgraded-dial-without-a-payload` is the empty-first case, one write, and the same test holds both.

@@ -219,6 +219,7 @@ carrier-httpupgrade sweep-dialled-verdicts-that-differ 2 ferrox-app-httpupgrade:
 carrier-httpupgrade sweep-dialled-payload-orders-that-differ 1 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-httpupgrade sweep-dialled-payload-bytes-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-httpupgrade sweep-request-header-lines-the-reference-adds-per-dial 3 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_an_httpupgrade_vmess_request
 carrier-xdrive ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-xdrive connections-per-five-templated-asks 1 ferrox-app-xdrive::tests::the_templated_store_sends_the_reference_bytes
 carrier-xdrive connections-per-five-drive-asks 1 ferrox-app-xdrive::tests::the_drive_service_asks_in_the_reference_shape
