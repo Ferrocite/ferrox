@@ -14,6 +14,8 @@ pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
 /// The chunk a response frames: the reference's HTTP writer hands its reader one `buf.Size` buffer at a time.
 const WIRE_CHUNK: usize = 8 * 1024;
+/// The chunks one relay window leaves as.
+const FRAMES_FRAMES_PER_WINDOW: usize = CHUNK.div_ceil(WIRE_CHUNK);
 /// A whole body plus the longest size line that can precede it and both bytes that close the body, so one framing read opens and finishes it.
 const FRAMING_READ: usize = CHUNK + 131;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -1044,13 +1046,12 @@ impl XhttpWriter {
         let Ok(mut stream) = stream.lock() else {
             return false;
         };
-        const PER_WINDOW: usize = CHUNK.div_ceil(WIRE_CHUNK);
         for window in data.chunks(CHUNK) {
             if window.is_empty() {
                 continue;
             }
-            let mut lines = [[0u8; 7]; PER_WINDOW];
-            let mut parts: [&[u8]; PER_WINDOW * 3] = [&[]; PER_WINDOW * 3];
+            let mut lines = [[0u8; 7]; FRAMES_PER_WINDOW];
+            let mut parts: [&[u8]; FRAMES_PER_WINDOW * 3] = [&[]; FRAMES_PER_WINDOW * 3];
             let mut kept = 0usize;
             for (piece, line) in window.chunks(WIRE_CHUNK).zip(&mut lines) {
                 let len = size_line(piece.len(), line);
