@@ -290,8 +290,7 @@ impl Connection {
         }
         #[cfg(not(unix))]
         {
-            // `read_ready` never waits on any platform: a Windows socket has no zero-timeout
-            // receive, so the probe asks for readability and lets `read` answer at once.
+            // `read_ready` never waits on any platform: a Windows socket has no zero-timeout receive, so the probe asks for readability and lets `read` answer at once.
             let _probe = crate::proxy::ProbeEmptyRead::new(true);
             self.read(buf)
         }
@@ -428,8 +427,7 @@ fn recv_ready<S: std::os::fd::AsRawFd>(stream: &S, buf: &mut [u8]) -> io::Result
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // A lane that parks on an empty read asks a Windows socket for readability first, so an
-        // empty one answers `WouldBlock` now and the lane waits on the socket, not on the clock.
+        // A lane that parks on an empty read asks a Windows socket for readability first, so an empty one answers `WouldBlock` now and the lane waits on the socket, not on the clock.
         #[cfg(windows)]
         if crate::proxy::probe_empty_read() && !readable_now(self) {
             crate::proxy::note_wait_fd(crate::proxy::wait_key(&*self));

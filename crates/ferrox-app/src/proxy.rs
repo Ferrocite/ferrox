@@ -32748,8 +32748,7 @@ where
     lane_pool::submit(
         Box::new(move || {
             let read = {
-                // A carrier that parks on an empty read probes for readability on Windows, so the
-                // lane parks on the socket instead of waiting the poll quantum inside the read.
+                // A carrier that parks on an empty read probes for readability on Windows, so the lane parks on the socket instead of waiting the poll quantum inside the read.
                 let _probe = ProbeEmptyRead::new(reader.parks_on_timeout());
                 reader.read_window()
             };
