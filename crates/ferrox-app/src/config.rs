@@ -3287,6 +3287,10 @@ mod tests {
         let blocked =
             stage(r#"{"settings":{"blockedSourceIPs":["192.0.2.0/24"]}}"#).expect("a blocked list");
         assert!(blocked.rejects(Some("192.0.2.5".parse().expect("ip"))));
+        assert!(
+            blocked.rejects(Some("::ffff:192.0.2.5".parse().expect("mapped ip"))),
+            "a dual-stack peer arrives mapped"
+        );
         assert!(!blocked.rejects(Some("198.51.100.1".parse().expect("ip"))));
         let allowed = stage(r#"{"settings":{"allowedSourceIPs":["198.51.100.0/24"]}}"#)
             .expect("an allowlist");

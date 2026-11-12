@@ -409,6 +409,7 @@ impl IpSets {
 }
 
 fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
+    let (ip, start, end) = (ip.to_canonical(), start.to_canonical(), end.to_canonical());
     match (ip, start, end) {
         (IpAddr::V4(ip), IpAddr::V4(start), IpAddr::V4(end)) => {
             u32::from(ip) >= u32::from(start) && u32::from(ip) <= u32::from(end)
