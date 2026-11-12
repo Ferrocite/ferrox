@@ -576,8 +576,7 @@ impl Read for H2StreamReader {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             if filled > 0 {
-                // A chunk still short of its frame is worth one more poll: the lane would wait on the
-                // next read anyway, and the two frames leave in one write instead of two.
+                // One more poll lets two frames leave in one write; the lane would wait on the next read anyway.
                 if !tried_extra
                     && filled >= 8_192
                     && buf.len() - filled >= 8_192
