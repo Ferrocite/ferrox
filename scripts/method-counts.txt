@@ -698,6 +698,8 @@ unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_pa
 unix unix-abstract-name-served 27 ferrox-app-conn::tests::a_unix_abstract_name_is_bound_and_dialed
 unix unix-abstract-padded-field 108 ferrox-app-conn::tests::a_doubled_unix_at_names_the_padded_abstract_name
 unix unix-permission-mode 504 ferrox-app-conn::tests::a_unix_listener_takes_the_permission_it_names
+unix unix-non-octal-comma-literal 7 ferrox-app-conn::tests::a_unix_comma_path_that_is_not_a_mode_stays_literal
+unix unix-regular-file-refused 16 ferrox-app-conn::tests::a_unix_listener_never_removes_a_regular_file
 
 # --- tun device inbound -----------------------------------------------------
 front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh

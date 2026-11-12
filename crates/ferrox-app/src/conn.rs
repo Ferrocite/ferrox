@@ -2620,6 +2620,68 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A single comma whose suffix is not octal is part of the name, not a mode: the text binds
+    /// and dials the same literal path a peer outside this tree can name, where a hard error on
+    /// that suffix would refuse a path that bound before the mode spelling existed.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_comma_path_that_is_not_a_mode_stays_literal() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-comma-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("app,v2.sock");
+        assert_eq!(
+            b"v2.sock".len(),
+            7,
+            "the witness spells a 7-byte non-octal suffix"
+        );
+        let target = parse_target(&format!("unix:{}", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("the literal comma path binds");
+        let mut client =
+            connect(&target, Duration::from_secs(5)).expect("the same text dials the literal path");
+        let (mut server, _) = listener.accept().expect("accepts");
+        server.write_all(b"c").expect("writes");
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).expect("reads");
+        assert_eq!(
+            &byte, b"c",
+            "the literal path serves the text it was bound from"
+        );
+        let file = std::fs::symlink_metadata(&path).expect("the socket file the listener created");
+        assert!(
+            file.file_type().is_socket(),
+            "the comma stays in the name the listener creates"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A unix listen path that already names a regular file is refused, never removed: a typo in a
+    /// config must not delete data on the way to a failed bind.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_listener_never_removes_a_regular_file() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-file-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let kept = [b'k'; 16];
+        std::fs::write(&path, kept).expect("writes a regular file at the socket path");
+        let result = Listener::bind(&Target::Unix(path.clone()));
+        assert!(result.is_err(), "binding over a regular file is refused");
+        assert_eq!(
+            std::fs::read(&path).expect("the file survives the refused bind"),
+            kept,
+            "the file is untouched"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
     /// is not waited out holds its caller past the budget; the seam spends the budget instead.
     #[cfg(target_os = "linux")]
