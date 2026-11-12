@@ -1813,6 +1813,10 @@ fn io(
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
             break;
         }
+        if quic::path_failed(&mut conn, local) {
+            let _ = conn.close(false, 0, b"rebind");
+            break;
+        }
         if let Err(reason) = control.read_stream(&mut conn) {
             eprintln!("masque: {reason}");
             break;

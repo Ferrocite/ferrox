@@ -435,6 +435,10 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         }
         take_queued(&mut conn, session);
         crate::quic::flush_egress(&mut conn, &session.sock);
+        if crate::quic::path_failed(&mut conn, local) {
+            let _ = conn.close(false, 0, b"rebind");
+            return false;
+        }
         return true;
     }
     match incoming {
@@ -446,6 +450,10 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         None => conn.on_timeout(),
     }
     crate::quic::flush_egress(&mut conn, &session.sock);
+    if crate::quic::path_failed(&mut conn, local) {
+        let _ = conn.close(false, 0, b"rebind");
+        return false;
+    }
     true
 }
 

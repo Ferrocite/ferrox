@@ -1895,6 +1895,18 @@ fn move_socket(conn: &mut quiche::Connection, sock: &Datagram, fresh: UdpSocket)
     Rebind::Moved(new_local)
 }
 
+/// Whether quiche has failed to validate `local` as a path, which leaves the move without
+/// a source the peer can answer on and lets the carrier end instead of waiting for idle.
+pub(crate) fn path_failed(conn: &mut quiche::Connection, local: SocketAddr) -> bool {
+    let mut failed = false;
+    while let Some(event) = conn.path_event_next() {
+        if let quiche::PathEvent::FailedValidation(from, _) = event {
+            failed |= from == local;
+        }
+    }
+    failed
+}
+
 /// Bind a datagram socket with a lane's buffers, coalescing only when the lane can read a coalesced datagram.
 fn bind_datagram_gro(address: &str, gro: bool) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;

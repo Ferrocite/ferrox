@@ -1033,6 +1033,10 @@ fn pump_connection(
         }
         conn.on_timeout();
         quic::flush_egress(&mut conn, sock);
+        if quic::path_failed(&mut conn, local) {
+            let _ = conn.close(false, 0, b"rebind");
+            break;
+        }
     }
     dead.store(true, Ordering::Relaxed);
 }
