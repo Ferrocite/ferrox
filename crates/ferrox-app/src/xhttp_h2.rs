@@ -517,9 +517,25 @@ impl H2StreamReader {
         self.idle_since = None;
         filled + n
     }
+
+    /// Pump one frame from the connection, yielding or parking according to the lane that owns the call.
+    fn pump(&self, yieldable: bool) -> Pumped {
+        self.conn.pump_read(
+            || {
+                let st = self
+                    .stream
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                !st.body.is_empty() || st.read_ended() || st.dead
+            },
+            yieldable,
+        )
+    }
 }
 
 impl Read for H2StreamReader {
+    #[allow(clippy::too_many_lines)]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -570,17 +586,7 @@ impl Read for H2StreamReader {
                 {
                     tried_extra = true;
                     drop(st);
-                    match self.conn.pump_read(
-                        || {
-                            let st = self
-                                .stream
-                                .state
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner);
-                            !st.body.is_empty() || st.read_ended() || st.dead
-                        },
-                        true,
-                    ) {
+                    match self.pump(true) {
                         Pumped::Alive => continue,
                         Pumped::Yield | Pumped::Dead => return Ok(filled),
                     }
@@ -590,17 +596,7 @@ impl Read for H2StreamReader {
             }
             if self.conn.client_read.is_some() {
                 drop(st);
-                match self.conn.pump_read(
-                    || {
-                        let st = self
-                            .stream
-                            .state
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        !st.body.is_empty() || st.read_ended() || st.dead
-                    },
-                    crate::proxy::relay_step_owns_poll(),
-                ) {
+                match self.pump(crate::proxy::relay_step_owns_poll()) {
                     Pumped::Alive => {}
                     Pumped::Yield => {
                         return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -2504,7 +2500,7 @@ fn open_stream(
     };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
-    crate::proxy::lane_pool::submit_stream_setup(move || {
+    crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
