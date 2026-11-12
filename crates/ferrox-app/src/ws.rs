@@ -300,14 +300,21 @@ impl<R: Read> WsReader<R> {
         self.handshake = until;
     }
 
-    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means
-    /// done, and a relay's poll timeout is handed back to the lane with the frame where it broke.
-    fn pull(&mut self, len: usize) -> std::io::Result<bool> {
-        if self.at > 0 && !self.assembling && !self.coalesce {
+    /// Drops the consumed prefix, so a window that must not compact can still start small.
+    fn compact(&mut self) {
+        if self.at > 0 && !self.assembling {
             self.have.copy_within(self.at.., 0);
             self.have.truncate(self.have.len() - self.at);
             self.msg_end = self.msg_end.saturating_sub(self.at);
             self.at = 0;
+        }
+    }
+
+    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means
+    /// done, and a relay's poll timeout is handed back to the lane with the frame where it broke.
+    fn pull(&mut self, len: usize) -> std::io::Result<bool> {
+        if !self.coalesce {
+            self.compact();
         }
         let room = READ_AHEAD.max(len);
         if self.have.capacity() - self.have.len() < room {
@@ -624,7 +631,8 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
             return Ok(crate::proxy::Window::one(&self.early[start..end]));
         }
         let mut spans = [(0usize, 0usize); crate::proxy::WINDOW_PARTS];
-        // The spans this call hands out are offsets into `have`, so nothing may compact it while the window fills.
+        // The spans this call hands out are offsets into `have`, so nothing may compact it while the window fills; the consumed prefix goes now, before the first span.
+        self.compact();
         self.coalesce = true;
         let filled = self.fill_window(&mut spans);
         self.coalesce = false;
@@ -1894,8 +1902,7 @@ mod tests {
         let second_start = wire.len();
         wire.extend(frame(&second));
         let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
-        let base = reader.have.as_ptr();
-        let capacity = reader.have.capacity();
+        let window_ptr;
         {
             let window = crate::proxy::WindowRead::read_window(&mut reader)
                 .expect("reads the buffered frames");
@@ -1906,14 +1913,6 @@ mod tests {
                 "one span per buffered message, headers left out"
             );
             assert_eq!(
-                window.bytes().as_ptr(),
-                base,
-                "the window is the reader's own buffer, not a copy"
-            );
-            assert!(
-                window.bytes().as_ptr() as usize + window.bytes().len() <= base as usize + capacity
-            );
-            assert_eq!(
                 &window.bytes()[window.parts()[0].0..][..window.parts()[0].1],
                 &first[..]
             );
@@ -1921,32 +1920,52 @@ mod tests {
                 &window.bytes()[window.parts()[1].0..][..window.parts()[1].1],
                 &second[..]
             );
+            window_ptr = window.bytes().as_ptr();
         }
-        assert_eq!(reader.have.as_ptr(), base, "the buffer did not move");
-        assert_eq!(reader.have.capacity(), capacity, "the buffer did not grow");
+        let base = reader.have.as_ptr();
+        let capacity = reader.have.capacity();
+        assert_eq!(
+            window_ptr, base,
+            "the window is the reader's own buffer, not a copy"
+        );
         assert!(
             crate::proxy::WindowRead::read_window(&mut reader)
                 .expect("reads")
                 .is_empty(),
             "the buffered messages are spent"
         );
+        assert_eq!(reader.have.as_ptr(), base, "the buffer did not move");
+        assert_eq!(reader.have.capacity(), capacity, "the buffer did not grow");
     }
 
     /// A server's small frames leave in one window: the reader keeps pulling within the lane's
     /// poll until the window is full, instead of handing the lane one frame per turn.
     #[test]
     fn small_frames_fill_one_window() {
-        struct Frames(std::vec::IntoIter<Vec<u8>>);
+        struct Bursts {
+            bursts: std::collections::VecDeque<std::collections::VecDeque<Vec<u8>>>,
+            blocked: bool,
+        }
 
-        impl Read for Frames {
+        impl Read for Bursts {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                match self.0.next() {
-                    Some(chunk) => {
+                loop {
+                    let Some(front) = self.bursts.front_mut() else {
+                        return Ok(0);
+                    };
+                    if let Some(chunk) = front.pop_front() {
                         let n = chunk.len().min(buf.len());
                         buf[..n].copy_from_slice(&chunk[..n]);
-                        Ok(n)
+                        self.blocked = false;
+                        return Ok(n);
                     }
-                    None => Ok(0),
+                    if self.blocked {
+                        self.bursts.pop_front();
+                        self.blocked = false;
+                        continue;
+                    }
+                    self.blocked = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
                 }
             }
         }
@@ -1957,18 +1976,35 @@ mod tests {
             wire.extend_from_slice(payload);
             wire
         };
-        let pieces = vec![
-            frame(&[0x11u8; 4096]),
-            frame(&[0x22u8; 4096]),
-            frame(&[0x33u8; 4096]),
-        ];
-        let mut reader = window_reader(Frames(pieces.into_iter()), Vec::new());
+        let burst = || {
+            std::collections::VecDeque::from([
+                frame(&[0x11u8; 4096]),
+                frame(&[0x22u8; 4096]),
+                frame(&[0x33u8; 4096]),
+            ])
+        };
+        let _step = crate::proxy::RelayStep::enter();
+        let mut reader = window_reader(
+            Bursts {
+                bursts: std::collections::VecDeque::from([burst(), burst()]),
+                blocked: false,
+            },
+            Vec::new(),
+        );
         let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
         assert_eq!(window.parts().len(), 3, "three frames, one window");
+        drop(window);
+        assert_eq!(reader.reads(), 3, "one syscall per frame, not per span");
+        let base = reader.have.as_ptr();
+        let capacity = reader.have.capacity();
+        let next = crate::proxy::WindowRead::read_window(&mut reader).expect("reads the rest");
+        assert_eq!(next.parts().len(), 3, "the next burst fills one window too");
+        drop(next);
+        assert_eq!(reader.have.as_ptr(), base, "the buffer did not move");
         assert_eq!(
-            reader.reads(),
-            4,
-            "one syscall per frame, plus the read that ends the window"
+            reader.have.capacity(),
+            capacity,
+            "the buffer did not grow across a window"
         );
     }
 
@@ -1980,10 +2016,8 @@ mod tests {
         wire.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         wire.extend_from_slice(&payload);
         let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
-        let base = reader.have.as_ptr();
         let first = {
             let window = crate::proxy::WindowRead::read_window(&mut reader).expect("first piece");
-            assert_eq!(window.bytes().as_ptr(), base);
             let total: usize = window.parts().iter().map(|&(_, len)| len).sum();
             assert_eq!(
                 total, WINDOW_MAX,
@@ -1996,9 +2030,14 @@ mod tests {
             out
         };
         assert_eq!(first, payload[..WINDOW_MAX]);
+        let base = reader.have.as_ptr();
         let second = {
             let window = crate::proxy::WindowRead::read_window(&mut reader).expect("remainder");
-            assert_eq!(window.bytes().as_ptr(), base);
+            assert_eq!(
+                window.bytes().as_ptr(),
+                base,
+                "the remainder stays where the first piece left it"
+            );
             let mut out = Vec::new();
             for &(start, len) in window.parts() {
                 out.extend_from_slice(&window.bytes()[start..start + len]);
@@ -2048,11 +2087,16 @@ mod tests {
                 .map(|(i, byte)| byte ^ mask[i % 4]),
         );
         let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
-        let base = reader.have.as_ptr();
         let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
         assert_eq!(window.parts(), &[(8, payload.len())]);
         assert_eq!(&window.bytes()[8..][..payload.len()], &payload[..]);
-        assert_eq!(window.bytes().as_ptr(), base);
+        let window_ptr = window.bytes().as_ptr();
+        drop(window);
+        assert_eq!(
+            window_ptr,
+            reader.have.as_ptr(),
+            "the window is the reader's own buffer, not a copy"
+        );
     }
 
     /// A fragmented message whose second fragment is not in hand joins across calls, and the first fragment is not delivered twice.
@@ -2084,15 +2128,21 @@ mod tests {
         let mut reader = window_reader(Chunks(vec![first, second].into_iter()), Vec::new());
         {
             let one = crate::proxy::WindowRead::read_window(&mut reader).expect("reads A");
+            assert_eq!(one.parts().len(), 2, "the window pulls the fragment in");
             assert_eq!(
                 &one.bytes()[one.parts()[0].0..][..one.parts()[0].1],
                 &b"A"[..]
             );
+            assert_eq!(
+                &one.bytes()[one.parts()[1].0..][..one.parts()[1].1],
+                b"hello world"
+            );
         }
-        let two = crate::proxy::WindowRead::read_window(&mut reader).expect("reads the rest");
-        assert_eq!(
-            &two.bytes()[two.parts()[0].0..][..two.parts()[0].1],
-            b"hello world"
+        assert!(
+            crate::proxy::WindowRead::read_window(&mut reader)
+                .expect("reads")
+                .is_empty(),
+            "the first fragment is not delivered twice"
         );
     }
 
