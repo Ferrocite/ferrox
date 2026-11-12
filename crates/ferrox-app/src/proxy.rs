@@ -32731,8 +32731,7 @@ where
     let upload_flow = Arc::clone(&flow);
     let upload_writer = writer.clone();
     let mut upload = Upload::new();
-    // Empty reads this lane retakes before it parks, so a frame a hair behind the last one costs a
-    // step instead of a reactor round-trip.
+    // Empty reads this lane retakes before it parks, so a frame a hair behind the last one costs a step instead of a reactor round-trip.
     let mut empty = 0u8;
     // Every wait of this shape carries the named stall, armed once outside the byte loop.
     let _ = peer_write.set_write_timeout(Some(stall));
