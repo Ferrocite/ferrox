@@ -1582,36 +1582,32 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// directory leaves no room for a staged name, to the path itself.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
         return abstract_listener(name, padded);
     }
     let (path, perm) = split_permission(path);
     let stale = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => true,
+        Ok(meta) if meta.file_type().is_socket() => Some((meta.dev(), meta.ino())),
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path names a file that is not a socket",
             ))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
     let Some(mode) = perm else {
-        if stale {
-            std::fs::remove_file(path)?;
-        }
+        take_stale(path, stale)?;
         return UnixListener::bind(path);
     };
     if let Some(listener) = bind_staged(path, mode, stale)? {
         return Ok(listener);
     }
     // The directory leaves no room for a staged name, so the mode goes on the path itself.
-    if stale {
-        std::fs::remove_file(path)?;
-    }
+    take_stale(path, stale)?;
     let listener = UnixListener::bind(path)?;
     if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
         let _ = std::fs::remove_file(path);
@@ -1620,12 +1616,35 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Remove the socket the initial check saw, only while the same inode is still at the path, so two
+/// starts racing for one path leave the winner's listener alone and the loser refuses.
+#[cfg(unix)]
+fn take_stale(path: &std::path::Path, stale: Option<(u64, u64)>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some((dev, ino)) = stale else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if (meta.dev(), meta.ino()) == (dev, ino) => std::fs::remove_file(path),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path was replaced while binding",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Bind the socket inside a private `0700` directory beside the configured path, so no other writer
 /// can create or swap the entry the mode is applied to, then hard-link it into place, which refuses
 /// to replace whatever another writer left at the path. `None` when the staged name would not fit
 /// the address field, where the caller binds the path itself.
 #[cfg(unix)]
-fn bind_staged(path: &std::path::Path, mode: u32, stale: bool) -> io::Result<Option<UnixListener>> {
+fn bind_staged(
+    path: &std::path::Path,
+    mode: u32,
+    stale: Option<(u64, u64)>,
+) -> io::Result<Option<UnixListener>> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     for _ in 0..8 {
         let dir = staged_name(path);
@@ -1635,15 +1654,15 @@ fn bind_staged(path: &std::path::Path, mode: u32, stale: bool) -> io::Result<Opt
         }
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-        if builder.create(&dir).is_err() {
-            continue;
+        match builder.create(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
         let published = (|| {
             let listener = UnixListener::bind(&inner)?;
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
-            if stale {
-                std::fs::remove_file(path)?;
-            }
+            take_stale(path, stale)?;
             std::fs::hard_link(&inner, path)?;
             Ok(listener)
         })();
@@ -2827,7 +2846,9 @@ mod tests {
             std::env::temp_dir().join(format!("ferrox-unix-missing-{}-{id}", std::process::id()));
         let target =
             parse_target(&format!("unix:{},0750", dir.join("sock").display())).expect("parses");
-        let error = Listener::bind(&target).err().expect("a missing directory is refused");
+        let error = Listener::bind(&target)
+            .err()
+            .expect("a missing directory is refused");
         assert_eq!(
             error.kind(),
             io::ErrorKind::NotFound,
