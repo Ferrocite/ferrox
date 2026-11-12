@@ -9,6 +9,7 @@ mod profiles;
 pub(crate) mod record;
 mod rsa;
 pub(crate) mod server;
+mod ticket;
 pub(crate) mod tls12;
 
 pub use client::Session;
@@ -20,12 +21,19 @@ use std::sync::OnceLock;
 /// The GREASE sentinel in a profile table: the builder draws a real value for it.
 pub(crate) const GREASE: u16 = 0x0a0a;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Profile {
     pub name: &'static str,
     pub ciphers: &'static [u16],
     pub shuffle: bool,
     pub exts: &'static [Ext],
+}
+
+impl Profile {
+    /// uTLS's PSK profiles carry a `PreSharedKeyExtension` slot; a TLS 1.3 ticket rides only those.
+    fn offers_psk(&self) -> bool {
+        self.name.contains("_psk")
+    }
 }
 
 #[derive(Debug)]

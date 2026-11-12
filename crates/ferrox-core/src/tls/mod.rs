@@ -7,6 +7,23 @@ impl<T: std::io::Read + std::io::Write> Stream for T {}
 /// The trust anchors a dial verifies with, as DER certificates behind one allocation: a config names them, it does not own a copy of them, so a dial costs a reference count rather than the whole platform store.
 pub type Anchors = std::sync::Arc<[Vec<u8>]>;
 
+/// A Psiphon obfuscated-ticket shared secret. `Debug` never prints the key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ObfuscatedTicket([u8; 32]);
+
+impl ObfuscatedTicket {
+    #[must_use]
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+impl fmt::Debug for ObfuscatedTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ObfuscatedTicket(redacted)")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct TlsConfig {
@@ -71,6 +88,9 @@ pub struct TlsConfig {
     /// An exact RFC 7685 padding extension body length, moved to the front of a shaped hello as
     /// Psiphon's `TLSPadding` does. `None` keeps each preset's own padding rule.
     pub padding: Option<u16>,
+    /// The shared secret for a client-made obfuscated session ticket, as Psiphon's
+    /// `ObfuscatedSessionTicketKey` names one.
+    pub obfuscated_ticket: Option<ObfuscatedTicket>,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key

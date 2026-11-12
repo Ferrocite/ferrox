@@ -147,8 +147,18 @@ pub(crate) fn finished_key(hash: Hash, traffic_secret: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn verify_data(hash: Hash, finished_key: &[u8], transcript: &[u8]) -> Vec<u8> {
+    verify_data_parts(hash, finished_key, &[transcript])
+}
+
+/// The same verify data over a transcript the caller splits, so a binder hashes a prefix and a
+/// partial hello without joining them first.
+pub(crate) fn verify_data_parts(hash: Hash, finished_key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let key = hmac::Key::new(hash.hmac(), finished_key);
-    let digest = digest::digest(hash.digest(), transcript);
+    let mut transcript = digest::Context::new(hash.digest());
+    for part in parts {
+        transcript.update(part);
+    }
+    let digest = transcript.finish();
     let mut ctx = hmac::Context::with_key(&key);
     ctx.update(digest.as_ref());
     ctx.sign().as_ref().to_vec()

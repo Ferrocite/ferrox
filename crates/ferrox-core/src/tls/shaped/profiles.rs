@@ -757,7 +757,7 @@ static P_HELLOCHROME_100_PSK: Profile = Profile {
     ],
 };
 
-static P_HELLOCHROME_106_SHUFFLE: Profile = Profile {
+const P_HELLOCHROME_106_SHUFFLE_DATA: Profile = Profile {
     name: "hellochrome_106_shuffle",
     ciphers: &[
         0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
@@ -845,6 +845,14 @@ static P_HELLOCHROME_106_SHUFFLE: Profile = Profile {
             body: Body::Pad,
         },
     ],
+};
+
+static P_HELLOCHROME_106_SHUFFLE: Profile = P_HELLOCHROME_106_SHUFFLE_DATA;
+
+/// Chrome 114 shares Chrome 106's shuffled bytes and adds the PSK slot its name carries.
+static P_HELLOCHROME_114_PADDING_PSK_SHUF: Profile = Profile {
+    name: "hellochrome_114_padding_psk_shuf",
+    ..P_HELLOCHROME_106_SHUFFLE_DATA
 };
 
 static P_HELLOCHROME_112_PSK_SHUF: Profile = Profile {
@@ -2630,9 +2638,8 @@ pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
         "hello360_11_0" => &P_HELLO360_11_0,
         "hellochrome_100" | "hellochrome_102" | "helloedge_106" => &P_HELLOCHROME_100,
         "hellochrome_100_psk" => &P_HELLOCHROME_100_PSK,
-        "hellochrome_106_shuffle" | "hellochrome_114_padding_psk_shuf" => {
-            &P_HELLOCHROME_106_SHUFFLE
-        }
+        "hellochrome_106_shuffle" => &P_HELLOCHROME_106_SHUFFLE,
+        "hellochrome_114_padding_psk_shuf" => &P_HELLOCHROME_114_PADDING_PSK_SHUF,
         "hellochrome_112_psk_shuf" => &P_HELLOCHROME_112_PSK_SHUF,
         "hellochrome_115_pq" => &P_HELLOCHROME_115_PQ,
         "hellochrome_115_pq_psk" => &P_HELLOCHROME_115_PQ_PSK,

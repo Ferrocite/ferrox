@@ -1,5 +1,6 @@
 // The shaped ClientHello: a pinned parrot's ciphers, extension order and bodies, with the GREASE, key shares, ECH cover and padding a browser draws.
 use super::keys::{self, Share};
+use super::ticket::Ticket;
 use super::{Body, Ext, Profile, GREASE};
 use crate::tls::hpke::Sealer;
 use crate::tls::TlsError;
@@ -9,6 +10,10 @@ use rustls::crypto::hpke::HpkeSealer as _;
 pub(super) const TLS12: u16 = 0x0303;
 const PAD: u16 = 0x0015;
 const ALPN: u16 = 0x0010;
+const SESSION_TICKET: u16 = 0x0023;
+const PSK: u16 = 0x0029;
+const PSK_MODES: u16 = 0x002d;
+const PSK_MODES_DHE: [u8; 2] = [0x01, 0x01];
 
 /// A built hello and everything a retry has to keep: the same random, session id,
 /// GREASE, ECH cover and ALPN, with only the key share the server asked for.
@@ -37,6 +42,10 @@ pub(crate) struct Hello {
     /// keeps the preset's own `BoringSSL` padding rule.
     padding: Option<usize>,
     offer: Option<EchOffer>,
+    /// A client-made session ticket or TLS 1.3 PSK.
+    psk: Option<Ticket>,
+    /// The transcript a retry's binder hashes ahead of the second hello.
+    binder_prefix: Vec<u8>,
     /// A fixture build: fixed entropy, table order, and a fixed ECH payload length.
     canonical: bool,
 }
@@ -107,6 +116,8 @@ impl Hello {
             ech_slot: false,
             padding: None,
             offer: None,
+            psk: None,
+            binder_prefix: Vec::new(),
             canonical: false,
         };
         hello.msg = hello.encode(None);
@@ -353,6 +364,8 @@ impl Hello {
             ech_slot: self.ech_slot,
             padding: self.padding,
             offer,
+            psk: self.psk.take(),
+            binder_prefix: self.binder_prefix.clone(),
             canonical: self.canonical,
         })
     }
@@ -471,6 +484,49 @@ impl Hello {
         self.msg = self.encode(None);
     }
 
+    /// Carries a client-made obfuscated ticket: TLS 1.2 as the session-ticket extension, TLS 1.3
+    /// as a PSK the server may select.
+    pub(crate) fn set_obfuscated_ticket(&mut self, shared: &[u8; 32]) -> Result<(), TlsError> {
+        if self.offer.is_some() || self.ech_slot {
+            return Err(TlsError::Other(
+                "obfuscated session tickets and ECH cannot share a hello".to_owned(),
+            ));
+        }
+        let tls13 = self
+            .profile
+            .exts
+            .iter()
+            .any(|ext| matches!(&ext.body, Body::Versions(values) if values.contains(&0x0304)));
+        let ems = self.profile.exts.iter().any(|ext| ext.kind == 0x0017);
+        if tls13 {
+            if !self.profile.offers_psk() {
+                return Ok(());
+            }
+            if !self.cipher_table().contains(&super::ticket::TLS13_SUITE) {
+                return Err(TlsError::Other(
+                    "obfuscated PSK cipher suite is missing".to_owned(),
+                ));
+            }
+        } else if !self.cipher_table().contains(&super::ticket::TLS12_SUITE) {
+            return Err(TlsError::Other(
+                "obfuscated session ticket cipher suite is missing".to_owned(),
+            ));
+        }
+        self.psk = Some(Ticket::new(shared, tls13, ems)?);
+        self.msg = self.encode(None);
+        Ok(())
+    }
+
+    /// The ticket this hello carries, if any.
+    pub(crate) fn ticket(&self) -> Option<&Ticket> {
+        self.psk.as_ref()
+    }
+
+    /// The transcript a `HelloRetryRequest` retry's binder hashes ahead of the new hello.
+    pub(crate) fn set_binder_prefix(&mut self, prefix: Vec<u8>) {
+        self.binder_prefix = prefix;
+    }
+
     pub(crate) fn ech_inner(&self) -> Option<&[u8]> {
         self.offer.as_ref().map(|offer| offer.transcript.as_slice())
     }
@@ -538,6 +594,11 @@ impl Hello {
             msg.extend_from_slice(&entry.kind.to_be_bytes());
             msg.extend_from_slice(&(entry.len as u16).to_be_bytes());
             self.write_body(&entry.source, shares, &mut msg);
+        }
+        if let Some(ticket) = &self.psk {
+            if ticket.tls13 {
+                super::ticket::complete_binder(&mut msg, &self.binder_prefix, &ticket.secret);
+            }
         }
         msg
     }
@@ -661,6 +722,27 @@ impl Hello {
                 entries.push(entry);
             }
         }
+
+        // A client-made ticket rides its version's extension, and a TLS 1.3 PSK is always last.
+        if let Some(ticket) = &self.psk {
+            if ticket.tls13 {
+                if !entries.iter().any(|entry| entry.kind == PSK_MODES) {
+                    let source = Source::Fixed(&PSK_MODES_DHE);
+                    let len = self.width_of(&source, shares);
+                    entries.push(Entry::new(PSK_MODES, len, false, source));
+                }
+                if let Some(at) = entries.iter().position(|entry| entry.kind == PSK) {
+                    entries.remove(at);
+                }
+                let source = Source::Psk(ticket);
+                let len = self.width_of(&source, shares);
+                entries.push(Entry::new(PSK, len, false, source));
+            } else if !entries.iter().any(|entry| entry.kind == SESSION_TICKET) {
+                let source = Source::Ticket(&ticket.bytes);
+                let len = self.width_of(&source, shares);
+                entries.push(Entry::new(SESSION_TICKET, len, false, source));
+            }
+        }
         entries
     }
 
@@ -712,6 +794,18 @@ impl Hello {
             Body::KeyShare { .. } if shares.is_empty() => return None,
             Body::KeyShare { .. } => (0x0033, false, Source::Shares),
             Body::Ech { .. } => (0xfe0d, false, Source::Fixed(ech?)),
+            Body::Raw(_)
+                if ext.kind == SESSION_TICKET && self.psk.as_ref().is_some_and(|t| !t.tls13) =>
+            {
+                (
+                    SESSION_TICKET,
+                    false,
+                    Source::Ticket(&self.psk.as_ref().expect("checked").bytes),
+                )
+            }
+            Body::Raw(_) if ext.kind == PSK && self.psk.as_ref().is_some_and(|t| t.tls13) => {
+                (PSK, false, Source::Psk(self.psk.as_ref().expect("checked")))
+            }
             Body::Raw(body) => (ext.kind, false, Source::Fixed(body)),
         };
         let len = self.width_of(&source, shares);
@@ -742,6 +836,17 @@ impl Hello {
             Source::Alpn(list) => alpn_body(out, list),
             Source::StockAlpn(list) => stock_alpn_body(out, list),
             Source::Fixed(body) => out.put(body),
+            Source::Ticket(ticket) => out.put(ticket),
+            Source::Psk(ticket) => {
+                let identities = ticket.bytes.len() + 6;
+                out.put(&(identities as u16).to_be_bytes());
+                out.put(&(ticket.bytes.len() as u16).to_be_bytes());
+                out.put(&ticket.bytes);
+                out.put(&ticket.age().to_be_bytes());
+                out.put(&33u16.to_be_bytes());
+                out.put(&[32]);
+                out.zeros(32);
+            }
             Source::Shares => key_share_body(out, shares, &self.grease),
             Source::Cookie(value) => {
                 out.put(&(value.len() as u16).to_be_bytes());
@@ -812,6 +917,8 @@ impl Hello {
             ech_slot: false,
             padding: None,
             offer: None,
+            psk: None,
+            binder_prefix: Vec::new(),
             canonical: true,
         };
         hello.msg = hello.encode(None);
@@ -850,6 +957,8 @@ enum Source<'a> {
     Alpn(&'a [&'a [u8]]),
     StockAlpn(&'a [Vec<u8>]),
     Fixed(&'a [u8]),
+    Ticket(&'a [u8]),
+    Psk(&'a Ticket),
     Shares,
     Cookie(&'a [u8]),
 }
@@ -1560,7 +1669,7 @@ mod tests {
             }
         }
         assert_eq!(cases.len(), 50, "every xray name is covered");
-        assert_eq!(seen.len(), 31, "the names resolve to 31 distinct presets");
+        assert_eq!(seen.len(), 32, "the names resolve to 32 distinct presets");
     }
 
     /// The hello's own bytes cost one heap buffer, reserved to their exact length before the first
@@ -1809,5 +1918,91 @@ mod tests {
             cover.capacity(),
             "no slack after the exact reserve"
         );
+    }
+
+    #[test]
+    fn a_tls13_ticket_is_the_last_extension_with_a_filled_binder() {
+        let profile = Fingerprint::resolve("hellochrome_112_psk_shuf")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello
+            .set_obfuscated_ticket(&[0x33; 32])
+            .expect("a hello without ECH carries a ticket");
+        assert!(hello.ticket().expect("a ticket").tls13);
+        let entries = extensions(&hello.msg[4..]);
+        let psk = entries.last().expect("extensions");
+        assert_eq!(kind(psk), PSK, "pre_shared_key is the last extension");
+        let body = &psk[4..];
+        let identities = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        let binders = 2 + identities;
+        assert_eq!(
+            u16::from_be_bytes([body[binders], body[binders + 1]]),
+            33,
+            "one SHA-256 binder"
+        );
+        let binder = &body[binders + 2..];
+        assert_eq!(binder[0], 32);
+        assert!(
+            binder[1..].iter().any(|byte| *byte != 0),
+            "the binder is filled after the hello's length walk"
+        );
+    }
+
+    #[test]
+    fn a_psk_alias_keeps_its_ticket_slot() {
+        let profile = Fingerprint::resolve("hellochrome_114_padding_psk_shuf")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello
+            .set_obfuscated_ticket(&[0x66; 32])
+            .expect("a hello without ECH carries a ticket");
+        assert!(hello.ticket().expect("a ticket").tls13);
+        assert!(extensions(&hello.msg[4..])
+            .iter()
+            .any(|entry| kind(entry) == PSK));
+    }
+
+    #[test]
+    fn a_profile_without_a_psk_slot_ignores_the_ticket() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello
+            .set_obfuscated_ticket(&[0x44; 32])
+            .expect("the reference drops the ticket quietly");
+        assert!(hello.ticket().is_none());
+        assert!(!extensions(&hello.msg[4..])
+            .iter()
+            .any(|entry| kind(entry) == PSK));
+    }
+
+    #[test]
+    fn a_tls12_ticket_replaces_the_session_ticket_extension() {
+        let profile = Fingerprint::resolve("hellochrome_58")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello
+            .set_obfuscated_ticket(&[0x55; 32])
+            .expect("a hello without ECH carries a ticket");
+        let ticket = hello.ticket().expect("a ticket");
+        assert!(!ticket.tls13);
+        let entries = extensions(&hello.msg[4..]);
+        let session = entries
+            .iter()
+            .find(|entry| kind(entry) == SESSION_TICKET)
+            .expect("the session_ticket extension");
+        assert_eq!(&session[4..], ticket.bytes.as_slice());
     }
 }

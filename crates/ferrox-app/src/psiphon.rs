@@ -3096,6 +3096,7 @@ impl Settings {
                 "psiphon: MeekMinLimitRequestPayloadLength exceeds MeekMaxLimitRequestPayloadLength; using the minimum for both"
             );
         }
+        let (tls_roots, disable_system_root_cas) = tls_trust_roots(settings);
         let tls_shape = TlsShape {
             min_padding: u16::try_from(
                 number(settings, "TLSTunnelMinTLSPadding")
@@ -3187,6 +3188,11 @@ impl Settings {
             )
             .unwrap_or(0.5)
             .clamp(0.0, 1.0),
+            obfuscated_ticket_probability: decimal(settings, "TLSTunnelObfuscatedPSKProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            roots: tls_roots,
+            disable_system_root_cas,
             tls_fragment_client_hello: decimal(settings, "TLSFragmentClientHelloProbability")
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
@@ -4481,6 +4487,23 @@ fn transform_scopes(settings: Option<&Json>, field: &str) -> Vec<(String, Vec<St
         .collect()
 }
 
+/// The anchors a verified Psiphon TLS dial uses, and whether the reference skips verification.
+/// A named file is read at dial time so a config with no verified dial keeps working without it.
+fn tls_trust_roots(settings: Option<&Json>) -> (crate::psiphon_ssh::TlsRoots, bool) {
+    let disabled = flag(
+        settings,
+        "DisableSystemRootCAs",
+        "AETHER_PSIPHON_DISABLE_SYSTEM_ROOT_CAS",
+    );
+    if disabled {
+        return (crate::psiphon_ssh::TlsRoots::Empty, true);
+    }
+    if let Some(path) = text(settings, "TrustedCACertificatesFilename") {
+        return (crate::psiphon_ssh::TlsRoots::File(path), false);
+    }
+    (crate::psiphon_ssh::TlsRoots::System, false)
+}
+
 /// The configured `LimitTLSProfiles` parrots, or the scalar `TLSProfile` when one is named.
 fn tls_profiles(settings: Option<&Json>) -> Vec<Fingerprint> {
     let names = if settings
@@ -4913,6 +4936,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "MeekPayloadPaddingOmitProbability",
     "TLSTunnelTrafficShapingProbability",
     "NoDefaultTLSSessionIDProbability",
+    "TLSTunnelObfuscatedPSKProbability",
+    "DisableSystemRootCAs",
+    "TrustedCACertificatesFilename",
     "TLSFragmentClientHelloProbability",
     "TargetAPIEncoding",
     "TLSFragmentClientHelloLimitProtocols",
@@ -5876,7 +5902,13 @@ fn load_source_entries(
     let fetch_remote =
         !settings.remote_fetch_disabled && (settings.server_lists_explicit || servers.is_empty());
     for url in settings.server_lists.iter().filter(|_| fetch_remote) {
-        match fetch_list(url, &settings.server_list_key, &settings.headers) {
+        match fetch_list(
+            url,
+            &settings.server_list_key,
+            &settings.headers,
+            &settings.tls_shape.roots,
+            settings.tls_shape.disable_system_root_cas,
+        ) {
             Ok(text) => {
                 absorb(
                     &text,
@@ -7706,14 +7738,31 @@ fn split_fronting_address_with(raw: &str, default_port: u16) -> (String, u16) {
     (raw.to_owned(), default_port)
 }
 
-fn fetch_list(url: &str, public_key: &str, custom: &[(String, String)]) -> Result<String, String> {
-    let body = fetch_bytes(url, custom)?;
+fn fetch_list(
+    url: &str,
+    public_key: &str,
+    custom: &[(String, String)],
+    roots: &crate::psiphon_ssh::TlsRoots,
+    insecure: bool,
+) -> Result<String, String> {
+    let body = fetch_bytes(url, custom, roots, insecure)?;
     unpack(&body, public_key)
 }
 
-fn fetch_bytes(url: &str, custom: &[(String, String)]) -> Result<Vec<u8>, String> {
-    let endpoint = crate::foxy_account::Endpoint::parse(url, crate::quic::system_roots())
-        .ok_or_else(|| format!("psiphon: {url} is not https"))?;
+fn fetch_bytes(
+    url: &str,
+    custom: &[(String, String)],
+    roots: &crate::psiphon_ssh::TlsRoots,
+    insecure: bool,
+) -> Result<Vec<u8>, String> {
+    let roots = if insecure {
+        Vec::new().into()
+    } else {
+        roots.load()?
+    };
+    let endpoint = crate::foxy_account::Endpoint::parse(url, roots)
+        .ok_or_else(|| format!("psiphon: {url} is not https"))?
+        .with_insecure(insecure);
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(custom.len() + 1);
     headers.push(("Accept", "*/*"));
     headers.extend(
@@ -7739,7 +7788,12 @@ fn fetch_osl_entries(
     let mut last = String::new();
     for root in &settings.osl_roots {
         let root = root.trim_end_matches('/');
-        let registry = match fetch_bytes(&format!("{root}/osl-registry"), &settings.headers) {
+        let registry = match fetch_bytes(
+            &format!("{root}/osl-registry"),
+            &settings.headers,
+            &settings.tls_shape.roots,
+            settings.tls_shape.disable_system_root_cas,
+        ) {
             Ok(body) => body,
             Err(why) => {
                 last = why;
@@ -7758,7 +7812,12 @@ fn fetch_osl_entries(
                 continue;
             }
             let url = format!("{root}/osl-{}", hex(&spec.id));
-            let body = match fetch_bytes(&url, &settings.headers) {
+            let body = match fetch_bytes(
+                &url,
+                &settings.headers,
+                &settings.tls_shape.roots,
+                settings.tls_shape.disable_system_root_cas,
+            ) {
                 Ok(body) => body,
                 Err(why) => {
                     last = why;
@@ -11981,6 +12040,67 @@ mod tests {
         assert_eq!(settings.tls_shape.transform_probability, 1.0);
         let padding = settings.tls_shape.padding().expect("padding");
         assert!((32..=64).contains(&padding));
+    }
+
+    /// The config's CA file replaces the system store, and disabling roots skips the file and verification.
+    #[test]
+    fn the_config_trust_store_reaches_the_tls_shape() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-psiphon-ca-{}-{}.pem",
+            std::process::id(),
+            hex(&random::<8>())
+        ));
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .expect("writes");
+        let named = Settings::from_json(Some(
+            &json::parse(&format!(
+                r#"{{"TrustedCACertificatesFilename":{:?}}}"#,
+                path.to_string_lossy()
+            ))
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(matches!(
+            &named.tls_shape.roots,
+            crate::psiphon_ssh::TlsRoots::File(_)
+        ));
+        let named_roots = named.tls_shape.roots.load().expect("the file reads");
+        assert_eq!(named_roots.len(), 1);
+        assert_eq!(named_roots[0], vec![1, 2, 3]);
+        assert!(!named.tls_shape.disable_system_root_cas);
+        let missing_path = path.with_extension("missing");
+        let missing = Settings::from_json(Some(
+            &json::parse(&format!(
+                r#"{{"TrustedCACertificatesFilename":{:?}}}"#,
+                missing_path.to_string_lossy()
+            ))
+            .expect("settings"),
+        ))
+        .expect("a config with no verified dial keeps working without the file");
+        assert!(missing.tls_shape.roots.load().is_err());
+        let disabled = Settings::from_json(Some(
+            &json::parse(&format!(
+                r#"{{"DisableSystemRootCAs":true,"TrustedCACertificatesFilename":{:?}}}"#,
+                missing_path.to_string_lossy()
+            ))
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(disabled.tls_shape.disable_system_root_cas);
+        assert!(matches!(
+            &disabled.tls_shape.roots,
+            crate::psiphon_ssh::TlsRoots::Empty
+        ));
+        assert!(disabled
+            .tls_shape
+            .roots
+            .load()
+            .expect("empty roots")
+            .is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
