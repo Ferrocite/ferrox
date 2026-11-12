@@ -291,7 +291,7 @@ impl Device {
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        self.handle.write_all(packet)
+        write_packet_to(&mut self.handle, packet).map(|_| ())
     }
 
     fn clone_writer(&self) -> io::Result<std::fs::File> {
