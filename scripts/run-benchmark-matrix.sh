@@ -482,7 +482,7 @@ while read -r id traffic connections iterations payload duration_ms; do
     continue
   fi
   if matrix_warp_needs_external_reference "$id" \
-    && ! engine_path aether >/dev/null && ! engine_path zeronet >/dev/null; then
+    && ! engine_path aether >/dev/null; then
     note "skipping $id: no external WARP reference on this host"
     echo "# $id: skipped, no external WARP reference on this host" >>"$out/commands.sh"
     continue

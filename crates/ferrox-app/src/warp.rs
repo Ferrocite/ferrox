@@ -233,13 +233,13 @@ impl WarpSpec {
         if path.is_file() {
             let saved = match Identity::load(path) {
                 Ok(saved) => saved,
-                Err(_reason) if self.register && reprovision_enabled() => {
+                Err(error) if error.corrupt() && self.register && reprovision_enabled() => {
                     let identity = register(self, self.mode != Mode::WireGuard)?;
                     quarantine(path);
                     identity.save(path)?;
                     return Ok(identity);
                 }
-                Err(reason) => return Err(reason),
+                Err(error) => return Err(error.into_message()),
             };
             return match refresh_saved(self, &saved) {
                 Ok(fresh) if fresh != saved => {
@@ -253,6 +253,7 @@ impl WarpSpec {
                     if should_reprovision(self.register, error.refused, reprovision_enabled()) =>
                 {
                     let identity = register(self, saved.masque.is_some())?;
+                    quarantine(path);
                     identity.save(path)?;
                     Ok(identity)
                 }
@@ -689,7 +690,11 @@ fn reprovision_enabled() -> bool {
 }
 
 fn reprovision_enabled_for(value: Option<&str>) -> bool {
-    !matches!(value, Some("0" | "off" | "false"))
+    !value.is_some_and(|value| {
+        ["0", "off", "false"]
+            .iter()
+            .any(|off| value.trim().eq_ignore_ascii_case(off))
+    })
 }
 
 fn should_reprovision(register: bool, refused: bool, enabled: bool) -> bool {
@@ -907,6 +912,26 @@ fn is_p256_spki(der: &[u8]) -> bool {
     der.windows(P256.len()).any(|window| window == P256)
 }
 
+/// A save the service cannot read back is not a corrupt identity: only a failed
+/// parse or field check may be replaced.
+#[derive(Debug)]
+enum LoadError {
+    Read(String),
+    Corrupt(String),
+}
+
+impl LoadError {
+    fn corrupt(&self) -> bool {
+        matches!(self, Self::Corrupt(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Read(message) | Self::Corrupt(message) => message,
+        }
+    }
+}
+
 impl Identity {
     fn from_json(value: &crate::json::Json) -> Result<Self, String> {
         let device_id = value
@@ -1026,12 +1051,15 @@ impl Identity {
         obj_pairs(pairs)
     }
 
-    fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("warp: cannot read `{}`: {error}", path.display()))?;
-        let value = crate::json::parse(&text)
-            .map_err(|error| format!("warp: `{}` is not JSON: {error}", path.display()))?;
-        Self::from_json(&value).map_err(|error| format!("warp: `{}`: {error}", path.display()))
+    fn load(path: &Path) -> Result<Self, LoadError> {
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            LoadError::Read(format!("warp: cannot read `{}`: {error}", path.display()))
+        })?;
+        let value = crate::json::parse(&text).map_err(|error| {
+            LoadError::Corrupt(format!("warp: `{}` is not JSON: {error}", path.display()))
+        })?;
+        Self::from_json(&value)
+            .map_err(|error| LoadError::Corrupt(format!("warp: `{}`: {error}", path.display())))
     }
 
     /// Write beside the target and rename over it, so a reader never sees half
@@ -1077,8 +1105,21 @@ impl Identity {
             }
             file.write_all(text.as_bytes())
                 .map_err(|error| format!("warp: cannot write `{}`: {error}", temp.display()))?;
+            file.sync_all()
+                .map_err(|error| format!("warp: cannot sync `{}`: {error}", temp.display()))?;
+            drop(file);
             std::fs::rename(&temp, path)
-                .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))
+                .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))?;
+            #[cfg(unix)]
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                if let Ok(parent) = std::fs::File::open(parent) {
+                    let _ = parent.sync_all();
+                }
+            }
+            Ok(())
         })();
         if result.is_err() && created {
             let _ = std::fs::remove_file(&temp);
@@ -1549,27 +1590,36 @@ fn planned_slots(kind: KeyKind, paths: &KeyPaths) -> Result<Vec<(Slot, PathBuf)>
     Ok(planned)
 }
 
-/// Load or make every identity the kind names, all in memory before any save,
-/// so a failed registration leaves the old keys where they are.
+struct PlannedSlot {
+    slot: Slot,
+    path: PathBuf,
+    identity: Identity,
+    replace: bool,
+    saved: bool,
+}
+
+/// Load or make every identity the kind names. A slot with no file is saved as
+/// soon as it is made so a later failure does not orphan it; a replacement is
+/// held until every slot is ready, so a failed registration leaves the old keys.
 fn provision_kind(
     spec: &WarpSpec,
     kind: KeyKind,
     paths: &KeyPaths,
-) -> Result<Vec<(Slot, PathBuf, Identity, bool)>, String> {
+) -> Result<Vec<PlannedSlot>, String> {
     let planned = planned_slots(kind, paths)?;
     let mut ready = Vec::new();
     for (slot, path) in planned {
-        let (identity, replace) = if path.is_file() {
+        let (identity, replace, saved) = if path.is_file() {
             match Identity::load(&path) {
                 Ok(saved) => match refresh_saved(spec, &saved) {
-                    Ok(fresh) => (fresh, false),
+                    Ok(fresh) => (fresh, false, false),
                     Err(error) if error.refused && reprovision_enabled() => {
                         eprintln!(
                             "warp-register: the saved {} identity was refused: {}; registering a fresh one",
                             slot.label(),
                             error.reason
                         );
-                        (register(spec, slot.enrolls_masque())?, true)
+                        (register(spec, slot.enrolls_masque())?, true, false)
                     }
                     Err(error) => {
                         eprintln!(
@@ -1577,22 +1627,31 @@ fn provision_kind(
                             slot.label(),
                             error.reason
                         );
-                        (saved, false)
+                        (saved, false, false)
                     }
                 },
-                Err(reason) if reprovision_enabled() => {
+                Err(error) if error.corrupt() && reprovision_enabled() => {
                     eprintln!(
-                        "warp-register: {reason}; registering a fresh {} identity",
+                        "warp-register: {}; registering a fresh {} identity",
+                        error.into_message(),
                         slot.label()
                     );
-                    (register(spec, slot.enrolls_masque())?, true)
+                    (register(spec, slot.enrolls_masque())?, true, false)
                 }
-                Err(reason) => return Err(reason),
+                Err(error) => return Err(error.into_message()),
             }
         } else {
-            (register(spec, slot.enrolls_masque())?, false)
+            let identity = register(spec, slot.enrolls_masque())?;
+            identity.save(&path)?;
+            (identity, false, true)
         };
-        ready.push((slot, path, identity, replace));
+        ready.push(PlannedSlot {
+            slot,
+            path,
+            identity,
+            replace,
+            saved,
+        });
     }
     Ok(ready)
 }
@@ -1797,16 +1856,18 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
                 masque.as_deref().map(Path::new),
             );
             match provision_kind(&spec, kind, &paths).and_then(|planned| {
-                for (slot, path, identity, replace) in &planned {
-                    if *replace {
-                        quarantine(path);
+                for planned in &planned {
+                    if !planned.saved {
+                        if planned.replace {
+                            quarantine(&planned.path);
+                        }
+                        planned.identity.save(&planned.path)?;
                     }
-                    identity.save(path)?;
                     println!(
                         "[+] {} identity ready: device={} at {}",
-                        slot.label(),
-                        identity.device_id,
-                        path.display()
+                        planned.slot.label(),
+                        planned.identity.device_id,
+                        planned.path.display()
                     );
                 }
                 Ok(())
@@ -2330,12 +2391,34 @@ mod tests {
 
     #[test]
     fn three_spellings_turn_reprovisioning_off() {
-        for off in ["0", "off", "false"] {
+        for off in ["0", "off", "false", " OFF ", "False", "0\t"] {
             assert!(!reprovision_enabled_for(Some(off)), "{off}");
         }
         assert!(reprovision_enabled_for(None));
         assert!(reprovision_enabled_for(Some("1")));
         assert!(reprovision_enabled_for(Some("true")));
+    }
+
+    #[test]
+    fn an_unreadable_identity_is_not_a_corrupt_one() {
+        let dir = std::env::temp_dir().join(format!("ferrox-warp-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("identity.json");
+        std::fs::create_dir(&path).expect("a directory where the file should be");
+        let error = Identity::load(&path).err().expect("a read failure");
+        assert!(!error.corrupt(), "{error:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_broken_identity_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!("ferrox-warp-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("identity.json");
+        std::fs::write(&path, b"not json").expect("a broken identity");
+        let error = Identity::load(&path).err().expect("a parse failure");
+        assert!(error.corrupt(), "{error:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

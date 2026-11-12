@@ -32,7 +32,8 @@ matrix_udp_carrier() {
   esac
 }
 
-# A WARP cell needs an external engine that speaks WARP: Aether or ZeroNet.
+# A WARP cell needs an external engine that speaks WARP. At this pin only Aether
+# qualifies: ZeroNet and xray-core are skipped for WARP cells.
 matrix_warp_needs_external_reference() {
   [[ "$1" == warp-* ]]
 }
