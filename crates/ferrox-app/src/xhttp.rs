@@ -3762,10 +3762,13 @@ impl crate::proxy::CarrierSink for XhttpWriter {
     }
     #[inline]
     fn read_window(&self) -> Option<usize> {
-        let Some(StreamOut::H2(out)) = self.stream.get() else {
-            return None;
-        };
-        usize::try_from(out.room()).ok().filter(|room| *room > 0)
+        if let Some(StreamOut::H2(out)) = self.stream.get() {
+            return usize::try_from(out.room()).ok().filter(|room| *room > 0);
+        }
+        match self.shared.body {
+            Body::Stream(_) => Some(WIRE_CHUNK),
+            Body::Packets(_) => None,
+        }
     }
     #[inline]
     fn wait_for_room(&self, turn: std::time::Duration) {
