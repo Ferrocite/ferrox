@@ -509,17 +509,22 @@ impl Read for H2StreamReader {
         if buf.is_empty() {
             return Ok(0);
         }
+        let mut filled = 0;
         loop {
             if self.at < self.cur.len() {
-                let n = (self.cur.len() - self.at).min(buf.len());
-                buf[..n].copy_from_slice(&self.cur[self.at..self.at + n]);
+                let n = (self.cur.len() - self.at).min(buf.len() - filled);
+                buf[filled..filled + n].copy_from_slice(&self.cur[self.at..self.at + n]);
                 self.at += n;
+                filled += n;
                 if self.at == self.cur.len() {
                     self.cur.clear();
                     self.at = 0;
                 }
                 self.idle_since = None;
-                return Ok(n);
+                if filled == buf.len() {
+                    return Ok(filled);
+                }
+                continue;
             }
             let mut st = self
                 .stream
@@ -536,12 +541,19 @@ impl Read for H2StreamReader {
                 st.abandoned = !st.ended;
                 drop(st);
                 self.conn.forget_upload(self.id);
-                return Ok(0);
+                return Ok(filled);
             }
             if st.dead || self.conn.dead.load(Ordering::SeqCst) {
                 drop(st);
+                if filled > 0 {
+                    return Ok(filled);
+                }
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            }
+            if filled > 0 {
+                drop(st);
+                return Ok(filled);
             }
             if self.conn.client_read.is_some() {
                 drop(st);
@@ -5536,6 +5548,28 @@ mod tests {
             1,
             "the reader does not return the same bytes again"
         );
+    }
+
+    /// A body read fills from every queued DATA frame before it parks: an 8 KiB peer frame no longer
+    /// forces one cipher chunk and one target write per H2 frame.
+    #[test]
+    fn a_body_read_fills_across_queued_frames() {
+        let (conn, _written, _slices) = bare_conn();
+        let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        assert!(queue_data(&conn, 0, 1, vec![0x11u8; 8]));
+        assert!(queue_data(&conn, 0, 1, vec![0x22u8; 8]));
+        let mut got = [0u8; 16];
+        assert_eq!(reader.read(&mut got).expect("reads"), 16);
+        assert_eq!(&got[..8], &[0x11u8; 8]);
+        assert_eq!(&got[8..], &[0x22u8; 8]);
+        assert!(queue_data(&conn, 0, 1, vec![0x33u8; 8]));
+        let mut short = [0u8; 24];
+        assert_eq!(
+            reader.read(&mut short).expect("reads"),
+            8,
+            "a read with no queued frame behind it returns what it has instead of parking"
+        );
+        assert_eq!(&short[..8], &[0x33u8; 8]);
     }
 
     /// A threaded connection spends one control write for four queued frames, and the end of the
