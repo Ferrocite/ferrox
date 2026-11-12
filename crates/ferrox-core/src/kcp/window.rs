@@ -256,6 +256,14 @@ impl AckList {
     }
 
     pub fn add(&mut self, number: u32, timestamp: u32) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.number == number) {
+            if timestamp.wrapping_sub(entry.timestamp) < 0x7FFF_FFFF {
+                entry.timestamp = timestamp;
+            }
+            entry.next_flush = 0;
+            self.dirty = true;
+            return;
+        }
         self.entries.push(AckEntry {
             number,
             timestamp,
@@ -574,6 +582,40 @@ mod tests {
             vec![7]
         );
         assert_eq!(l.entries[0].timestamp, 20);
+    }
+
+    #[test]
+    fn a_duplicate_segment_refreshes_its_ack_instead_of_growing_the_list() {
+        let mut l = AckList::new();
+        l.add(7, 100);
+        let mut emitted = Vec::new();
+        l.flush(0, 100, 300, &mut |seg: &mut AckSegment| {
+            emitted.push(seg.numbers.clone());
+        });
+        assert_eq!(emitted, vec![vec![7]]);
+        for _ in 0..64 {
+            l.add(7, 200);
+        }
+        assert_eq!(
+            l.entries.len(),
+            1,
+            "a repeated segment added a second entry"
+        );
+        assert_eq!(l.entries[0].timestamp, 200);
+        l.add(7, 100);
+        assert_eq!(
+            l.entries[0].timestamp, 200,
+            "a late older retransmission rewound the timestamp"
+        );
+        assert_eq!(
+            l.entries[0].next_flush, 0,
+            "a repeated segment is due again"
+        );
+        emitted.clear();
+        l.flush(1, 100, 300, &mut |seg: &mut AckSegment| {
+            emitted.push(seg.numbers.clone());
+        });
+        assert_eq!(emitted, vec![vec![7]], "the repeated segment re-acked once");
     }
 
     #[test]
