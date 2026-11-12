@@ -38,6 +38,9 @@ const NO_PART: &[u8] = &[];
 const CREDIT_FRAME: usize = 26;
 const CONTROL_MAX: usize = CREDIT_FRAME;
 const CONTROL_BATCH: usize = 8;
+/// A threaded connection returns the peer's credit in one pair per this many queued bytes: four
+/// default frames, so the control thread wakes once for four DATA frames instead of once each.
+const CREDIT_BATCH_BYTES: usize = 64 * 1024;
 
 /// A window's DATA frames held apart rather than staged together: each nine-byte head in its own
 /// slot and every payload still the caller's own slice, so one flush is one write whose bytes are
@@ -216,6 +219,8 @@ struct StreamState {
     /// The response status a client decoded, so a packet POST can refuse a non-2xx answer.
     status: Option<u16>,
     dead: bool,
+    /// Credit for DATA queued since the last `WINDOW_UPDATE`; only a threaded connection defers.
+    pending_credit: u32,
 }
 
 impl StreamState {
@@ -1341,9 +1346,15 @@ impl H2Conn {
             .streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&stream)
-            .is_some();
-        if removed {
+            .remove(&stream);
+        if let Some(state) = removed {
+            let pending = {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                std::mem::take(&mut st.pending_credit)
+            };
+            if pending > 0 {
+                self.replenish_connection(pending as usize);
+            }
             self.forget_upload(stream);
             self.end_session_of(stream);
         }
@@ -1356,16 +1367,23 @@ impl H2Conn {
             .send_conn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        {
+        let pending = {
             let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(state) = streams.remove(&stream) {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.dead = true;
+                let pending = std::mem::take(&mut st.pending_credit);
                 state.cv.notify_all();
+                pending
+            } else {
+                0
             }
-        }
+        };
         self.wake.notify_all();
         drop(credit);
+        if pending > 0 {
+            self.replenish_connection(pending as usize);
+        }
         self.end_session_of(stream);
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
         let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
@@ -1550,6 +1568,7 @@ impl H2Conn {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(initial),
@@ -2925,7 +2944,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         return true;
     };
     drop(streams);
-    let done = {
+    let (done, flush, credit) = {
         let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !st.dead {
             st.body.push_back(body);
@@ -2933,11 +2952,27 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
                 st.ended = true;
             }
         }
+        let done = st.both_ended();
+        let pending = st
+            .pending_credit
+            .saturating_add(u32::try_from(wire_len).unwrap_or(u32::MAX));
+        let flush = st.dead
+            || done
+            || flags & F_END != 0
+            || pending as usize >= CREDIT_BATCH_BYTES
+            || matches!(conn.control, Control::Inline);
+        if flush {
+            st.pending_credit = 0;
+        } else {
+            st.pending_credit = pending;
+        }
         state.cv.notify_all();
-        st.both_ended()
+        (done, flush, pending)
     };
     // The frame grants its credit once, when it is queued; the reader hands the bytes out without a second grant.
-    conn.replenish(sid, wire_len);
+    if flush {
+        conn.replenish(sid, credit as usize);
+    }
     if done {
         conn.retire(sid);
     }
@@ -3497,6 +3532,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -3588,6 +3624,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -3651,6 +3688,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4340,6 +4378,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -4389,6 +4428,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4463,6 +4503,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4758,6 +4799,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4844,6 +4886,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4895,6 +4938,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -5494,6 +5538,50 @@ mod tests {
         );
     }
 
+    /// A threaded connection spends one control write for four queued frames, and the end of the
+    /// stream flushes the credit still held: the peer's window never waits on a batch that no
+    /// further DATA will complete.
+    #[test]
+    fn a_threaded_credit_batches_four_frames_and_flushes_at_the_end() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::clone(&written),
+                slices: Arc::clone(&slices),
+            }),
+            true,
+        );
+        let (_reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        for _ in 0..3 {
+            assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_384]));
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "three frames are below the batch and grant nothing yet"
+        );
+        assert!(queue_data(&conn, F_END, 1, vec![0x5Au8; 16_384]));
+        for _ in 0..100 {
+            if slices.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "four frames and the end go out as one credit"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 26, "the pair is 26 bytes and nothing else");
+        assert_eq!(
+            u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
+            CREDIT_BATCH_BYTES as u32,
+            "the batch carries every queued byte"
+        );
+    }
+
     /// A writer whose first `write_slices` holds the lock until the test releases it, so a second
     /// credit proves it queued instead of waiting behind a data write the peer has not drained.
     struct Blocked {
@@ -5872,6 +5960,7 @@ mod tests {
                 abandoned: true,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -5935,6 +6024,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(total as u64),
@@ -6134,6 +6224,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -6179,6 +6270,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -6239,6 +6331,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(4),
@@ -6274,6 +6367,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -6418,6 +6512,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
