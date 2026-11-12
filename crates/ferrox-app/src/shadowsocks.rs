@@ -979,7 +979,10 @@ fn uplink_step(
     };
     match read {
         Ok(0) => crate::proxy::lane_pool::Next::Done,
-        Ok(n) if seal_all(send, buf, n, writer).is_ok() => crate::proxy::lane_pool::Next::More,
+        Ok(n) if seal_all(send, buf, n, writer).is_ok() => {
+            flow.mark_progress();
+            crate::proxy::lane_pool::Next::More
+        }
         Err(error)
             if crate::proxy::is_timeout(&error)
                 && !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) =>
@@ -1179,6 +1182,12 @@ fn aead_step<R: Read>(
     {
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
     }
+    // A chunk that reached its target is progress: it restarts the reply grace a sibling's end started.
+    if opened.chunks > 0 {
+        if let Some(flow) = flow {
+            flow.mark_progress();
+        }
+    }
     if opened.forged {
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
     }
@@ -1213,6 +1222,9 @@ fn stream_step<R: Read>(
             rc4.crypt(&mut buf[..n]);
             if out.write_all(&buf[..n]).is_err() {
                 return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            }
+            if let Some(flow) = flow {
+                flow.mark_progress();
             }
             crate::proxy::lane_pool::Next::More
         }
@@ -3718,6 +3730,88 @@ mod tests {
         );
         drop(held);
         drop(held_first);
+    }
+
+    /// A chunk handed to its target restarts the reply grace: a slow reply that keeps trickling after the sibling ends must not be cut one window later, which is what a grace no write ever restarts does.
+    #[test]
+    fn a_forwarded_chunk_restarts_the_reply_grace() {
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
+        let idle = crate::budgets::RELAY_RESPONSE_IDLE;
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut send = Uplink::Aead(
+            Cipher::new(method, "an-example-shared-password", &salt).expect("derives"),
+        );
+        let mut msg = [0u8; SEAL_HEAD + 17 + TAG_LEN];
+        msg[SEAL_HEAD..SEAL_HEAD + 17].copy_from_slice(b"length-is-framing");
+        let mut wire = Vec::new();
+        seal_all(&mut send, &mut msg, 17, &mut wire).expect("seals");
+        flow.mark_ended();
+        let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
+        while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            flow.ended_and_idle(idle),
+            "the grace did not run from the sibling's end"
+        );
+        let mut window = ChunkReader::new(std::io::Cursor::new(&wire[..]));
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
+        assert_eq!(crate::proxy::lane_pool::Next::More, next);
+        assert_eq!(
+            &b"length-is-framing"[..],
+            &out[..],
+            "the chunk reached its target"
+        );
+        assert!(
+            !flow.ended_and_idle(idle),
+            "the forwarded chunk did not restart the grace"
+        );
+    }
+
+    /// A chunk sealed into the carrier is progress too: a download that pauses after the upload ended keeps its lane while it still seals.
+    #[test]
+    fn a_sealed_chunk_restarts_the_reply_grace() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let mut client = std::net::TcpStream::connect(addr).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        client.write_all(b"length-is-framing").expect("writes");
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
+        let idle = crate::budgets::RELAY_RESPONSE_IDLE;
+        flow.mark_ended();
+        let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
+        while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            flow.ended_and_idle(idle),
+            "the grace did not run from the sibling's end"
+        );
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut send = Uplink::Aead(
+            Cipher::new(method, "an-example-shared-password", &salt).expect("derives"),
+        );
+        let mut buf = crate::proxy::unfilled(uplink_buffer_len(&send));
+        let mut wire = Vec::new();
+        let next = uplink_step(
+            &mut Connection::Tcp(server),
+            &mut buf,
+            &mut send,
+            &mut wire,
+            &flow,
+        );
+        assert_eq!(crate::proxy::lane_pool::Next::More, next);
+        assert!(!wire.is_empty(), "the chunk reached the carrier");
+        assert!(
+            !flow.ended_and_idle(idle),
+            "the sealed chunk did not restart the grace"
+        );
+        drop(client);
     }
 
     /// A lane that finds its socket quiet waits out the reply grace after its sibling ends: a chunk still in flight when the other direction finishes keeps that window, where ending on the first poll dropped it.

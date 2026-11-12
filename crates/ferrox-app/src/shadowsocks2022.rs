@@ -900,6 +900,7 @@ fn uplink_step(
         Err(_) => return crate::proxy::lane_pool::Next::Done,
     };
     if sealed.is_ok() {
+        flow.mark_progress();
         crate::proxy::lane_pool::Next::More
     } else {
         crate::proxy::lane_pool::Next::Done
@@ -1185,6 +1186,9 @@ fn first_step<R: Read>(
             if out.write_all(&chunk[..got]).is_err() {
                 return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             }
+            if let Some(flow) = flow {
+                flow.mark_progress();
+            }
             (
                 crate::proxy::lane_pool::Next::More,
                 Downlink::Aead {
@@ -1219,6 +1223,10 @@ fn aead_step<R: Read>(
     let next = if opened > 0 {
         if write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened]).is_err() {
             return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+        }
+        // A chunk that reached its target is progress: it restarts the reply grace a sibling's end started.
+        if let Some(flow) = flow {
+            flow.mark_progress();
         }
         crate::proxy::lane_pool::Next::More
     } else {
@@ -3681,5 +3689,41 @@ mod tests {
         );
         drop(held);
         drop(held_first);
+    }
+
+    /// A chunk handed to its target restarts the reply grace: a slow reply that keeps trickling after the sibling ends must not be cut one window later, which is what a grace no write ever restarts does.
+    #[test]
+    fn a_forwarded_chunk_restarts_the_reply_grace() {
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
+        let idle = crate::budgets::RELAY_RESPONSE_IDLE;
+        let method = Method::Aes256Gcm;
+        let psk = vec![7u8; 32];
+        let salt = vec![7u8; 32];
+        let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let msg = b"length-is-framing";
+        let mut plain = vec![0u8; SEAL_HEAD + msg.len() + TAG_LEN];
+        plain[SEAL_HEAD..SEAL_HEAD + msg.len()].copy_from_slice(msg);
+        let mut wire = Vec::new();
+        seal_all(&mut send, &mut plain, msg.len(), &mut wire).expect("seals");
+        flow.mark_ended();
+        let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
+        while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            flow.ended_and_idle(idle),
+            "the grace did not run from the sibling's end"
+        );
+        let mut window = ChunkReader::new(std::io::Cursor::new(&wire[..]));
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
+        assert_eq!(crate::proxy::lane_pool::Next::More, next);
+        assert_eq!(&msg[..], &out[..], "the chunk reached its target");
+        assert!(
+            !flow.ended_and_idle(idle),
+            "the forwarded chunk did not restart the grace"
+        );
     }
 }
