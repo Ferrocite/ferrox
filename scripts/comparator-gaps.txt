@@ -29,6 +29,13 @@ vless-raw-routed-down-8--srv-xray-core|sing-box|0.82|359
 vless-raw-udp-8--srv-ferrox|xray-rust|0.92|359
 vless-raw-up-1--srv-ferrox|sing-box|0.56|359
 vless-raw-up-1--srv-ferrox|xray-rust|0.88|359
+# WireGuard's remaining deficits are against sing-box's kernel-TCP upload client and its
+# duplex cell; ferrox is best on every download row and on four of nine priced rows.
+# Measured by run 43127254767.
+wireguard-raw-duplex-8--srv-sing-box|sing-box|0.70|1214
+wireguard-raw-up-1--srv-ferrox|sing-box|0.86|1214
+wireguard-raw-up-1--srv-sing-box|sing-box|0.71|1214
+wireguard-raw-up-1--srv-xray-core|sing-box|0.94|1214
 vless-reality-xhttp-down-8--srv-ferrox|xray-core-rust|0.47|359
 vless-reality-xhttp-down-8--srv-xray-core|xray-core-rust|0.68|359
 vless-tls-httpupgrade-down-8--srv-ferrox|zeronet|0.88|359
