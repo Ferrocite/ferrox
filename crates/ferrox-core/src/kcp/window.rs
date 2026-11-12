@@ -577,6 +577,35 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_segment_refreshes_its_ack_instead_of_growing_the_list() {
+        let mut l = AckList::new();
+        l.add(7, 100);
+        let mut emitted = Vec::new();
+        l.flush(0, 100, 300, &mut |seg: &mut AckSegment| {
+            emitted.push(seg.numbers.clone());
+        });
+        assert_eq!(emitted, vec![vec![7]]);
+        for _ in 0..64 {
+            l.add(7, 200);
+        }
+        assert_eq!(
+            l.entries.len(),
+            1,
+            "a repeated segment added a second entry"
+        );
+        assert_eq!(l.entries[0].timestamp, 200);
+        assert_eq!(
+            l.entries[0].next_flush, 0,
+            "a repeated segment is due again"
+        );
+        emitted.clear();
+        l.flush(1, 100, 300, &mut |seg: &mut AckSegment| {
+            emitted.push(seg.numbers.clone());
+        });
+        assert_eq!(emitted, vec![vec![7]], "the repeated segment re-acked once");
+    }
+
+    #[test]
     fn the_ack_list_reuses_its_scratch_across_flushes() {
         let mut l = AckList::new();
         l.add(1, 100);
