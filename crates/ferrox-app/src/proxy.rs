@@ -22700,6 +22700,23 @@ fn serve_connect_freedom(
     if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
         return;
     }
+    if !prefix.is_empty() {
+        loop {
+            let Some(mut head) =
+                read_http_head(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+            else {
+                return;
+            };
+            let interim = http_head_is_interim(&head);
+            drop_invalid_header_names(&mut head);
+            if client.write_all(&head).is_err() {
+                return;
+            }
+            if !interim {
+                break;
+            }
+        }
+    }
     relay_handoff(client, &upstream);
 }
 
@@ -24104,6 +24121,73 @@ fn crlf_in(head: &[u8], mut at: usize) -> Option<usize> {
     }
 }
 
+/// Whether a header name is an HTTP token, which is what Go's header writer accepts and re-serializes.
+fn header_name_is_token(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Whether a response head is an interim `1xx`, which is answered and then followed by the final head.
+fn http_head_is_interim(head: &[u8]) -> bool {
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let _version = parts.next();
+    let code = parts.next().unwrap_or(&[]);
+    code.len() == 3 && code[0] == b'1' && code.iter().all(u8::is_ascii_digit)
+}
+
+/// Removes every header line whose name is not an HTTP token, in place: a name the origin would
+/// frame differently from the bytes this side relays is a request-smuggling desync, not a header.
+fn drop_invalid_header_names(head: &mut Vec<u8>) {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            return;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            return;
+        }
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            at = end + 1;
+            continue;
+        }
+        let valid = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|colon| header_name_is_token(&line[..colon]));
+        if valid {
+            at = end + 1;
+            continue;
+        }
+        head.copy_within(end + 1.., at);
+        head.truncate(head.len() - (end + 1 - at));
+    }
+}
+
 /// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
 fn drop_header(head: &mut Vec<u8>, name: &str) {
     let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
@@ -24370,6 +24454,8 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 forward_headers(&origin, &mut attrs);
                 attrs
             });
+            let mut origin = origin;
+            drop_invalid_header_names(&mut origin);
             let facts = FlowFacts {
                 source: None,
                 local: None,
