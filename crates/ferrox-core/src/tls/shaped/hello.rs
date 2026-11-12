@@ -4,7 +4,6 @@ use super::ticket::Ticket;
 use super::{Body, Ext, Profile, GREASE};
 use crate::tls::hpke::Sealer;
 use crate::tls::TlsError;
-use rustls::crypto::hpke::HpkeSealer as _;
 
 /// The version this hello's legacy field names, which a static-RSA premaster repeats.
 pub(super) const TLS12: u16 = 0x0303;
@@ -258,7 +257,7 @@ impl Hello {
         );
         let ciphertext = offer
             .sealer
-            .seal(&outer[4..], &encoded)
+            .seal_owned(&outer[4..], encoded)
             .map_err(|e| TlsError::Other(format!("ech: seal: {e}")))?;
         let at = outer
             .len()
@@ -317,14 +316,16 @@ impl Hello {
             },
             &entries,
             true,
+            0,
         );
-        let mut encoded = self.encode_prepared(head, &entries, false);
         let name_pad = match offer.inner_name.as_deref() {
             Some(name) => offer.maximum_name_length.saturating_sub(name.len()),
             None => offer.maximum_name_length + 9,
         };
+        let padded = head.message_len - 4 + name_pad;
+        let pad = 31 - ((padded - 1) % 32);
+        let mut encoded = self.encode_prepared(head, &entries, false, name_pad + pad + 16);
         encoded.extend(std::iter::repeat_n(0, name_pad));
-        let pad = 31 - ((encoded.len() - 1) % 32);
         encoded.extend(std::iter::repeat_n(0, pad));
         (encoded, transcript)
     }
@@ -647,18 +648,26 @@ impl Hello {
             message_len,
             shares,
         };
-        self.encode_prepared(head, &entries, true)
+        self.encode_prepared(head, &entries, true, 0)
     }
 
     /// The hello body, or the framed handshake message when `frame` is set: the header is reserved
     /// before the first body byte, so the caller's message is never copied behind a new one.
-    fn encode_prepared(&self, head: Prepared<'_>, entries: &[Entry], frame: bool) -> Vec<u8> {
+    fn encode_prepared(
+        &self,
+        head: Prepared<'_>,
+        entries: &[Entry],
+        frame: bool,
+        extra: usize,
+    ) -> Vec<u8> {
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
-        let mut body = Vec::with_capacity(if frame {
-            head.message_len
-        } else {
-            head.message_len - 4
-        });
+        let mut body = Vec::with_capacity(
+            if frame {
+                head.message_len
+            } else {
+                head.message_len - 4
+            } + extra,
+        );
         if frame {
             body.resize(4, 0);
         }
@@ -1423,7 +1432,7 @@ mod tests {
     }
 
     /// A real `enable_ech` offer parses the list in place, builds the HPKE info and both hello
-    /// frames where they are written, and stages only the cover's payload and the sealed bytes.
+    /// frames where they are written, and seals the inner body where it lies.
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
     fn an_enable_ech_offer_parses_in_place() {
@@ -1433,7 +1442,7 @@ mod tests {
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 17, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 15, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"

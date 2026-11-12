@@ -1,4 +1,4 @@
-use aes_gcm::aead::{Aead as _, Payload};
+use aes_gcm::aead::{Aead as _, AeadInOut as _, Payload};
 use hkdf::{Hkdf, HkdfExtract};
 use rustls::crypto::hpke::{
     EncapsulatedSecret, Hpke, HpkeOpener, HpkePublicKey, HpkeSealer, HpkeSuite,
@@ -86,6 +86,54 @@ impl Aead {
                     .encrypt(
                         &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
                         payload,
+                    )
+                    .map_err(|_| general("hpke: chacha20poly1305 seal"))
+            }
+        }
+    }
+
+    /// Seals `buffer` where it lies, appending the tag, with the fixed 32-byte HPKE key.
+    fn seal_in_place(
+        self,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), rustls::Error> {
+        match self {
+            Self::Aes128Gcm => {
+                use aes_gcm::{Aes128Gcm, KeyInit as _};
+                let cipher = Aes128Gcm::new_from_slice(&key[..16])
+                    .map_err(|_| general("hpke: aes-128-gcm key length"))?;
+                cipher
+                    .encrypt_in_place(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        aad,
+                        buffer,
+                    )
+                    .map_err(|_| general("hpke: aes-128-gcm seal"))
+            }
+            Self::Aes256Gcm => {
+                use aes_gcm::{Aes256Gcm, KeyInit as _};
+                let cipher = Aes256Gcm::new_from_slice(&key[..])
+                    .map_err(|_| general("hpke: aes-256-gcm key length"))?;
+                cipher
+                    .encrypt_in_place(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        aad,
+                        buffer,
+                    )
+                    .map_err(|_| general("hpke: aes-256-gcm seal"))
+            }
+            Self::ChaCha20Poly1305 => {
+                use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _};
+                let cipher = ChaCha20Poly1305::new_from_slice(&key[..])
+                    .map_err(|_| general("hpke: chacha20poly1305 key length"))?;
+                cipher
+                    .encrypt_in_place(
+                        &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
+                        aad,
+                        buffer,
                     )
                     .map_err(|_| general("hpke: chacha20poly1305 seal"))
             }
@@ -254,6 +302,18 @@ impl Context {
             .seal(&self.key, &self.nonce(sequence), aad, plaintext)
     }
 
+    /// Seals a message the caller already owns, in place, so its bytes are never copied.
+    fn seal_owned(
+        &self,
+        aad: &[u8],
+        mut buffer: Vec<u8>,
+        sequence: u64,
+    ) -> Result<Vec<u8>, rustls::Error> {
+        self.aead
+            .seal_in_place(&self.key, &self.nonce(sequence), aad, &mut buffer)?;
+        Ok(buffer)
+    }
+
     /// Opens one message in the context's sequence.
     fn open(&self, aad: &[u8], ciphertext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
@@ -307,6 +367,19 @@ pub(crate) struct Sealer {
 impl HpkeSealer for Sealer {
     fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, rustls::Error> {
         let out = self.context.seal(aad, plaintext, self.sequence)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        Ok(out)
+    }
+}
+
+impl Sealer {
+    /// Seals the caller's buffer where it lies: the tag is appended, no plaintext is copied.
+    pub(crate) fn seal_owned(
+        &mut self,
+        aad: &[u8],
+        buffer: Vec<u8>,
+    ) -> Result<Vec<u8>, rustls::Error> {
+        let out = self.context.seal_owned(aad, buffer, self.sequence)?;
         self.sequence = self.sequence.wrapping_add(1);
         Ok(out)
     }
@@ -523,6 +596,26 @@ mod tests {
             context.seal(b"Count-0", &plaintext, 0).unwrap(),
             hex("1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28")
         );
+    }
+
+    /// An owned seal appends the tag into the caller's buffer, so its bytes are never copied.
+    #[test]
+    fn an_owned_seal_appends_where_the_plaintext_lay() {
+        let secret = [7u8; 32];
+        let plaintext = b"the inner hello body";
+        for aead in [Aead::Aes128Gcm, Aead::Aes256Gcm, Aead::ChaCha20Poly1305] {
+            let context = Context::new(&secret, b"tls ech\0config", aead);
+            let expected = context.seal(b"aad", plaintext, 0).unwrap();
+            let mut buffer = Vec::with_capacity(plaintext.len() + 16);
+            buffer.extend_from_slice(plaintext);
+            let base = buffer.as_ptr();
+            let capacity = buffer.capacity();
+            let got = context.seal_owned(b"aad", buffer, 0).unwrap();
+            assert_eq!(got, expected, "the in-place seal is the same ciphertext");
+            assert_eq!(got.as_ptr(), base, "the tag lands in the caller's buffer");
+            assert_eq!(got.capacity(), capacity, "the seal does not reallocate");
+            assert_eq!(got.len(), plaintext.len() + 16);
+        }
     }
 
     /// The key schedule lands in fixed slots, so a dial's HPKE context touches the allocator not at all.
