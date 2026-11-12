@@ -376,8 +376,7 @@ impl SourceFilter {
         let Some(source) = source else {
             return !self.allowed.is_empty();
         };
-        let _ = (self.blocked.matches(source), self.allowed.matches(source));
-        false
+        self.blocked.matches(source) || (!self.allowed.is_empty() && !self.allowed.matches(source))
     }
 }
 
