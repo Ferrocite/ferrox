@@ -1192,6 +1192,12 @@ fn aead_step<R: Read>(
     if opened.forged {
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
     }
+    // An empty frame cannot hold a lane open: once the sibling has ended and its reply grace has run out, no payload can follow it.
+    if opened.chunks > 0
+        && flow.is_some_and(|flow| flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE))
+    {
+        return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+    }
     let next = if opened.chunks > 0 {
         crate::proxy::lane_pool::Next::More
     } else {
