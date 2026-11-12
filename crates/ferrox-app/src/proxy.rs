@@ -22667,7 +22667,7 @@ fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked
 /// Nothing carries the destination onward, so this lane is the one that has to redirect it,
 /// resolve it by the configured strategy, and add the header or fragment the config asks for.
 fn serve_connect_freedom(
-    client: &Connection,
+    mut client: &Connection,
     freedom: &FreedomOut,
     asked: &Destination,
     prefix: &[u8],
@@ -22699,6 +22699,23 @@ fn serve_connect_freedom(
     let mut upstream = upstream.with_mask(freedom.fragment.as_deref());
     if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
         return;
+    }
+    if !prefix.is_empty() {
+        loop {
+            let Some(mut head) =
+                read_http_head(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+            else {
+                return;
+            };
+            let interim = http_head_is_interim(&head);
+            drop_invalid_header_names(&mut head);
+            if client.write_all(&head).is_err() {
+                return;
+            }
+            if !interim {
+                break;
+            }
+        }
     }
     relay_handoff(client, &upstream);
 }
@@ -24104,6 +24121,112 @@ fn crlf_in(head: &[u8], mut at: usize) -> Option<usize> {
     }
 }
 
+/// Whether a header name is an HTTP token, which is what Go's header writer accepts and re-serializes.
+fn header_name_is_token(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Whether a response head is an interim `1xx`, which is answered and then followed by the final head.
+fn http_head_is_interim(head: &[u8]) -> bool {
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let _version = parts.next();
+    let code = parts.next().unwrap_or(&[]);
+    code.len() == 3 && code[0] == b'1' && code != b"101" && code.iter().all(u8::is_ascii_digit)
+}
+
+/// Whether every header line's name is an HTTP token, so a head that needs no rewrite can be forwarded as it landed.
+fn header_names_are_tokens(head: &[u8]) -> bool {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            return true;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            return true;
+        }
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            at = end + 1;
+            continue;
+        }
+        let valid = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|colon| header_name_is_token(&line[..colon]));
+        if !valid {
+            return false;
+        }
+        at = end + 1;
+    }
+    true
+}
+
+/// Removes every header line whose name is not an HTTP token, in place: a name the origin would
+/// frame differently from the bytes this side relays is a request-smuggling desync, not a header.
+fn drop_invalid_header_names(head: &mut Vec<u8>) {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    let mut dropped = false;
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            return;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            return;
+        }
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            if !dropped {
+                at = end + 1;
+                continue;
+            }
+            head.copy_within(end + 1.., at);
+            head.truncate(head.len() - (end + 1 - at));
+            continue;
+        }
+        let valid = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|colon| header_name_is_token(&line[..colon]));
+        if valid {
+            dropped = false;
+            at = end + 1;
+            continue;
+        }
+        dropped = true;
+        head.copy_within(end + 1.., at);
+        head.truncate(head.len() - (end + 1 - at));
+    }
+}
+
 /// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
 fn drop_header(head: &mut Vec<u8>, name: &str) {
     let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
@@ -24370,6 +24493,12 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 forward_headers(&origin, &mut attrs);
                 attrs
             });
+            let filtered = (!header_names_are_tokens(&origin)).then(|| {
+                let mut copy = origin.clone();
+                drop_invalid_header_names(&mut copy);
+                copy
+            });
+            let prefix = filtered.as_deref().unwrap_or(&origin);
             let facts = FlowFacts {
                 source: None,
                 local: None,
@@ -24390,7 +24519,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 &out,
                 &asked,
                 Front::Http,
-                &origin,
+                prefix,
                 tag.as_deref(),
                 facts,
             );
@@ -66732,6 +66861,87 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn an_upgrade_head_is_final_not_interim() {
+        assert!(http_head_is_interim(b"HTTP/1.1 100 Continue\r\n\r\n"));
+        assert!(http_head_is_interim(b"HTTP/1.1 103 Early Hints\r\n\r\n"));
+        assert!(!http_head_is_interim(
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
+        ));
+        assert!(!http_head_is_interim(b"HTTP/1.1 200 OK\r\n\r\n"));
+    }
+
+    #[test]
+    fn an_http_forward_drops_header_names_that_are_not_tokens() {
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin.local_addr().expect("addr").port();
+        let origin_thread = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accepts");
+            let head = read_http_head(&mut stream, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+                .expect("the request head");
+            let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            assert!(
+                !text.contains("transfer-encoding"),
+                "a spaced transfer-encoding reached the origin: {text}"
+            );
+            assert!(
+                !text.contains("content-length"),
+                "a spaced content-length reached the origin: {text}"
+            );
+            assert!(
+                !text.contains("folded-request"),
+                "a folded line of a dropped header reached the origin: {text}"
+            );
+            assert!(
+                text.contains("x-kept: 1"),
+                "a legal header did not reach the origin: {text}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n folded-response\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\nhello",
+                )
+                .expect("answers");
+        });
+        let front = http_front_with(freedom());
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{origin_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nTransfer-Encoding : chunked\r\n folded-request\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(
+            !text.contains("transfer-encoding"),
+            "a spaced transfer-encoding reached the client: {text}"
+        );
+        assert!(
+            !text.contains("content-length"),
+            "a spaced content-length reached the client: {text}"
+        );
+        assert!(
+            !text.contains("folded-response"),
+            "a folded line of a dropped response header reached the client: {text}"
+        );
+        assert!(
+            text.contains("x-kept: 1"),
+            "a legal response header was dropped: {text}"
+        );
+        let mut body = [0u8; 5];
+        client.read_exact(&mut body).expect("reads the body");
+        assert_eq!(
+            &body, b"hello",
+            "the body after the filtered head still arrives"
+        );
+        origin_thread.join().expect("the origin answers");
     }
 
     #[test]
