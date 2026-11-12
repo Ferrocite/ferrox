@@ -3789,10 +3789,7 @@ impl crate::proxy::CarrierSink for XhttpWriter {
         let Body::Stream(stream) = &self.shared.body else {
             return false;
         };
-        stream
-            .lock()
-            .map(|mut stream| stream.pace())
-            .unwrap_or(false)
+        stream.lock().is_ok_and(|mut stream| stream.pace())
     }
     #[inline]
     fn settle(&self) -> crate::proxy::Settle {
@@ -3804,8 +3801,7 @@ impl crate::proxy::CarrierSink for XhttpWriter {
         };
         stream
             .lock()
-            .map(|mut stream| stream.settle())
-            .unwrap_or(crate::proxy::Settle::Lost)
+            .map_or(crate::proxy::Settle::Lost, |mut stream| stream.settle())
     }
     #[inline]
     fn read_window(&self) -> Option<usize> {
@@ -3834,6 +3830,7 @@ impl crate::proxy::CarrierSink for XhttpWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::CarrierSink as _;
     use std::thread;
     use std::time::Duration;
 
