@@ -2816,6 +2816,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A mode on a path whose directory is missing reports the missing directory, not a made-up
+    /// "no staged name free": only a name collision is retried, every other error is the caller's.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_mode_reports_a_missing_directory() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-missing-{}-{id}", std::process::id()));
+        let target =
+            parse_target(&format!("unix:{},0750", dir.join("sock").display())).expect("parses");
+        let error = Listener::bind(&target).err().expect("a missing directory is refused");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "the directory's own error, not a staging one"
+        );
+    }
+
     /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
     /// is not waited out holds its caller past the budget; the seam spends the budget instead.
     #[cfg(target_os = "linux")]
