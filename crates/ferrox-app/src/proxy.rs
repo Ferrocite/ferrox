@@ -28977,12 +28977,11 @@ pub(crate) mod lane_pool {
     static DEMUX_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
     static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// A server's flow parks one leg on the peer's window, so six carries the widest standard cell
-    /// (eight connections) and leaves room for the accept path and the parking reaper under the
-    /// reference's ten-thread server peak. A worker starts only when a lane is queued and no
-    /// worker is idle, so this is the ceiling, not the shape.
+    /// A server's flow parks one leg on the peer's window, so eight download lanes carry the widest
+    /// standard cell. The h2 demux runs on its own pool with its own reaper, so this caps the relay
+    /// workers, not the process. A worker starts only when a lane is queued and no worker is idle.
     #[cfg(target_os = "linux")]
-    pub(crate) const RELAY_LANES: usize = 6;
+    pub(crate) const RELAY_LANES: usize = 8;
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
     #[cfg(not(target_os = "linux"))]
     pub(crate) const RELAY_LANES: usize = 8;
@@ -30311,7 +30310,7 @@ pub(crate) mod lane_pool {
             );
         }
 
-        /// Every lane in the fixed set must have a worker; six carry a full cell because an idle
+        /// Every lane in the fixed set must have a worker; eight carry a full cell because an idle
         /// lane parks its descriptor and the reaper wakes it instead of one blocking thread per flow.
         #[test]
         fn every_lane_of_a_full_cell_has_a_worker() {

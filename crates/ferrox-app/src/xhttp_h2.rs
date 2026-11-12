@@ -38,6 +38,9 @@ const NO_PART: &[u8] = &[];
 const CREDIT_FRAME: usize = 26;
 const CONTROL_MAX: usize = CREDIT_FRAME;
 const CONTROL_BATCH: usize = 8;
+/// A threaded connection returns the peer's credit in one pair per this many queued bytes: four
+/// default frames, so the control thread wakes once for four DATA frames instead of once each.
+const CREDIT_BATCH_BYTES: usize = 64 * 1024;
 
 /// A window's DATA frames held apart rather than staged together: each nine-byte head in its own
 /// slot and every payload still the caller's own slice, so one flush is one write whose bytes are
@@ -216,6 +219,8 @@ struct StreamState {
     /// The response status a client decoded, so a packet POST can refuse a non-2xx answer.
     status: Option<u16>,
     dead: bool,
+    /// Credit for DATA queued since the last `WINDOW_UPDATE`; only a threaded connection defers.
+    pending_credit: u32,
 }
 
 impl StreamState {
@@ -499,23 +504,51 @@ fn body_wait_timeout() -> std::io::Error {
     }
 }
 
+impl H2StreamReader {
+    /// Move the current frame into the caller's buffer from the last offset read, and report the new fill.
+    fn take_cur(&mut self, buf: &mut [u8], filled: usize) -> usize {
+        let n = (self.cur.len() - self.at).min(buf.len() - filled);
+        buf[filled..filled + n].copy_from_slice(&self.cur[self.at..self.at + n]);
+        self.at += n;
+        if self.at == self.cur.len() {
+            self.cur.clear();
+            self.at = 0;
+        }
+        self.idle_since = None;
+        filled + n
+    }
+
+    /// Pump one frame from the connection, yielding or parking according to the lane that owns the call.
+    fn pump(&self, yieldable: bool) -> Pumped {
+        self.conn.pump_read(
+            || {
+                let st = self
+                    .stream
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                !st.body.is_empty() || st.read_ended() || st.dead
+            },
+            yieldable,
+        )
+    }
+}
+
 impl Read for H2StreamReader {
+    #[allow(clippy::too_many_lines)]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let mut filled = 0;
+        let mut tried_extra = false;
         loop {
             if self.at < self.cur.len() {
-                let n = (self.cur.len() - self.at).min(buf.len());
-                buf[..n].copy_from_slice(&self.cur[self.at..self.at + n]);
-                self.at += n;
-                if self.at == self.cur.len() {
-                    self.cur.clear();
-                    self.at = 0;
+                filled = self.take_cur(buf, filled);
+                if filled == buf.len() {
+                    return Ok(filled);
                 }
-                self.idle_since = None;
-                self.conn.replenish(self.id, n);
-                return Ok(n);
+                continue;
             }
             let mut st = self
                 .stream
@@ -532,26 +565,38 @@ impl Read for H2StreamReader {
                 st.abandoned = !st.ended;
                 drop(st);
                 self.conn.forget_upload(self.id);
-                return Ok(0);
+                return Ok(filled);
             }
             if st.dead || self.conn.dead.load(Ordering::SeqCst) {
                 drop(st);
+                if filled > 0 {
+                    return Ok(filled);
+                }
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
+            if filled > 0 {
+                // One more poll lets two frames leave in one write; the lane would wait on the next read anyway.
+                if !tried_extra
+                    && filled >= 8_192
+                    && buf.len() - filled >= 8_192
+                    && self.conn.client_read.is_some()
+                    && !self.conn.read_busy()
+                    && crate::proxy::relay_step_owns_poll()
+                {
+                    tried_extra = true;
+                    drop(st);
+                    match self.pump(true) {
+                        Pumped::Alive => continue,
+                        Pumped::Yield | Pumped::Dead => return Ok(filled),
+                    }
+                }
+                drop(st);
+                return Ok(filled);
+            }
             if self.conn.client_read.is_some() {
                 drop(st);
-                match self.conn.pump_read(
-                    || {
-                        let st = self
-                            .stream
-                            .state
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        !st.body.is_empty() || st.read_ended() || st.dead
-                    },
-                    crate::proxy::relay_step_owns_poll(),
-                ) {
+                match self.pump(crate::proxy::relay_step_owns_poll()) {
                     Pumped::Alive => {}
                     Pumped::Yield => {
                         return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -604,7 +649,6 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 let start = self.at;
                 self.at = self.cur.len();
                 self.idle_since = None;
-                self.conn.replenish(self.id, self.cur.len() - start);
                 return Ok(crate::proxy::Window::one(&self.cur[start..]));
             }
             let mut st = self
@@ -1304,13 +1348,20 @@ impl H2Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&stream);
-        if let Some(state) = state {
+        let pending = if let Some(state) = state {
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.dead = true;
+            let pending = std::mem::take(&mut st.pending_credit);
             state.cv.notify_all();
-        }
+            pending
+        } else {
+            0
+        };
         self.wake.notify_all();
         drop(credit);
+        if pending > 0 {
+            self.replenish_connection(pending as usize);
+        }
     }
 
     fn end_stream(&self, stream: u32) {
@@ -1343,9 +1394,15 @@ impl H2Conn {
             .streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&stream)
-            .is_some();
-        if removed {
+            .remove(&stream);
+        if let Some(state) = removed {
+            let pending = {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                std::mem::take(&mut st.pending_credit)
+            };
+            if pending > 0 {
+                self.replenish_connection(pending as usize);
+            }
             self.forget_upload(stream);
             self.end_session_of(stream);
         }
@@ -1358,16 +1415,23 @@ impl H2Conn {
             .send_conn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        {
+        let pending = {
             let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(state) = streams.remove(&stream) {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.dead = true;
+                let pending = std::mem::take(&mut st.pending_credit);
                 state.cv.notify_all();
+                pending
+            } else {
+                0
             }
-        }
+        };
         self.wake.notify_all();
         drop(credit);
+        if pending > 0 {
+            self.replenish_connection(pending as usize);
+        }
         self.end_session_of(stream);
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
         let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
@@ -1552,6 +1616,7 @@ impl H2Conn {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(initial),
@@ -1614,6 +1679,13 @@ fn fill_frame(
 }
 
 impl H2Conn {
+    /// Whether another pump already holds the connection's read half.
+    fn read_busy(&self) -> bool {
+        self.client_read
+            .as_ref()
+            .is_some_and(|read| read.try_lock().is_err())
+    }
+
     /// A client's frames arrive on the same transport its reader consumes: one frame is parsed on
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
     /// A lane step that cannot finish the frame yields the poll instead of sleeping in it.
@@ -2927,7 +2999,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         return true;
     };
     drop(streams);
-    let done = {
+    let (done, flush, credit) = {
         let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !st.dead {
             st.body.push_back(body);
@@ -2935,10 +3007,27 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
                 st.ended = true;
             }
         }
+        let done = st.both_ended();
+        let pending = st
+            .pending_credit
+            .saturating_add(u32::try_from(wire_len).unwrap_or(u32::MAX));
+        let flush = st.dead
+            || done
+            || flags & F_END != 0
+            || pending as usize >= CREDIT_BATCH_BYTES
+            || matches!(conn.control, Control::Inline);
+        if flush {
+            st.pending_credit = 0;
+        } else {
+            st.pending_credit = pending;
+        }
         state.cv.notify_all();
-        st.both_ended()
+        (done, flush, pending)
     };
-    conn.replenish(sid, wire_len);
+    // The frame grants its credit once, when it is queued; the reader hands the bytes out without a second grant.
+    if flush {
+        conn.replenish(sid, credit as usize);
+    }
     if done {
         conn.retire(sid);
     }
@@ -3498,6 +3587,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -3589,6 +3679,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -3652,6 +3743,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4341,6 +4433,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -4390,6 +4483,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4464,6 +4558,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4759,6 +4854,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4845,6 +4941,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -4896,6 +4993,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -5472,6 +5570,141 @@ mod tests {
         }
     }
 
+    /// A DATA frame grants its windows when it is queued, and reading the queued bytes grants them no
+    /// second time: the peer's credit is returned once per frame, not twice.
+    #[test]
+    fn a_queued_frame_grants_its_credit_once() {
+        let (conn, _written, slices) = bare_conn();
+        let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        let payload = vec![0x5Au8; 32];
+        assert!(queue_data(&conn, 0, 1, payload.clone()));
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "the queue returns the frame's credit"
+        );
+        let mut got = [0u8; 32];
+        assert_eq!(reader.read(&mut got).expect("reads"), payload.len());
+        assert_eq!(&got[..], &payload[..]);
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "the reader does not return the same bytes again"
+        );
+    }
+
+    /// A body read fills from every queued DATA frame before it parks: an 8 KiB peer frame no longer
+    /// forces one cipher chunk and one target write per H2 frame.
+    #[test]
+    fn a_body_read_fills_across_queued_frames() {
+        let (conn, _written, _slices) = bare_conn();
+        let (mut reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        assert!(queue_data(&conn, 0, 1, vec![0x11u8; 8]));
+        assert!(queue_data(&conn, 0, 1, vec![0x22u8; 8]));
+        let mut got = [0u8; 16];
+        assert_eq!(reader.read(&mut got).expect("reads"), 16);
+        assert_eq!(&got[..8], &[0x11u8; 8]);
+        assert_eq!(&got[8..], &[0x22u8; 8]);
+        assert!(queue_data(&conn, 0, 1, vec![0x33u8; 8]));
+        let mut short = [0u8; 24];
+        assert_eq!(
+            reader.read(&mut short).expect("reads"),
+            8,
+            "a read with no queued frame behind it returns what it has instead of parking"
+        );
+        assert_eq!(&short[..8], &[0x33u8; 8]);
+    }
+
+    /// A threaded connection spends one control write for four queued frames, and the end of the
+    /// stream flushes the credit still held: the peer's window never waits on a batch that no
+    /// further DATA will complete.
+    #[test]
+    fn a_threaded_credit_batches_four_frames_and_flushes_at_the_end() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::clone(&written),
+                slices: Arc::clone(&slices),
+            }),
+            true,
+        );
+        let (_reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        for _ in 0..3 {
+            assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_384]));
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "three frames are below the batch and grant nothing yet"
+        );
+        assert!(queue_data(&conn, F_END, 1, vec![0x5Au8; 16_384]));
+        for _ in 0..100 {
+            if slices.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "four frames and the end go out as one credit"
+        );
+        assert!(
+            conn.control.drained(Duration::from_secs(1)),
+            "the credit write finishes before its bytes are read"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 26, "the pair is 26 bytes and nothing else");
+        assert_eq!(
+            u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
+            CREDIT_BATCH_BYTES as u32,
+            "the batch carries every queued byte"
+        );
+    }
+
+    /// A peer reset frees the stream's stream window but must hand its deferred connection credit
+    /// back: otherwise repeated resets spend the shared window and stall unrelated streams.
+    #[test]
+    fn a_failed_stream_returns_its_deferred_credit() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::clone(&written),
+                slices: Arc::clone(&slices),
+            }),
+            true,
+        );
+        let (_reader, _writer, _out) = conn.open(1, false).expect("stream opens");
+        for _ in 0..3 {
+            assert!(queue_data(&conn, 0, 1, vec![0x5Au8; 16_384]));
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "three frames are below the batch and grant nothing yet"
+        );
+        conn.fail_stream(1);
+        assert!(
+            conn.control.drained(Duration::from_secs(1)),
+            "the returned credit writes before it is read"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 13, "one connection credit and nothing else");
+        let (len, kind, flags, sid) = read_head(&mut &bytes[..]).expect("head");
+        assert_eq!(
+            (len, kind, flags, sid),
+            (4, T_WINDOW, 0, 0),
+            "the reset returns the connection window"
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
+            3 * 16_384,
+            "the reset returns every deferred byte"
+        );
+    }
+
     /// A writer whose first `write_slices` holds the lock until the test releases it, so a second
     /// credit proves it queued instead of waiting behind a data write the peer has not drained.
     struct Blocked {
@@ -5850,6 +6083,7 @@ mod tests {
                 abandoned: true,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
@@ -5913,6 +6147,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(total as u64),
@@ -6112,6 +6347,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -6157,6 +6393,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -6217,6 +6454,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(4),
@@ -6252,6 +6490,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(0),
@@ -6396,6 +6635,7 @@ mod tests {
                 abandoned: false,
                 status: None,
                 dead: false,
+                pending_credit: 0,
             }),
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),

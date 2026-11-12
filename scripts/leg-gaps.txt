@@ -50,6 +50,9 @@ trojan-tls-grpc-down-8|server-cpu|1.09|696
 trojan-tls-grpc-down-8|server-threads|1.15|696
 trojan-tls-xhttp-h2-down-8|server-threads|1.70|696
 vmess-tls-xhttp-h2-down-8|server-threads|1.70|696
+# The h2 server keeps one thread per stream and the relay pool on top; its vless, trojan and vmess h2 siblings file the same #696 gap at 1.70-1.85.
+shadowsocks-tls-xhttp-h2-down-8|server-threads|1.70|696
+shadowsocks2022-tls-xhttp-h2-down-8|server-threads|1.40|696
 vmess-tls-ws-down-8|server-threads|1.54|696
 vmess-reality-raw-down-8|server|0.78|486|ceiling
 vmess-grpc-down-8|server-threads|1.08|696
