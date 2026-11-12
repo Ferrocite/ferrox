@@ -37042,7 +37042,7 @@ fn outbound_mux(outbound: &Json) -> Result<Mux, String> {
     let udp443 = match mux.get("xudpProxyUDP443") {
         None => Udp443::Reject,
         Some(Json::Str(policy)) => match policy.as_str() {
-            "reject" => Udp443::Reject,
+            "" | "reject" => Udp443::Reject,
             "allow" => Udp443::Allow,
             "skip" => Udp443::Skip,
             _ => return Err(format!("unknown \"xudpProxyUDP443\": {policy}")),
@@ -52094,6 +52094,16 @@ mod tests {
             out.mux.udp_443("192.0.2.1:443".parse().expect("addr")),
             Udp443::Reject,
             "xray's default refuses udp/443"
+        );
+        let empty = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpProxyUDP443": ""}}]}"#,
+        )
+        .expect("parses");
+        let empty = find_shadowsocks_outbound(&empty).expect("finds");
+        assert_eq!(
+            empty.mux.udp443,
+            Udp443::Reject,
+            "an empty policy is xray's default"
         );
         let direct = crate::json::parse(
             r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpConcurrency": -1, "xudpProxyUDP443": "skip"}}]}"#,
