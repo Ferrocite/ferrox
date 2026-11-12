@@ -22667,7 +22667,7 @@ fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked
 /// Nothing carries the destination onward, so this lane is the one that has to redirect it,
 /// resolve it by the configured strategy, and add the header or fragment the config asks for.
 fn serve_connect_freedom(
-    client: &Connection,
+    mut client: &Connection,
     freedom: &FreedomOut,
     asked: &Destination,
     prefix: &[u8],
@@ -24155,6 +24155,37 @@ fn http_head_is_interim(head: &[u8]) -> bool {
     code.len() == 3 && code[0] == b'1' && code.iter().all(u8::is_ascii_digit)
 }
 
+/// Whether every header line's name is an HTTP token, so a head that needs no rewrite can be forwarded as it landed.
+fn header_names_are_tokens(head: &[u8]) -> bool {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            return true;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            return true;
+        }
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            at = end + 1;
+            continue;
+        }
+        let valid = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|colon| header_name_is_token(&line[..colon]));
+        if !valid {
+            return false;
+        }
+        at = end + 1;
+    }
+    true
+}
+
 /// Removes every header line whose name is not an HTTP token, in place: a name the origin would
 /// frame differently from the bytes this side relays is a request-smuggling desync, not a header.
 fn drop_invalid_header_names(head: &mut Vec<u8>) {
@@ -24454,8 +24485,12 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 forward_headers(&origin, &mut attrs);
                 attrs
             });
-            let mut origin = origin;
-            drop_invalid_header_names(&mut origin);
+            let filtered = (!header_names_are_tokens(&origin)).then(|| {
+                let mut copy = origin.clone();
+                drop_invalid_header_names(&mut copy);
+                copy
+            });
+            let prefix = filtered.as_deref().unwrap_or(&origin);
             let facts = FlowFacts {
                 source: None,
                 local: None,
@@ -24476,7 +24511,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 &out,
                 &asked,
                 Front::Http,
-                &origin,
+                prefix,
                 tag.as_deref(),
                 facts,
             );
