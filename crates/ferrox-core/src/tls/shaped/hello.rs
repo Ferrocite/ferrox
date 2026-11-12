@@ -2022,6 +2022,7 @@ mod tests {
         assert_eq!(&session[4..], ticket.bytes.as_slice());
     }
 
+    #[test]
     fn a_grease_collision_at_the_mask_edge_does_not_overflow() {
         let grease = distinct_grease([0xffff; 7]);
         for slot in [3usize, 5, 6] {
