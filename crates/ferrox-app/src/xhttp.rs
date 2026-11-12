@@ -14,8 +14,6 @@ pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
 /// The chunk a response frames: the reference's HTTP writer hands its reader one `buf.Size` buffer at a time.
 const WIRE_CHUNK: usize = 8 * 1024;
-/// The chunks one relay window leaves as.
-const FRAMES_PER_WINDOW: usize = CHUNK.div_ceil(WIRE_CHUNK);
 /// A whole body plus the longest size line that can precede it and both bytes that close the body, so one framing read opens and finishes it.
 const FRAMING_READ: usize = CHUNK + 131;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -1050,18 +1048,12 @@ impl XhttpWriter {
             if window.is_empty() {
                 continue;
             }
-            let mut lines = [[0u8; 7]; FRAMES_PER_WINDOW];
-            let mut parts: [&[u8]; FRAMES_PER_WINDOW * 3] = [&[]; FRAMES_PER_WINDOW * 3];
-            let mut kept = 0usize;
-            for (piece, line) in window.chunks(WIRE_CHUNK).zip(&mut lines) {
-                let len = size_line(piece.len(), line);
-                parts[kept] = &line[..len];
-                parts[kept + 1] = piece;
-                parts[kept + 2] = b"\r\n";
-                kept += 3;
-            }
-            if !stream.write_slices(&parts[..kept]) {
-                return false;
+            for piece in window.chunks(WIRE_CHUNK) {
+                let mut line = [0u8; 7];
+                let len = size_line(piece.len(), &mut line);
+                if !stream.write_slices(&[&line[..len], piece, b"\r\n"]) {
+                    return false;
+                }
             }
         }
         true
@@ -3923,9 +3915,9 @@ mod tests {
         }
     }
 
-    /// The sink frames one relay window in one call: `one_window_is_one_framed_offer` counts the `write_slices` calls and reassembles their bytes, because a socket sees the bytes and not how many calls carried them.
+    /// The sink frames one relay window a peer-sized chunk at a time: `a_window_is_framed_one_reference_chunk_at_a_time` counts the `write_slices` calls and reassembles their bytes, because a socket sees the bytes and not how many calls carried them.
     #[test]
-    fn one_window_is_one_framed_offer() {
+    fn a_window_is_framed_one_reference_chunk_at_a_time() {
         #[derive(Default)]
         struct Frames {
             calls: usize,
@@ -3957,7 +3949,8 @@ mod tests {
         assert!(writer.send(&payload), "the window is framed");
         let seen = log.lock().expect("sink");
         assert_eq!(
-            seen.calls, 1,
+            seen.calls,
+            CHUNK.div_ceil(WIRE_CHUNK),
             "a promoted window left as {} framed offers",
             seen.calls
         );
