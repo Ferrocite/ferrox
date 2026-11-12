@@ -378,7 +378,10 @@ impl Read for H3Reader {
         if !more {
             return Ok(0);
         }
-        let n = self.frame_left.min(self.buf.len() - self.buf_at).min(buf.len());
+        let n = self
+            .frame_left
+            .min(self.buf.len() - self.buf_at)
+            .min(buf.len());
         buf[..n].copy_from_slice(&self.buf[self.buf_at..self.buf_at + n]);
         self.buf_at += n;
         self.frame_left -= n;
