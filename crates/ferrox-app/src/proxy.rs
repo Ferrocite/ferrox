@@ -54565,9 +54565,11 @@ mod tests {
                         stream.write_all(&chunk[..n]).expect("writes the bulk");
                         left -= n;
                     }
+                    echo_trace("sink wrote all");
                     let _ = stream.shutdown(std::net::Shutdown::Write);
                     let mut rest = [0u8; 1024];
                     while stream.read(&mut rest).unwrap_or(0) != 0 {}
+                    echo_trace("sink drained");
                 });
             }
         });
@@ -54607,6 +54609,7 @@ mod tests {
                             true,
                             |_, _| true,
                         );
+                        echo_trace("carrier returned");
                     });
                 });
             }
@@ -54641,8 +54644,12 @@ mod tests {
                 while got < BULK {
                     let n = sock.read(&mut buf).expect("the download must not stall");
                     assert!(n > 0, "a flow ended early at {got} of {BULK}");
+                    if got == 0 {
+                        echo_trace("flow read first");
+                    }
                     got += n;
                 }
+                echo_trace("flow read all");
                 got
             }));
         }
