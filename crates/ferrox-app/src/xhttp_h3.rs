@@ -347,6 +347,12 @@ impl H3Reader {
             return Ok(true);
         }
         if self.ended {
+            if self.frame_left > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "h3 data frame ended early",
+                ));
+            }
             return Ok(false);
         }
         if self.frame_left > 0 {
