@@ -1575,6 +1575,7 @@ enum Owned {
 
 /// The request stream's frame state: the head block and the capsule bytes a
 /// CONNECT-IP tunnel answers with, kept apart because a frame can split either.
+#[derive(Default)]
 struct Stream {
     id: u64,
     buf: Vec<u8>,
@@ -1586,25 +1587,6 @@ struct Stream {
     done: bool,
     packets: Vec<Vec<u8>>,
     early_bytes: usize,
-    mtu: usize,
-}
-
-impl Default for Stream {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            buf: Vec::new(),
-            at: 0,
-            capsules: Vec::new(),
-            capsule_at: 0,
-            status: None,
-            pending: Vec::new(),
-            done: false,
-            packets: Vec::new(),
-            early_bytes: 0,
-            mtu: DEFAULT_MTU,
-        }
-    }
 }
 
 impl Stream {
@@ -1739,7 +1721,7 @@ impl Stream {
             let owned = match capsule {
                 connectip::Capsule::AddressAssign(body) => Owned::AddressAssign(body.to_vec()),
                 #[cfg(test)]
-                connectip::Capsule::Datagram(payload) if payload.len() <= self.mtu => {
+                connectip::Capsule::Datagram(payload) if payload.len() <= DEFAULT_MTU => {
                     Owned::Datagram(payload.to_vec())
                 }
                 _ => Owned::Other,
@@ -3365,7 +3347,6 @@ fn drain_capsules(tunnel: &mut Tunnel, mtu: usize) -> Option<Vec<Vec<u8>>> {
                     udp.send(payload);
                 }
             }
-            connectip::Capsule::Datagram(_) => {}
             connectip::Capsule::AddressRequest(body) if tunnel.udp.is_none() => {
                 let assignments = respond(body, &tunnel.addrs);
                 if !assignments.is_empty() {
