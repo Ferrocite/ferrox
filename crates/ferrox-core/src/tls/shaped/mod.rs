@@ -31,8 +31,13 @@ pub struct Profile {
 
 impl Profile {
     /// uTLS's PSK profiles carry a `PreSharedKeyExtension` slot; a TLS 1.3 ticket rides only those.
+    /// A custom profile's name is the config's, not uTLS's, so only its extension table can open the slot.
     fn offers_psk(&self) -> bool {
-        self.name.contains("_psk") || self.exts.iter().any(|ext| ext.kind == 0x0029)
+        self.exts.iter().any(|ext| ext.kind == 0x0029)
+            || (self.name.contains("_psk")
+                && Fingerprint::resolve(self.name)
+                    .and_then(Fingerprint::profile)
+                    .is_some_and(|stock| std::ptr::eq(stock, self)))
     }
 }
 

@@ -596,7 +596,7 @@ fn profile_enabled(profile: Fingerprint, disabled: &[String]) -> bool {
 
 impl TlsShape {
     /// The browser hello one dial presents: a configured parrot drawn uniformly, the
-    /// reference's randomized shape when its coin lands, or Chrome when nothing is named.
+    /// reference's randomized shape when its coin lands, or the unshaped hello when nothing is allowed.
     pub(crate) fn fingerprint(&self, fronted: bool, provider: Option<&str>) -> Fingerprint {
         if let Some(profile) = self.forced_profile {
             return profile;
@@ -612,6 +612,11 @@ impl TlsShape {
         } else {
             &[]
         };
+        let fallback = if profile_enabled(Fingerprint::default(), disabled) {
+            Fingerprint::default()
+        } else {
+            Fingerprint::stock()
+        };
         let custom: Vec<Fingerprint> = self
             .custom_profiles
             .iter()
@@ -621,7 +626,7 @@ impl TlsShape {
         let mut stock: Vec<Fingerprint> = if self.use_only_custom_profiles && !custom.is_empty() {
             Vec::new()
         } else if self.profiles.is_empty() {
-            vec![Fingerprint::default()]
+            vec![fallback]
         } else {
             self.profiles
                 .iter()
@@ -630,7 +635,7 @@ impl TlsShape {
                 .collect()
         };
         if stock.is_empty() && custom.is_empty() {
-            stock.push(Fingerprint::default());
+            stock.push(fallback);
         }
 
         let draw = f64::from(u16::from_be_bytes(dial_random::<2>())) / 65_536.0;
