@@ -1,7 +1,7 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -865,9 +865,15 @@ impl H3Client {
             quic::quiche_config(&tls.roots, None)?
         };
         config.set_initial_max_data(16 * 1024 * 1024);
-        let (sock, local) = quic::datagram_to(peer)?;
+        let sock = if peer.is_ipv6() {
+            UdpSocket::bind("[::]:0").ok()?
+        } else {
+            UdpSocket::bind("0.0.0.0:0").ok()?
+        };
+        let local = sock.local_addr().ok()?;
         let net = quic::network_generation();
         let sock = Arc::new(Datagram::plain(sock));
+        sock.remember_source(peer)?;
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);

@@ -1826,24 +1826,21 @@ pub(crate) fn rebind_path(
     if !sock.rebindable() {
         return Rebind::Unsupported;
     }
-    let Ok(current) = sock.local_addr() else {
+    let Ok(bound) = sock.local_addr() else {
         return Rebind::Failed;
     };
-    let bind = if peer.is_ipv6() {
-        "[::]:0"
+    let current = if bound.ip().is_unspecified() {
+        sock.source
+            .lock()
+            .ok()
+            .and_then(|source| *source)
+            .unwrap_or(bound)
     } else {
-        "0.0.0.0:0"
+        bound
     };
-    let Ok(probe) = UdpSocket::bind(bind) else {
+    let Some(source) = probe_source(peer) else {
         return Rebind::Failed;
     };
-    if probe.connect(peer).is_err() {
-        return Rebind::Failed;
-    }
-    let Ok(source) = probe.local_addr() else {
-        return Rebind::Failed;
-    };
-    drop(probe);
     let same = match (source, current) {
         (SocketAddr::V4(found), SocketAddr::V4(now)) => found.ip() == now.ip(),
         (SocketAddr::V6(found), SocketAddr::V6(now)) => {
@@ -1870,6 +1867,9 @@ pub(crate) fn rebind_path(
     set_gro(&fresh, true);
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
+    if let Ok(mut slot) = sock.source.lock() {
+        *slot = Some(source);
+    }
     move_socket(conn, sock, fresh)
 }
 
@@ -2139,6 +2139,10 @@ pub(crate) struct Datagram {
     /// before it pays the lock: a lane that never roams keeps the direct descriptor.
     moved: Arc<AtomicBool>,
     rebound: Arc<Mutex<Option<UdpSocket>>>,
+    /// The source the kernel picked when this lane dialled, kept for a wildcard
+    /// socket so a later route event compares against that source rather than the
+    /// unspecified address the socket was bound to.
+    source: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 /// The datagrams the kernel refused that a later sweep retries, in the order quiche
@@ -2715,7 +2719,18 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         }
+    }
+
+    /// Record the source the kernel picks for `peer` without binding it, for a
+    /// lane whose wildcard socket must keep receiving the peer's replies.
+    pub(crate) fn remember_source(&self, peer: SocketAddr) -> Option<SocketAddr> {
+        let source = probe_source(peer)?;
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(source);
+        }
+        Some(source)
     }
 
     /// A socket whose every datagram is salamander-masked under `obfs`, the Hysteria v2 `obfs: salamander` lane.
@@ -2731,6 +2746,7 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         }
     }
 
@@ -2747,6 +2763,7 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         }
     }
 
@@ -2765,6 +2782,7 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         }
     }
 
@@ -2788,6 +2806,7 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         })
     }
 
@@ -2813,6 +2832,7 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         })
     }
 
@@ -2840,6 +2860,7 @@ impl Datagram {
             held: Arc::default(),
             moved: Arc::default(),
             rebound: Arc::default(),
+            source: Arc::default(),
         })
     }
 
@@ -3026,6 +3047,7 @@ impl Datagram {
             held: Arc::clone(&self.held),
             moved: Arc::clone(&self.moved),
             rebound: Arc::clone(&self.rebound),
+            source: Arc::clone(&self.source),
         })
     }
 
@@ -3212,10 +3234,7 @@ pub(crate) fn datagram_to(peer: SocketAddr) -> Option<(UdpSocket, SocketAddr)> {
     } else {
         "0.0.0.0:0"
     };
-    let probe = UdpSocket::bind(bind).ok()?;
-    probe.connect(peer).ok()?;
-    let source = probe.local_addr().ok()?;
-    drop(probe);
+    let source = probe_source(peer)?;
     let at = match source {
         SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), 0),
         SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -3228,6 +3247,17 @@ pub(crate) fn datagram_to(peer: SocketAddr) -> Option<(UdpSocket, SocketAddr)> {
     let sock = bind_datagram_at(at).or_else(|_| bind_datagram(bind)).ok()?;
     let local = sock.local_addr().ok()?;
     Some((sock, local))
+}
+
+fn probe_source(peer: SocketAddr) -> Option<SocketAddr> {
+    let bind = if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let probe = UdpSocket::bind(bind).ok()?;
+    probe.connect(peer).ok()?;
+    probe.local_addr().ok()
 }
 
 fn bind_datagram_at(at: SocketAddr) -> std::io::Result<UdpSocket> {
