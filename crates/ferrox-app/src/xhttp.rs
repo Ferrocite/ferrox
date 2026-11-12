@@ -124,27 +124,93 @@ fn read_line_into(
     }
 }
 
-fn chunk_size(line: &[u8]) -> Option<usize> {
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkLine {
+    Size(usize),
+    Invalid,
+    Need,
+}
+
+/// One walk from the size line's first byte to the CRLF that ends it: find the
+/// terminator, parse the hex, and leave `at` past the pair. The caller's prefix is
+/// read in place, so the line crosses no stack buffer. `Need` says the CRLF has
+/// not arrived, `Invalid` a line that can never be a size.
+fn xhttp_chunk_line(prefix: &[u8], at: &mut usize) -> ChunkLine {
+    let start = *at;
+    let window = &prefix[start..(start + 130).min(prefix.len())];
     let mut size = 0usize;
+    let mut digits = 0usize;
+    let mut ended = false;
+    let mut invalid = false;
     let mut i = 0;
-    while i < line.len() {
-        let v = CHUNK_LINE_LUT[line[i] as usize];
-        if v == 16 {
-            return if i == 0 { None } else { Some(size) };
+    while i < window.len() {
+        let b = window[i];
+        if !invalid && !ended {
+            let v = CHUNK_LINE_LUT[b as usize];
+            match v {
+                0..=15 => {
+                    if digits == 16 {
+                        invalid = true;
+                    } else {
+                        size = (size << 4) | v as usize;
+                        digits += 1;
+                    }
+                }
+                16 => {
+                    if digits == 0 {
+                        invalid = true;
+                    } else {
+                        ended = true;
+                    }
+                }
+                _ => invalid = true,
+            }
         }
-        if v == 255 {
-            return None;
+        if b == b'\r' && window.get(i + 1) == Some(&b'\n') {
+            if i > 127 {
+                return ChunkLine::Need;
+            }
+            *at = start + i + 2;
+            return if invalid || digits == 0 {
+                ChunkLine::Invalid
+            } else {
+                ChunkLine::Size(size)
+            };
         }
-        if i == 16 {
-            return None;
-        }
-        size = (size << 4) | v as usize;
         i += 1;
     }
-    if i == 0 {
-        return None;
+    ChunkLine::Need
+}
+
+enum SizeLine {
+    Size(usize),
+    Invalid,
+    End,
+}
+
+fn read_chunk_line(reader: &mut Reader<impl Read>) -> std::io::Result<SizeLine> {
+    loop {
+        match xhttp_chunk_line(&reader.prefix, &mut reader.at) {
+            ChunkLine::Size(size) => return Ok(SizeLine::Size(size)),
+            ChunkLine::Invalid => return Ok(SizeLine::Invalid),
+            ChunkLine::Need => {}
+        }
+        if reader.prefix.len() - reader.at >= 129 {
+            return Ok(SizeLine::End);
+        }
+        if reader.at >= reader.prefix.len() {
+            reader.prefix.clear();
+            reader.at = 0;
+        } else if reader.at > 0 {
+            reader.prefix.drain(..reader.at);
+            reader.at = 0;
+        }
+        match reader.fill(FRAMING_READ) {
+            Ok(n) if n > 0 => {}
+            Err(error) if crate::proxy::is_timeout(&error) => return Err(error),
+            _ => return Ok(SizeLine::End),
+        }
     }
-    Some(size)
 }
 
 /// One pass over the size line: 0..=15 is a hex nibble, 16 marks a terminator (any of `;`, space, tab, CR, LF), 255 marks a byte that can be neither.
@@ -366,11 +432,15 @@ impl<R: Read> Reader<R> {
                 }
                 continue;
             }
-            let mut line = [0u8; 130];
-            let len = read_line_into(self, &mut line)?
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-            let size = chunk_size(&line[..len])
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let size = match read_chunk_line(self)? {
+                SizeLine::Size(size) => size,
+                SizeLine::Invalid => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+                }
+                SizeLine::End => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                }
+            };
             if size == 0 {
                 self.chunk = Chunk::Trailers;
                 continue;
@@ -439,15 +509,17 @@ impl<R: Read> Reader<R> {
                     }
                 }
             }
-            let mut line = [0u8; 130];
-            let Some(len) = self.line_in_prefix(&mut line) else {
-                if self.prefix.len() - self.at >= 129 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            let size = match xhttp_chunk_line(&self.prefix, &mut self.at) {
+                ChunkLine::Size(size) => size,
+                ChunkLine::Invalid => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
                 }
-                return Ok(false);
-            };
-            let Some(size) = chunk_size(&line[..len]) else {
-                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                ChunkLine::Need => {
+                    if self.prefix.len() - self.at >= 129 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                    }
+                    return Ok(false);
+                }
             };
             if size == 0 {
                 self.chunk = Chunk::Trailers;
@@ -3939,44 +4011,52 @@ mod tests {
         Some(size)
     }
 
-    /// Bit-identity for the fused `chunk_size`: for every length 0..=20 and every probe byte at every position (with the rest filled by `1`, a hex digit), the fused loop and the two-pass reference agree. The full-window cases (length 16 with and without a terminator) and the length that overruns the cap (17) are the ones the fused rewrite could have moved, so they are covered explicitly.
+    /// Bit-identity for the fused line parser: for every length 0..=20 and every probe byte at every position (with the rest filled by `1`, a hex digit), the walk from the CRLF scan through the hex parse and the two-pass reference agree. The full-window cases (length 16 with and without a terminator) and the length that overruns the cap (17) are the ones the rewrite could have moved, so they are covered explicitly.
     #[test]
-    fn chunk_size_fused_matches_two_pass_on_every_probe() {
+    fn chunk_line_fused_matches_two_pass_on_every_probe() {
         let probes: [u8; 18] = [
             b'0', b'1', b'9', b'a', b'f', b'A', b'F', b';', b' ', b'\t', b'\r', b'\n', b'g', b'/',
             b':', b'@', b'`', 0xff,
         ];
+        let check = |line: &[u8]| {
+            let mut text = line.to_vec();
+            text.extend_from_slice(b"\r\n\x07\x07\x07");
+            let mut at = 0;
+            let want = match chunk_size_two_pass(line) {
+                Some(size) => ChunkLine::Size(size),
+                None => ChunkLine::Invalid,
+            };
+            assert_eq!(xhttp_chunk_line(&text, &mut at), want, "line={line:?}");
+            assert_eq!(at, line.len() + 2, "line={line:?}");
+            let mut at = 0;
+            assert_eq!(
+                xhttp_chunk_line(&text[..line.len()], &mut at),
+                ChunkLine::Need,
+                "line without its CRLF={line:?}"
+            );
+            assert_eq!(at, 0);
+        };
         for len in 0..=20usize {
             let base = vec![b'1'; len];
-            assert_eq!(
-                chunk_size(&base),
-                chunk_size_two_pass(&base),
-                "all-hex len={len}"
-            );
+            check(&base);
             for i in 0..len {
                 for &probe in &probes {
                     let mut line = base.clone();
                     line[i] = probe;
-                    assert_eq!(
-                        chunk_size(&line),
-                        chunk_size_two_pass(&line),
-                        "len={len} pos={i} probe={probe:#04x}"
-                    );
+                    check(&line);
                 }
             }
         }
-        for prefix in [
+        for line in [
             "",
             ";",
             " ;",
             "\t;",
-            "\r\n",
             "f",
             "ff",
             "Ff",
             "1234567890abcdef",
             "1234567890abcdef;",
-            "1234567890abcdef\r\n",
             "1234567890abcdefg",
             "1234567890abcdefg;",
             "1234567890abcdef0",
@@ -3987,12 +4067,30 @@ mod tests {
             "0;",
             "00000",
         ] {
-            assert_eq!(
-                chunk_size(prefix.as_bytes()),
-                chunk_size_two_pass(prefix.as_bytes()),
-                "prefix={prefix:?}"
-            );
+            check(line.as_bytes());
         }
+    }
+
+    #[inline(never)]
+    fn xhttp_line_probe(line: &mut [u8; 12], at: &mut usize) -> ChunkLine {
+        let mut parsed = ChunkLine::Need;
+        for i in 0..256 {
+            line[0] = b'0' + (i % 10) as u8;
+            *at = 0;
+            parsed = xhttp_chunk_line(std::hint::black_box(&line[..]), at);
+            std::hint::black_box(*at);
+        }
+        parsed
+    }
+
+    #[test]
+    fn the_chunk_line_costs_one_walk() {
+        let mut line = *b"12345678\r\nne";
+        let mut at = 0;
+        assert_eq!(
+            xhttp_line_probe(&mut line, &mut at),
+            ChunkLine::Size(0x5234_5678)
+        );
     }
 
     #[test]
