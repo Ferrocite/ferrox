@@ -7238,7 +7238,7 @@ fn dns_udp_with(
         })
         .ok()?;
     let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
-    let frame = socks_udp_frame(&mut framed, None, &target, query);
+    let frame = socks_udp_frame(&mut framed, &target, query);
     client.send(frame).ok()?;
     let mut response = unfilled(ferrox_core::dns::MESSAGE_MAX + 32);
     let read = client.recv(&mut response).ok()?;
@@ -15335,7 +15335,7 @@ fn spawn_udp_uplink_reader(
             let Some(dest) = dest else {
                 continue;
             };
-            let out = socks_udp_frame(&mut reply, None, &target, &buf[..n]);
+            let out = socks_udp_frame(&mut reply, &target, &buf[..n]);
             let _ = udp.send_to(out, dest);
         }
     })
@@ -15920,7 +15920,7 @@ where
             let Some(dest) = dest else {
                 continue;
             };
-            let out = socks_udp_frame(&mut reply, None, &target, chunk);
+            let out = socks_udp_frame(&mut reply, &target, chunk);
             let _ = udp.send_to(out, dest);
         }
     })
@@ -16466,7 +16466,7 @@ where
             let Some(dest) = dest else {
                 continue;
             };
-            let out = socks_udp_frame(&mut reply, None, &src_addr, &buf[..n]);
+            let out = socks_udp_frame(&mut reply, &src_addr, &buf[..n]);
             let _ = udp.send_to(out, dest);
         }
     })
@@ -22636,7 +22636,7 @@ fn reject_socks(client: &Connection) {
     );
 }
 
-fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Handshake) {
+fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Handshake<'_>) {
     let email = handshake
         .account
         .as_ref()
@@ -24841,7 +24841,7 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
                 vacant.insert((leg, association.control, alive))
             }
         };
-        let out = socks_udp_frame(&mut frame, None, &target, &buf[..n]);
+        let out = socks_udp_frame(&mut frame, &target, &buf[..n]);
         let _ = leg.0.send(out);
     }
 }
@@ -24924,7 +24924,7 @@ fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound, listen: Soc
                 vacant.insert((leg, association.control, alive))
             }
         };
-        let out = socks_udp_frame(&mut frame, None, &original, &buf[..n]);
+        let out = socks_udp_frame(&mut frame, &original, &buf[..n]);
         let _ = leg.0.send(out);
     }
 }
@@ -25026,7 +25026,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             }
         }
         let frame = match dial {
-            Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
+            Some(address) => socks_udp_frame(&mut frame, &address, payload),
             None => &buf[..n],
         };
         let _ = relay.send_to(frame, lane_address);
@@ -25194,7 +25194,7 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
                         while let Ok((data, from)) = flow.down.recv() {
                             // The header names the sender the bridge saw, so the datagram reads as coming from the address that answered.
                             let sender = from.unwrap_or(dest);
-                            let frame = socks_udp_frame(&mut frame, None, &sender, &data);
+                            let frame = socks_udp_frame(&mut frame, &sender, &data);
                             if output.send_to(frame, client_addr).is_err() {
                                 break;
                             }
@@ -25338,7 +25338,7 @@ fn serve_socks_udp_split(
                 };
                 if let Some(lane_address) = lane_address {
                     let frame = match dial {
-                        Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
+                        Some(address) => socks_udp_frame(&mut frame, &address, payload),
                         None => &buf[..n],
                     };
                     let _ = relay.send_to(frame, lane_address);
@@ -25518,8 +25518,14 @@ fn serve_socks_udp_client(
                     continue;
                 }
                 touch(&activity);
-                let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &dest, payload);
-                if sender.send(out).is_err() {
+                let forwarded = socks_udp_forwarded(&buf[..n], &dest, payload);
+                let sent = if let Some(whole) = forwarded {
+                    sender.send(whole).is_ok()
+                } else {
+                    let (front, tail) = socks_udp_parts(&mut frame, &dest, payload);
+                    send_two(&sender, front, tail).is_ok()
+                };
+                if !sent {
                     break;
                 }
             }
@@ -25628,8 +25634,14 @@ fn serve_udp_answer(
         let Some(dest) = source.lock().ok().and_then(|slot| *slot) else {
             continue;
         };
-        let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &from, payload);
-        if client.send_to(out, dest).is_err() {
+        let forwarded = socks_udp_forwarded(&buf[..n], &from, payload);
+        let sent = if let Some(whole) = forwarded {
+            client.send_to(whole, dest).is_ok()
+        } else {
+            let (front, tail) = socks_udp_parts(&mut frame, &from, payload);
+            send_to_two(client, front, tail, dest).is_ok()
+        };
+        if !sent {
             break;
         }
         touch(activity);
@@ -25842,7 +25854,7 @@ fn freedom_reader(
             let Some(source) = source.lock().ok().and_then(|slot| *slot) else {
                 continue;
             };
-            let out = socks_udp_frame(&mut framed, None, &dest, &back[..read]);
+            let out = socks_udp_frame(&mut framed, &dest, &back[..read]);
             if relay.send_to(out, source).is_err() {
                 break;
             }
@@ -26118,7 +26130,7 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
         match ferrox_core::dns::decide(payload, &dns.rules, &dns_lookup) {
             ferrox_core::dns::Step::Quiet => {}
             ferrox_core::dns::Step::Reply(answer) => {
-                let out = socks_udp_frame(&mut frame, None, &dest, &answer);
+                let out = socks_udp_frame(&mut frame, &dest, &answer);
                 if relay.send_to(out, src).is_err() {
                     break;
                 }
@@ -26155,8 +26167,7 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
                                 DnsUpstream::Tcp(stream) => {
                                     match read_dns_source(stream, &mut body) {
                                         Some(message) => {
-                                            let out =
-                                                socks_udp_frame(&mut framed, None, &named, message);
+                                            let out = socks_udp_frame(&mut framed, &named, message);
                                             let Some(src) = peer.lock().ok().and_then(|slot| *slot)
                                             else {
                                                 continue;
@@ -26168,12 +26179,8 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
                                 }
                                 DnsUpstream::Udp(socket) => match socket.recv(&mut back) {
                                     Ok(read) => {
-                                        let out = socks_udp_frame(
-                                            &mut framed,
-                                            None,
-                                            &named,
-                                            &back[..read],
-                                        );
+                                        let out =
+                                            socks_udp_frame(&mut framed, &named, &back[..read]);
                                         let Some(src) = peer.lock().ok().and_then(|slot| *slot)
                                         else {
                                             continue;
@@ -26273,7 +26280,7 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Co
                     Ok(n) => {
                         quiet = Instant::now();
                         if let Some(src) = client {
-                            let out = socks_udp_frame(&mut reply, None, dest, &datagram[..n]);
+                            let out = socks_udp_frame(&mut reply, dest, &datagram[..n]);
                             let _ = relay.send_to(out, src);
                         }
                     }
@@ -26415,7 +26422,7 @@ fn drain_foxy_ip_tunnel(
                 }
                 let peer = socket_from_bytes(read.source, read.destination);
                 if let Some(src) = client {
-                    let out = socks_udp_frame(reply, None, &peer, read.payload);
+                    let out = socks_udp_frame(reply, &peer, read.payload);
                     let _ = relay.send_to(out, src);
                 }
             }
@@ -26964,7 +26971,7 @@ fn spawn_ss_udp_reader2022(
                     let Some(dest) = dest else {
                         continue;
                     };
-                    let out = socks_udp_frame(&mut reply, None, &target, payload);
+                    let out = socks_udp_frame(&mut reply, &target, payload);
                     let _ = send.send_to(out, dest);
                 }
                 Err(error) if is_timeout(&error) => {
@@ -27223,7 +27230,7 @@ fn serve_socks_udp_pool<F, G>(
                 return;
             };
             let mut head = Vec::with_capacity(HEAD);
-            let out = socks_udp_frame(&mut head, None, &target.unwrap_or(dest), data);
+            let out = socks_udp_frame(&mut head, &target.unwrap_or(dest), data);
             let _ = sink_reply.send_to(out, peer);
         });
         if let Some(flow) = pool.udp(&target, id.as_ref(), &buf[at..at + len], deliver) {
@@ -33880,22 +33887,32 @@ fn socks_udp_head_len(frame: &[u8], dest: &SocketAddr) -> Option<usize> {
     }
 }
 
+/// The SOCKS5 UDP frame to send for a datagram: the head and the payload in the caller's buffer.
+///
+/// A caller that already holds the frame it arrived in asks `socks_udp_forwarded` first: when
+/// that frame is byte for byte the one this tree would build, it is sent as it arrived and the
+/// payload is not copied at all. Otherwise the frame is rebuilt here around the payload, which
+/// is the only copy there is. The caller's buffer is the only buffer: the frame never allocates.
 pub(crate) fn socks_udp_frame<'a>(
     out: &'a mut Vec<u8>,
-    client: Option<&'a [u8]>,
     dest: &SocketAddr,
     payload: &'a [u8],
 ) -> &'a [u8] {
-    if let Some(client) = client {
-        if let Some(head) = socks_udp_head_len(client, dest) {
-            if client.len() == head + payload.len() {
-                return client;
-            }
-        }
-    }
     socks_udp_head(out, dest);
     out.extend_from_slice(payload);
     out
+}
+
+/// The datagram as it arrived, when the client framed it with the literal address the tree
+/// would have written: the payload is the frame's own tail, so nothing is copied. A name, a
+/// short tail or a header the tree would not have written returns `None` and is rebuilt.
+fn socks_udp_forwarded<'a>(
+    client: &'a [u8],
+    dest: &SocketAddr,
+    payload: &[u8],
+) -> Option<&'a [u8]> {
+    let head = socks_udp_head_len(client, dest)?;
+    (client.len() == head + payload.len()).then_some(client)
 }
 
 /// Read a SOCKS address body straight off a slice: the same field order `read_socks_addr_rest` draws from a stream, read where the bytes already lie, so a relayed datagram pays no cursor, no `dyn Read` call per field and no copy into scratch.
@@ -33990,24 +34007,26 @@ pub(crate) fn parse_socks_udp_dest(packet: &[u8]) -> Option<(Destination, &[u8])
 
 /// The handshake a front's client made: the command, the destination, and the version
 /// the reply is written in.
-struct Handshake {
+struct Handshake<'a> {
     /// 1 for CONNECT, 3 for UDP ASSOCIATE.
     cmd: u8,
     /// The destination the request named.
     asked: Destination,
     /// The version the client spoke.
     version: crate::socks::Version,
-    /// The account the greeting authenticated, when the front asked for one.
-    account: Option<SocksAccount>,
+    /// The account the greeting authenticated, when the front asked for one. Borrowed
+    /// from the front's own list, which outlives the flow, so the handshake takes no
+    /// heap copy of a name and a password.
+    account: Option<&'a SocksAccount>,
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
 #[cfg(test)]
-fn socks_target(
+fn socks_target<'a>(
     client: &mut Connection,
     grant: bool,
-    accounts: &SocksAccounts,
-) -> Option<Handshake> {
+    accounts: &'a SocksAccounts,
+) -> Option<Handshake<'a>> {
     // Bound only the greeting to a wall-clock budget, then restore the untimed relay reads behind it.
     let budget = budgets::handshake();
     let _ = client.set_read_timeout(Some(budget));
@@ -34017,12 +34036,12 @@ fn socks_target(
 }
 
 /// Each greeting read under the deadline the caller armed: the relay's `read_exact` retries a quiet socket forever, so the socket's poll quantum wakes the read and the deadline ends it.
-fn socks_request(
+fn socks_request<'a>(
     client: &mut Connection,
     grant: bool,
     until: Instant,
-    accounts: &SocksAccounts,
-) -> Option<Handshake> {
+    accounts: &'a SocksAccounts,
+) -> Option<Handshake<'a>> {
     let mut head = [0u8; 2];
     read_exact(
         &mut HandshakeDeadline {
@@ -34204,11 +34223,11 @@ fn read_socks4_name(client: &mut Connection, until: Instant, buf: &mut [u8]) -> 
 /// The RFC 1929 exchange: the version, the name's length, the name, the password's
 /// length, and the password. The answer is the version and a status byte — zero when
 /// the account is one the front knows.
-fn socks_authenticate(
+fn socks_authenticate<'a>(
     client: &mut Connection,
     until: Instant,
-    accounts: &SocksAccounts,
-) -> Option<SocksAccount> {
+    accounts: &'a SocksAccounts,
+) -> Option<&'a SocksAccount> {
     let mut head = [0u8; 2];
     if read_exact(
         &mut HandshakeDeadline {
@@ -34225,13 +34244,14 @@ fn socks_authenticate(
         let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, 1]);
         return None;
     }
-    let mut user = crate::proxy::unfilled(usize::from(head[1]));
+    let mut name = [0u8; u8::MAX as usize];
+    let user_len = usize::from(head[1]);
     if read_exact(
         &mut HandshakeDeadline {
             inner: &mut *client,
             until,
         },
-        &mut user,
+        &mut name[..user_len],
     )
     .is_err()
     {
@@ -34249,19 +34269,20 @@ fn socks_authenticate(
     {
         return None;
     }
-    let mut pass = crate::proxy::unfilled(usize::from(len[0]));
+    let mut pass = [0u8; u8::MAX as usize];
+    let pass_len = usize::from(len[0]);
     if read_exact(
         &mut HandshakeDeadline {
             inner: &mut *client,
             until,
         },
-        &mut pass,
+        &mut pass[..pass_len],
     )
     .is_err()
     {
         return None;
     }
-    let accepted = accounts.account(&user, &pass).cloned();
+    let accepted = accounts.account(&name[..user_len], &pass[..pass_len]);
     let _ = client.write_all(&[
         ferrox_core::socks::AUTH_VERSION,
         u8::from(accepted.is_none()),
@@ -41352,7 +41373,8 @@ mod tests {
             client.write_all(b"example.com").expect("names");
             client.write_all(&[0, 80]).expect("ports");
             let mut server = accepted.join().expect("accepts");
-            let handshake = socks_target(&mut server, grant, &no_accounts()).expect("handshakes");
+            let accounts = no_accounts();
+            let handshake = socks_target(&mut server, grant, &accounts).expect("handshakes");
             assert_eq!(handshake.cmd, 1);
             assert_eq!(handshake.asked.authority(), "example.com:80");
             let mut reply = [0u8; 2];
@@ -41387,7 +41409,8 @@ mod tests {
         greeting.extend([0, 80]);
         client.write_all(&greeting).expect("greets");
         let mut server = accepted.join().expect("accepts");
-        let handshake = socks_target(&mut server, true, &no_accounts()).expect("handshakes");
+        let accounts = no_accounts();
+        let handshake = socks_target(&mut server, true, &accounts).expect("handshakes");
         assert_eq!(handshake.cmd, 1);
         assert_eq!(handshake.asked.authority(), "example.com:80");
         let mut reply = [0u8; 2];
@@ -50676,7 +50699,7 @@ mod tests {
         let payloads = [format!("ping-{echo_port}"), format!("pong-{echo_port}")];
         let mut frame = Vec::new();
         for (index, payload) in payloads.iter().map(String::as_bytes).enumerate() {
-            let datagram = socks_udp_frame(&mut frame, None, &target, payload);
+            let datagram = socks_udp_frame(&mut frame, &target, payload);
             assert_eq!(
                 socks_udp_answer(udp, datagram, payload, tag, index == 0),
                 target,
@@ -55431,7 +55454,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("timeout");
         let mut head = Vec::new();
-        let frame = socks_udp_frame(&mut head, None, &dest, b"ping");
+        let frame = socks_udp_frame(&mut head, &dest, b"ping");
         client.send_to(frame, relay_addr).expect("sends");
         let mut buf = udp_buffer();
         let (n, _) = client.recv_from(&mut buf).expect("the echo returns");
@@ -55503,11 +55526,11 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("timeout");
         let mut lost = Vec::new();
-        let first = socks_udp_frame(&mut lost, None, &target, b"lost");
+        let first = socks_udp_frame(&mut lost, &target, b"lost");
         client.send_to(first, relay_addr).expect("sends");
         thread::sleep(Duration::from_millis(300));
         let mut head = Vec::new();
-        let frame = socks_udp_frame(&mut head, None, &target, b"ping");
+        let frame = socks_udp_frame(&mut head, &target, b"ping");
         client.send_to(frame, relay_addr).expect("sends");
         let mut buf = udp_buffer();
         let (n, _) = client.recv_from(&mut buf).expect("the redial echoes");
@@ -66127,6 +66150,39 @@ mod tests {
         drop(client);
     }
 
+    /// The RFC 1929 exchange costs no heap buffer: the name and the password are read
+    /// into stack blocks and the account is borrowed from the front's list, which
+    /// outlives the flow. The pinned Go server allocates the name, the password and the
+    /// account it answers with.
+    #[test]
+    fn a_credentialed_literal_handshake_costs_no_heap_buffer() {
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![SocksAccount {
+                user: "u".to_owned(),
+                pass: "p".to_owned(),
+                email: String::new(),
+                level: 0,
+            }],
+        };
+        // The greeting, the RFC 1929 block, and the request for a local address.
+        let request = [
+            5, 1, 2, 1, 1, b'u', 1, b'p', 5, 1, 0, 1, 127, 0, 0, 1, 0, 80,
+        ];
+        let (client, mut server) = socks4_pair(&request);
+        let (asked, counts) = ferrox_core::alloc_count::measure(|| {
+            socks_target(&mut server, false, &accounts)
+                .expect("handshakes")
+                .asked
+        });
+        assert_eq!(asked.authority(), "127.0.0.1:80");
+        assert_eq!(
+            counts.allocs, 0,
+            "the credential is read on the stack and the account is borrowed"
+        );
+        drop(client);
+    }
+
     /// The association the device front and the door both ride: the server half is the
     /// tree's own SOCKS5 UDP path, and the reply names the relay its lane reads from.
     #[test]
@@ -66588,30 +66644,26 @@ mod tests {
         push_socks_addr(&mut client, &dest);
         client.extend_from_slice(payload);
 
-        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
-        let base = out.as_ptr() as usize;
-        let capacity = out.capacity();
+        let forwarded =
+            socks_udp_forwarded(&client, &dest, payload).expect("the literal frame goes on");
+        assert_eq!(
+            forwarded.as_ptr() as usize,
+            client.as_ptr() as usize,
+            "the datagram is sent as the client framed it"
+        );
+
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
-            assert_eq!(
-                sent.as_ptr() as usize,
-                client.as_ptr() as usize,
-                "the datagram is sent as the client framed it"
-            );
+            let sent =
+                socks_udp_forwarded(&client, &dest, payload).expect("the literal frame goes on");
+            assert_eq!(sent, &client[..]);
         });
         assert_eq!(counts.allocs, 0, "the frame costs no buffer of its own");
-        assert_eq!(out.as_ptr() as usize, base, "the buffer does not move");
-        assert_eq!(out.capacity(), capacity, "the buffer does not grow");
 
         // The frame the tree would have built is byte for byte the client's own, so the fast path cannot change a byte on the wire.
-        let mut rebuilt = vec![0, 0, 0];
-        push_socks_addr(&mut rebuilt, &dest);
-        rebuilt.extend_from_slice(payload);
-        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
-        let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+        let mut rebuilt_out = Vec::with_capacity(HEAD + UDP_BUF);
+        let rebuilt = socks_udp_frame(&mut rebuilt_out, &dest, payload);
         assert_eq!(
-            sent,
-            &rebuilt[..],
+            forwarded, rebuilt,
             "the bytes on the wire are the tree's own"
         );
     }
@@ -66626,14 +66678,13 @@ mod tests {
         push_socks_addr(&mut client, &dest);
         client.extend_from_slice(payload);
 
-        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
-        let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+        let forwarded =
+            socks_udp_forwarded(&client, &dest, payload).expect("the literal frame goes on");
         assert_eq!(
-            sent.as_ptr() as usize,
+            forwarded.as_ptr() as usize,
             client.as_ptr() as usize,
             "the datagram is sent as the client framed it"
         );
-        assert!(out.is_empty(), "the rebuild buffer was not touched");
     }
 
     /// A datagram the client framed with a name is not the frame this tree builds —
@@ -66649,7 +66700,11 @@ mod tests {
         client.extend_from_slice(payload);
 
         let mut out = Vec::with_capacity(HEAD + UDP_BUF);
-        let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+        assert!(
+            socks_udp_forwarded(&client, &dest, payload).is_none(),
+            "the name frame is not the tree's"
+        );
+        let sent = socks_udp_frame(&mut out, &dest, payload);
         assert_ne!(
             sent.as_ptr() as usize,
             client.as_ptr() as usize,
@@ -66663,6 +66718,41 @@ mod tests {
         assert_eq!(&sent[4..8], &[198, 51, 100, 7], "the address it resolved");
         assert_eq!(&sent[8..10], &443u16.to_be_bytes(), "the port");
         assert_eq!(&sent[10..], payload, "the payload");
+    }
+
+    /// The SOCKS client lane hands the head and the payload to the kernel as two parts, so
+    /// a datagram it has to reframe around the address it resolved copies no payload: the
+    /// tail is the caller's own pointer and the head keeps its base and capacity over a
+    /// push/drain cycle. The bytes on the wire are the client's own frame for a literal.
+    #[test]
+    fn a_client_datagram_hands_its_payload_over_by_pointer() {
+        let dest: SocketAddr = "198.51.100.7:443".parse().expect("addr");
+        let payload = b"the payload the client sent";
+        let mut head = Vec::with_capacity(HEAD + UDP_BUF);
+        let base = head.as_ptr() as usize;
+        let capacity = head.capacity();
+        for _ in 0..2 {
+            let (front, tail) = socks_udp_parts(&mut head, &dest, payload);
+            assert_eq!(tail.as_ptr(), payload.as_ptr(), "no payload copy");
+            assert_eq!(front.len(), 10, "the literal head is ten bytes");
+            assert_eq!(head.as_ptr() as usize, base, "the head does not move");
+            assert_eq!(head.capacity(), capacity, "the head does not grow");
+        }
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let (front, tail) = socks_udp_parts(&mut head, &dest, payload);
+            assert_eq!(front.len(), 10);
+            assert_eq!(tail.len(), payload.len());
+        });
+        assert_eq!(counts.allocs, 0, "the warm head costs no heap buffer");
+
+        // The two parts are byte for byte the frame the client framed for a literal.
+        let mut framed = vec![0, 0, 0];
+        push_socks_addr(&mut framed, &dest);
+        framed.extend_from_slice(payload);
+        let (front, tail) = socks_udp_parts(&mut head, &dest, payload);
+        let mut wire = front.to_vec();
+        wire.extend_from_slice(tail);
+        assert_eq!(wire, framed, "the bytes on the wire are the client's own");
     }
 
     /// A destination that is an IPv6 literal in the name field is the address and
@@ -69287,7 +69377,7 @@ mod tests {
         )
         .expect("lane");
         let mut buf = Vec::new();
-        let frame = socks_udp_frame(&mut buf, None, &target, b"hi");
+        let frame = socks_udp_frame(&mut buf, &target, b"hi");
         uplink.send(frame).expect("send");
         let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
         let header = ferrox_core::wireguard::transport::HEADER_SIZE;
@@ -69351,7 +69441,7 @@ mod tests {
             .expect("timeout");
         let mut buf = Vec::new();
         let mut back = vec![0u8; UDP_BUF];
-        let frame = socks_udp_frame(&mut buf, None, &target_addr, b"one");
+        let frame = socks_udp_frame(&mut buf, &target_addr, b"one");
         client.send_to(frame, relay_addr).expect("send");
         let mut payloads = Vec::new();
         for _ in 0..8 {
@@ -69366,7 +69456,7 @@ mod tests {
                 .all(|payload| payload.as_slice() == b"tick"),
             "the replies cross the lane while requests are paused"
         );
-        let frame = socks_udp_frame(&mut buf, None, &target_addr, b"two");
+        let frame = socks_udp_frame(&mut buf, &target_addr, b"two");
         client.send_to(frame, relay_addr).expect("send");
         let (n, _) = client.recv_from(&mut back).expect("reply");
         let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
@@ -69419,7 +69509,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("timeout");
             let mut frame = Vec::new();
-            let request = socks_udp_frame(&mut frame, None, &echo_addr, b"one");
+            let request = socks_udp_frame(&mut frame, &echo_addr, b"one");
             client.send_to(request, lane.address).expect("send");
             let mut back = vec![0u8; UDP_BUF];
             let (n, _) = client.recv_from(&mut back).expect("reply");
@@ -69453,7 +69543,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
         let mut frame = Vec::new();
-        let request = socks_udp_frame(&mut frame, None, &echo_addr, b"six");
+        let request = socks_udp_frame(&mut frame, &echo_addr, b"six");
         client.send_to(request, lane.address).expect("send");
         let mut back = vec![0u8; UDP_BUF];
         let (n, _) = client.recv_from(&mut back).expect("reply");
@@ -69490,7 +69580,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .expect("timeout");
             let mut frame = Vec::new();
-            let request = socks_udp_frame(&mut frame, None, &echo_addr, b"one");
+            let request = socks_udp_frame(&mut frame, &echo_addr, b"one");
             client.send_to(request, lane.address).expect("send");
             let mut back = vec![0u8; UDP_BUF];
             client.recv_from(&mut back).is_ok()
@@ -74370,7 +74460,7 @@ mod dns_lane_tests {
         let query = dns_question("nameserver.test.", 16);
         {
             let mut frame = Vec::new();
-            let framed = socks_udp_frame(&mut frame, None, &up_addr, &query);
+            let framed = socks_udp_frame(&mut frame, &up_addr, &query);
             packet.extend_from_slice(framed);
         }
         let relay_token = relay.local_addr().expect("addr");
@@ -74385,7 +74475,7 @@ mod dns_lane_tests {
         let mut back = udp_buffer();
         let (read, _) = app.recv_from(&mut back).expect("answer arrives");
         let mut expected = Vec::new();
-        let framed = socks_udp_frame(&mut expected, None, &up_addr, answer);
+        let framed = socks_udp_frame(&mut expected, &up_addr, answer);
         assert_eq!(&back[..read], framed);
     }
 
@@ -74407,7 +74497,7 @@ mod dns_lane_tests {
         let up_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 53);
         {
             let mut frame = Vec::new();
-            let framed = socks_udp_frame(&mut frame, None, &up_addr, &query);
+            let framed = socks_udp_frame(&mut frame, &up_addr, &query);
             packet.extend_from_slice(framed);
         }
         let relay_token = relay.local_addr().expect("addr");
@@ -75337,7 +75427,7 @@ mod reverse_tests {
         let mut buf = [0u8; 512];
         for (known, payload, want) in exchanges {
             let dest = dests[known];
-            let framed = socks_udp_frame(&mut frame, None, &dest, payload);
+            let framed = socks_udp_frame(&mut frame, &dest, payload);
             client.send_to(framed, relay_addr).expect("send");
             let (n, _) = client.recv_from(&mut buf).expect("reply");
             let (from, replied) = parse_socks_udp(&buf[..n]).expect("frame");

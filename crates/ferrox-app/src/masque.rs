@@ -4870,7 +4870,7 @@ mod tests {
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
         let mut frame = Vec::new();
-        crate::proxy::socks_udp_frame(&mut frame, None, &target, b"hello");
+        crate::proxy::socks_udp_frame(&mut frame, &target, b"hello");
         app.send_to(&frame, relay_address).expect("send");
         let mut received = [0u8; 2048];
         let (n, _) = app.recv_from(&mut received).expect("framed reply");
@@ -4903,7 +4903,7 @@ mod tests {
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
         let mut frame = Vec::new();
-        crate::proxy::socks_udp_frame(&mut frame, None, &target, b"hello");
+        crate::proxy::socks_udp_frame(&mut frame, &target, b"hello");
         app.send_to(&frame, relay_address).expect("send");
         let mut received = [0u8; 2048];
         let (n, _) = app.recv_from(&mut received).expect("framed reply");

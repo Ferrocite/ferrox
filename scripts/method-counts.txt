@@ -789,6 +789,7 @@ socks datagram-payload-copies-per-forwarded-datagram 0 ferrox-app-proxy::tests::
 socks datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
 socks front-name-zero-filled-bytes 0 ferrox-app-proxy::tests::a_socks_front_reads_no_buffer_it_zeroed
 socks datagram-rebuild-copies-per-reframed-datagram 1 ferrox-app-proxy::tests::a_datagram_naming_a_host_is_reframed_around_its_payload
+socks client-datagram-payload-copies 0 ferrox-app-proxy::tests::a_client_datagram_hands_its_payload_over_by_pointer
 socks device-datagram-payload-copies 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
 socks device-datagram-head-reallocations-after-the-first 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
 socks device-datagram-head-bytes 22 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
@@ -800,8 +801,10 @@ socks config-lanes-named 1 ferrox-app-proxy::tests::a_socks_outbound_names_its_s
 socks pb-scenario-sides-decoded 2 ferrox-app-xray_pb::tests::a_socks_scenario_decodes_both_sides
 socks socks4-handshake-allocations 0 ferrox-app-proxy::tests::a_socks4_handshake_costs_no_heap_buffer
 socks socks4a-handshake-allocations 1 ferrox-app-proxy::tests::a_socks4a_handshake_costs_one_heap_buffer
+socks credentialed-literal-handshake-allocations 0 ferrox-app-proxy::tests::a_credentialed_literal_handshake_costs_no_heap_buffer
 socks socks4-reply-bytes 8 ferrox-core-socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes
 socks socks4-client-request-buffers 0 ferrox-app-socks::tests::a_socks4_connect_takes_no_heap_buffer
+socks socks4-request-zero-filled-bytes 0 ferrox-core-socks::tests::the_socks4_request_is_one_unzeroed_buffer
 socks socks4a-client-request-buffers 0 ferrox-app-socks::tests::a_socks4a_connect_takes_no_heap_buffer
 socks socks5-connect-write-calls 2 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
 socks socks5-connect-read-calls 3 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request

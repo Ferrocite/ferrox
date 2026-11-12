@@ -156,12 +156,11 @@ pub fn user_pass(user: &[u8], pass: &[u8]) -> Vec<u8> {
 )]
 #[must_use]
 pub fn request(cmd: u8, target: &Target<'_>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(3 + target.wire_len());
+    let len = target.wire_len();
+    let mut out = Vec::with_capacity(3 + len);
     out.push(VERSION);
     out.push(cmd);
     out.push(0);
-    let len = target.wire_len();
-    out.reserve_exact(len);
     // SAFETY: the address is written into the room below before the vector is read, and `encode_into` fills every byte of it.
     unsafe { out.set_len(3 + len) };
     target.encode_into(&mut out[3..]);
@@ -245,8 +244,17 @@ pub fn refuse4() -> &'static [u8] {
 #[must_use]
 pub fn request4(cmd: u8, port: u16, address: [u8; 4], user: &[u8], name: Option<&[u8]>) -> Vec<u8> {
     let total = 9 + user.len() + name.map_or(0, |name| name.len() + 1);
-    let mut out = vec![0u8; total];
-    request4_into(cmd, port, address, user, name, &mut out).expect("the counted room");
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&[VERSION4, cmd]);
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(&address);
+    out.extend_from_slice(user);
+    out.push(0);
+    if let Some(name) = name {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    debug_assert_eq!(out.len(), total);
     out
 }
 
@@ -355,8 +363,8 @@ pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     out.push(0);
     out.push(0);
     out.push(0);
-    let mut addr = [0u8; 1 + 1 + 256 + 2];
     let len = target.wire_len();
+    let mut addr = [0u8; 260];
     target.encode_into(&mut addr[..len]);
     out.extend_from_slice(&addr[..len]);
     out.extend_from_slice(payload);
@@ -501,6 +509,25 @@ mod tests {
     }
 
     #[test]
+    fn the_socks4_request_is_one_unzeroed_buffer() {
+        let (request, counts) = crate::alloc_count::measure(|| {
+            request4(
+                CMD4_CONNECT,
+                80,
+                [0, 0, 0, 1],
+                b"user",
+                Some(b"example.com"),
+            )
+        });
+        assert_eq!(&request[..8], &[4, 1, 0, 80, 0, 0, 0, 1]);
+        assert_eq!(counts.allocs, 1, "the request is one buffer");
+        assert_eq!(
+            counts.zeroed, 0,
+            "the request is written, not zero-filled before the write"
+        );
+    }
+
+    #[test]
     fn the_socks4_reply_is_the_bytes_the_pinned_server_writes() {
         // `writeSocks4Response` writes the version byte zero, the code, the port and the address — `net.AnyIP` and port 0, both zero.
         assert_eq!(grant4(), &[0, 90, 0, 0, 0, 0, 0, 0]);
@@ -594,6 +621,27 @@ mod tests {
         let (source, payload) = parse_datagram(&out).expect("the frame round trips");
         assert_eq!(source, Bound::V4([198, 51, 100, 7], 53));
         assert_eq!(payload, b"who-is");
+    }
+
+    #[test]
+    fn a_datagram_frame_encodes_every_address_form() {
+        let mut out = Vec::new();
+        datagram(
+            &Target::V6(
+                [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7],
+                53,
+            ),
+            b"p",
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![
+                0, 0, 0, 4, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 53, b'p'
+            ]
+        );
+        datagram(&Target::Name(b"a", 53), b"p", &mut out);
+        assert_eq!(out, vec![0, 0, 0, 3, 1, b'a', 0, 53, b'p']);
     }
 
     #[test]
