@@ -701,6 +701,7 @@ unix unix-permission-mode 504 ferrox-app-conn::tests::a_unix_listener_takes_the_
 unix unix-non-octal-comma-literal 7 ferrox-app-conn::tests::a_unix_comma_path_that_is_not_a_mode_stays_literal
 unix unix-regular-file-refused 16 ferrox-app-conn::tests::a_unix_listener_never_removes_a_regular_file
 unix unix-mode-path-at-field-limit 107 ferrox-app-conn::tests::a_unix_mode_on_a_path_at_the_address_field_limit
+unix unix-mode-staging-litter 0 ferrox-app-conn::tests::a_unix_mode_staging_leaves_only_the_socket
 
 # --- tun device inbound -----------------------------------------------------
 front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh
