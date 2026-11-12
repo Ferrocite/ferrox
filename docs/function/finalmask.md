@@ -46,7 +46,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | pieces-restaged-per-hello | 0 | ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies |
-| filter-verdicts-from-one-list | 4 | ferrox-app-config::tests::a_finalmask_filter_reads_both_lists |
+| filter-verdicts-from-one-list | 5 | ferrox-app-config::tests::a_finalmask_filter_reads_both_lists |
 | getrandoms-for-two-random-widths | 1 | ferrox-core-finalmask::tests::a_random_merged_hello_draws_only_the_random_widths_from_the_supply |
 | merged-buffer-regrowths-per-hello | 0 | ferrox-core-finalmask::tests::the_merged_run_is_the_only_buffer_the_mask_owns |
 | first-merged-hello-growth | 0 | ferrox-core-finalmask::tests::a_merged_first_hello_lands_in_room_it_drew_ahead_of |

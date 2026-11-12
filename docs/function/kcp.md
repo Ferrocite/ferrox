@@ -64,7 +64,7 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 
 | reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries |
 | mask-families-implemented | 9 | ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback |
-| filter-verdicts-from-one-list | 4 | ferrox-app-config::tests::a_finalmask_filter_reads_both_lists |
+| filter-verdicts-from-one-list | 5 | ferrox-app-config::tests::a_finalmask_filter_reads_both_lists |
 | mask-chain-wire-overhead-bytes | 32 | ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask |
 | mask-read-side-payload-copies-per-datagram | 0 | ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire |
 | mask-encode-buffer-allocations-per-frame | 0 | ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames |
