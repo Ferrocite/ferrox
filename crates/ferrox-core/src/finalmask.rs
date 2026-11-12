@@ -364,12 +364,6 @@ impl SourceFilter {
         Self { blocked, allowed }
     }
 
-    /// Merge another stage's lists in config order; either list may be empty.
-    pub fn merge(&mut self, other: Self) {
-        self.blocked.extend(other.blocked);
-        self.allowed.extend(other.allowed);
-    }
-
     /// A blocked match rejects; when an allowlist is present, an address outside it — or a source
     /// the transport cannot name — is rejected.
     pub fn rejects(&self, source: Option<IpAddr>) -> bool {
@@ -396,16 +390,22 @@ impl IpSets {
         self.sets.iter().all(|(ranges, _)| ranges.is_empty())
     }
 
-    fn extend(&mut self, other: Self) {
-        self.sets.extend(other.sets);
-    }
-
     fn matches(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
         self.sets.iter().any(|(ranges, reverse)| {
-            !ranges.is_empty()
-                && ranges.iter().any(|(start, end)| between(ip, *start, *end)) != *reverse
+            let family = ranges
+                .iter()
+                .any(|(start, _)| same_family(ip, start.to_canonical()));
+            family && ranges.iter().any(|(start, end)| between(ip, *start, *end)) != *reverse
         })
     }
+}
+
+fn same_family(ip: IpAddr, other: IpAddr) -> bool {
+    matches!(
+        (ip, other),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
 }
 
 fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
@@ -426,7 +426,7 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 #[derive(Debug, Default, Clone)]
 pub struct Chain {
     stages: Vec<Fragment>,
-    filter: Option<SourceFilter>,
+    filters: Vec<SourceFilter>,
 }
 
 impl Chain {
@@ -439,16 +439,18 @@ impl Chain {
         self.stages.is_empty()
     }
 
-    /// Attach the chain's source filter; a later filter stage merges into it rather than replacing it.
+    /// Attach one more source filter; every stage's verdict is a separate gate.
     pub fn set_filter(&mut self, filter: SourceFilter) {
-        match &mut self.filter {
-            Some(current) => current.merge(filter),
-            slot => *slot = Some(filter),
-        }
+        self.filters.push(filter);
     }
 
-    pub fn filter(&self) -> Option<&SourceFilter> {
-        self.filter.as_ref()
+    pub fn filters(&self) -> &[SourceFilter] {
+        &self.filters
+    }
+
+    /// A source is refused when any filter stage refuses it.
+    pub fn rejects(&self, source: Option<IpAddr>) -> bool {
+        self.filters.iter().any(|filter| filter.rejects(source))
     }
 
     /// The write the stream was asked to make, answered with how much of it reached the wire.
@@ -548,6 +550,44 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_reversed_set_does_not_match_the_other_family() {
+        let v4 = |start: &str, end: &str| {
+            (
+                vec![(
+                    start.parse::<IpAddr>().expect("start"),
+                    end.parse::<IpAddr>().expect("end"),
+                )],
+                true,
+            )
+        };
+        let set = IpSets::new(vec![v4("192.0.2.0", "192.0.2.255")]);
+        assert!(!set.matches("2001:db8::1".parse().expect("ip")));
+        assert!(set.matches("198.51.100.1".parse().expect("ip")));
+        assert!(!set.matches("192.0.2.5".parse().expect("ip")));
+    }
+
+    #[test]
+    fn every_filter_stage_is_a_gate() {
+        let allow = |start: &str, end: &str| {
+            SourceFilter::new(
+                IpSets::default(),
+                IpSets::new(vec![(
+                    vec![(
+                        start.parse::<IpAddr>().expect("start"),
+                        end.parse::<IpAddr>().expect("end"),
+                    )],
+                    false,
+                )]),
+            )
+        };
+        let mut chain = Chain::default();
+        chain.set_filter(allow("192.0.2.0", "192.0.2.255"));
+        chain.set_filter(allow("198.51.100.0", "198.51.100.255"));
+        assert!(chain.rejects(Some("192.0.2.5".parse().expect("ip"))));
+        assert!(chain.rejects(Some("198.51.100.5".parse().expect("ip"))));
     }
 
     /// What a peer's record walk finds: the widths of the records emitted, and the message between

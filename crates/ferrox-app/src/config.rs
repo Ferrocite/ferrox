@@ -1403,7 +1403,7 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
         max_sending_window: num("maxSendingWindow", "max_sending_window")
             .unwrap_or(base.max_sending_window),
         mask: base.mask,
-        filter: None,
+        filters: base.filters,
     }
 }
 
@@ -1695,10 +1695,13 @@ impl Carrier {
         }
     }
 
-    /// The source-address filter a raw carrier's chain carries, if the config named one.
-    pub(crate) fn tcp_filter(&self) -> Option<&ferrox_core::finalmask::SourceFilter> {
+    /// The source-address filters a raw carrier's chain carries, if the config named any.
+    pub(crate) fn tcp_filter(&self) -> Option<&[ferrox_core::finalmask::SourceFilter]> {
         match self {
-            Carrier::Raw(chain) => chain.filter(),
+            Carrier::Raw(chain) => {
+                let filters = chain.filters();
+                (!filters.is_empty()).then_some(filters)
+            }
             _ => None,
         }
     }
@@ -1818,14 +1821,14 @@ fn resolve_quic(_: Option<&Json>, _: &str) -> Carrier {
 }
 
 fn resolve_kcp(settings: Option<&Json>, network: &str) -> Carrier {
-    let Some((mask, filter)) = kcp_mask(settings) else {
+    let Some((mask, filters)) = kcp_mask(settings) else {
         return Carrier::Unknown {
             network: network.to_owned(),
         };
     };
     let mut config = kcp_config(settings);
     config.mask = mask;
-    config.filter = filter;
+    config.filters = filters;
     Carrier::Kcp(config)
 }
 
@@ -1836,7 +1839,7 @@ fn kcp_mask(
     settings: Option<&Json>,
 ) -> Option<(
     ferrox_core::kcp::Mask,
-    Option<ferrox_core::finalmask::SourceFilter>,
+    Vec<ferrox_core::finalmask::SourceFilter>,
 )> {
     use ferrox_core::kcp::{HeaderKind, Mask, Spec};
     let Some(udp) = settings
@@ -1844,11 +1847,11 @@ fn kcp_mask(
         .and_then(|f| f.get("udp"))
         .and_then(Json::as_arr)
     else {
-        return Some((Mask::default(), None));
+        return Some((Mask::default(), Vec::new()));
     };
     let mut specs = Vec::with_capacity(udp.len());
     let mut headers = Vec::with_capacity(udp.len());
-    let mut filter: Option<ferrox_core::finalmask::SourceFilter> = None;
+    let mut filters = Vec::new();
     for entry in udp {
         let conf = entry.get("settings");
         match entry
@@ -1877,10 +1880,7 @@ fn kcp_mask(
             }
             Some("filter") => {
                 if let Some(stage) = source_filter(conf).ok()? {
-                    match &mut filter {
-                        Some(current) => current.merge(stage),
-                        slot => *slot = Some(stage),
-                    }
+                    filters.push(stage);
                 }
             }
             Some("mkcp-legacy") => {
@@ -1937,7 +1937,7 @@ fn kcp_mask(
         specs[at..end].reverse();
         at = end;
     }
-    Some((Mask::from_spec(&specs).ok()?, filter))
+    Some((Mask::from_spec(&specs).ok()?, filters))
 }
 
 /// The source-address lists one `filter` stage carries. An absent or empty list is no list; a
@@ -1946,6 +1946,9 @@ fn source_filter(conf: Option<&Json>) -> Result<Option<ferrox_core::finalmask::S
     let Some(conf) = conf else {
         return Ok(None);
     };
+    if !matches!(conf, Json::Obj(_)) {
+        return Err(());
+    }
     let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
     let blocked = filter_list(
         conf.get("blockedSourceIPs"),
@@ -3310,6 +3313,11 @@ mod tests {
             source_filter(malformed.get("settings")).is_err(),
             "a malformed rule refuses the carrier"
         );
+        let not_an_object = crate::json::parse(r#"{"settings":[]}"#).expect("parses");
+        assert!(
+            source_filter(not_an_object.get("settings")).is_err(),
+            "settings that are not an object refuse the carrier"
+        );
     }
 
     #[test]
@@ -3331,7 +3339,7 @@ mod tests {
         let Carrier::Kcp(config) = stream_carrier(Some(&udp)) else {
             panic!("a filtered kcp carrier");
         };
-        assert!(config.filter.is_some());
+        assert!(!config.filters.is_empty());
         assert!(config.mask.is_empty(), "the filter writes no byte");
         let malformed = crate::json::parse(
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"filter","settings":{"blockedSourceIPs":["192.0.2.0/33"]}}]}}"#,
@@ -3341,6 +3349,26 @@ mod tests {
             stream_carrier(Some(&malformed)),
             Carrier::Unknown { .. }
         ));
+        let not_an_object = crate::json::parse(
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"filter","settings":[]}]}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(Some(&not_an_object)),
+            Carrier::Unknown { .. }
+        ));
+        let two = crate::json::parse(
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"filter","settings":{"allowedSourceIPs":["192.0.2.0/24"]}},{"type":"filter","settings":{"allowedSourceIPs":["198.51.100.0/24"]}}]}}"#,
+        )
+        .expect("parses");
+        let Carrier::Raw(chain) = stream_carrier(Some(&two)) else {
+            panic!("two filtered tcp stages");
+        };
+        assert_eq!(chain.filters().len(), 2, "both stages are kept");
+        assert!(
+            chain.rejects(Some("192.0.2.5".parse().expect("ip"))),
+            "the second allowlist still gates a source the first admits"
+        );
     }
 
     #[test]

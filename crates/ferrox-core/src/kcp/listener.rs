@@ -241,9 +241,9 @@ impl Listener {
                         let Some(inner) = weak.upgrade() else { break };
                         if inner
                             .config
-                            .filter
-                            .as_ref()
-                            .is_some_and(|filter| filter.rejects(Some(src.ip())))
+                            .filters
+                            .iter()
+                            .any(|filter| filter.rejects(Some(src.ip())))
                         {
                             continue;
                         }

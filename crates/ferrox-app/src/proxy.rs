@@ -1888,8 +1888,8 @@ impl Role {
         }
     }
 
-    /// The source-address filter an accepted stream of this role carries, from its tcp carrier.
-    fn tcp_filter(&self) -> Option<&ferrox_core::finalmask::SourceFilter> {
+    /// The source-address filters an accepted stream of this role carries, from its tcp carrier.
+    fn tcp_filter(&self) -> Option<&[ferrox_core::finalmask::SourceFilter]> {
         match self {
             Role::Vless { carrier, .. }
             | Role::VlessTls { carrier, .. }
@@ -1901,7 +1901,10 @@ impl Role {
             | Role::VmessTls { carrier, .. }
             | Role::VmessReality { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_filter(),
-            Role::Dokodemo { mask, .. } => mask.as_ref().and_then(|chain| chain.filter()),
+            Role::Dokodemo { mask, .. } => mask.as_ref().and_then(|chain| {
+                let filters = chain.filters();
+                (!filters.is_empty()).then_some(filters)
+            }),
             Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
             Role::Proxied(inner) => inner.tcp_filter(),
         }
@@ -4400,7 +4403,7 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         if !matches!(role, Role::Proxied(_))
             && role
                 .tcp_filter()
-                .is_some_and(|filter| filter.rejects(source))
+                .is_some_and(|filters| filters.iter().any(|filter| filter.rejects(source)))
         {
             continue;
         }
@@ -4479,10 +4482,11 @@ fn serve_accepted(
         }
         role => (stream, role),
     };
-    if role
-        .tcp_filter()
-        .is_some_and(|filter| filter.rejects(stream.peer_addr().ok().map(|peer| peer.ip())))
-    {
+    if role.tcp_filter().is_some_and(|filters| {
+        filters
+            .iter()
+            .any(|filter| filter.rejects(stream.peer_addr().ok().map(|peer| peer.ip())))
+    }) {
         return;
     }
     // Armed once per accepted stream, as the reference wraps its listener's conn.
@@ -14198,7 +14202,7 @@ fn serve_dokodemo(
         mode => mode,
     };
     let mask = match crate::config::tcp_mask(inbound.get("streamSettings")) {
-        Some(chain) if !chain.is_empty() || chain.filter().is_some() => Some(chain),
+        Some(chain) if !chain.is_empty() || !chain.filters().is_empty() => Some(chain),
         Some(_) => None,
         None => {
             eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");

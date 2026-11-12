@@ -11,8 +11,8 @@ pub struct Config {
     pub max_sending_window: u32,
     /// The mkcp legacy mask stacked under the framing, empty for raw KCP.
     pub mask: Mask,
-    /// The source-address allow/deny list applied to received datagrams.
-    pub filter: Option<crate::finalmask::SourceFilter>,
+    /// The source-address allow/deny lists applied to received datagrams.
+    pub filters: Vec<crate::finalmask::SourceFilter>,
 }
 
 impl Default for Config {
@@ -25,7 +25,7 @@ impl Default for Config {
             cwnd_multiplier: 1,
             max_sending_window: 2 * 1024 * 1024,
             mask: Mask::default(),
-            filter: None,
+            filters: Vec::new(),
         }
     }
 }
