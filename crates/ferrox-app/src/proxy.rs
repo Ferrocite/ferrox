@@ -72651,10 +72651,20 @@ mod relay_tests {
         let body: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
         let mut written = 0usize;
         for _ in 0..rounds {
-            if stream.write_all(&body).is_err() {
+            let mut off = 0;
+            while off < body.len() {
+                match stream.write(&body[off..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        off += n;
+                        written += n;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if off < body.len() {
                 break;
             }
-            written += body.len();
         }
         let _ = stream.shutdown(Shutdown::Write);
         written
