@@ -1403,6 +1403,7 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
         max_sending_window: num("maxSendingWindow", "max_sending_window")
             .unwrap_or(base.max_sending_window),
         mask: base.mask,
+        filter: None,
     }
 }
 
@@ -1847,7 +1848,7 @@ fn kcp_mask(
     };
     let mut specs = Vec::with_capacity(udp.len());
     let mut headers = Vec::with_capacity(udp.len());
-    let mut filter = None;
+    let mut filter: Option<ferrox_core::finalmask::SourceFilter> = None;
     for entry in udp {
         let conf = entry.get("settings");
         match entry
