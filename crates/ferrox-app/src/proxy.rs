@@ -72780,6 +72780,7 @@ mod relay_tests {
     /// itself. The fallback copy path gives every direction its own thread and
     /// cannot be poisoned, so the witness is the Linux job. Loopback only, dials
     /// nothing.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_stalled_destination_does_not_freeze_the_flows_behind_it() {
         const ROUNDS: usize = 512;
