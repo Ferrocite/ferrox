@@ -211,6 +211,7 @@ impl std::fmt::Debug for Listener {
 }
 
 impl Listener {
+    #[allow(clippy::too_many_lines)]
     pub fn bind(addr: SocketAddr, config: Config) -> io::Result<Self> {
         let sock = UdpSocket::bind(addr)?;
         let local = sock.local_addr()?;
