@@ -518,13 +518,6 @@ impl H2StreamReader {
         filled + n
     }
 
-    /// Whether another pump already holds the connection's read half.
-    fn read_busy(&self) -> bool {
-        self.client_read
-            .as_ref()
-            .is_some_and(|read| read.try_lock().is_err())
-    }
-
     /// Pump one frame from the connection, yielding or parking according to the lane that owns the call.
     fn pump(&self, yieldable: bool) -> Pumped {
         self.conn.pump_read(
@@ -1686,6 +1679,13 @@ fn fill_frame(
 }
 
 impl H2Conn {
+    /// Whether another pump already holds the connection's read half.
+    fn read_busy(&self) -> bool {
+        self.client_read
+            .as_ref()
+            .is_some_and(|read| read.try_lock().is_err())
+    }
+
     /// A client's frames arrive on the same transport its reader consumes: one frame is parsed on
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
     /// A lane step that cannot finish the frame yields the poll instead of sleeping in it.
