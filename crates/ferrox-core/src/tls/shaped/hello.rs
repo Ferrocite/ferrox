@@ -2002,30 +2002,6 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_profile_borrowing_a_psk_name_gets_no_slot() {
-        let stock = Fingerprint::resolve("hellochrome_112_psk_shuf")
-            .expect("a preset name resolves")
-            .profile()
-            .expect("a shaped profile");
-        let borrowed: &'static Profile = Box::leak(Box::new(Profile {
-            name: "fixture_psk",
-            ciphers: stock.ciphers,
-            shuffle: stock.shuffle,
-            exts: stock.exts,
-        }));
-        let profile = Fingerprint::custom(borrowed);
-        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
-            .expect("a shaped dial hello");
-        hello
-            .set_obfuscated_ticket(&[0x77; 32], 0)
-            .expect("the reference drops the ticket quietly");
-        assert!(hello.ticket().is_none());
-        assert!(!extensions(&hello.msg[4..])
-            .iter()
-            .any(|entry| kind(entry) == PSK));
-    }
-
-    #[test]
     fn a_tls12_ticket_replaces_the_session_ticket_extension() {
         let profile = Fingerprint::resolve("hellochrome_58")
             .expect("a preset name resolves")

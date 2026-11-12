@@ -686,7 +686,10 @@ mod tests {
             exts: &[],
         };
         assert!(!named.offers_psk(), "a custom name alone opens nothing");
-        let slotted = Profile { exts: &SLOTS, ..named };
+        let slotted = Profile {
+            exts: &SLOTS,
+            ..named
+        };
         assert!(slotted.offers_psk(), "the extension table opens the slot");
         let stock = Fingerprint::resolve("hellochrome_112_psk_shuf")
             .and_then(Fingerprint::profile)
