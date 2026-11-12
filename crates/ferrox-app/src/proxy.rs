@@ -22838,14 +22838,15 @@ fn serve_connect_freedom(
     }
     if !prefix.is_empty() {
         loop {
-            let Some(mut head) =
-                read_http_head(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+            let Some((mut head, at)) =
+                read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
             else {
                 return;
             };
+            let tail = head.split_off(at);
             let interim = http_head_is_interim(&head);
             drop_invalid_header_names(&mut head);
-            if client.write_all(&head).is_err() {
+            if client.write_all(&head).is_err() || client.write_all(&tail).is_err() {
                 return;
             }
             if !interim {
