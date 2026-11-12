@@ -667,6 +667,31 @@ mod tests {
         );
     }
 
+    /// A custom profile's name is the config's, not uTLS's: only its extension table opens the PSK slot.
+    #[test]
+    fn a_custom_psk_name_without_the_extension_has_no_slot() {
+        static SLOTS: [Ext; 1] = [Ext {
+            kind: 0x0029,
+            body: Body::Raw(&[]),
+        }];
+        let named = Profile {
+            name: "fixture_psk",
+            ciphers: &[],
+            shuffle: false,
+            exts: &[],
+        };
+        assert!(!named.offers_psk(), "a custom name alone opens nothing");
+        let slotted = Profile { exts: &SLOTS, ..named };
+        assert!(slotted.offers_psk(), "the extension table opens the slot");
+        let stock = Fingerprint::resolve("hellochrome_112_psk_shuf")
+            .and_then(Fingerprint::profile)
+            .expect("a shaped preset");
+        assert!(
+            stock.offers_psk(),
+            "uTLS's PSK parrots carry the slot by name"
+        );
+    }
+
     /// zeronet's stock spellings join uTLS's two, and an unknown name stays `None` so the
     /// config boundary can choose the reference's stock fallback.
     #[test]

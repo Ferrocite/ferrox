@@ -5738,6 +5738,27 @@ mod tests {
         assert!(random_hostname(r"(a|b)+").is_none());
     }
 
+    /// A provider that disables every named hello gets the reference's unshaped fallback, not the one it disabled.
+    #[test]
+    fn a_disabled_profile_falls_back_to_the_stock_hello() {
+        let chrome = Fingerprint::default();
+        let name = chrome.name().expect("chrome is shaped").to_owned();
+        let mut shape = TlsShape {
+            disable_fronting_profiles: vec![("fronted".to_owned(), vec![name])],
+            ..TlsShape::default()
+        };
+        assert_eq!(
+            Fingerprint::stock(),
+            shape.fingerprint(true, Some("fronted"))
+        );
+        shape.profiles = vec![chrome];
+        assert_eq!(
+            Fingerprint::stock(),
+            shape.fingerprint(true, Some("fronted"))
+        );
+        assert_eq!(chrome, shape.fingerprint(false, None));
+    }
+
     #[test]
     fn an_obfuscated_ticket_needs_the_coin_a_named_protocol_and_a_hex_key() {
         let key = "11".repeat(32);

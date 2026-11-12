@@ -3880,9 +3880,9 @@ mod tests {
         );
     }
 
-    /// An authenticated empty frame restarts nothing: the grace runs from bytes that moved, so a peer cannot hold a finished lane open with chunks that carry none.
+    /// An authenticated empty frame restarts nothing and keeps nothing after the grace: the clock runs from bytes that moved, so a peer cannot hold a finished lane open with chunks that carry none.
     #[test]
-    fn an_empty_frame_does_not_restart_the_reply_grace() {
+    fn an_empty_frame_cannot_hold_a_lane_past_the_reply_grace() {
         let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
         let idle = crate::budgets::RELAY_RESPONSE_IDLE;
         let salt = [7u8; SALT_LEN];
@@ -3896,6 +3896,17 @@ mod tests {
         wire.extend_from_slice(&length);
         wire.extend_from_slice(&length_tag);
         wire.extend_from_slice(&tag);
+        let mut window = ChunkReader::new(std::io::Cursor::new(&wire[..]));
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
+        assert_eq!(
+            crate::proxy::lane_pool::Next::More,
+            next,
+            "an empty frame keeps a live lane"
+        );
+        assert!(out.is_empty(), "an empty frame forwards nothing");
         flow.mark_ended();
         let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
         while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
@@ -3911,9 +3922,9 @@ mod tests {
         let mut out = Vec::new();
         let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
         assert_eq!(
-            crate::proxy::lane_pool::Next::More,
+            crate::proxy::lane_pool::Next::Done,
             next,
-            "the frame opened"
+            "an empty frame cannot hold a lane past its grace"
         );
         assert!(out.is_empty(), "an empty frame forwards nothing");
         assert!(
