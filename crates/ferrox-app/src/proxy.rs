@@ -29290,7 +29290,7 @@ pub(crate) mod lane_pool {
     /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
     /// one of them for the life of its flow and the lanes behind it do not run: eight steps is
     /// shorter than the read clock it would otherwise hide behind.
-    const LANE_STREAK: usize = 8;
+    const LANE_STREAK: usize = 64;
 
     fn pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
