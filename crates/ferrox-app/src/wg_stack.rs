@@ -11,7 +11,7 @@
 //! directly and leaves their routing to the caller.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
@@ -48,6 +48,9 @@ const TCP_SEND_BUFFER: usize = 1024 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
+
+/// Bytes pulled off a full receive ring into the spill when the local stream stalls.
+const DOWN_SPILL: usize = 64 * 1024;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -370,19 +373,19 @@ impl Readiness {
     }
 }
 
-/// One TCP flow and the local stream on the other side of it. `pending_down`
-/// holds bytes the local socket refused because its send buffer was full;
-/// `pending_up` holds bytes read locally that the TCP window has not accepted.
+/// One TCP flow and the local stream on the other side of it. `pending_up`
+/// holds bytes the TCP window has not accepted; `pending_down` holds the tail a
+/// full local stream refused, pulled off the ring so the window stays open.
 #[allow(clippy::struct_excessive_bools)]
 struct Flow {
     handle: SocketHandle,
     local: Connection,
     local_port: u16,
     races: Vec<(SocketHandle, u16)>,
-    pending_down: Vec<u8>,
-    pending_down_at: usize,
     pending_up: Vec<u8>,
     pending_up_at: usize,
+    pending_down: Vec<u8>,
+    pending_down_at: usize,
     up_eof: bool,
     sent_fin: bool,
     down_eof: bool,
@@ -398,10 +401,10 @@ impl Flow {
             local,
             local_port,
             races: Vec::new(),
-            pending_down: Vec::new(),
-            pending_down_at: 0,
             pending_up: Vec::new(),
             pending_up_at: 0,
+            pending_down: Vec::new(),
+            pending_down_at: 0,
             up_eof: false,
             sent_fin: false,
             down_eof: false,
@@ -411,24 +414,12 @@ impl Flow {
         }
     }
 
-    fn down_pending(&self) -> bool {
-        self.pending_down_at < self.pending_down.len()
-    }
-
     fn up_pending(&self) -> bool {
         self.pending_up_at < self.pending_up.len()
     }
 
-    fn stage_down(&mut self, bytes: &[u8]) {
-        self.pending_down.clear();
-        self.pending_down.extend_from_slice(bytes);
-        self.pending_down_at = 0;
-    }
-
-    fn stage_up(&mut self, bytes: &[u8]) {
-        self.pending_up.clear();
-        self.pending_up.extend_from_slice(bytes);
-        self.pending_up_at = 0;
+    fn down_pending(&self) -> bool {
+        self.pending_down_at < self.pending_down.len()
     }
 
     fn adopt(
@@ -1244,21 +1235,20 @@ pub(crate) fn client(
     let mut stack = ClientStack::new(&config, to_tunnel, headroom);
     stack.routes = routes;
     stack.device.recycle = recycle;
-    let mut buf = vec![0u8; 64 * 1024];
     loop {
         while let Ok(flow) = flows.try_recv() {
             if let Err(error) = stack.connect(flow) {
                 eprintln!("wireguard client: {error}");
             }
         }
-        if client_turn(&mut stack, &packets, &mut buf) {
+        if client_turn(&mut stack, &packets) {
             return;
         }
     }
 }
 
 /// One client turn, or true once the tunnel is closed.
-fn client_turn(stack: &mut ClientStack, packets: &Packets, buf: &mut [u8]) -> bool {
+fn client_turn(stack: &mut ClientStack, packets: &Packets) -> bool {
     let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
@@ -1270,7 +1260,7 @@ fn client_turn(stack: &mut ClientStack, packets: &Packets, buf: &mut [u8]) -> bo
             }
         }
     }
-    let progressed = stack.poll(buf);
+    let progressed = stack.poll();
     if closed {
         return true;
     }
@@ -1317,9 +1307,8 @@ pub(crate) fn server(
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     stack.device.recycle = recycle;
-    let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if server_turn(&mut stack, &packets, &mut buf, TICK) {
+        if server_turn(&mut stack, &packets, TICK) {
             return;
         }
     }
@@ -1340,7 +1329,6 @@ pub(crate) fn serve_tun_device(
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
     stack.device.tun_recycle = recycle;
     let _ = wake.set_nonblocking(true);
-    let mut buf = vec![0u8; 64 * 1024];
     loop {
         if failed.load(Ordering::Relaxed) {
             return;
@@ -1356,7 +1344,7 @@ pub(crate) fn serve_tun_device(
                 }
             }
         }
-        let progressed = stack.poll(&mut buf);
+        let progressed = stack.poll();
         if closed {
             return;
         }
@@ -1382,7 +1370,6 @@ pub(crate) fn serve_tun_device(
 ) {
     let mut stack = ServerStack::new_tun(&config, to_tunnel, out);
     stack.device.tun_recycle = recycle;
-    let mut buf = vec![0u8; 64 * 1024];
     loop {
         if failed.load(Ordering::Relaxed) {
             return;
@@ -1392,7 +1379,7 @@ pub(crate) fn serve_tun_device(
         } else {
             TUN_TICK
         };
-        if server_turn(&mut stack, &packets, &mut buf, tick) {
+        if server_turn(&mut stack, &packets, tick) {
             return;
         }
     }
@@ -1441,7 +1428,7 @@ fn wait_for_tun(stack: &ServerStack, wake: &std::os::unix::net::UnixStream) -> b
 }
 
 /// One server turn, or true once the inbound is closed.
-fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8], tick: Duration) -> bool {
+fn server_turn(stack: &mut ServerStack, packets: &Packets, tick: Duration) -> bool {
     let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
@@ -1453,7 +1440,7 @@ fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8], tick:
             }
         }
     }
-    let progressed = stack.poll(buf);
+    let progressed = stack.poll();
     if closed {
         return true;
     }
@@ -1658,7 +1645,7 @@ impl ClientStack {
     }
 
     /// Drive the interface, every flow, and the queued transmits one turn.
-    fn poll(&mut self, buf: &mut [u8]) -> bool {
+    fn poll(&mut self) -> bool {
         let now = self.now();
         self.reassembly.expire();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -1672,7 +1659,7 @@ impl ClientStack {
                 &mut retiring,
                 &mut self.race_bytes,
             );
-            moved |= pump(flow, &mut self.sockets, buf, up_ready);
+            moved |= pump(flow, &mut self.sockets, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         retire(
@@ -1914,7 +1901,7 @@ impl ServerStack {
     }
 
     /// Drive the server interface and hand off every completed flow.
-    fn poll(&mut self, buf: &mut [u8]) -> bool {
+    fn poll(&mut self) -> bool {
         self.syn_ports.clear();
         self.reassembly.expire();
         for (packet, at) in &self.device.rx {
@@ -1932,7 +1919,7 @@ impl ServerStack {
         let ready = self.readiness.sync(&self.flows);
         let mut moved = false;
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
-            moved |= pump(flow, &mut self.sockets, buf, up_ready);
+            moved |= pump(flow, &mut self.sockets, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         for _ in 0..TX_BURST {
@@ -2079,10 +2066,69 @@ impl ServerStack {
     }
 }
 
+/// One step of moving the local stream's bytes into the socket's transmit ring.
+enum Up {
+    Wrote(usize),
+    Idle,
+    Closed,
+    Failed,
+}
+
+/// One step of moving the socket's receive ring to the local stream.
+enum Down {
+    Wrote(usize),
+    Staged(usize),
+    Idle,
+    Closed,
+    Failed,
+}
+
+/// Read the local stream straight into the socket's transmit ring, so the bytes
+/// are copied once instead of into a caller's scratch buffer and then again.
+fn upload(socket: &mut TcpSocket, local: &mut impl Read) -> Result<Up, SendError> {
+    socket.send(|data| {
+        if data.is_empty() {
+            return (0, Up::Idle);
+        }
+        match local.read(data) {
+            Ok(0) => (0, Up::Closed),
+            Ok(n) => (n, Up::Wrote(n)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (0, Up::Idle),
+            Err(_) => (0, Up::Failed),
+        }
+    })
+}
+
+/// Write the socket's receive ring straight to the local stream. A full local
+/// stream pulls one bounded slice off the ring into the spill, so the peer never
+/// sees a closed window while the local drains.
+fn download(
+    socket: &mut TcpSocket,
+    local: &mut impl Write,
+    spill: &mut Vec<u8>,
+) -> Result<Down, RecvError> {
+    socket.recv(|data| {
+        if data.is_empty() {
+            return (0, Down::Idle);
+        }
+        let data = &data[..data.len().min(DOWN_SPILL)];
+        match local.write(data) {
+            Ok(0) => (0, Down::Closed),
+            Ok(n) => (n, Down::Wrote(n)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                spill.clear();
+                spill.extend_from_slice(data);
+                (data.len(), Down::Staged(data.len()))
+            }
+            Err(_) => (0, Down::Failed),
+        }
+    })
+}
+
 /// Move bytes between one flow's local stream and its TCP socket. Every read and
 /// write is nonblocking, so a slow local peer parks only its own buffers.
 #[allow(clippy::too_many_lines)]
-fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: bool) -> bool {
+fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, up_ready: bool) -> bool {
     let mut moved = false;
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
@@ -2117,32 +2163,26 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
     }
 
     while !flow.down_pending() {
-        match socket.recv_slice(buf) {
-            Ok(0) | Err(RecvError::InvalidState) => break,
-            Ok(n) => {
-                moved = true;
-                let mut at = 0;
-                while at < n {
-                    match flow.local.write(&buf[at..n]) {
-                        Ok(0) => {
-                            flow.down_eof = true;
-                            at = n;
-                        }
-                        Ok(written) => at += written,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            flow.stage_down(&buf[at..n]);
-                            at = n;
-                        }
-                        Err(_) => {
-                            flow.done = true;
-                            socket.abort();
-                            at = n;
-                        }
-                    }
+        match download(socket, &mut flow.local, &mut flow.pending_down) {
+            Ok(Down::Wrote(n)) => {
+                if n > 0 {
+                    moved = true;
                 }
             }
-            Err(RecvError::Finished) => {
+            Ok(Down::Staged(n)) => {
+                if n > 0 {
+                    moved = true;
+                }
+                break;
+            }
+            Ok(Down::Idle) | Err(RecvError::InvalidState) => break,
+            Ok(Down::Closed) | Err(RecvError::Finished) => {
                 flow.down_eof = true;
+                break;
+            }
+            Ok(Down::Failed) => {
+                flow.done = true;
+                socket.abort();
                 break;
             }
         }
@@ -2170,26 +2210,19 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
                 }
             }
         } else if up_ready {
-            match flow.local.read(buf) {
-                Ok(0) => {
+            match upload(socket, &mut flow.local) {
+                Ok(Up::Wrote(n)) => {
+                    if n > 0 {
+                        moved = true;
+                        bursts += 1;
+                    }
+                }
+                Ok(Up::Idle) => break,
+                Ok(Up::Closed) => {
                     flow.up_eof = true;
                     break;
                 }
-                Ok(n) => {
-                    moved = true;
-                    bursts += 1;
-                    match socket.send_slice(&buf[..n]) {
-                        Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
-                        Ok(_) => {}
-                        Err(SendError::InvalidState) => {
-                            flow.done = true;
-                            socket.abort();
-                            break;
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => {
+                Ok(Up::Failed) | Err(_) => {
                     flow.done = true;
                     socket.abort();
                     break;
@@ -2203,11 +2236,11 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         socket.close();
         flow.sent_fin = true;
     }
-    if flow.down_eof && !flow.down_shutdown && !flow.down_pending() {
+    if flow.down_eof && !flow.down_shutdown {
         let _ = flow.local.shutdown(Shutdown::Write);
         flow.down_shutdown = true;
     }
-    if socket.state() == State::Closed && flow.established && !flow.down_pending() {
+    if socket.state() == State::Closed && flow.established {
         flow.down_eof = true;
         flow.done = true;
     }
@@ -3043,8 +3076,7 @@ mod tests {
         stack.listeners.get_mut(&expired).expect("listener")[0].since = StdInstant::now()
             .checked_sub(LISTENER_TTL)
             .expect("instant");
-        let mut buf = [0u8; 1024];
-        stack.poll(&mut buf);
+        stack.poll();
         assert!(!stack.listeners.contains_key(&expired));
         stack.listen(10_000 + LISTENERS as u16 + 20);
         assert_eq!(stack.listeners.len(), LISTENERS);
@@ -3144,6 +3176,83 @@ mod tests {
         packet
     }
 
+    /// A TCP data segment a peer would send, with a payload.
+    #[allow(clippy::too_many_arguments)]
+    fn tcp_segment_data(
+        source: [u8; 4],
+        source_port: u16,
+        destination: [u8; 4],
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 40 + payload.len();
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = PROTOCOL_TCP;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        let header_sum = checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header_sum.to_be_bytes());
+        let tcp = &mut packet[20..];
+        tcp[0..2].copy_from_slice(&source_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&destination_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&sequence.to_be_bytes());
+        tcp[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = 0x18;
+        tcp[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+        tcp[20..].copy_from_slice(payload);
+        let mut pseudo = Vec::with_capacity(12 + total - 20);
+        pseudo.extend_from_slice(&source);
+        pseudo.extend_from_slice(&destination);
+        pseudo.extend_from_slice(&[0, PROTOCOL_TCP]);
+        pseudo.extend_from_slice(&((total - 20) as u16).to_be_bytes());
+        pseudo.extend_from_slice(&packet[20..]);
+        let tcp_sum = checksum(&pseudo);
+        packet[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
+        packet
+    }
+
+    /// A reader that records the buffer it is handed, so a test can see where bytes land.
+    struct ProbeReader {
+        bytes: Vec<u8>,
+        at: usize,
+        seen: Option<*mut u8>,
+    }
+
+    impl std::io::Read for ProbeReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.seen = Some(buf.as_mut_ptr());
+            let n = buf.len().min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    /// A writer that records the buffer it is handed, so a test can see where bytes come from.
+    #[derive(Default)]
+    struct ProbeWriter {
+        seen: Option<*mut u8>,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for ProbeWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen = Some(buf.as_ptr().cast_mut());
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// The TCP payload of an inner IPv4 packet, which is where an upload's bytes ride.
     fn tcp_payload(packet: &[u8]) -> &[u8] {
         let ihl = usize::from(packet[0] & 0x0f) * 4;
@@ -3161,38 +3270,19 @@ mod tests {
         ))
     }
 
-    /// Every byte the stack handed the tunnel since the last drain, with the TCP headers removed.
-    fn tunnel_payload(packets: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        while let Ok(packet) = packets.try_recv() {
-            if packet.get(9) == Some(&PROTOCOL_TCP) {
-                bytes.extend_from_slice(tcp_payload(&packet));
-            }
-        }
-        bytes
-    }
-
-    /// Poll the stack until the tunnel has carried `want` payload bytes, which may take a turn beyond the one that drained the staging buffer.
-    fn tunnel_bytes(
-        stack: &mut ClientStack,
-        packets: &std::sync::mpsc::Receiver<Vec<u8>>,
-        buf: &mut [u8],
-        want: usize,
-    ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for _ in 0..50 {
-            stack.poll(buf);
-            bytes.extend_from_slice(&tunnel_payload(packets));
-            if bytes.len() >= want {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        bytes
-    }
-
     /// A client stack whose first flow is established, its handshake packets drained, and the local end of the flow kept alive by the returned handle.
     fn established_client() -> (ClientStack, std::sync::mpsc::Receiver<Vec<u8>>, Connection) {
+        let (stack, packets, app, _syn) = established_client_with_syn();
+        (stack, packets, app)
+    }
+
+    /// The same established flow, with the client's SYN so a test can answer in sequence.
+    fn established_client_with_syn() -> (
+        ClientStack,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        Connection,
+        Vec<u8>,
+    ) {
         let (app, proxy) = loopback().expect("pair");
         let config = DeviceConfig {
             secret: [0u8; 32],
@@ -3214,14 +3304,13 @@ mod tests {
                 prefix: Vec::new(),
             })
             .expect("connect");
-        let mut buf = [0u8; 2048];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn = packets
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
         assert_eq!(syn[9], 6, "the inner packet is TCP");
         stack.device.push(syn_ack(&syn), 0);
-        stack.poll(&mut buf);
+        stack.poll();
         assert_eq!(
             stack
                 .sockets
@@ -3231,101 +3320,106 @@ mod tests {
             "the SYN-ACK establishes the flow"
         );
         while packets.try_recv().is_ok() {}
-        (stack, packets, app)
+        (stack, packets, app, syn)
     }
 
-    /// The bytes a refused write leaves staged are written where they lie, and the same buffer takes the next stage instead of a fresh allocation.
+    /// An upload is read straight into the socket's transmit ring: the reader
+    /// sees that ring's slice, not a caller buffer.
     #[test]
-    fn a_staged_direction_reuses_its_buffer_across_a_drain() {
-        let (mut stack, packets, mut app) = established_client();
-        app.set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("a read timeout, so a lost download fails rather than hangs");
-        let mut buf = [0u8; 2048];
+    fn an_upload_writes_into_the_socket_transmit_ring() {
+        let (mut stack, _packets, _app) = established_client();
+        let socket = stack.sockets.get_mut::<TcpSocket>(stack.flows[0].handle);
+        let ring = socket.send(|data| (0, data.as_mut_ptr())).expect("a send");
+        let mut probe = ProbeReader {
+            bytes: b"straight".to_vec(),
+            at: 0,
+            seen: None,
+        };
+        match upload(socket, &mut probe).expect("a direct upload") {
+            Up::Wrote(n) => assert_eq!(n, b"straight".len()),
+            _ => panic!("the direct upload wrote no bytes"),
+        }
+        assert_eq!(probe.seen, Some(ring), "the upload copied through a buffer");
+    }
 
-        let upload = [b'u'; 512];
-        stack.flows[0].stage_up(&upload);
-        let cap = stack.flows[0].pending_up.capacity();
-        let base = stack.flows[0].pending_up.as_ptr();
-        assert!(cap >= upload.len(), "the upload landed in a buffer");
-        stack.poll(&mut buf);
-        assert!(
-            !stack.flows[0].up_pending(),
-            "the socket takes the staged upload"
+    /// A download is written straight out of the socket's receive ring: the
+    /// writer sees that ring's slice, not a caller buffer.
+    #[test]
+    fn a_download_reads_from_the_socket_receive_ring() {
+        let (mut stack, _packets, _app, syn) = established_client_with_syn();
+        let client_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let client_sequence =
+            u32::from_be_bytes(syn[24..28].try_into().expect("the client's sequence"));
+        let packet = tcp_segment_data(
+            [192, 0, 2, 1],
+            80,
+            [10, 0, 0, 2],
+            client_port,
+            0x1235,
+            client_sequence + 1,
+            b"straight",
         );
+        stack.device.push(packet, 0);
+        let now = stack.now();
+        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        let socket = stack.sockets.get_mut::<TcpSocket>(stack.flows[0].handle);
+        let ring = socket
+            .peek(usize::MAX)
+            .expect("the download is buffered")
+            .as_ptr()
+            .cast_mut();
+        let mut probe = ProbeWriter::default();
+        match download(socket, &mut probe, &mut Vec::new()).expect("a direct download") {
+            Down::Wrote(n) => assert_eq!(n, b"straight".len()),
+            _ => panic!("the direct download wrote no bytes"),
+        }
         assert_eq!(
-            tunnel_bytes(&mut stack, &packets, &mut buf, upload.len()),
-            upload,
-            "the staged upload leaves unchanged"
+            probe.seen,
+            Some(ring),
+            "the download copied through a buffer"
         );
-        assert_eq!(
-            stack.flows[0].pending_up.capacity(),
-            cap,
-            "a drained upload released its buffer"
-        );
-        assert_eq!(
-            stack.flows[0].pending_up.as_ptr(),
-            base,
-            "a drained upload moved its buffer"
-        );
-        stack.flows[0].stage_up(&upload);
-        assert_eq!(
-            stack.flows[0].pending_up.capacity(),
-            cap,
-            "a same-sized upload reallocated"
-        );
-        assert_eq!(
-            stack.flows[0].pending_up.as_ptr(),
-            base,
-            "a same-sized upload moved its buffer"
-        );
-        stack.poll(&mut buf);
-        assert!(!stack.flows[0].up_pending());
-        assert_eq!(
-            tunnel_bytes(&mut stack, &packets, &mut buf, upload.len()),
-            upload,
-            "a reused upload leaves unchanged"
-        );
+    }
 
-        let download = [b'd'; 512];
-        stack.flows[0].stage_down(&download);
-        let cap = stack.flows[0].pending_down.capacity();
-        let base = stack.flows[0].pending_down.as_ptr();
-        assert!(cap >= download.len(), "the download landed in a buffer");
-        stack.poll(&mut buf);
-        assert!(
-            !stack.flows[0].down_pending(),
-            "the local socket takes the staged download"
+    /// A local stream that is full takes the ring's bytes into the spill, so the
+    /// peer keeps its window instead of stalling on a closed one.
+    #[test]
+    fn a_stalled_download_spills_the_ring_instead_of_closing_the_window() {
+        let (mut stack, _packets, _app, syn) = established_client_with_syn();
+        let client_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let client_sequence =
+            u32::from_be_bytes(syn[24..28].try_into().expect("the client's sequence"));
+        let packet = tcp_segment_data(
+            [192, 0, 2, 1],
+            80,
+            [10, 0, 0, 2],
+            client_port,
+            0x1235,
+            client_sequence + 1,
+            b"straight",
         );
-        let mut got = [0u8; 512];
-        app.read_exact(&mut got)
-            .expect("the local peer reads the download");
-        assert_eq!(got, download, "the staged download arrives unchanged");
-        assert_eq!(
-            stack.flows[0].pending_down.capacity(),
-            cap,
-            "a drained download released its buffer"
-        );
-        assert_eq!(
-            stack.flows[0].pending_down.as_ptr(),
-            base,
-            "a drained download moved its buffer"
-        );
-        stack.flows[0].stage_down(&download);
-        assert_eq!(
-            stack.flows[0].pending_down.capacity(),
-            cap,
-            "a same-sized download reallocated"
-        );
-        assert_eq!(
-            stack.flows[0].pending_down.as_ptr(),
-            base,
-            "a same-sized download moved its buffer"
-        );
-        stack.poll(&mut buf);
-        assert!(!stack.flows[0].down_pending());
-        app.read_exact(&mut got)
-            .expect("the local peer reads the reused download");
-        assert_eq!(got, download, "a reused download arrives unchanged");
+        stack.device.push(packet, 0);
+        let now = stack.now();
+        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        let socket = stack.sockets.get_mut::<TcpSocket>(stack.flows[0].handle);
+        let mut spill = Vec::new();
+        match download(socket, &mut FullWriter, &mut spill).expect("a stalled download") {
+            Down::Staged(n) => assert_eq!(n, b"straight".len()),
+            _ => panic!("the stalled download did not spill"),
+        }
+        assert_eq!(spill, b"straight");
+        assert_eq!(socket.peek(1).expect("the ring is drained").len(), 0);
+    }
+
+    struct FullWriter;
+
+    impl Write for FullWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -3343,9 +3437,8 @@ mod tests {
             }
         }
         assert!(written > 0, "the local window holds an upload");
-        let mut buf = [0u8; 2048];
         let mut turns = 0;
-        while stack.poll(&mut buf) {
+        while stack.poll() {
             turns += 1;
             assert!(turns < 1024, "a ready upload drains");
         }
@@ -3374,13 +3467,12 @@ mod tests {
                 prefix: Vec::new(),
             })
             .expect("connect");
-        let mut buf = [0u8; 2048];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn = tunnel
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
         stack.device.push(syn_ack(&syn), 0);
-        stack.poll(&mut buf);
+        stack.poll();
         assert_eq!(
             stack
                 .sockets
@@ -3399,9 +3491,10 @@ mod tests {
                 at: 0,
             })
             .expect("a queued echo");
-        stack.flows[0].stage_up(&[b'u'; 512]);
+        stack.flows[0].pending_up = vec![b'u'; 512];
+        stack.flows[0].pending_up_at = 0;
         assert!(
-            !client_turn(&mut stack, &packets, &mut buf),
+            !client_turn(&mut stack, &packets),
             "a live tunnel keeps the client turning"
         );
         assert!(
@@ -3419,12 +3512,11 @@ mod tests {
     #[test]
     fn a_direct_upload_never_builds_the_staging_buffer() {
         let (mut stack, packets, mut app) = established_client();
-        let mut buf = [0u8; 2048];
 
         app.write_all(b"hello").expect("write");
         let mut seen = false;
         for _ in 0..50 {
-            stack.poll(&mut buf);
+            stack.poll();
             while let Ok(packet) = packets.try_recv() {
                 if packet
                     .windows(b"hello".len())
@@ -3658,8 +3750,7 @@ mod tests {
                 last_used,
             },
         );
-        let mut buf = [0u8; 1024];
-        stack.poll(&mut buf);
+        stack.poll();
         assert!(stack.udp.is_empty(), "an idle lane leaves the table");
         assert!(stop.load(Ordering::Relaxed), "its reader is told to stop");
         crate::budgets::clear();
@@ -3834,8 +3925,7 @@ mod tests {
             bytes: tcp_segment(source, 1234, destination, 80, 1000, 0, 0x02),
             at: 0,
         });
-        let mut buf = [0u8; 2048];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn_ack = packets
             .recv_timeout(Duration::from_secs(5))
             .expect("the server's SYN-ACK");
@@ -3858,7 +3948,7 @@ mod tests {
             ),
             at: 0,
         });
-        stack.poll(&mut buf);
+        stack.poll();
 
         let line = received
             .recv_timeout(Duration::from_secs(5))
@@ -3895,8 +3985,7 @@ mod tests {
             bytes: syn_with_mss(65_495, 0x02),
             at: 0,
         });
-        let mut buf = vec![0u8; 64 * 1024];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn_ack = packets
             .recv_timeout(Duration::from_secs(5))
             .expect("the server's SYN-ACK");
@@ -3926,7 +4015,7 @@ mod tests {
         let mut want = server_sequence + 1;
         let mut saw_fragment = false;
         for _ in 0..1_000 {
-            stack.poll(&mut buf);
+            stack.poll();
             while let Ok(packet) = packets.try_recv() {
                 saw_fragment |= fragment([0u8; 32], &packet).is_some();
                 let packet = match reassembly.accept([0u8; 32], &packet, 0) {
@@ -4155,8 +4244,7 @@ mod tests {
                 prefix: Vec::new(),
             })
             .expect("connect");
-        let mut buf = [0u8; 2048];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn = packets
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
@@ -4177,8 +4265,7 @@ mod tests {
                 prefix: Vec::new(),
             })
             .expect("connect");
-        let mut buf = [0u8; 2048];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn = packets
             .recv_timeout(Duration::from_secs(5))
             .expect("the client's SYN");
@@ -4203,8 +4290,7 @@ mod tests {
             "the peer's advertised segment size is kept"
         );
         assert!(tcp_checksum_verifies(&queued[*at..]));
-        let mut buf = [0u8; 1024];
-        stack.poll(&mut buf);
+        stack.poll();
         let answer = tunneled
             .recv_timeout(Duration::from_secs(5))
             .expect("the SYN-ACK");
@@ -5264,8 +5350,7 @@ mod client_tests {
                 prefix: Vec::new(),
             })
             .expect("connect");
-        let mut buf = [0u8; 2048];
-        stack.poll(&mut buf);
+        stack.poll();
         let syn = packets.recv_timeout(LANE_WAIT).expect("SYN");
         let header = usize::from(syn[0] & 0x0f) * 4;
         let options = header + 20..header + usize::from(syn[header + 12] >> 4) * 4;
