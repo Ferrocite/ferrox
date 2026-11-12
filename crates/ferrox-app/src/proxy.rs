@@ -15386,6 +15386,7 @@ struct CarriedVmess {
     close: VmessClose,
     send: crate::vmess::Flow,
     recv: crate::vmess::Flow,
+    response: ([u8; 16], [u8; 16], u8),
 }
 
 struct VmessUdpUplink {
@@ -15429,7 +15430,15 @@ fn dial_vmess_udp_uplink(
         (carried.close)();
         return None;
     };
-    let done = spawn_vmess_udp_reader(carried.reader, udp_send, source, *dest, carried.recv);
+    let done = spawn_vmess_udp_reader(
+        carried.reader,
+        udp_send,
+        source,
+        *dest,
+        carried.recv,
+        carried.response,
+        Arc::clone(&carried.close),
+    );
     Some(VmessUdpUplink {
         write: carried.writer,
         close: carried.close,
@@ -15484,20 +15493,10 @@ fn open_vmess_udp_quic(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVme
     let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
     let pooled = crate::quic::pumped_stream_within(&vmess_quic_dial(vmess), budgets::dial())?;
     let mut writer = pooled.stream_handle();
-    let mut reader = pooled.stream_handle();
+    let reader = pooled.stream_handle();
     if writer.write_all(&request).is_err() {
         pooled.cancel();
         return None;
-    }
-    {
-        let mut bounded = HandshakeDeadline {
-            inner: &mut reader,
-            until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
-        };
-        if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
-            pooled.cancel();
-            return None;
-        }
     }
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
@@ -15511,6 +15510,7 @@ fn open_vmess_udp_quic(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVme
         close,
         send,
         recv,
+        response: (response_key, response_iv, auth),
     })
 }
 
@@ -15518,17 +15518,7 @@ fn open_vmess_udp_hysteria(vmess: &VmessOut, dest: &SocketAddr) -> Option<Carrie
     let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
     let dial = vmess_hysteria_dial(vmess)?;
     let flow = crate::hysteria::open(&dial, &request, 0)?;
-    let mut reader = crate::hysteria::FlowRead::new(flow.clone());
-    {
-        let mut bounded = HandshakeDeadline {
-            inner: &mut reader,
-            until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
-        };
-        if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
-            flow.close();
-            return None;
-        }
-    }
+    let reader = crate::hysteria::FlowRead::new(flow.clone());
     let closer = flow.clone();
     let close: VmessClose = Arc::new(move || closer.close());
     Some(CarriedVmess {
@@ -15537,6 +15527,7 @@ fn open_vmess_udp_hysteria(vmess: &VmessOut, dest: &SocketAddr) -> Option<Carrie
         close,
         send,
         recv,
+        response: (response_key, response_iv, auth),
     })
 }
 
@@ -15560,15 +15551,6 @@ fn open_vmess_udp_kcp(
         if session.write_all(&request).is_err() {
             return None;
         }
-        {
-            let mut bounded = HandshakeDeadline {
-                inner: &mut session,
-                until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
-            };
-            if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
-                return None;
-            }
-        }
         let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         return Some(CarriedVmess {
             reader: Box::new(reader),
@@ -15576,21 +15558,13 @@ fn open_vmess_udp_kcp(
             close: kcp_close(&conn),
             send,
             recv,
+            response: (response_key, response_iv, auth),
         });
     }
     if conn.write(&request).is_err() {
         return None;
     }
-    let mut reader = KcpIo::new(Arc::clone(&conn));
-    {
-        let mut bounded = HandshakeDeadline {
-            inner: &mut reader,
-            until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
-        };
-        if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
-            return None;
-        }
-    }
+    let reader = KcpIo::new(Arc::clone(&conn));
     let writer = KcpIo::new(Arc::clone(&conn));
     Some(CarriedVmess {
         reader: Box::new(reader),
@@ -15598,6 +15572,7 @@ fn open_vmess_udp_kcp(
         close: kcp_close(&conn),
         send,
         recv,
+        response: (response_key, response_iv, auth),
     })
 }
 
@@ -15605,9 +15580,7 @@ fn open_vmess_udp_xdrive(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedV
     let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
     let session = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
     let mut reader = session.clone();
-    if reader.write_all(&request).is_err()
-        || !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth)
-    {
+    if reader.write_all(&request).is_err() {
         return None;
     }
     let close: VmessClose = {
@@ -15623,6 +15596,7 @@ fn open_vmess_udp_xdrive(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedV
         close,
         send,
         recv,
+        response: (response_key, response_iv, auth),
     })
 }
 
@@ -15638,17 +15612,15 @@ fn open_vmess_udp_plain(
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             uplink.write_all(&request).ok()?;
-            let mut reader = uplink.try_clone().ok()?;
+            let reader = uplink.try_clone().ok()?;
             reader.set_read_timeout(Some(RELAY_POLL)).ok()?;
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             Some(CarriedVmess {
                 reader: Box::new(reader),
                 writer: Box::new(uplink),
                 close: shutdown_close(shutdown),
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Ws { path, ed } => {
@@ -15664,9 +15636,6 @@ fn open_vmess_udp_plain(
                 vmess.heartbeat,
             )?;
             reader.set_poll(Some(RELAY_POLL));
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             let closer = writer.clone();
             let close = shutdown_close(shutdown);
             let close: VmessClose = Arc::new(move || {
@@ -15679,6 +15648,7 @@ fn open_vmess_udp_plain(
                 close,
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Grpc(settings) => {
@@ -15689,9 +15659,6 @@ fn open_vmess_udp_plain(
             if !writer.send(&request) {
                 return None;
             }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             let closer = writer.clone();
             let close = shutdown_close(shutdown);
             let close: VmessClose = Arc::new(move || {
@@ -15704,6 +15671,7 @@ fn open_vmess_udp_plain(
                 close,
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Xhttp { settings, .. } => {
@@ -15713,9 +15681,6 @@ fn open_vmess_udp_plain(
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
-                return None;
-            }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
             let closer = writer.clone();
@@ -15730,6 +15695,7 @@ fn open_vmess_udp_plain(
                 close,
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::HttpHeader { path } => {
@@ -15741,15 +15707,13 @@ fn open_vmess_udp_plain(
             if writer.write_all(&request).is_err() {
                 return None;
             }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             Some(CarriedVmess {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 close: shutdown_close(shutdown),
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::HttpUpgrade { path, .. } => {
@@ -15758,15 +15722,13 @@ fn open_vmess_udp_plain(
             let (mut reader, writer) =
                 crate::httpupgrade::connect(uplink, &vmess.host, path, &request, &vmess.headers)?;
             reader.set_poll(Some(RELAY_POLL));
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             Some(CarriedVmess {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 close: shutdown_close(shutdown),
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Quic
@@ -15794,9 +15756,6 @@ fn open_vmess_udp_session<S: Dialed>(
                 vmess_udp_request(vmess, dest)?;
             let mut session = session;
             session.write_all(&request).ok()?;
-            if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
-                return None;
-            }
             let (reader, writer, _) = session.into_halves()?;
             Some(CarriedVmess {
                 reader: Box::new(reader),
@@ -15804,12 +15763,13 @@ fn open_vmess_udp_session<S: Dialed>(
                 close: shutdown_close(raw),
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Ws { path, ed } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
-            let (mut reader, writer) = tls_ws(
+            let (reader, writer) = tls_ws(
                 server,
                 session,
                 &vmess.host,
@@ -15819,9 +15779,6 @@ fn open_vmess_udp_session<S: Dialed>(
                 &vmess.headers,
                 vmess.heartbeat,
             )?;
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             let closer = writer.clone();
             let close = shutdown_close(raw);
             let close: VmessClose = Arc::new(move || {
@@ -15834,18 +15791,16 @@ fn open_vmess_udp_session<S: Dialed>(
                 close,
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Grpc(settings) => {
-            let (mut reader, writer) = tls_grpc(server, session, &vmess.host, settings)?;
+            let (reader, writer) = tls_grpc(server, session, &vmess.host, settings)?;
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
                 return None;
             }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             let closer = writer.clone();
             let close = shutdown_close(raw);
             let close: VmessClose = Arc::new(move || {
@@ -15858,17 +15813,15 @@ fn open_vmess_udp_session<S: Dialed>(
                 close,
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Xhttp { settings, .. } => {
-            let (mut reader, writer) =
+            let (reader, writer) =
                 tls_xhttp(server, session, redial, &vmess.host, settings, false)?;
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
-                return None;
-            }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
             let closer = writer.clone();
@@ -15883,6 +15836,7 @@ fn open_vmess_udp_session<S: Dialed>(
                 close,
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::HttpHeader { path } => {
@@ -15893,32 +15847,27 @@ fn open_vmess_udp_session<S: Dialed>(
             if writer.write_all(&request).is_err() {
                 return None;
             }
-            let mut reader = reader;
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             Some(CarriedVmess {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 close: shutdown_close(raw),
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::HttpUpgrade { path, .. } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
-            let (mut reader, writer) =
+            let (reader, writer) =
                 tls_httpupgrade(server, session, &vmess.host, path, &request, &vmess.headers)?;
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return None;
-            }
             Some(CarriedVmess {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 close: shutdown_close(raw),
                 send,
                 recv,
+                response: (response_key, response_iv, auth),
             })
         }
         Carrier::Quic
@@ -15937,11 +15886,25 @@ fn spawn_vmess_udp_reader<R>(
     source: Arc<Mutex<Option<SocketAddr>>>,
     target: SocketAddr,
     recv: crate::vmess::Flow,
+    response: ([u8; 16], [u8; 16], u8),
+    close: VmessClose,
 ) -> RelayEnd
 where
     R: Read + Send + 'static,
 {
     RelayPool::global().run(move || {
+        // The reference writes its first datagram before it decodes the header, so a server that buffers the head until the first body frame still answers.
+        let mut read = read;
+        {
+            let mut bounded = HandshakeDeadline {
+                inner: &mut read,
+                until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
+            };
+            if !crate::vmess::read_response(&mut bounded, &response.0, &response.1, response.2) {
+                close();
+                return;
+            }
+        }
         let mut read = crate::vmess::Buffered::new(read);
         let mut recv = recv;
         let mut scratch = Vec::with_capacity(UDP_BUF);
@@ -27085,8 +27048,15 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
+        // A reader that ended carries no more replies, so its carrier is discarded before this datagram rather than dropping the answer.
         let redial = match &uplink {
-            Some(up) => up.target != dest,
+            Some(up) => {
+                up.target != dest
+                    || !matches!(
+                        up.done.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    )
+            }
             None => true,
         };
         if redial {
@@ -56486,6 +56456,199 @@ mod tests {
         ));
         let back = crate::vmess::read_frame(&mut uplink, &mut recv, &mut scratch).expect("reads");
         assert_eq!(back, b"ping");
+    }
+
+    /// A server that holds its response header until the first datagram arrives, as the reference does.
+    #[test]
+    fn a_vmess_udp_client_speaks_before_it_reads_the_response_header() {
+        let id = [0x5au8; 16];
+        let users = crate::vmess::Users::single(id);
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        let (early_tx, early_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("timeout");
+            let mut reader = stream.try_clone().expect("clone");
+            let Some(decoded) = crate::vmess::accept_request(&mut reader, &users) else {
+                early_tx.send(false).ok();
+                return;
+            };
+            let mut recv = decoded.recv;
+            let mut send = decoded.send;
+            let mut scratch = Vec::with_capacity(UDP_BUF);
+            let mut first = None;
+            let early = {
+                let mut bounded = HandshakeDeadline {
+                    inner: &mut reader,
+                    until: Instant::now() + Duration::from_millis(500),
+                };
+                match crate::vmess::read_frame(&mut bounded, &mut recv, &mut scratch) {
+                    Some(chunk) => {
+                        first = Some(chunk.to_vec());
+                        true
+                    }
+                    None => false,
+                }
+            };
+            let mut writer = stream;
+            if writer.write_all(&decoded.prefix).is_err() {
+                early_tx.send(early).ok();
+                return;
+            }
+            let payload = first.or_else(|| {
+                crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch).map(<[u8]>::to_vec)
+            });
+            let Some(payload) = payload else {
+                early_tx.send(early).ok();
+                return;
+            };
+            let Some(mut pad) = crate::vmess::PadSource::fresh() else {
+                early_tx.send(early).ok();
+                return;
+            };
+            let mut staging = Vec::with_capacity(UDP_BUF);
+            let _ =
+                crate::vmess::write_frame(&mut writer, &mut send, &payload, &mut staging, &mut pad);
+            early_tx.send(early).ok();
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_port = relay.local_addr().expect("addr").port();
+        let out = VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            id,
+            cipher: crate::vmess::Cipher::Chacha,
+            auth_len: false,
+            no_termination: false,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+        };
+        thread::spawn(move || serve_socks_udp_vmess(&relay, &out));
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, ("127.0.0.1", relay_port))
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(payload, b"ping");
+        assert!(
+            early_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reports"),
+            "the client waited for the response header before sending its first datagram"
+        );
+    }
+
+    /// A carrier that dies before its header arrives must not swallow the next datagram.
+    #[test]
+    fn a_vmess_udp_client_redials_after_the_carrier_dies() {
+        let id = [0x5au8; 16];
+        let users = crate::vmess::Users::single(id);
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for attempt in 0..2 {
+                let (stream, _) = tunnel.accept().expect("accepts");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .expect("timeout");
+                let mut reader = stream.try_clone().expect("clone");
+                let Some(decoded) = crate::vmess::accept_request(&mut reader, &users) else {
+                    continue;
+                };
+                if attempt == 0 {
+                    drop(reader);
+                    drop(stream);
+                    closed_tx.send(()).ok();
+                    continue;
+                }
+                let mut recv = decoded.recv;
+                let mut send = decoded.send;
+                let mut scratch = Vec::with_capacity(UDP_BUF);
+                let mut writer = stream;
+                if writer.write_all(&decoded.prefix).is_err() {
+                    return;
+                }
+                let Some(payload) = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
+                else {
+                    return;
+                };
+                let Some(mut pad) = crate::vmess::PadSource::fresh() else {
+                    return;
+                };
+                let mut staging = Vec::with_capacity(UDP_BUF);
+                let _ = crate::vmess::write_frame(
+                    &mut writer,
+                    &mut send,
+                    payload,
+                    &mut staging,
+                    &mut pad,
+                );
+            }
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_port = relay.local_addr().expect("addr").port();
+        let out = VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            id,
+            cipher: crate::vmess::Cipher::Chacha,
+            auth_len: false,
+            no_termination: false,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+        };
+        thread::spawn(move || serve_socks_udp_vmess(&relay, &out));
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, ("127.0.0.1", relay_port))
+            .expect("sends");
+        closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first carrier closes");
+        thread::sleep(Duration::from_millis(250));
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"pong");
+        udp.send_to(&datagram, ("127.0.0.1", relay_port))
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(payload, b"pong");
     }
 
     #[test]
