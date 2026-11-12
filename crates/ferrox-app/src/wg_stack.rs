@@ -2665,7 +2665,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
             } else if datagram.destination_port != port {
                 continue;
             }
-            let out = crate::proxy::socks_udp_frame(&mut frame, None, &remote, datagram.payload);
+            let out = crate::proxy::socks_udp_frame(&mut frame, &remote, datagram.payload);
             let _ = relay.send_to(out, app);
             quiet = StdInstant::now();
         }
@@ -3517,7 +3517,7 @@ mod tests {
         )
         .expect("lane");
         let mut buf = Vec::new();
-        let frame = crate::proxy::socks_udp_frame(&mut buf, None, &target, b"hi");
+        let frame = crate::proxy::socks_udp_frame(&mut buf, &target, b"hi");
         uplink.send(frame).expect("send");
         let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
         assert!(
@@ -4880,7 +4880,7 @@ mod client_tests {
 
         let target: SocketAddr = "192.0.2.1:53".parse().unwrap();
         let mut buf = Vec::new();
-        let frame = crate::proxy::socks_udp_frame(&mut buf, None, &target, b"query");
+        let frame = crate::proxy::socks_udp_frame(&mut buf, &target, b"query");
         app.send_to(frame, relay_address).expect("send");
         let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
         let datagram = udp_from_packet(&inner).expect("packet");
