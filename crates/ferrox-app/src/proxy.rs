@@ -4397,9 +4397,10 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         }
         let Ok(stream) = stream else { continue };
         let source = stream.peer_addr().ok().map(|peer| peer.ip());
-        if role
-            .tcp_filter()
-            .is_some_and(|filter| filter.rejects(source))
+        if !matches!(role, Role::Proxied(_))
+            && role
+                .tcp_filter()
+                .is_some_and(|filter| filter.rejects(source))
         {
             continue;
         }
@@ -4478,6 +4479,12 @@ fn serve_accepted(
         }
         role => (stream, role),
     };
+    if role
+        .tcp_filter()
+        .is_some_and(|filter| filter.rejects(stream.peer_addr().ok().map(|peer| peer.ip())))
+    {
+        return;
+    }
     // Armed once per accepted stream, as the reference wraps its listener's conn.
     let stream = stream
         .with_mask(role.tcp_mask())
@@ -14191,7 +14198,7 @@ fn serve_dokodemo(
         mode => mode,
     };
     let mask = match crate::config::tcp_mask(inbound.get("streamSettings")) {
-        Some(chain) if !chain.is_empty() => Some(chain),
+        Some(chain) if !chain.is_empty() || chain.filter().is_some() => Some(chain),
         Some(_) => None,
         None => {
             eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
@@ -66048,6 +66055,42 @@ mod tests {
         assert_eq!(&back[..n], b"who-is", "the answer comes back to the client");
     }
 
+    /// A filter-only chain is still a chain the door must arm: the blocked source is
+    /// dropped before the door dials its target, while the write stages stay empty.
+    #[test]
+    fn a_dokodemo_door_applies_a_filter_only_chain() {
+        let echo = echo_loop();
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let door = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo}}},"streamSettings":{{"finalmask":{{"tcp":[{{"type":"filter","settings":{{"blockedSourceIPs":["127.0.0.0/8"]}}}}]}}}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let opened = serve_inbounds(
+            "test",
+            &root,
+            Some(&freedom()),
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+            None,
+            None,
+        );
+        assert_eq!(opened, 1, "the filter-only door opens");
+        let mut client = connect_until(door);
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        let got = client.read(&mut back);
+        assert!(
+            got.map_or(true, |n| n == 0),
+            "a blocked source reached the target: {got:?}"
+        );
+    }
+
     #[test]
     fn a_dokodemo_door_keeps_two_clients_apart_over_a_socks_outbound() {
         const PATIENCE: Duration = Duration::from_secs(10);
@@ -75379,6 +75422,37 @@ mod accept_proxy_protocol_tests {
         let asked = Destination::Address("192.0.2.9:80".parse().expect("target"));
         let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, Some(&client), None);
         assert_eq!(tag.as_deref(), Some("pinned"));
+    }
+
+    #[test]
+    fn a_proxy_header_source_is_filtered_before_the_handshake() {
+        let port = free_port();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","port":{port},"settings":{{"clients":[{{"id":"{ID}"}}]}},
+                "streamSettings":{{"network":"raw","tcpSettings":{{"acceptProxyProtocol":true}},
+                "finalmask":{{"tcp":[{{"type":"filter","settings":{{"blockedSourceIPs":["192.0.2.1"]}}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY TCP4 192.0.2.1 192.0.2.2 1234 5678\r\n")
+            .expect("writes the header");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut byte = [0u8; 1];
+        let got = client.read(&mut byte);
+        assert!(
+            got.map_or(true, |n| n == 0),
+            "the socket peer, not the reported source, was filtered: {got:?}"
+        );
     }
 
     #[test]
