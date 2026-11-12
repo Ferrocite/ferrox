@@ -346,9 +346,8 @@ fn rebind_if_moved(session: &Session) -> Option<bool> {
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
-    let moved = match rebind_if_moved(session) {
-        Some(moved) => moved,
-        None => return false,
+    let Some(moved) = rebind_if_moved(session) else {
+        return false;
     };
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
