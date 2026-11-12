@@ -896,6 +896,27 @@ mod tests {
     }
 
     #[test]
+    fn a_merged_run_survives_a_socket_that_takes_a_little_at_a_time() {
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid");
+        let whole = hello(400);
+        let mut wire = Wire {
+            takes: 7,
+            ..Wire::default()
+        };
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert!(wire.calls > 1, "a short-take socket is handed the rest");
+        let (_, message) = records(&wire.bytes);
+        assert_eq!(message, whole[HEADER..], "no octet is lost or replayed");
+    }
+
+    #[test]
     fn a_merged_run_past_the_gather_width_keeps_every_octet() {
         let mut mask =
             Fragment::new(0, 1, vec![range(1, 1)], vec![range(0, 0)], range(0, 0)).expect("valid");
