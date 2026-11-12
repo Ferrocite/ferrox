@@ -695,20 +695,21 @@ impl core::fmt::Debug for Aes128Gcm {
 #[must_use]
 pub fn has_hardware_support() -> bool {
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("aes")
-        && std::is_x86_feature_detected!("pclmulqdq")
-        && std::is_x86_feature_detected!("ssse3")
     {
-        return true;
+        std::is_x86_feature_detected!("aes")
+            && std::is_x86_feature_detected!("pclmulqdq")
+            && std::is_x86_feature_detected!("ssse3")
     }
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("aes")
-        && std::arch::is_aarch64_feature_detected!("pmull")
-        && std::arch::is_aarch64_feature_detected!("neon")
     {
-        return true;
+        std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("pmull")
+            && std::arch::is_aarch64_feature_detected!("neon")
     }
-    false
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
 }
 
 impl Aes128Gcm {
