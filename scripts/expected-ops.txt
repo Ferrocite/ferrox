@@ -268,3 +268,9 @@ ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_s
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is
 # never copied. Nothing on the wire moves. Re-blessed 33046 by that rewrite.
 ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_costs_one_walk
+# The merged hello: 256 fixed 300-octet hellos cut at widths 11 and 37 through
+# one stage with a single zero delay, over a sink that takes a whole gathered
+# write and keeps nothing. 323610 is 1264.1 per turn; the two widths and the
+# zero delay never draw, so the probe prices the cuts and the 32-record gather.
+# The record bytes are the same as the merge-copy path this replaced.
+ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
