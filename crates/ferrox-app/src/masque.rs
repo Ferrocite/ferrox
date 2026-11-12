@@ -1751,6 +1751,7 @@ impl Stream {
 /// Writes inner packets to the tunnel and hands the ones it answers back: a TCP
 /// packet to the stack, a UDP packet to the loopback lane waiting on its port.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 fn io(
     lane: Lane,
     sock: &Datagram,

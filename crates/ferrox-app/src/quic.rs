@@ -3022,16 +3022,15 @@ impl Datagram {
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         // The arm and its record are one step under the shared cell, so a concurrent holder cannot leave the cell naming a wait the socket does not carry.
         let guard = self.armed.lock();
-        let result = match self.hop.as_ref() {
-            Some(hop) => hop.set_read_timeout(timeout),
-            None => {
-                if let Ok(rebound) = self.rebound.lock() {
-                    if let Some(sock) = rebound.as_ref() {
-                        let _ = sock.set_read_timeout(timeout);
-                    }
+        let result = if let Some(hop) = self.hop.as_ref() {
+            hop.set_read_timeout(timeout)
+        } else {
+            if let Ok(rebound) = self.rebound.lock() {
+                if let Some(sock) = rebound.as_ref() {
+                    let _ = sock.set_read_timeout(timeout);
                 }
-                self.sock.set_read_timeout(timeout)
             }
+            self.sock.set_read_timeout(timeout)
         };
         if let Ok(mut armed) = guard {
             *armed = Some(timeout);

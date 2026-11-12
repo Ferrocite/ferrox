@@ -309,33 +309,45 @@ fn send_all_metered(
     }
 }
 
-/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
-pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
-    if let Some(peer) = session.peer {
-        let now = crate::quic::network_generation();
-        let seen = session.net.load(Ordering::Relaxed);
-        if now != seen
-            && session
-                .net
-                .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            let Ok(mut conn) = session.shared.lock() else {
-                return false;
-            };
-            match crate::quic::rebind_path(&mut conn, &session.sock, peer) {
-                crate::quic::Rebind::Moved(moved) => {
-                    if let Ok(mut local) = session.local_now.lock() {
-                        *local = moved;
-                    }
-                }
-                crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => {}
-                crate::quic::Rebind::Failed => {
-                    let _ = conn.close(false, 0, b"rebind");
-                    return false;
-                }
+/// Move this session when the route generation changed: a moved source updates the shared
+/// local for every clone, and a failed move ends the turn so the carrier redials.
+fn rebind_if_moved(session: &Session) -> bool {
+    let Some(peer) = session.peer else {
+        return true;
+    };
+    let now = crate::quic::network_generation();
+    let seen = session.net.load(Ordering::Relaxed);
+    if now == seen
+        || session
+            .net
+            .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return true;
+    }
+    let Ok(mut conn) = session.shared.lock() else {
+        return false;
+    };
+    match crate::quic::rebind_path(&mut conn, &session.sock, peer) {
+        crate::quic::Rebind::Moved(moved) => {
+            if let Ok(mut local) = session.local_now.lock() {
+                *local = moved;
             }
         }
+        crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => {}
+        crate::quic::Rebind::Failed => {
+            let _ = conn.close(false, 0, b"rebind");
+            return false;
+        }
+    }
+    true
+}
+
+/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
+    if !rebind_if_moved(session) {
+        return false;
     }
     let local = session
         .local_now
