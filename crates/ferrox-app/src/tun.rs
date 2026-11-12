@@ -306,8 +306,12 @@ impl Device {
 
 /// One packet write, all-or-nothing: a full write is carried, a short or refused write is dropped.
 fn write_packet_to<W: Write>(writer: &mut W, packet: &[u8]) -> io::Result<bool> {
-    writer.write_all(packet)?;
-    Ok(true)
+    match writer.write(packet) {
+        Ok(written) if written == packet.len() => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) if crate::tun_stack::refused(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -839,7 +843,7 @@ impl Handler {
                             &buf[..n],
                             &mut pkt,
                         );
-                        if dev_writer.write_all(&pkt).is_err() {
+                        if write_packet_to(&mut dev_writer, &pkt).is_err() {
                             break FLAG_RST | FLAG_ACK;
                         }
                     }
@@ -869,7 +873,7 @@ impl Handler {
                     &[],
                     &mut pkt,
                 );
-                let _ = dev_writer.write_all(&pkt);
+                let _ = write_packet_to(&mut dev_writer, &pkt);
             }
             // Queue the entry's removal before the shutdown that wakes the relay leg, so a caller that sees the leg end can reap the entry at its next dispatch.
             let _ = ended_tx.send(Ended::Stream(key));
@@ -965,7 +969,7 @@ fn open_leg(
             if !udp_datagram(&datagram, &mut out) {
                 continue;
             }
-            if dev_writer.write_all(&out).is_err() {
+            if write_packet_to(&mut dev_writer, &out).is_err() {
                 break;
             }
         }
