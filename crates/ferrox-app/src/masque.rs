@@ -58,6 +58,10 @@ pub(crate) const QUEUE: usize = 512;
 /// Datagrams a client may hold before its stack attaches, and their total bytes.
 pub(crate) const EARLY_PACKETS: usize = 64;
 pub(crate) const EARLY_BYTES: usize = 1 << 20;
+
+/// The most capsule bytes one HTTP/3 request stream may hold while a capsule is incomplete, the
+/// same ceiling the HTTP/2 path uses.
+const CAPSULE_CAP: usize = 1 << 20;
 /// Frames the connection may hold before `dgram_send` refuses more: the
 /// reference queues 32, and a peer that drains slower drops what the wire
 /// delivers above its own receive queue, which the inner TCP then backs off
@@ -1571,7 +1575,6 @@ enum Owned {
 
 /// The request stream's frame state: the head block and the capsule bytes a
 /// CONNECT-IP tunnel answers with, kept apart because a frame can split either.
-#[derive(Default)]
 struct Stream {
     id: u64,
     buf: Vec<u8>,
@@ -1583,6 +1586,25 @@ struct Stream {
     done: bool,
     packets: Vec<Vec<u8>>,
     early_bytes: usize,
+    mtu: usize,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            buf: Vec::new(),
+            at: 0,
+            capsules: Vec::new(),
+            capsule_at: 0,
+            status: None,
+            pending: Vec::new(),
+            done: false,
+            packets: Vec::new(),
+            early_bytes: 0,
+            mtu: DEFAULT_MTU,
+        }
+    }
 }
 
 impl Stream {
@@ -1662,6 +1684,9 @@ impl Stream {
                 }
                 Ok((n, fin)) => {
                     self.buf.extend_from_slice(&room[..n]);
+                    if self.buf.len() > CAPSULE_CAP {
+                        return Err("masque: stream buffer exceeds the capsule cap".to_owned());
+                    }
                     if fin {
                         self.done = true;
                     }
@@ -1670,11 +1695,11 @@ impl Stream {
                 Err(error) => return Err(format!("masque: stream read: {error}")),
             }
         }
-        self.parse();
+        self.parse()?;
         Ok(())
     }
 
-    fn parse(&mut self) {
+    fn parse(&mut self) -> Result<(), String> {
         let mut at = self.at;
         loop {
             let before = at;
@@ -1682,7 +1707,11 @@ impl Stream {
                 at = before;
                 break;
             };
-            let length = frame.length as usize;
+            let length = usize::try_from(frame.length)
+                .map_err(|_| "masque: frame length does not fit".to_owned())?;
+            if length > CAPSULE_CAP {
+                return Err("masque: frame exceeds the capsule cap".to_owned());
+            }
             let Some(room) = self.buf.get(at..at + length) else {
                 at = before;
                 break;
@@ -1698,6 +1727,11 @@ impl Stream {
         }
         self.buf.drain(..at);
         self.at = 0;
+        if let Some((_, declared)) = connectip::capsule_header(&self.capsules[self.capsule_at..]) {
+            if declared > CAPSULE_CAP as u64 {
+                return Err("masque: capsule exceeds the cap".to_owned());
+            }
+        }
         while let Some((used, capsule)) =
             connectip::capsule_split(&self.capsules[self.capsule_at..])
         {
@@ -1705,7 +1739,9 @@ impl Stream {
             let owned = match capsule {
                 connectip::Capsule::AddressAssign(body) => Owned::AddressAssign(body.to_vec()),
                 #[cfg(test)]
-                connectip::Capsule::Datagram(payload) => Owned::Datagram(payload.to_vec()),
+                connectip::Capsule::Datagram(payload) if payload.len() <= self.mtu => {
+                    Owned::Datagram(payload.to_vec())
+                }
                 _ => Owned::Other,
             };
             self.pending.push(owned);
@@ -1714,6 +1750,10 @@ impl Stream {
             self.capsules.drain(..self.capsule_at);
             self.capsule_at = 0;
         }
+        if self.capsules.len() > CAPSULE_CAP {
+            return Err("masque: capsules exceed the cap".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -2879,6 +2919,11 @@ fn service(
                 Ok((0, _)) | Err(quiche::Error::Done) => break,
                 Ok((n, fin)) => {
                     tunnel.buf.extend_from_slice(&room[..n]);
+                    if tunnel.buf.len() > CAPSULE_CAP {
+                        let _ = conn.close(false, 0, b"capsule bound");
+                        tunnel.rejected = true;
+                        return;
+                    }
                     if fin && !tunnel.headers {
                         break;
                     }
@@ -2897,8 +2942,9 @@ fn service(
                 send_stream(conn, id, &head, true).ok();
                 tunnel.rejected = true;
             }
-        } else if !tunnel.rejected {
-            parse_capsules(conn, tunnel);
+        } else if !tunnel.rejected && !parse_capsules(conn, tunnel, spec.mtu) {
+            let _ = conn.close(false, 0, b"capsule bound");
+            tunnel.rejected = true;
         }
     }
     if tunnel.opened && !tunnel.rejected {
@@ -3272,10 +3318,27 @@ pub(crate) fn register(
     })
 }
 
-fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
+fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel, mtu: usize) -> bool {
+    let Some(answers) = drain_capsules(tunnel, mtu) else {
+        return false;
+    };
+    if let Some(stream) = tunnel.stream {
+        for body in answers {
+            send_data(conn, stream, &body).ok();
+        }
+    }
+    true
+}
+
+/// Drain the capsules a tunnel's request stream has whole. `None` refuses a frame or capsule past
+/// the cap before it can grow the buffer; a datagram wider than the tunnel MTU is dropped here.
+fn drain_capsules(tunnel: &mut Tunnel, mtu: usize) -> Option<Vec<Vec<u8>>> {
     let mut at = tunnel.at;
     while let Some(frame) = frames::h3_frame(&tunnel.buf, &mut at) {
-        let length = frame.length as usize;
+        let length = usize::try_from(frame.length).ok()?;
+        if length > CAPSULE_CAP {
+            return None;
+        }
         let Some(room) = tunnel.buf.get(at..at + length) else {
             break;
         };
@@ -3286,24 +3349,29 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
     }
     tunnel.buf.drain(..at);
     tunnel.at = 0;
+    if let Some((_, declared)) = connectip::capsule_header(&tunnel.capsules[tunnel.capsule_at..]) {
+        if declared > CAPSULE_CAP as u64 {
+            return None;
+        }
+    }
+    let mut answers = Vec::new();
     while let Some((used, capsule)) =
         connectip::capsule_split(&tunnel.capsules[tunnel.capsule_at..])
     {
         tunnel.capsule_at += used;
         match capsule {
-            connectip::Capsule::Datagram(payload) => {
+            connectip::Capsule::Datagram(payload) if payload.len() <= mtu => {
                 if let Some(udp) = &tunnel.udp {
                     udp.send(payload);
                 }
             }
+            connectip::Capsule::Datagram(_) => {}
             connectip::Capsule::AddressRequest(body) if tunnel.udp.is_none() => {
                 let assignments = respond(body, &tunnel.addrs);
                 if !assignments.is_empty() {
                     let mut body = Vec::new();
                     connectip::address_assign_encode(&assignments, &mut body);
-                    if let Some(stream) = tunnel.stream {
-                        send_data(conn, stream, &body).ok();
-                    }
+                    answers.push(body);
                 }
             }
             _ => {}
@@ -3313,6 +3381,10 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
         tunnel.capsules.drain(..tunnel.capsule_at);
         tunnel.capsule_at = 0;
     }
+    if tunnel.capsules.len() > CAPSULE_CAP {
+        return None;
+    }
+    Some(answers)
 }
 
 /// Frames one UDP payload into the tunnel's reusable buffer and queues it on the
@@ -5276,6 +5348,73 @@ mod tests {
             udp_frame: Vec::new(),
             udp_at: 0,
         }
+    }
+
+    /// One HTTP/3 DATA frame carrying `body`, as the request stream's parser sees it.
+    fn data_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frames::quic_varint(&mut frame, frames::H3_DATA);
+        frames::quic_varint(&mut frame, body.len() as u64);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// A capsule header that declares more bytes than the cap is refused as soon as the header is
+    /// whole, and the buffer never grows toward the declared length.
+    #[test]
+    fn an_h3_capsule_past_the_cap_is_refused_before_it_grows() {
+        let mut header = Vec::new();
+        frames::quic_varint(&mut header, 0);
+        frames::quic_varint(&mut header, (CAPSULE_CAP + 1) as u64);
+        let mut tunnel = head_tunnel(data_frame(&header));
+        assert!(drain_capsules(&mut tunnel, DEFAULT_MTU).is_none());
+        assert!(
+            tunnel.capsules.len() < CAPSULE_CAP,
+            "the declared length is refused before it is buffered"
+        );
+    }
+
+    /// A DATA frame whose own length is past the cap is refused before its body is appended.
+    #[test]
+    fn an_h3_data_frame_past_the_cap_is_refused_before_it_grows() {
+        let mut frame = Vec::new();
+        frames::quic_varint(&mut frame, frames::H3_DATA);
+        frames::quic_varint(&mut frame, (CAPSULE_CAP + 1) as u64);
+        let mut tunnel = head_tunnel(frame);
+        assert!(drain_capsules(&mut tunnel, DEFAULT_MTU).is_none());
+        assert!(
+            tunnel.capsules.is_empty(),
+            "the frame body is never buffered"
+        );
+    }
+
+    /// A DATAGRAM capsule wider than the tunnel MTU is dropped at parse; one that fits reaches the
+    /// lane unchanged.
+    #[test]
+    fn an_oversized_h3_datagram_is_dropped_at_parse() {
+        let target = UdpSocket::bind("127.0.0.1:0").expect("target");
+        target
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("timeout");
+        let port = target.local_addr().expect("address").port();
+        let mut tunnel = head_tunnel(Vec::new());
+        tunnel.udp = Some(UdpLane::open("127.0.0.1", port).expect("lane"));
+        let mut oversized = Vec::new();
+        connectip::packet_encode(&vec![0x45; DEFAULT_MTU + 1], &mut oversized);
+        tunnel.buf = data_frame(&oversized);
+        assert!(drain_capsules(&mut tunnel, DEFAULT_MTU).is_some());
+        let mut room = [0u8; DEFAULT_MTU + 1];
+        assert!(
+            target.recv_from(&mut room).is_err(),
+            "the oversized packet never reaches the lane"
+        );
+        let packet = vec![0x45; DEFAULT_MTU];
+        let mut fits = Vec::new();
+        connectip::packet_encode(&packet, &mut fits);
+        tunnel.buf = data_frame(&fits);
+        assert!(drain_capsules(&mut tunnel, DEFAULT_MTU).is_some());
+        let (read, _) = target.recv_from(&mut room).expect("the packet that fits");
+        assert_eq!(read, DEFAULT_MTU);
     }
 
     /// quiche greases a request stream before the HEADERS frame; a peer that stops at the first
