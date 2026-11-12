@@ -538,7 +538,17 @@ where
     let headers = borrow_headers(&headers);
     let reply = call("POST", "/reg", &headers, &body)
         .map_err(|error| RegisterError::retryable(error.reason))?;
-    let registered = parse_registration(&reply)?;
+    // A 2xx that names the device it made is not posted again: another host would mint a second.
+    let registered = parse_registration(&reply).map_err(|error| {
+        let minted = (200..300).contains(&reply.status)
+            && crate::json::parse(&String::from_utf8_lossy(&reply.body))
+                .is_ok_and(|root| root.get("id").is_some() || root.get("token").is_some());
+        if minted {
+            RegisterError::fatal(error.reason)
+        } else {
+            error
+        }
+    })?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
     let mut masque = None;
@@ -596,12 +606,7 @@ where
 
 /// Read a device back from the API, so an identity Cloudflare no longer knows
 /// is replaced instead of handshaking into nothing.
-fn refresh<F>(
-    spec: &WarpSpec,
-    identity: &Identity,
-    single: bool,
-    call: &F,
-) -> Result<Identity, RegisterError>
+fn refresh<F>(spec: &WarpSpec, identity: &Identity, call: &F) -> Result<Identity, RegisterError>
 where
     F: Fn(&str, &str, &[(&str, &str)], &[u8]) -> Result<Reply, RegisterError>,
 {
@@ -610,7 +615,7 @@ where
     let headers = registration_headers(Some(&bearer));
     let headers = borrow_headers(&headers);
     let reply = call("GET", &path, &headers, b"")?;
-    if refuses_identity(&reply) || (single && reply.status == 404) {
+    if refuses_identity(&reply) {
         return Err(RegisterError::refused(format!(
             "the API answered the saved identity with {}: {}",
             reply.status,
@@ -643,12 +648,12 @@ fn refuses_identity(reply: &Reply) -> bool {
     matches!(reply.status, 401 | 410) || (reply.status == 404 && is_api_envelope(&reply.body))
 }
 
-/// Cloudflare's JSON envelope, rather than a page of another server that fronts
-/// the name: a 404 page says nothing about the identity.
+/// Cloudflare's JSON error envelope, rather than a page of another server that
+/// fronts the name: a 404 page says nothing about the identity.
 fn is_api_envelope(body: &[u8]) -> bool {
     crate::json::parse(&String::from_utf8_lossy(body)).is_ok_and(|root| {
-        matches!(root.get("success"), Some(crate::json::Json::Bool(_)))
-            && matches!(root.get("errors"), Some(crate::json::Json::Arr(_)))
+        matches!(root.get("success"), Some(crate::json::Json::Bool(false)))
+            && matches!(root.get("errors"), Some(crate::json::Json::Arr(errors)) if !errors.is_empty())
     })
 }
 
@@ -661,9 +666,7 @@ fn reply_root(reply: &Reply) -> Result<crate::json::Json, RegisterError> {
 
 fn refresh_saved(spec: &WarpSpec, identity: &Identity) -> Result<Identity, RegisterError> {
     let mut last = String::new();
-    let bases = spec.api_url();
-    let routes = bases.len();
-    for base in bases {
+    for base in spec.api_url() {
         let endpoint = match api_endpoint(spec, &base) {
             Ok(endpoint) => endpoint,
             Err(reason) => {
@@ -671,8 +674,7 @@ fn refresh_saved(spec: &WarpSpec, identity: &Identity) -> Result<Identity, Regis
                 continue;
             }
         };
-        let single = routes == 1;
-        match refresh(spec, identity, single, &|method, path, headers, body| {
+        match refresh(spec, identity, &|method, path, headers, body| {
             let url = endpoint.url(path);
             crate::foxy_account::h2_ask(&endpoint, method, &url, headers, body)
                 .map_err(RegisterError::retryable)
@@ -2355,7 +2357,7 @@ mod tests {
             assert_eq!(body, []);
             Ok::<_, RegisterError>(fresh_reply.clone())
         };
-        let fresh = refresh(&spec, &saved, true, &call).expect("a read-back");
+        let fresh = refresh(&spec, &saved, &call).expect("a read-back");
         assert_eq!(fresh.wireguard.peer, [0x55; 32]);
         assert_eq!(fresh.wireguard.reserved, [9, 8, 7]);
         assert_eq!(fresh.wireguard.addresses.len(), 2);
@@ -2376,15 +2378,26 @@ mod tests {
             },
             masque: None,
         };
-        for (status, refused) in [(401, true), (404, true), (410, true), (503, false)] {
-            let call = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+        for (status, body, refused) in [
+            (401, &b"{\"error\":\"x\"}"[..], true),
+            (404, &b"{\"error\":\"x\"}"[..], false),
+            (
+                404,
+                &b"{\"success\":false,\"errors\":[{\"code\":1000}]}"[..],
+                true,
+            ),
+            (404, &b"{\"success\":true,\"errors\":[]}"[..], false),
+            (410, &b"{\"error\":\"x\"}"[..], true),
+            (503, &b"{\"error\":\"x\"}"[..], false),
+        ] {
+            let call = move |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
                 Ok::<_, RegisterError>(Reply {
                     status,
                     headers: Vec::new(),
-                    body: b"{\"error\":\"x\"}".to_vec(),
+                    body: body.to_vec(),
                 })
             };
-            let error = refresh(&spec, &saved, true, &call).expect_err("not a usable read-back");
+            let error = refresh(&spec, &saved, &call).expect_err("not a usable read-back");
             assert_eq!(error.refused, refused, "{status}");
         }
     }
@@ -2451,19 +2464,40 @@ mod tests {
                 body: b"<html>not the API</html>".to_vec(),
             })
         };
-        let error = refresh(&spec, &saved, false, &page).expect_err("a 404 page");
+        let error = refresh(&spec, &saved, &page).expect_err("a 404 page");
         assert!(!error.refused, "{}", error.reason);
-        let error = refresh(&spec, &saved, true, &page).expect_err("a 404 on the only route");
-        assert!(error.refused, "{}", error.reason);
         let envelope = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
             Ok::<_, RegisterError>(Reply {
                 status: 404,
                 headers: Vec::new(),
-                body: b"{\"success\":false,\"errors\":[]}".to_vec(),
+                body: b"{\"success\":false,\"errors\":[{\"code\":1000}]}".to_vec(),
             })
         };
-        let error = refresh(&spec, &saved, false, &envelope).expect_err("a refusal");
+        let error = refresh(&spec, &saved, &envelope).expect_err("a refusal");
         assert!(error.refused, "{}", error.reason);
+    }
+
+    #[test]
+    fn a_shaped_registration_reply_is_not_retried_on_another_host() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let shaped = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+            Ok::<_, RegisterError>(Reply {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"id\":\"a-device\",\"token\":\"a-token\"}".to_vec(),
+            })
+        };
+        let error = register_with(&spec, false, &shaped).expect_err("no config");
+        assert!(error.fatal, "{}", error.reason);
+        let page = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+            Ok::<_, RegisterError>(Reply {
+                status: 200,
+                headers: Vec::new(),
+                body: b"<html>not the API</html>".to_vec(),
+            })
+        };
+        let error = register_with(&spec, false, &page).expect_err("not the API");
+        assert!(!error.fatal, "{}", error.reason);
     }
 
     #[test]
