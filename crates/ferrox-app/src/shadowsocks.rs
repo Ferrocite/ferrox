@@ -1182,8 +1182,8 @@ fn aead_step<R: Read>(
     {
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
     }
-    // A chunk that reached its target is progress: it restarts the reply grace a sibling's end started.
-    if opened.chunks > 0 {
+    // Only bytes that reached the target are progress: an authenticated empty frame keeps a lane, not its grace.
+    if batch[..opened.chunks].iter().any(|&(_, len)| len > 0) {
         if let Some(flow) = flow {
             flow.mark_progress();
         }
@@ -3769,6 +3769,48 @@ mod tests {
         assert!(
             !flow.ended_and_idle(idle),
             "the forwarded chunk did not restart the grace"
+        );
+    }
+
+    /// An authenticated empty frame restarts nothing: the grace runs from bytes that moved, so a peer cannot hold a finished lane open with chunks that carry none.
+    #[test]
+    fn an_empty_frame_does_not_restart_the_reply_grace() {
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::new(|| {}), None);
+        let idle = crate::budgets::RELAY_RESPONSE_IDLE;
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut seal = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut length = [0u8; LENGTH_LEN];
+        let length_tag = seal.seal_piece_in_place(&mut length).expect("tags");
+        let mut body: [u8; 0] = [];
+        let tag = seal.seal_piece_in_place(&mut body).expect("tags");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&length);
+        wire.extend_from_slice(&length_tag);
+        wire.extend_from_slice(&tag);
+        flow.mark_ended();
+        let deadline = std::time::Instant::now() + idle + Duration::from_millis(500);
+        while !flow.ended_and_idle(idle) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            flow.ended_and_idle(idle),
+            "the grace did not run from the sibling's end"
+        );
+        let mut window = ChunkReader::new(std::io::Cursor::new(&wire[..]));
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, Some(&flow));
+        assert_eq!(
+            crate::proxy::lane_pool::Next::More,
+            next,
+            "the frame opened"
+        );
+        assert!(out.is_empty(), "an empty frame forwards nothing");
+        assert!(
+            flow.ended_and_idle(idle),
+            "an empty frame must not restart the grace"
         );
     }
 
