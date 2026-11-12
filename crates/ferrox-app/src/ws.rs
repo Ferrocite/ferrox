@@ -583,8 +583,7 @@ impl<R: Read> WsReader<R> {
                         self.eof = true;
                         break;
                     }
-                    // Nothing parsed out of what is in hand: pull the next frame the lane's poll
-                    // allows and try once more. A timeout here ends the window, not the flow.
+                    // Nothing parsed out of what is in hand: pull the next frame the lane's poll allows and try once more; a timeout ends the window, not the flow.
                     if self.at < self.have.len() {
                         break;
                     }
@@ -625,8 +624,7 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
             return Ok(crate::proxy::Window::one(&self.early[start..end]));
         }
         let mut spans = [(0usize, 0usize); crate::proxy::WINDOW_PARTS];
-        // The spans this call hands out are offsets into `have`, so nothing may compact it while
-        // the window fills.
+        // The spans this call hands out are offsets into `have`, so nothing may compact it while the window fills.
         self.coalesce = true;
         let filled = self.fill_window(&mut spans);
         self.coalesce = false;
