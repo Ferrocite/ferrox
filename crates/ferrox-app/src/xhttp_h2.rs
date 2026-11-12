@@ -16,8 +16,9 @@ use crate::xhttp::XhttpSettings;
 
 const CONN_WINDOW_TOP_UP: u32 = 16 * 1024 * 1024 - 65_535;
 const MAX_STREAMS: u32 = 100;
-/// The default `SETTINGS_MAX_FRAME_SIZE` (RFC 7540 6.5.2): the largest inbound frame we accept because we never advertise a larger one.
-const MAX_RECV_FRAME: usize = 16_384;
+/// The largest frame we advertise and accept: one relay window, so a window crosses the wire as one DATA frame instead of four.
+const MAX_FRAME_SIZE: u32 = 64 * 1024;
+const MAX_RECV_FRAME: usize = MAX_FRAME_SIZE as usize;
 /// The two `WINDOW_UPDATE` frames one credit grants differ only by stream id, so twenty of their twenty-six bytes are constant; the connection frame keeps the first slot because that is the order it was written in.
 const CREDIT_TEMPLATE: [u8; 26] = {
     let mut out = [0u8; 26];
@@ -29,8 +30,17 @@ const CREDIT_TEMPLATE: [u8; 26] = {
     out
 };
 
-/// The DATA frames one downlink write carries: a promoted relay window is `64 KiB`, four frames of the default `SETTINGS_MAX_FRAME_SIZE`, so one window reaches the peer as one vectored write.
+/// The DATA frames one downlink write carries: a promoted relay window is `64 KiB`, one frame at the size we advertise, so one window reaches the peer as one vectored write.
 const DATA_FRAMES_PER_WRITE: usize = 8;
+
+fn initial_settings() -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    out.extend_from_slice(&S_WINDOW.to_be_bytes());
+    out.extend_from_slice(&WINDOW.to_be_bytes());
+    out.extend_from_slice(&S_MAX_FRAME.to_be_bytes());
+    out.extend_from_slice(&MAX_FRAME_SIZE.to_be_bytes());
+    out
+}
 
 const NO_PART: &[u8] = &[];
 
@@ -1949,9 +1959,7 @@ impl H2Client {
                 return None;
             }
         }
-        let mut initial = Vec::with_capacity(12);
-        initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-        initial.extend_from_slice(&WINDOW.to_be_bytes());
+        let initial = initial_settings();
         if !conn.frame(T_SETTINGS, 0, 0, &initial) {
             return None;
         }
@@ -2797,9 +2805,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     raw: None,
                     decryption: self.decryption.take(),
                 });
-                let mut initial = Vec::with_capacity(12);
-                initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-                initial.extend_from_slice(&WINDOW.to_be_bytes());
+                let initial = initial_settings();
                 if !conn.frame(T_SETTINGS, 0, 0, &initial) {
                     self.conn = Some(conn);
                     return self.end();
@@ -2818,7 +2824,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     u32::from_be_bytes([self.head[5], self.head[6], self.head[7], self.head[8]])
                         & 0x7FFF_FFFF;
                 if len > MAX_RECV_FRAME {
-                    // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
+                    // A frame past the advertised SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
                     if let Some(conn) = &self.conn {
                         conn.refuse(E_FRAME_SIZE);
                     }
@@ -3229,9 +3235,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(20)))
                 .expect("timeout");
             stream.write_all(MAGIC).expect("preface");
-            let mut initial = Vec::with_capacity(12);
-            initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-            initial.extend_from_slice(&WINDOW.to_be_bytes());
+            let initial = initial_settings();
             write_frame(&mut stream, T_SETTINGS, 0, 0, &initial);
             let mut conn = Self {
                 stream,
@@ -4102,7 +4106,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A peer that announces a frame larger than the default `SETTINGS_MAX_FRAME_SIZE` must be refused with `FRAME_SIZE_ERROR`, not have its length reserved and its phantom body awaited — the read is unbounded, so a parked oversized head would pin the thread.
+    /// A peer that announces a frame larger than the advertised `SETTINGS_MAX_FRAME_SIZE` must be refused with `FRAME_SIZE_ERROR`, not have its length reserved and its phantom body awaited — the read is unbounded, so a parked oversized head would pin the thread.
     #[test]
     fn a_frame_beyond_the_max_size_is_refused_not_reserved_or_read() {
         let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
@@ -5354,6 +5358,23 @@ mod tests {
             false,
         );
         (conn, written, slices)
+    }
+
+    /// The opening SETTINGS offer one relay window: the peer may answer a whole window in one DATA frame instead of four.
+    #[test]
+    fn the_initial_settings_advertise_one_relay_window() {
+        let settings = initial_settings();
+        assert_eq!(settings.len(), 18, "two settings before the frame size");
+        assert_eq!(
+            u16::from_be_bytes([settings[6], settings[7]]),
+            S_MAX_FRAME,
+            "the second setting is SETTINGS_MAX_FRAME_SIZE"
+        );
+        assert_eq!(
+            u32::from_be_bytes([settings[8], settings[9], settings[10], settings[11]]),
+            MAX_FRAME_SIZE,
+            "one relay window"
+        );
     }
 
     /// A SETTINGS payload whose length is not a multiple of six is a connection error
