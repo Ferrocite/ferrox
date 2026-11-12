@@ -1334,9 +1334,9 @@ impl Listener {
     /// Bind a listener for the target's family. A unix target is read the way the reference's
     /// listener reads it: an `@` name is Linux's abstract namespace, a second `@` pads it across
     /// the kernel's whole `sun_path`, and a path may carry one comma-separated octal mode applied
-    /// after binding. A path left from a previous run is unlinked first: binding over an existing
-    /// socket file fails `EADDRINUSE`, and a stale socket nobody owns is exactly that — the same
-    /// unlink-then-bind recovery the references do.
+    /// after binding. A comma followed by anything but an octal mode is part of the name. A stale
+    /// socket left from a previous run is unlinked first, the same recovery the references do; a
+    /// file that is not a socket is refused rather than removed.
     pub(crate) fn bind(target: &Target) -> io::Result<Listener> {
         match target {
             Target::Ip(addr) => std::net::TcpListener::bind(addr).map(Listener::Tcp),
@@ -1551,53 +1551,83 @@ fn abstract_name(path: &std::path::Path) -> Option<(&[u8], bool)> {
 }
 
 /// The one comma-separated octal permission the reference's listener takes after a socket path,
-/// split before anything touches the filesystem. Exactly one comma is the spelling; another count
-/// stays part of the path, which is what the reference's own split leaves behind.
+/// split before anything touches the filesystem. Exactly one comma followed by octal digits is
+/// the spelling; another count, or a suffix that is not octal, stays part of the path, so a name
+/// like `app,v2.sock` binds and dials the same literal text a peer outside this tree can name.
 #[cfg(unix)]
-fn split_permission(path: &std::path::Path) -> io::Result<(&std::path::Path, Option<u32>)> {
+fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
     use std::os::unix::ffi::OsStrExt as _;
     let bytes = path.as_os_str().as_bytes();
     let Some(comma) = bytes.iter().position(|byte| *byte == b',') else {
-        return Ok((path, None));
+        return (path, None);
     };
     if bytes[comma + 1..].contains(&b',') {
-        return Ok((path, None));
+        return (path, None);
     }
-    let text = std::str::from_utf8(&bytes[comma + 1..]).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a unix permission is not octal",
-        )
-    })?;
-    let mode = u32::from_str_radix(text, 8).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a unix permission is not octal",
-        )
-    })?;
+    let Ok(text) = std::str::from_utf8(&bytes[comma + 1..]) else {
+        return (path, None);
+    };
+    let Ok(mode) = u32::from_str_radix(text, 8) else {
+        return (path, None);
+    };
     let head = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..comma]));
-    Ok((head, Some(mode)))
+    (head, Some(mode))
 }
 
 /// Bind a unix listener from the text a config names: an abstract name on the hosts that serve
-/// one, else a filesystem path after the permission the reference accepts is split off, the stale
-/// socket removed, and the requested mode applied once the socket exists.
+/// one, else a filesystem path after the permission the reference accepts is split off. A stale
+/// socket is replaced and a file that is not a socket is refused, so a typo cannot delete data; a
+/// requested mode is applied to a sibling name the path cannot have been swapped under and then
+/// moved into place, so nothing but our own socket ever takes the permission.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
         return abstract_listener(name, padded);
     }
-    let (path, perm) = split_permission(path)?;
-    if std::fs::symlink_metadata(path).is_ok() {
-        std::fs::remove_file(path)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    if let Some(mode) = perm {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    let (path, perm) = split_permission(path);
+    let stale = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => true,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let Some(mode) = perm else {
+        if stale {
+            std::fs::remove_file(path)?;
+        }
+        return UnixListener::bind(path);
+    };
+    let staged = staged_name(path);
+    let _ = std::fs::remove_file(&staged);
+    let listener = UnixListener::bind(&staged)?;
+    let moved = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))
+        .and_then(|()| std::fs::rename(&staged, path));
+    if let Err(error) = moved {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
     }
     Ok(listener)
+}
+
+/// A sibling name in the socket's own directory — same filesystem, so the rename into place is
+/// atomic — that no configured path can name.
+#[cfg(unix)]
+fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(".ferrox-{}-{id}", std::process::id());
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => std::path::PathBuf::from(name),
+    }
 }
 
 #[cfg(windows)]
@@ -1629,8 +1659,8 @@ fn unix_connect(path: &std::path::Path, timeout: Duration) -> io::Result<Connect
 #[cfg(unix)]
 fn unix_dial_path(path: &std::path::Path) -> &std::path::Path {
     match split_permission(path) {
-        Ok((head, Some(_))) => head,
-        _ => path,
+        (head, Some(_)) => head,
+        (_, None) => path,
     }
 }
 
@@ -2616,6 +2646,68 @@ mod tests {
         assert_eq!(
             &byte, b"s",
             "the mode is a listener spelling, never part of the dialed name"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single comma whose suffix is not octal is part of the name, not a mode: the text binds
+    /// and dials the same literal path a peer outside this tree can name, where a hard error on
+    /// that suffix would refuse a path that bound before the mode spelling existed.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_comma_path_that_is_not_a_mode_stays_literal() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-comma-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("app,v2.sock");
+        assert_eq!(
+            b"v2.sock".len(),
+            7,
+            "the witness spells a 7-byte non-octal suffix"
+        );
+        let target = parse_target(&format!("unix:{}", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("the literal comma path binds");
+        let mut client =
+            connect(&target, Duration::from_secs(5)).expect("the same text dials the literal path");
+        let (mut server, _) = listener.accept().expect("accepts");
+        server.write_all(b"c").expect("writes");
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).expect("reads");
+        assert_eq!(
+            &byte, b"c",
+            "the literal path serves the text it was bound from"
+        );
+        let file = std::fs::symlink_metadata(&path).expect("the socket file the listener created");
+        assert!(
+            file.file_type().is_socket(),
+            "the comma stays in the name the listener creates"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A unix listen path that already names a regular file is refused, never removed: a typo in a
+    /// config must not delete data on the way to a failed bind.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_listener_never_removes_a_regular_file() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-file-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let kept = [b'k'; 16];
+        std::fs::write(&path, kept).expect("writes a regular file at the socket path");
+        let result = Listener::bind(&Target::Unix(path.clone()));
+        assert!(result.is_err(), "binding over a regular file is refused");
+        assert_eq!(
+            std::fs::read(&path).expect("the file survives the refused bind"),
+            kept,
+            "the file is untouched"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
