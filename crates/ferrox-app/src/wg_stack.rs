@@ -48,6 +48,9 @@ const TCP_SEND_BUFFER: usize = 1024 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
+
+/// Bytes pulled off a full receive ring into the spill when the local stream stalls.
+const DOWN_SPILL: usize = 64 * 1024;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -380,6 +383,8 @@ struct Flow {
     races: Vec<(SocketHandle, u16)>,
     pending_up: Vec<u8>,
     pending_up_at: usize,
+    pending_down: Vec<u8>,
+    pending_down_at: usize,
     up_eof: bool,
     sent_fin: bool,
     down_eof: bool,
@@ -397,6 +402,8 @@ impl Flow {
             races: Vec::new(),
             pending_up: Vec::new(),
             pending_up_at: 0,
+            pending_down: Vec::new(),
+            pending_down_at: 0,
             up_eof: false,
             sent_fin: false,
             down_eof: false,
@@ -408,6 +415,10 @@ impl Flow {
 
     fn up_pending(&self) -> bool {
         self.pending_up_at < self.pending_up.len()
+    }
+
+    fn down_pending(&self) -> bool {
+        self.pending_down_at < self.pending_down.len()
     }
 
     fn adopt(
@@ -2065,6 +2076,7 @@ enum Up {
 /// One step of moving the socket's receive ring to the local stream.
 enum Down {
     Wrote(usize),
+    Staged(usize),
     Idle,
     Closed,
     Failed,
@@ -2086,17 +2098,27 @@ fn upload(socket: &mut TcpSocket, local: &mut impl Read) -> Result<Up, SendError
     })
 }
 
-/// Write the socket's receive ring straight to the local stream, leaving an
-/// unwritten tail queued in the ring instead of in a caller's staging buffer.
-fn download(socket: &mut TcpSocket, local: &mut impl Write) -> Result<Down, RecvError> {
+/// Write the socket's receive ring straight to the local stream. A full local
+/// stream pulls one bounded slice off the ring into the spill, so the peer never
+/// sees a closed window while the local drains.
+fn download(
+    socket: &mut TcpSocket,
+    local: &mut impl Write,
+    spill: &mut Vec<u8>,
+) -> Result<Down, RecvError> {
     socket.recv(|data| {
         if data.is_empty() {
             return (0, Down::Idle);
         }
+        let data = &data[..data.len().min(DOWN_SPILL)];
         match local.write(data) {
             Ok(0) => (0, Down::Closed),
             Ok(n) => (n, Down::Wrote(n)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (0, Down::Idle),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                spill.clear();
+                spill.extend_from_slice(data);
+                (data.len(), Down::Staged(data.len()))
+            }
             Err(_) => (0, Down::Failed),
         }
     })
@@ -2115,12 +2137,42 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, up_ready: bool) -> bool {
         flow.done = true;
     }
 
-    loop {
-        match download(socket, &mut flow.local) {
+    while flow.down_pending() {
+        let at = flow.pending_down_at;
+        match flow.local.write(&flow.pending_down[at..]) {
+            Ok(0) => {
+                flow.down_eof = true;
+                break;
+            }
+            Ok(n) => {
+                flow.pending_down_at += n;
+                moved = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => {
+                flow.done = true;
+                socket.abort();
+                break;
+            }
+        }
+    }
+    if !flow.down_pending() {
+        flow.pending_down.clear();
+        flow.pending_down_at = 0;
+    }
+
+    while !flow.down_pending() {
+        match download(socket, &mut flow.local, &mut flow.pending_down) {
             Ok(Down::Wrote(n)) => {
                 if n > 0 {
                     moved = true;
                 }
+            }
+            Ok(Down::Staged(n)) => {
+                if n > 0 {
+                    moved = true;
+                }
+                break;
             }
             Ok(Down::Idle) | Err(RecvError::InvalidState) => break,
             Ok(Down::Closed) | Err(RecvError::Finished) => {
@@ -3316,7 +3368,7 @@ mod tests {
             .as_ptr()
             .cast_mut();
         let mut probe = ProbeWriter::default();
-        match download(socket, &mut probe).expect("a direct download") {
+        match download(socket, &mut probe, &mut Vec::new()).expect("a direct download") {
             Down::Wrote(n) => assert_eq!(n, b"straight".len()),
             _ => panic!("the direct download wrote no bytes"),
         }
@@ -3325,6 +3377,48 @@ mod tests {
             Some(ring),
             "the download copied through a buffer"
         );
+    }
+
+    /// A local stream that is full takes the ring's bytes into the spill, so the
+    /// peer keeps its window instead of stalling on a closed one.
+    #[test]
+    fn a_stalled_download_spills_the_ring_instead_of_closing_the_window() {
+        let (mut stack, _packets, _app, syn) = established_client_with_syn();
+        let client_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let client_sequence =
+            u32::from_be_bytes(syn[24..28].try_into().expect("the client's sequence"));
+        let packet = tcp_segment_data(
+            [192, 0, 2, 1],
+            80,
+            [10, 0, 0, 2],
+            client_port,
+            0x1235,
+            client_sequence + 1,
+            b"straight",
+        );
+        stack.device.push(packet, 0);
+        let now = stack.now();
+        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        let socket = stack.sockets.get_mut::<TcpSocket>(stack.flows[0].handle);
+        let mut spill = Vec::new();
+        match download(socket, &mut FullWriter, &mut spill).expect("a stalled download") {
+            Down::Staged(n) => assert_eq!(n, b"straight".len()),
+            _ => panic!("the stalled download did not spill"),
+        }
+        assert_eq!(spill, b"straight");
+        assert_eq!(socket.peek(1).expect("the ring is drained").len(), 0);
+    }
+
+    struct FullWriter;
+
+    impl Write for FullWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
