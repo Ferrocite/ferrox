@@ -241,17 +241,20 @@ pub fn refuse4() -> &'static [u8] {
 ///
 /// The address of a `SOCKS4a` request is the marker `0.0.0.1`: the first byte zero is
 /// what tells the server a name follows. One buffer carries the whole request.
-#[allow(
-    clippy::uninit_vec,
-    reason = "the request is written into the room below before the vector is read"
-)]
 #[must_use]
 pub fn request4(cmd: u8, port: u16, address: [u8; 4], user: &[u8], name: Option<&[u8]>) -> Vec<u8> {
     let total = 9 + user.len() + name.map_or(0, |name| name.len() + 1);
     let mut out = Vec::with_capacity(total);
-    // SAFETY: `request4_into` fills every byte of the claimed room before the vector is read.
-    unsafe { out.set_len(total) };
-    request4_into(cmd, port, address, user, name, &mut out).expect("the counted room");
+    out.extend_from_slice(&[VERSION4, cmd]);
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(&address);
+    out.extend_from_slice(user);
+    out.push(0);
+    if let Some(name) = name {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    debug_assert_eq!(out.len(), total);
     out
 }
 
@@ -354,21 +357,16 @@ pub fn datagram_header_len(target: &Target<'_>) -> usize {
 /// The fragment byte is zero: a fragmented datagram is dropped by every server that
 /// implements RFC 1928 strictly, and the pinned Go reader drops one too
 /// (`DecodeUDPPacket` refuses `packet.Byte(2) != 0`).
-#[allow(
-    clippy::uninit_vec,
-    reason = "the destination is written into the room below before the vector is read"
-)]
 pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(datagram_header_len(target) + payload.len());
     out.push(0);
     out.push(0);
     out.push(0);
-    let at = out.len();
     let len = target.wire_len();
-    // SAFETY: `encode_into` fills every byte of the claimed room before the vector is read.
-    unsafe { out.set_len(at + len) };
-    target.encode_into(&mut out[at..]);
+    let mut addr = [0u8; 260];
+    target.encode_into(&mut addr[..len]);
+    out.extend_from_slice(&addr[..len]);
     out.extend_from_slice(payload);
 }
 

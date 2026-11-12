@@ -800,7 +800,7 @@ socks config-lanes-named 1 ferrox-app-proxy::tests::a_socks_outbound_names_its_s
 socks pb-scenario-sides-decoded 2 ferrox-app-xray_pb::tests::a_socks_scenario_decodes_both_sides
 socks socks4-handshake-allocations 0 ferrox-app-proxy::tests::a_socks4_handshake_costs_no_heap_buffer
 socks socks4a-handshake-allocations 1 ferrox-app-proxy::tests::a_socks4a_handshake_costs_one_heap_buffer
-socks credentialed-handshake-allocations 0 ferrox-app-proxy::tests::a_credentialed_handshake_costs_no_heap_buffer
+socks credentialed-literal-handshake-allocations 0 ferrox-app-proxy::tests::a_credentialed_literal_handshake_costs_no_heap_buffer
 socks socks4-reply-bytes 8 ferrox-core-socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes
 socks socks4-client-request-buffers 0 ferrox-app-socks::tests::a_socks4_connect_takes_no_heap_buffer
 socks socks4-request-zero-filled-bytes 0 ferrox-core-socks::tests::the_socks4_request_is_one_unzeroed_buffer

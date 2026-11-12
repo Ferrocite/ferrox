@@ -65993,7 +65993,7 @@ mod tests {
     /// outlives the flow. The pinned Go server allocates the name, the password and the
     /// account it answers with.
     #[test]
-    fn a_credentialed_handshake_costs_no_heap_buffer() {
+    fn a_credentialed_literal_handshake_costs_no_heap_buffer() {
         let accounts = SocksAccounts {
             password: true,
             pairs: vec![SocksAccount {
