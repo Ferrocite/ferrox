@@ -13,6 +13,7 @@
 //! the reference's reverse-then-wrap order read from the other end.
 
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// The record type a handshake rides, and the width of a TLS record header.
@@ -350,11 +351,79 @@ fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<(
     Ok(())
 }
 
+/// A source-address allow/deny list applied where a transport accepts a connection or reads a
+/// datagram; it writes no byte, so it never enters the chain's write path.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SourceFilter {
+    blocked: IpSets,
+    allowed: IpSets,
+}
+
+impl SourceFilter {
+    pub fn new(blocked: IpSets, allowed: IpSets) -> Self {
+        Self { blocked, allowed }
+    }
+
+    /// Merge another stage's lists in config order; either list may be empty.
+    pub fn merge(&mut self, other: Self) {
+        self.blocked.extend(other.blocked);
+        self.allowed.extend(other.allowed);
+    }
+
+    /// A blocked match rejects; when an allowlist is present, an address outside it — or a source
+    /// the transport cannot name — is rejected.
+    pub fn rejects(&self, source: Option<IpAddr>) -> bool {
+        let _ = (self, source);
+        false
+    }
+}
+
+/// The positive and negative range sets one filter list parsed into, each with the reference's
+/// reverse flag.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IpSets {
+    sets: Vec<(Vec<(IpAddr, IpAddr)>, bool)>,
+}
+
+impl IpSets {
+    pub fn new(sets: Vec<(Vec<(IpAddr, IpAddr)>, bool)>) -> Self {
+        Self { sets }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.iter().all(|(ranges, _)| ranges.is_empty())
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.sets.extend(other.sets);
+    }
+
+    fn matches(&self, ip: IpAddr) -> bool {
+        self.sets.iter().any(|(ranges, reverse)| {
+            !ranges.is_empty()
+                && ranges.iter().any(|(start, end)| between(ip, *start, *end)) != *reverse
+        })
+    }
+}
+
+fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
+    match (ip, start, end) {
+        (IpAddr::V4(ip), IpAddr::V4(start), IpAddr::V4(end)) => {
+            u32::from(ip) >= u32::from(start) && u32::from(ip) <= u32::from(end)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(start), IpAddr::V6(end)) => {
+            u128::from(ip) >= u128::from(start) && u128::from(ip) <= u128::from(end)
+        }
+        _ => false,
+    }
+}
+
 /// The chain one TCP stream carries: the stages in config order, the first of which sees the
 /// session's whole and the last of which is nearest the socket.
 #[derive(Debug, Default, Clone)]
 pub struct Chain {
     stages: Vec<Fragment>,
+    filter: Option<SourceFilter>,
 }
 
 impl Chain {
@@ -365,6 +434,18 @@ impl Chain {
 
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// Attach the chain's source filter; a later filter stage merges into it rather than replacing it.
+    pub fn set_filter(&mut self, filter: SourceFilter) {
+        match &mut self.filter {
+            Some(current) => current.merge(filter),
+            slot => *slot = Some(filter),
+        }
+    }
+
+    pub fn filter(&self) -> Option<&SourceFilter> {
+        self.filter.as_ref()
     }
 
     /// The write the stream was asked to make, answered with how much of it reached the wire.

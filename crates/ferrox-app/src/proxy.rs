@@ -1888,6 +1888,25 @@ impl Role {
         }
     }
 
+    /// The source-address filter an accepted stream of this role carries, from its tcp carrier.
+    fn tcp_filter(&self) -> Option<&ferrox_core::finalmask::SourceFilter> {
+        match self {
+            Role::Vless { carrier, .. }
+            | Role::VlessTls { carrier, .. }
+            | Role::VlessReality { carrier, .. }
+            | Role::Trojan { carrier, .. }
+            | Role::TrojanTls { carrier, .. }
+            | Role::TrojanReality { carrier, .. }
+            | Role::Vmess { carrier, .. }
+            | Role::VmessTls { carrier, .. }
+            | Role::VmessReality { carrier, .. }
+            | Role::Shadowsocks { carrier, .. } => carrier.tcp_filter(),
+            Role::Dokodemo { mask, .. } => mask.as_ref().and_then(|chain| chain.filter()),
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
+            Role::Proxied(inner) => inner.tcp_filter(),
+        }
+    }
+
     /// The transparent spelling an accepted connection asks the kernel for.
     fn transparent(&self) -> Option<crate::sockopt::Tproxy> {
         match self {
@@ -4377,6 +4396,13 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
             break;
         }
         let Ok(stream) = stream else { continue };
+        let source = stream.peer_addr().ok().map(|peer| peer.ip());
+        if role
+            .tcp_filter()
+            .is_some_and(|filter| filter.rejects(source))
+        {
+            continue;
+        }
         no_delay(&stream);
         let role = role.clone();
         let sniffing = sniffing.clone();

@@ -1694,6 +1694,14 @@ impl Carrier {
         }
     }
 
+    /// The source-address filter a raw carrier's chain carries, if the config named one.
+    pub(crate) fn tcp_filter(&self) -> Option<&ferrox_core::finalmask::SourceFilter> {
+        match self {
+            Carrier::Raw(chain) => chain.filter(),
+            _ => None,
+        }
+    }
+
     /// The gRPC dial settings, which carry both stream names and the head's fields.
     pub(crate) fn grpc_settings(&self) -> Option<&GrpcSettings> {
         match self {
@@ -1809,30 +1817,37 @@ fn resolve_quic(_: Option<&Json>, _: &str) -> Carrier {
 }
 
 fn resolve_kcp(settings: Option<&Json>, network: &str) -> Carrier {
-    let Some(mask) = kcp_mask(settings) else {
+    let Some((mask, filter)) = kcp_mask(settings) else {
         return Carrier::Unknown {
             network: network.to_owned(),
         };
     };
     let mut config = kcp_config(settings);
     config.mask = mask;
+    config.filter = filter;
     Carrier::Kcp(config)
 }
 
 /// The `finalmask.udp` chain for a KCP carrier, in wire order (outermost first). `Some(default)`
 /// means no finalmask at all; `None` refuses the carrier — an unknown udp mask type, a gecko packet
 /// size, a bad header name or an unpackable dns domain must never silently dial unmasked.
-fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
+fn kcp_mask(
+    settings: Option<&Json>,
+) -> Option<(
+    ferrox_core::kcp::Mask,
+    Option<ferrox_core::finalmask::SourceFilter>,
+)> {
     use ferrox_core::kcp::{HeaderKind, Mask, Spec};
     let Some(udp) = settings
         .and_then(|s| s.get("finalmask"))
         .and_then(|f| f.get("udp"))
         .and_then(Json::as_arr)
     else {
-        return Some(Mask::default());
+        return Some((Mask::default(), None));
     };
     let mut specs = Vec::with_capacity(udp.len());
     let mut headers = Vec::with_capacity(udp.len());
+    let mut filter = None;
     for entry in udp {
         let conf = entry.get("settings");
         match entry
@@ -1858,6 +1873,14 @@ fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
                     password: password.to_owned(),
                 });
                 headers.push(false);
+            }
+            Some("filter") => {
+                if let Some(stage) = source_filter(conf).ok()? {
+                    match &mut filter {
+                        Some(current) => current.merge(stage),
+                        slot => *slot = Some(stage),
+                    }
+                }
             }
             Some("mkcp-legacy") => {
                 let header = conf
@@ -1913,7 +1936,49 @@ fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
         specs[at..end].reverse();
         at = end;
     }
-    Mask::from_spec(&specs).ok()
+    Some((Mask::from_spec(&specs).ok()?, filter))
+}
+
+/// The source-address lists one `filter` stage carries. An absent or empty list is no list; a
+/// malformed rule refuses the carrier rather than silently serving every source.
+fn source_filter(conf: Option<&Json>) -> Option<ferrox_core::finalmask::SourceFilter> {
+    let conf = conf?;
+    let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
+    let blocked = filter_list(
+        conf.get("blockedSourceIPs"),
+        &mut assets,
+        "blockedSourceIPs",
+    )?;
+    let allowed = filter_list(
+        conf.get("allowedSourceIPs"),
+        &mut assets,
+        "allowedSourceIPs",
+    )?;
+    if blocked.is_none() && allowed.is_none() {
+        return None;
+    }
+    Some(ferrox_core::finalmask::SourceFilter::new(
+        blocked.map_or_else(ferrox_core::finalmask::IpSets::default, |matcher| {
+            ferrox_core::finalmask::IpSets::new(matcher.ranges())
+        }),
+        allowed.map_or_else(ferrox_core::finalmask::IpSets::default, |matcher| {
+            ferrox_core::finalmask::IpSets::new(matcher.ranges())
+        }),
+    ))
+}
+
+fn filter_list(
+    value: Option<&Json>,
+    assets: &mut crate::router::Assets,
+    field: &str,
+) -> Option<Option<crate::router::IpMatcher>> {
+    match value {
+        None | Some(Json::Null) => Some(None),
+        Some(value) if value.as_arr().is_some_and(<[Json]>::is_empty) => Some(None),
+        Some(value) => crate::router::ip_matcher(value, assets, field)
+            .ok()
+            .map(Some),
+    }
 }
 
 fn resolve_hysteria(settings: Option<&Json>, network: &str) -> Carrier {
@@ -1969,15 +2034,21 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
     };
     let mut chain = ferrox_core::finalmask::Chain::default();
     for entry in tcp {
-        if entry
+        let conf = entry.get("settings");
+        match entry
             .get("type")
             .and_then(Json::as_str)
             .map(str::to_lowercase)
-            != Some("fragment".to_owned())
+            .as_deref()
         {
-            return None;
+            Some("fragment") => chain.push(fragment(conf)?),
+            Some("filter") => {
+                if let Some(stage) = source_filter(conf).ok()? {
+                    chain.set_filter(stage);
+                }
+            }
+            _ => return None,
         }
-        chain.push(fragment(entry.get("settings"))?);
     }
     Some(chain)
 }
@@ -3202,6 +3273,67 @@ mod tests {
         let (decoded, counts) = ferrox_core::alloc_count::measure(|| b64url_len(&verify));
         assert_eq!(decoded, Some(1952));
         assert_eq!(counts.allocs, 0, "the length is counted, not the bytes");
+    }
+
+    #[test]
+    fn a_finalmask_filter_reads_both_lists() {
+        let stage = |text: &str| {
+            let json = crate::json::parse(text).expect("parses");
+            source_filter(json.get("settings")).expect("a valid filter")
+        };
+        let blocked =
+            stage(r#"{"settings":{"blockedSourceIPs":["192.0.2.0/24"]}}"#).expect("a blocked list");
+        assert!(blocked.rejects(Some("192.0.2.5".parse().expect("ip"))));
+        assert!(!blocked.rejects(Some("198.51.100.1".parse().expect("ip"))));
+        let allowed = stage(r#"{"settings":{"allowedSourceIPs":["198.51.100.0/24"]}}"#)
+            .expect("an allowlist");
+        assert!(!allowed.rejects(Some("198.51.100.9".parse().expect("ip"))));
+        assert!(allowed.rejects(Some("192.0.2.5".parse().expect("ip"))));
+        assert!(
+            allowed.rejects(None),
+            "an unnamed source cannot satisfy an allowlist"
+        );
+        assert!(
+            stage(r#"{"settings":{"blockedSourceIPs":[],"allowedSourceIPs":[]}}"#).is_none(),
+            "two empty lists filter nothing"
+        );
+        let malformed = crate::json::parse(r#"{"settings":{"blockedSourceIPs":["192.0.2.0/33"]}}"#)
+            .expect("parses");
+        assert!(
+            source_filter(malformed.get("settings")).is_err(),
+            "a malformed rule refuses the carrier"
+        );
+    }
+
+    #[test]
+    fn a_filter_stage_is_accepted_in_both_finalmask_chains() {
+        let tcp = crate::json::parse(
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"filter","settings":{"blockedSourceIPs":["192.0.2.0/24"]}}]}}"#,
+        )
+        .expect("parses");
+        let carrier = stream_carrier(Some(&tcp));
+        assert!(matches!(&carrier, Carrier::Raw(_)));
+        assert!(
+            carrier.tcp_filter().is_some(),
+            "the tcp chain keeps the filter out of the write stages"
+        );
+        let udp = crate::json::parse(
+            r#"{"network":"kcp","finalmask":{"udp":[{"type":"filter","settings":{"allowedSourceIPs":["198.51.100.0/24"]}}]}}"#,
+        )
+        .expect("parses");
+        let Carrier::Kcp(config) = stream_carrier(Some(&udp)) else {
+            panic!("a filtered kcp carrier");
+        };
+        assert!(config.filter.is_some());
+        assert!(config.mask.is_empty(), "the filter writes no byte");
+        let malformed = crate::json::parse(
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"filter","settings":{"blockedSourceIPs":["192.0.2.0/33"]}}]}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(Some(&malformed)),
+            Carrier::Unknown { .. }
+        ));
     }
 
     #[test]

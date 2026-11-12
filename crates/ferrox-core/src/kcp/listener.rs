@@ -238,6 +238,14 @@ impl Listener {
                 match sock_r.recv_from(&mut buf) {
                     Ok((n, src)) => {
                         let Some(inner) = weak.upgrade() else { break };
+                        if inner
+                            .config
+                            .filter
+                            .as_ref()
+                            .is_some_and(|filter| filter.rejects(Some(src.ip())))
+                        {
+                            continue;
+                        }
                         // The mask strips in place before the conversation is read: a datagram failing the hash or the tag never reaches the session table.
                         let Some(framed) = inner.config.mask.decode_in_place(&mut buf[..n]) else {
                             continue;

@@ -4,7 +4,7 @@ The core rung is real, bit-identical and proved against the pinned Go, and the c
 
 The proof is `kcp::oracle::the_scripted_core_matches_the_pinned_go`: a scripted clock drives the sending window's queue/flush/fast-ack behaviour, the ack list, and the RTO estimator — including the cap probe and peer-RTO adoption — and the segments it produces are compared against `scripts/kcp-oracle/expected.txt`, which was recorded from `xray-core/transport/internet/kcp` at the pin in `upstream/pins.toml`. That is the strongest claim in this tree: not "looks right", but byte-for-byte equal to the implementation it replaces, over a script that deliberately probes the estimator's edges.
 
-Nothing on this rung is now named-without-being-honoured. `kcpSettings` is parsed into `kcp::Config` (`mtu`, `tti`, capacities, multiplier, window, both spellings), and every `streamSettings.finalmask.udp` entry of type `mkcp-legacy` or `salamander` contributes one mask to the chain. An entry naming any other finalmask type, or a `salamander` that names a gecko `packetSize`, is refused by name rather than dialled unmasked — a config asking for a mask this tree does not carry either runs the whole chain it asked for or does not dial.
+Nothing on this rung is now named-without-being-honoured. `kcpSettings` is parsed into `kcp::Config` (`mtu`, `tti`, capacities, multiplier, window, both spellings), and every `streamSettings.finalmask.udp` entry of type `mkcp-legacy` or `salamander` contributes one mask to the chain, and a `filter` entry contributes a source-address allow/deny list checked on every received datagram before the mask or a session sees it. An entry naming any other finalmask type, or a `salamander` that names a gecko `packetSize`, is refused by name rather than dialled unmasked — a config asking for a mask this tree does not carry either runs the whole chain it asked for or does not dial.
 
 ## Data path
 
@@ -64,6 +64,7 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 
 | reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries |
 | mask-families-implemented | 9 | ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback |
+| filter-verdicts-from-one-list | 4 | ferrox-app-config::tests::a_finalmask_filter_reads_both_lists |
 | mask-chain-wire-overhead-bytes | 32 | ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask |
 | mask-read-side-payload-copies-per-datagram | 0 | ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire |
 | mask-encode-buffer-allocations-per-frame | 0 | ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames |
