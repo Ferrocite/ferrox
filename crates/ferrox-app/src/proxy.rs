@@ -66735,6 +66735,69 @@ mod tests {
     }
 
     #[test]
+    fn an_http_forward_drops_header_names_that_are_not_tokens() {
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin.local_addr().expect("addr").port();
+        let origin_thread = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accepts");
+            let head = read_http_head(&mut stream, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+                .expect("the request head");
+            let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            assert!(
+                !text.contains("transfer-encoding"),
+                "a spaced transfer-encoding reached the origin: {text}"
+            );
+            assert!(
+                !text.contains("content-length"),
+                "a spaced content-length reached the origin: {text}"
+            );
+            assert!(
+                text.contains("x-kept: 1"),
+                "a legal header did not reach the origin: {text}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\nhello",
+                )
+                .expect("answers");
+        });
+        let front = http_front_with(freedom());
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{origin_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nTransfer-Encoding : chunked\r\nContent-Length : 5\r\nX-Kept: 1\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(
+            !text.contains("transfer-encoding"),
+            "a spaced transfer-encoding reached the client: {text}"
+        );
+        assert!(
+            !text.contains("content-length"),
+            "a spaced content-length reached the client: {text}"
+        );
+        assert!(
+            text.contains("x-kept: 1"),
+            "a legal response header was dropped: {text}"
+        );
+        let mut body = [0u8; 5];
+        client.read_exact(&mut body).expect("reads the body");
+        assert_eq!(
+            &body, b"hello",
+            "the body after the filtered head still arrives"
+        );
+        origin_thread.join().expect("the origin answers");
+    }
+
+    #[test]
     fn http_get_forwards_origin_form_to_direct() {
         let echo = echo_loop();
         let front = http_front_with(freedom());
