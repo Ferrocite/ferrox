@@ -72716,6 +72716,7 @@ mod relay_tests {
 
     /// The destination of the stalled flow: it reads none of the flow until the
     /// neighbours have been collected, then reports how much of it reached it.
+    #[cfg(not(target_os = "windows"))]
     fn hold_then_read(listener: &Listener, release: &mpsc::Receiver<()>) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
@@ -72746,6 +72747,7 @@ mod relay_tests {
     }
 
     /// One neighbour peer: one chunk, a half-close, and the same bytes back.
+    #[cfg(not(target_os = "windows"))]
     fn write_then_read_back(stream: &mut Connection) -> usize {
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
@@ -72758,6 +72760,7 @@ mod relay_tests {
     }
 
     /// One neighbour origin: it reads the whole body and echoes it back.
+    #[cfg(not(target_os = "windows"))]
     fn read_then_echo_back(stream: &mut Connection) {
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
