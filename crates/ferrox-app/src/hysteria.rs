@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,13 @@ pub(crate) struct Session {
     pub(crate) shared: Arc<Mutex<quiche::Connection>>,
     pub(crate) sock: Arc<crate::quic::Datagram>,
     pub(crate) local: SocketAddr,
+    /// The source the next packet must name, shared by every clone of the session:
+    /// a rebind moves it under the connection rather than in one clone's copy.
+    pub(crate) local_now: Arc<Mutex<SocketAddr>>,
+    /// The edge a client dial names, or none on a served session: only a dial moves.
+    pub(crate) peer: Option<SocketAddr>,
+    /// The route generation this session last acted on.
+    pub(crate) net: Arc<AtomicU64>,
     // Written once by `connect` from the auth response and read by the UDP dial that follows: a server that skips the lane header still carries TCP flows, so the flag gates datagrams only, never the connection.
     pub(crate) udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
@@ -162,6 +169,9 @@ impl Driver {
         let shared = Arc::clone(&session.shared);
         let sock = Arc::clone(&session.sock);
         let local = session.local;
+        let local_now = Arc::clone(&session.local_now);
+        let peer = session.peer;
+        let net = Arc::clone(&session.net);
         let keep_alive = session.keep_alive;
         let pump = Arc::clone(self);
         self.alive.store(true, Ordering::Relaxed);
@@ -170,6 +180,9 @@ impl Driver {
                 shared,
                 sock,
                 local,
+                local_now,
+                peer,
+                net,
                 udp_supported: false,
                 driver: None,
                 send_wake: None,
@@ -298,6 +311,36 @@ fn send_all_metered(
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
+    if let Some(peer) = session.peer {
+        let now = crate::quic::network_generation();
+        let seen = session.net.load(Ordering::Relaxed);
+        if now != seen
+            && session
+                .net
+                .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let Ok(mut conn) = session.shared.lock() else {
+                return false;
+            };
+            match crate::quic::rebind_path(&mut conn, &session.sock, peer) {
+                crate::quic::Rebind::Moved(moved) => {
+                    if let Ok(mut local) = session.local_now.lock() {
+                        *local = moved;
+                    }
+                }
+                crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => {}
+                crate::quic::Rebind::Failed => {
+                    let _ = conn.close(false, 0, b"rebind");
+                    return false;
+                }
+            }
+        }
+    }
+    let local = session
+        .local_now
+        .lock()
+        .map_or(session.local, |local| *local);
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -322,7 +365,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         match crate::quic::recv_batch(&session.sock, &mut batch) {
             crate::quic::Drain::Read => {
                 batched = true;
-                Some((0, session.local))
+                Some((0, local))
             }
             crate::quic::Drain::Empty => None,
             crate::quic::Drain::Unbatchable => match session.sock.recv_from(room.as_mut()) {
@@ -375,10 +418,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
             let Some((bytes, from)) = batch.at(at) else {
                 continue;
             };
-            let info = quiche::RecvInfo {
-                from,
-                to: session.local,
-            };
+            let info = quiche::RecvInfo { from, to: local };
             let _ = conn.recv(bytes, info);
         }
         take_queued(&mut conn, session);
@@ -387,10 +427,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     }
     match incoming {
         Some((n, from)) => {
-            let info = quiche::RecvInfo {
-                from,
-                to: session.local,
-            };
+            let info = quiche::RecvInfo { from, to: local };
             let _ = conn.recv(&mut room.as_mut()[..n], info);
             take_queued(&mut conn, session);
         }
@@ -402,6 +439,10 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
 
 /// The datagrams already queued behind the one the turn took, never waiting for one that has not arrived: a lane whose read is the wire's own hands over a batch in one call, and a masked one reads what is there behind a tail short enough that a writer is not held behind it.
 fn take_queued(conn: &mut quiche::Connection, session: &Session) {
+    let local = session
+        .local_now
+        .lock()
+        .map_or(session.local, |local| *local);
     if !session.sock.refresh_read_timeout(crate::quic::PUMP_TAIL) {
         return;
     }
@@ -414,10 +455,7 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
                     let Some((bytes, from)) = batch.at(at) else {
                         continue;
                     };
-                    let info = quiche::RecvInfo {
-                        from,
-                        to: session.local,
-                    };
+                    let info = quiche::RecvInfo { from, to: local };
                     let _ = conn.recv(bytes, info);
                 }
                 return;
@@ -431,10 +469,7 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
         let Ok((n, from)) = session.sock.recv_from(room.as_mut()) else {
             return;
         };
-        let info = quiche::RecvInfo {
-            from,
-            to: session.local,
-        };
+        let info = quiche::RecvInfo { from, to: local };
         let _ = conn.recv(&mut room.as_mut()[..n], info);
     }
 }
@@ -583,6 +618,9 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         shared: Arc::new(Mutex::new(conn)),
         sock: Arc::new(sock),
         local,
+        local_now: Arc::new(Mutex::new(local)),
+        peer: Some(peer),
+        net: Arc::new(AtomicU64::new(crate::quic::network_generation())),
         udp_supported: false,
         driver: None,
         send_wake: None,
@@ -639,6 +677,9 @@ impl Flow {
     pub(crate) fn with_session(mut self, session: &Session) -> Self {
         self.session.driver.clone_from(&session.driver);
         self.session.send_wake.clone_from(&session.send_wake);
+        self.session.local_now = Arc::clone(&session.local_now);
+        self.session.peer = session.peer;
+        self.session.net = Arc::clone(&session.net);
         self
     }
 
@@ -656,6 +697,9 @@ impl Flow {
                 shared,
                 sock,
                 local,
+                local_now: Arc::new(Mutex::new(local)),
+                peer: None,
+                net: Arc::new(AtomicU64::new(crate::quic::network_generation())),
                 udp_supported: false,
                 driver: None,
                 send_wake: None,
@@ -3389,6 +3433,9 @@ mod tests {
             shared: Arc::new(Mutex::new(conn)),
             sock: Arc::new(crate::quic::Datagram::plain(sock)),
             local,
+            local_now: Arc::new(Mutex::new(local)),
+            peer: None,
+            net: Arc::new(AtomicU64::new(crate::quic::network_generation())),
             udp_supported: false,
             driver: None,
             send_wake: None,

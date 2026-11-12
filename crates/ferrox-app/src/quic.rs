@@ -1778,6 +1778,120 @@ pub(crate) fn bind_datagram_plain(address: &str) -> std::io::Result<UdpSocket> {
     bind_datagram_gro(address, false)
 }
 
+/// What a network change did to a lane: a moved source, a route that still picks
+/// the same source, a lane whose own schedule owns its descriptors, or a failed
+/// move that leaves the caller to dial afresh.
+pub(crate) enum Rebind {
+    Moved(SocketAddr),
+    Same,
+    Unsupported,
+    Failed,
+}
+
+/// The route table's generation, bumped by a listener thread on every route add,
+/// delete or change: a QUIC carrier compares it on a tick and moves its socket
+/// when the default path has moved under it. A platform without a listener leaves
+/// the generation at one, and the carrier keeps the path it dialled.
+pub(crate) fn network_generation() -> u64 {
+    static NETWORK: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+    NETWORK
+        .get_or_init(|| {
+            let generation = Arc::new(AtomicU64::new(1));
+            let bump = Arc::clone(&generation);
+            let _ = std::thread::Builder::new()
+                .name("ferrox-routes".to_owned())
+                .spawn(move || loop {
+                    let Ok(mut listener) = route_manager::RouteManager::listener() else {
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    };
+                    while listener.listen().is_ok() {
+                        bump.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                });
+            generation
+        })
+        .load(Ordering::Relaxed)
+}
+
+/// Move a client connection to a fresh socket on the route the kernel picks for
+/// `peer`: the connection keeps its IDs and stream ids, and the next write leaves
+/// from the new source. A lane that cannot move says so rather than closing.
+pub(crate) fn rebind_path(
+    conn: &mut quiche::Connection,
+    sock: &Datagram,
+    peer: SocketAddr,
+) -> Rebind {
+    if !sock.rebindable() {
+        return Rebind::Unsupported;
+    }
+    let Ok(current) = sock.local_addr() else {
+        return Rebind::Failed;
+    };
+    let bind = if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let Ok(probe) = UdpSocket::bind(bind) else {
+        return Rebind::Failed;
+    };
+    if probe.connect(peer).is_err() {
+        return Rebind::Failed;
+    }
+    let Ok(source) = probe.local_addr() else {
+        return Rebind::Failed;
+    };
+    drop(probe);
+    let same = match (source, current) {
+        (SocketAddr::V4(found), SocketAddr::V4(now)) => found.ip() == now.ip(),
+        (SocketAddr::V6(found), SocketAddr::V6(now)) => {
+            found.ip() == now.ip() && found.scope_id() == now.scope_id()
+        }
+        _ => false,
+    };
+    if same {
+        return Rebind::Same;
+    }
+    let at = match source {
+        SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), 0),
+        SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
+            *addr.ip(),
+            0,
+            addr.flowinfo(),
+            addr.scope_id(),
+        )),
+    };
+    let Ok(fresh) = UdpSocket::bind(at) else {
+        return Rebind::Failed;
+    };
+    clear_gro(&fresh);
+    set_receive_buffer(&fresh, DATAGRAM_BUFFER);
+    set_send_buffer(&fresh, DATAGRAM_BUFFER);
+    move_socket(conn, sock, fresh)
+}
+
+/// Hand a connection and its lane the fresh socket `rebind_path` bound: spare IDs first, so the
+/// peer can walk to a new path, then the migration and the swap, then the packet that proves it.
+fn move_socket(conn: &mut quiche::Connection, sock: &Datagram, fresh: UdpSocket) -> Rebind {
+    let Ok(new_local) = fresh.local_addr() else {
+        return Rebind::Failed;
+    };
+    if issue_two_scids(conn, quiche::MAX_CONN_ID_LEN).is_err()
+        || conn.migrate_source(new_local).is_err()
+    {
+        let _ = conn.close(false, 0, b"rebind");
+        return Rebind::Failed;
+    }
+    if sock.rebind(fresh).is_err() {
+        let _ = conn.close(false, 0, b"rebind");
+        return Rebind::Failed;
+    }
+    flush_egress(conn, sock);
+    Rebind::Moved(new_local)
+}
+
 /// Bind a datagram socket with a lane's buffers, coalescing only when the lane can read a coalesced datagram.
 fn bind_datagram_gro(address: &str, gro: bool) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;
@@ -2006,6 +2120,10 @@ pub(crate) struct Datagram {
     /// Shared behind an `Arc` because a clone describes the same file description
     /// and the same peer, and a datagram one clone holds must be retried by both.
     held: Arc<Held>,
+    /// The socket a network change moved this lane to, and the flag a send reads
+    /// before it pays the lock: a lane that never roams keeps the direct descriptor.
+    moved: Arc<AtomicBool>,
+    rebound: Arc<Mutex<Option<UdpSocket>>>,
 }
 
 /// The datagrams the kernel refused that a later sweep retries, in the order quiche
@@ -2580,6 +2698,8 @@ impl Datagram {
             gecko: None,
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         }
     }
 
@@ -2594,6 +2714,8 @@ impl Datagram {
             gecko: None,
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         }
     }
 
@@ -2608,6 +2730,8 @@ impl Datagram {
             gecko: None,
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         }
     }
 
@@ -2624,6 +2748,8 @@ impl Datagram {
             gecko: None,
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         }
     }
 
@@ -2645,6 +2771,8 @@ impl Datagram {
             gecko: Some(Arc::new(Gecko::new(handle, obfs, window))),
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         })
     }
 
@@ -2668,6 +2796,8 @@ impl Datagram {
             gecko: Some(Arc::new(Gecko::hopped(obfs, window, hop)?)),
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         })
     }
 
@@ -2693,13 +2823,19 @@ impl Datagram {
             gecko: None,
             armed: Arc::default(),
             held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
         })
     }
 
     /// A lane the kernel can speak to in batches: no gecko fragment, no hop, no obfuscation and no relay frame, so the datagram quiche wrote is the datagram on the wire, and Linux is where the batched call exists.
     #[cfg(target_os = "linux")]
     fn batchable(&self) -> bool {
-        self.gecko.is_none() && self.hop.is_none() && self.obfs.is_none() && self.relay.is_none()
+        self.gecko.is_none()
+            && self.hop.is_none()
+            && self.obfs.is_none()
+            && self.relay.is_none()
+            && !self.moved.load(Ordering::Acquire)
     }
 
     /// Send one datagram, or hold it when the kernel refused it for a reason that
@@ -2746,6 +2882,53 @@ impl Datagram {
         self.held.holding.store(false, Ordering::Relaxed);
     }
 
+    /// Whether a network change can move this lane: a hop and a gecko lane own the
+    /// descriptors they write through, so their schedule is the move.
+    pub(crate) fn rebindable(&self) -> bool {
+        self.hop.is_none() && self.gecko.is_none()
+    }
+
+    /// Move every write and read after this call to `sock`, which is bound to the
+    /// new path: the old descriptor stays for a reply already in flight, and the
+    /// flag keeps a lane that never roams on the direct path.
+    pub(crate) fn rebind(&self, sock: UdpSocket) -> std::io::Result<()> {
+        clear_gro(&sock);
+        if let Ok(armed) = self.armed.lock() {
+            if let Some(Some(timeout)) = *armed {
+                sock.set_read_timeout(Some(timeout))?;
+            }
+        }
+        let mut rebound = self
+            .rebound
+            .lock()
+            .map_err(|_| std::io::Error::other("datagram rebound lock poisoned"))?;
+        *rebound = Some(sock);
+        self.moved.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn send_on(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        if self.moved.load(Ordering::Acquire) {
+            if let Ok(rebound) = self.rebound.lock() {
+                if let Some(sock) = rebound.as_ref() {
+                    return sock.send_to(buf, to);
+                }
+            }
+        }
+        self.sock.send_to(buf, to)
+    }
+
+    fn recv_on(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        if self.moved.load(Ordering::Acquire) {
+            if let Ok(rebound) = self.rebound.lock() {
+                if let Some(sock) = rebound.as_ref() {
+                    return sock.recv_from(buf);
+                }
+            }
+        }
+        self.sock.recv_from(buf)
+    }
+
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         if let Some(gecko) = self.gecko.as_ref() {
             return gecko.send(buf, to);
@@ -2754,7 +2937,7 @@ impl Datagram {
             return hop.send(buf, to, self.obfs.as_ref());
         }
         if self.obfs.is_none() && self.relay.is_none() {
-            return self.sock.send_to(buf, to);
+            return self.send_on(buf, to);
         }
         let mut room = Unfilled::<{ RELAY_HEADER + MAX_DATAGRAM }>::new();
         let framed = room.as_mut();
@@ -2766,14 +2949,14 @@ impl Datagram {
                 .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
         };
         let Some(obfs) = self.obfs.as_ref() else {
-            return self.sock.send_to(plain, target);
+            return self.send_on(plain, target);
         };
         // A fresh salt masks whatever the hop above produced.
         let mut wire = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
         let sealed = obfs
             .seal_into(plain, wire.as_mut())
             .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        self.sock.send_to(&wire.as_mut()[..sealed], target)
+        self.send_on(&wire.as_mut()[..sealed], target)
     }
 
     pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -2792,9 +2975,9 @@ impl Datagram {
     /// A read with no obfuscation on it: plain bytes straight from the socket, or the relay hop stripped.
     fn raw_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let Some(relay) = self.relay.as_ref() else {
-            return self.sock.recv_from(buf);
+            return self.recv_on(buf);
         };
-        let (found, from) = self.sock.recv_from(buf)?;
+        let (found, from) = self.recv_on(buf)?;
         if from != relay.via {
             // A datagram from anywhere but the hop is not for this association.
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -2807,10 +2990,17 @@ impl Datagram {
     }
 
     pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        match self.hop.as_ref() {
-            Some(hop) => hop.local_addr(),
-            None => self.sock.local_addr(),
+        if let Some(hop) = self.hop.as_ref() {
+            return hop.local_addr();
         }
+        if self.moved.load(Ordering::Acquire) {
+            if let Ok(rebound) = self.rebound.lock() {
+                if let Some(sock) = rebound.as_ref() {
+                    return sock.local_addr();
+                }
+            }
+        }
+        self.sock.local_addr()
     }
 
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
@@ -2822,6 +3012,8 @@ impl Datagram {
             gecko: self.gecko.clone(),
             armed: Arc::clone(&self.armed),
             held: Arc::clone(&self.held),
+            moved: Arc::clone(&self.moved),
+            rebound: Arc::clone(&self.rebound),
         })
     }
 
@@ -2830,7 +3022,14 @@ impl Datagram {
         let guard = self.armed.lock();
         let result = match self.hop.as_ref() {
             Some(hop) => hop.set_read_timeout(timeout),
-            None => self.sock.set_read_timeout(timeout),
+            None => {
+                if let Ok(rebound) = self.rebound.lock() {
+                    if let Some(sock) = rebound.as_ref() {
+                        let _ = sock.set_read_timeout(timeout);
+                    }
+                }
+                self.sock.set_read_timeout(timeout)
+            }
         };
         if let Ok(mut armed) = guard {
             *armed = Some(timeout);
@@ -2861,7 +3060,7 @@ impl Datagram {
         use std::os::fd::AsRawFd as _;
         let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut row = libc::pollfd {
-            fd: self.sock.as_raw_fd(),
+            fd: self.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -2890,7 +3089,7 @@ impl Datagram {
         };
         let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut row = WSAPOLLFD {
-            fd: self.sock.as_raw_socket() as SOCKET,
+            fd: self.as_raw_socket() as SOCKET,
             events: POLLIN | POLLRDNORM,
             revents: 0,
         };
@@ -2910,6 +3109,13 @@ impl Datagram {
 impl std::os::fd::AsRawFd for Datagram {
     /// The descriptor `recv_from` reads, which is not one for a hopped dial — see [`Datagram::waits_here`].
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        if self.moved.load(Ordering::Acquire) {
+            if let Ok(rebound) = self.rebound.lock() {
+                if let Some(sock) = rebound.as_ref() {
+                    return sock.as_raw_fd();
+                }
+            }
+        }
         self.sock.as_raw_fd()
     }
 }
@@ -2918,6 +3124,13 @@ impl std::os::fd::AsRawFd for Datagram {
 impl std::os::windows::io::AsRawSocket for Datagram {
     /// The handle `recv_from` reads, which is not one for a hopped dial — see [`Datagram::waits_here`].
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        if self.moved.load(Ordering::Acquire) {
+            if let Ok(rebound) = self.rebound.lock() {
+                if let Some(sock) = rebound.as_ref() {
+                    return sock.as_raw_socket();
+                }
+            }
+        }
         self.sock.as_raw_socket()
     }
 }
@@ -5979,6 +6192,111 @@ mod tests {
             }
         }
         assert_eq!(&after[..got], b"after");
+    }
+
+    /// A route change moves a live client to a fresh socket on the source the
+    /// kernel now picks, and the same stream still carries bytes after the move.
+    #[test]
+    fn a_network_change_moves_a_live_stream_to_a_new_socket() {
+        let (mut client, mut server) = lane_pair();
+        let before = client.sock.local_addr().expect("addr");
+        client.conn.stream_send(0, b"before", false).expect("sends");
+        let mut buf = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            match server.conn.stream_recv(0, &mut buf) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads before the move: {error:?}"),
+            }
+        }
+        assert_eq!(&buf[..got], b"before");
+
+        let fresh = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let moved = match move_socket(&mut client.conn, &client.sock, fresh) {
+            Rebind::Moved(addr) => addr,
+            Rebind::Same => panic!("a fresh socket is a new source"),
+            Rebind::Unsupported => panic!("a plain lane must be movable"),
+            Rebind::Failed => panic!("the fresh socket did not swap"),
+        };
+        assert_ne!(moved, before, "the new source is a fresh socket");
+        assert_eq!(client.sock.local_addr().expect("addr"), moved);
+        client.conn.stream_send(0, b"after", false).expect("sends");
+
+        let mut after = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                moved,
+            );
+            match server.conn.stream_recv(0, &mut after) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads after the move: {error:?}"),
+            }
+        }
+        assert_eq!(&after[..got], b"after");
+    }
+
+    /// A move that cannot swap the socket ends the connection instead of leaving
+    /// it writing into a path the caller no longer owns: the carrier then dials
+    /// afresh rather than waiting for a timeout.
+    #[test]
+    fn a_rebind_that_cannot_swap_the_socket_closes_instead_of_hanging() {
+        let (mut client, _server) = lane_pair();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = client.sock.rebound.lock().expect("lock");
+            panic!("poison the rebound lock");
+        }));
+        assert!(poisoned.is_err());
+        let fresh = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            move_socket(&mut client.conn, &client.sock, fresh),
+            Rebind::Failed
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a failed move must not wait on the old path"
+        );
+        assert!(client.conn.is_closed(), "the failed move closes the lane");
+    }
+
+    /// A route change that still picks the source this lane already holds must not churn the
+    /// socket: the probe answers `Same` and the connection keeps the descriptor it dialled.
+    #[test]
+    fn a_route_change_that_keeps_the_source_leaves_the_socket_alone() {
+        let (mut client, server) = lane_pair();
+        let before = client.sock.local_addr().expect("addr");
+        assert!(matches!(
+            rebind_path(&mut client.conn, &client.sock, server.addr),
+            Rebind::Same
+        ));
+        assert_eq!(client.sock.local_addr().expect("addr"), before);
     }
 
     /// A first dial leaves a session the store keeps: the second dial to the same edge offers it,

@@ -897,7 +897,7 @@ impl H3Client {
         let pump_dead = Arc::clone(&dead);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
-            .spawn(move || pump_connection(&pump, &pump_sock, local, &pump_dead))
+            .spawn(move || pump_connection(&pump, &pump_sock, local, peer, &pump_dead))
             .ok()?;
         Some(Arc::new(Self {
             conn,
@@ -988,10 +988,24 @@ fn pump_connection(
     conn: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<Datagram>,
     local: SocketAddr,
+    peer: SocketAddr,
     dead: &Arc<AtomicBool>,
 ) {
+    let mut local = local;
+    let mut generation = quic::network_generation();
     let mut buf = vec![0u8; 65535];
     loop {
+        let now = quic::network_generation();
+        if now != generation {
+            generation = now;
+            if let Ok(mut conn) = conn.lock() {
+                match quic::rebind_path(&mut conn, sock, peer) {
+                    quic::Rebind::Moved(moved) => local = moved,
+                    quic::Rebind::Same | quic::Rebind::Unsupported => {}
+                    quic::Rebind::Failed => break,
+                }
+            }
+        }
         let wait = conn
             .lock()
             .ok()

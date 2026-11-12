@@ -326,7 +326,16 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
         initial,
         alive,
         move |from_tunnel, to_stack, routes| {
-            io(lane, &sock, local, keepalive, from_tunnel, to_stack, routes);
+            io(
+                lane,
+                &sock,
+                local,
+                peer,
+                keepalive,
+                from_tunnel,
+                to_stack,
+                routes,
+            );
         },
     ))
 }
@@ -1746,11 +1755,14 @@ fn io(
     lane: Lane,
     sock: &Datagram,
     local: SocketAddr,
+    peer: SocketAddr,
     keepalive: Option<Duration>,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: UdpRoutes,
 ) {
+    let mut local = local;
+    let mut generation = quic::network_generation();
     let Lane {
         mut conn,
         stream,
@@ -1764,6 +1776,15 @@ fn io(
     let mut unsent: Option<Vec<u8>> = None;
     let mut keepalive_at = keepalive.map(|period| Instant::now() + period);
     loop {
+        let now = quic::network_generation();
+        if now != generation {
+            generation = now;
+            match quic::rebind_path(&mut conn, sock, peer) {
+                quic::Rebind::Moved(moved) => local = moved,
+                quic::Rebind::Same | quic::Rebind::Unsupported => {}
+                quic::Rebind::Failed => break,
+            }
+        }
         let sent_before = conn.stats().sent;
         let recv_before = conn.stats().recv;
         while let Some(packet) = unsent.take().or_else(|| from_tunnel.try_recv().ok()) {
