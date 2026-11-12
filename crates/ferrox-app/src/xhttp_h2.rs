@@ -4150,7 +4150,7 @@ mod tests {
             // Open a header block that never ends: HEADERS without END_HEADERS.
             write_frame(&mut client.stream, T_HEADERS, 0, 1, &[0x88]);
             // Feed CONTINUATION frames of one max-size payload each; a compliant endpoint refuses at HEAD_CAP, so none is ever answered by an opened stream.
-            let chunk = [0u8; MAX_RECV_FRAME];
+            let chunk = vec![0u8; MAX_RECV_FRAME];
             for _ in 0..(HEAD_CAP / MAX_RECV_FRAME + 2) {
                 write_frame(&mut client.stream, T_CONT, 0, 1, &chunk);
             }
