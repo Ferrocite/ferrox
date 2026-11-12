@@ -2786,6 +2786,104 @@ mod tests {
         assert_eq!(back, b"ping"[..]);
     }
 
+    /// A carrier whose close is a FIN at the current offset: a write after it is lost, as the
+    /// hysteria flow's is, where a TCP dup past the peer's own FIN would still deliver.
+    struct HalfClosedFlow {
+        wire: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Write for HalfClosedFlow {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.wire
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The hysteria carrier half-closes the stream once the request is written, so the reply must
+    /// outlive that FIN: a server that ends the flow on the first lane drops the tail still in flight.
+    #[test]
+    fn a_half_closed_hysteria_carrier_keeps_the_whole_reply() {
+        let method = "2022-blake3-aes-256-gcm";
+        let password = psk_b64(Method::Aes256Gcm.key_len());
+        let served = password.clone();
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        let published = body.clone();
+        thread::spawn(move || {
+            let (mut peer, _) = target.accept().expect("accepts");
+            release_rx
+                .recv()
+                .expect("released after the half-close landed");
+            peer.write_all(&published).expect("writes");
+        });
+        let mut request = Vec::new();
+        let (_send, recv) = client_send_handshake(
+            &mut request,
+            &password,
+            method,
+            &crate::proxy::Destination::from(
+                format!("127.0.0.1:{target_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            ),
+        )
+        .expect("handshake");
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flow = HalfClosedFlow {
+            wire: std::sync::Arc::clone(&wire),
+            closed: std::sync::Arc::clone(&closed),
+        };
+        let flag = std::sync::Arc::clone(&closed);
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = closed_tx.send(());
+        });
+        thread::spawn(move || {
+            serve_kcp(
+                std::io::Cursor::new(request),
+                flow,
+                &served,
+                method,
+                &[],
+                true,
+                &close,
+            );
+        });
+        let early = closed_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        release_tx.send(()).expect("releases the reply");
+        let ended = closed_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let wire = wire
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut back = Vec::new();
+        relay_downlink(std::io::Cursor::new(wire), recv, &mut back);
+        assert_eq!(
+            back.len(),
+            body.len(),
+            "the reply outlives the request's FIN (closed before the reply: {early}, ended: {ended})"
+        );
+        assert!(
+            back == body,
+            "the reply outlives the request's FIN (closed before the reply: {early}, ended: {ended})"
+        );
+    }
+
     /// Served traffic meters the generated and configured identities apart, even when a foreign inbound reserves the name the generated one would have taken.
     #[test]
     fn served_multi_user_traffic_counts_the_generated_and_configured_identities_apart() {
