@@ -40,6 +40,7 @@ graph TD
 | unix-permission-mode | 504 | ferrox-app-conn::tests::a_unix_listener_takes_the_permission_it_names |
 | unix-non-octal-comma-literal | 7 | ferrox-app-conn::tests::a_unix_comma_path_that_is_not_a_mode_stays_literal |
 | unix-regular-file-refused | 16 | ferrox-app-conn::tests::a_unix_listener_never_removes_a_regular_file |
+| unix-mode-path-at-field-limit | 107 | ferrox-app-conn::tests::a_unix_mode_on_a_path_at_the_address_field_limit |
 <!-- counts:end -->
 
 The first row is the byte-identity claim itself: a 64 KiB stream round-tripped both ways over a real `AF_UNIX` socket equals the same round trip over TCP and equals the payload. The second is the arithmetic on the inputs a round number hides — lengths `1`, `3`, `1501`, `65535`, none a multiple of the vector width the vectored write path splits on — each arriving whole. Both rows run on either host, so they are the checkers of the Windows arm's open, dial, accept, read, write, half-close and EOF, not only of the Unix one.

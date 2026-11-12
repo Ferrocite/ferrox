@@ -2712,6 +2712,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A mode must not narrow a path that already fills the address field: applying it to a
+    /// longer sibling name would make a config that binds without a mode fail with one.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_mode_on_a_path_at_the_address_field_limit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The longest path text a socket address holds, less the family field and the trailing NUL.
+        let limit = std::mem::size_of::<libc::sockaddr_un>() - 3;
+        let root =
+            std::env::temp_dir().join(format!("ferrox-unix-limit-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        let room = limit - 3 - root.as_os_str().len();
+        assert!(room > 8, "the temp dir leaves room for a deep name");
+        let dir = root.join("d".repeat(room));
+        std::fs::create_dir_all(&dir).expect("the deep dir");
+        let path = dir.join("s");
+        assert_eq!(
+            path.as_os_str().len(),
+            limit,
+            "the witness fills the address field exactly"
+        );
+        let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
+        let listener = Listener::bind(&target)
+            .expect("a path at the field limit still binds when a mode follows it");
+        let mode = std::fs::metadata(&path)
+            .expect("the socket file at the field limit")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o750, "the mode reaches the path at the field limit");
+        drop(listener);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
     /// is not waited out holds its caller past the budget; the seam spends the budget instead.
     #[cfg(target_os = "linux")]
