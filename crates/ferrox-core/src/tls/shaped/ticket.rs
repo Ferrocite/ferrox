@@ -36,33 +36,7 @@ impl Ticket {
         let mut age = [0u8; 4];
         random(&mut age)?;
         let age_add = u32::from_le_bytes(age);
-        let (version, suite) = if tls13 {
-            (0x0304u16, TLS13_SUITE)
-        } else {
-            (0x0303, TLS12_SUITE)
-        };
-        let mut state = Vec::with_capacity(128);
-        state.extend_from_slice(&version.to_be_bytes());
-        state.push(1);
-        state.extend_from_slice(&suite.to_be_bytes());
-        state.extend_from_slice(&created.to_be_bytes());
-        state.push(48);
-        state.extend_from_slice(&secret);
-        state.extend_from_slice(&[0, 0, 0]);
-        state.push(u8::from(ems));
-        state.push(0);
-        state.extend_from_slice(&[0, 0, 0]);
-        state.extend_from_slice(&[0, 0, 0]);
-        if !tls13 {
-            state.extend_from_slice(&X25519.to_be_bytes());
-        }
-        let mut pick = [0u8; 1];
-        random(&mut pick)?;
-        state.resize(
-            state.len() + PADDED[usize::from(pick[0]) % PADDED.len()] - INITIAL,
-            0,
-        );
-        let bytes = encrypt(shared, &state)?;
+        let bytes = encode_state(shared, &secret, tls13, ems, created)?;
         Ok(Self {
             bytes,
             secret,
@@ -81,6 +55,44 @@ impl Ticket {
             .wrapping_mul(1000)
             .wrapping_add(self.age_add)
     }
+}
+
+/// Encodes and encrypts one state around a caller-supplied secret and creation time, as a
+/// ticket minted beside another handshake needs to reuse that handshake's secret.
+pub(crate) fn encode_state(
+    shared: &[u8; 32],
+    secret: &[u8],
+    tls13: bool,
+    ems: bool,
+    created: u64,
+) -> Result<Vec<u8>, TlsError> {
+    let (version, suite) = if tls13 {
+        (0x0304u16, TLS13_SUITE)
+    } else {
+        (0x0303, TLS12_SUITE)
+    };
+    let mut state = Vec::with_capacity(128);
+    state.extend_from_slice(&version.to_be_bytes());
+    state.push(1);
+    state.extend_from_slice(&suite.to_be_bytes());
+    state.extend_from_slice(&created.to_be_bytes());
+    state.push(u8::try_from(secret.len()).map_err(|_| TlsError::Other("ticket secret".into()))?);
+    state.extend_from_slice(secret);
+    state.extend_from_slice(&[0, 0, 0]);
+    state.push(u8::from(ems));
+    state.push(0);
+    state.extend_from_slice(&[0, 0, 0]);
+    state.extend_from_slice(&[0, 0, 0]);
+    if !tls13 {
+        state.extend_from_slice(&X25519.to_be_bytes());
+    }
+    let mut pick = [0u8; 1];
+    random(&mut pick)?;
+    state.resize(
+        state.len() + PADDED[usize::from(pick[0]) % PADDED.len()] - INITIAL,
+        0,
+    );
+    encrypt(shared, &state)
 }
 
 /// Fills an existing encrypted ticket's sole binder from the ticket secret.
@@ -189,6 +201,17 @@ mod tests {
             "padding {padding} is one of the reference's sizes"
         );
         assert!(state[73..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_caller_supplied_secret_is_the_state_secret() {
+        let shared = [0x33; 32];
+        let secret = [0x44; 32];
+        let bytes = encode_state(&shared, &secret, true, false, 1_234).expect("entropy");
+        let state = open(&shared, &bytes);
+        assert_eq!(state[13], 32);
+        assert_eq!(&state[14..46], &secret);
+        assert_eq!(&state[5..13], &1_234u64.to_be_bytes());
     }
 
     #[test]

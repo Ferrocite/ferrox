@@ -9,7 +9,7 @@ mod profiles;
 pub(crate) mod record;
 mod rsa;
 pub(crate) mod server;
-mod ticket;
+pub(crate) mod ticket;
 pub(crate) mod tls12;
 
 pub use client::Session;
@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 pub(crate) const GREASE: u16 = 0x0a0a;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Profile {
+pub struct Profile {
     pub name: &'static str,
     pub ciphers: &'static [u16],
     pub shuffle: bool,
@@ -32,18 +32,18 @@ pub(crate) struct Profile {
 impl Profile {
     /// uTLS's PSK profiles carry a `PreSharedKeyExtension` slot; a TLS 1.3 ticket rides only those.
     fn offers_psk(&self) -> bool {
-        self.name.contains("_psk")
+        self.name.contains("_psk") || self.exts.iter().any(|ext| ext.kind == 0x0029)
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct Ext {
+pub struct Ext {
     pub kind: u16,
     pub body: Body,
 }
 
 #[derive(Debug)]
-pub(crate) enum Body {
+pub enum Body {
     Grease,
     Sni,
     Pad,
@@ -89,6 +89,19 @@ impl Fingerprint {
     /// The stock hello, by the two names uTLS gives it.
     pub const fn stock() -> Self {
         Self(None)
+    }
+
+    /// A caller-owned immutable profile as a fingerprint. The caller holds the
+    /// storage for the process, so every dial shares the same table.
+    #[must_use]
+    pub const fn custom(profile: &'static Profile) -> Self {
+        Self(Some(profile))
+    }
+
+    /// The profile's wire name, or `None` for the stock hello.
+    #[must_use]
+    pub fn name(self) -> Option<&'static str> {
+        self.0.map(|profile| profile.name)
     }
 
     /// The xray default, widened to the spellings sing-box and zeronet accept: an empty

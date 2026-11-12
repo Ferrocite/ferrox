@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{self, ErrorKind, IoSlice, Read, Write};
+use std::io::{self, Cursor, ErrorKind, IoSlice, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
@@ -21,10 +21,13 @@ use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use hkdf::Hkdf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::{ResolvesClientCert, Resumption};
+use rustls::client::{
+    ClientSessionMemoryCache, ClientSessionStore, ResolvesClientCert, Resumption,
+};
 use rustls::crypto::SecureRandom;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::quic::{ClientConnection, DirectionalKeys, KeyChange, Keys, Secrets, Version};
+use rustls::server::{ProducesTickets, ServerConfig, ServerConnection};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, Side, SignatureScheme};
 use sha2::{Digest, Sha256};
@@ -265,9 +268,11 @@ struct Remembered {
 }
 
 static QUIC_SESSIONS: OnceLock<Mutex<HashMap<String, Remembered>>> = OnceLock::new();
-static QUIC_RESUMPTION: OnceLock<Resumption> = OnceLock::new();
+static QUIC_SESSION_STORE: OnceLock<Arc<dyn ClientSessionStore>> = OnceLock::new();
+static QUIC_PSK_TICKETS: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
 static QUIC_VERIFIER: OnceLock<Arc<dyn ServerCertVerifier>> = OnceLock::new();
 static QUIC_CLIENT_AUTH: OnceLock<Arc<dyn ResolvesClientCert>> = OnceLock::new();
+const PSK_TICKETS_PER_MINT: u8 = 8;
 
 /// Shared flow-control grants remembered from completed handshakes.
 fn sessions() -> &'static Mutex<HashMap<String, Remembered>> {
@@ -275,10 +280,19 @@ fn sessions() -> &'static Mutex<HashMap<String, Remembered>> {
 }
 
 /// The process-wide rustls ticket store shared by every QUIC dial.
+fn session_store() -> &'static Arc<dyn ClientSessionStore> {
+    QUIC_SESSION_STORE
+        .get_or_init(|| Arc::new(ClientSessionMemoryCache::new(256)) as Arc<dyn ClientSessionStore>)
+}
+
+/// The resumption handle over that store.
 fn resumption() -> Resumption {
-    QUIC_RESUMPTION
-        .get_or_init(|| Resumption::in_memory_sessions(256))
-        .clone()
+    Resumption::store(Arc::clone(session_store()))
+}
+
+/// How many minted obfuscated tickets remain for one server name.
+fn psk_tickets() -> &'static Mutex<HashMap<String, u8>> {
+    QUIC_PSK_TICKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The permissive verifier shared by every QUIC client config.
@@ -317,6 +331,7 @@ impl ResolvesClientCert for NoClientAuth {
 }
 thread_local! {
     static PENDING_RANDOM: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
+    static PENDING_ORDER_SEED: RefCell<Option<u16>> = const { RefCell::new(None) };
 }
 
 struct Shared {
@@ -397,6 +412,20 @@ fn quic_parameters(server: &Server) -> Result<(bool, bool, bool, &str, [u8; 32])
     Ok((obfuscated, decoy, randomized, proof_key, packet_key))
 }
 
+/// The shared obfuscation key a non-fronted QUIC dial uses for a client-made PSK, when its coin
+/// lands and the entry carries one.
+fn psk_key(server: &Server, shape: &crate::psiphon_ssh::TlsShape) -> Option<[u8; 32]> {
+    if !coin(shape.quic_obfuscated_psk) {
+        return None;
+    }
+    let key = server.obfuscation_key.as_deref()?;
+    let shared = ferrox_core::realm::hex_decode::<32>(key);
+    if shared.is_none() {
+        eprintln!("psiphon quic: invalid obfuscated PSK key; dialing without a PSK");
+    }
+    shared
+}
+
 /// Wrap a packet source in the entry's QUIC obfuscation layer.
 fn packet_io(
     io: PacketIo,
@@ -419,6 +448,194 @@ fn packet_io(
             None
         },
     })
+}
+
+/// Mint a batch of client-made obfuscated tickets when this server's pool runs dry.
+fn ensure_obfuscated_psk(name: &str, shared: [u8; 32]) -> Result<(), String> {
+    let mut counts = lock(psk_tickets());
+    let remaining = counts.entry(name.to_owned()).or_insert(0);
+    if *remaining == 0 {
+        mint_obfuscated_sessions(name, shared, session_store(), PSK_TICKETS_PER_MINT)?;
+        *remaining = PSK_TICKETS_PER_MINT;
+    }
+    *remaining -= 1;
+    Ok(())
+}
+
+/// Run one local TLS 1.3 handshake whose ticket wraps a caller-supplied obfuscation key, so the
+/// resulting PSK has the reference's obfuscated ticket shape rather than rustls' own.
+fn mint_obfuscated_sessions(
+    name: &str,
+    shared: [u8; 32],
+    store: &Arc<dyn ClientSessionStore>,
+    count: u8,
+) -> Result<(), String> {
+    let server_name = ServerName::try_from(name)
+        .map_err(|error| format!("psiphon quic psk name: {error}"))?
+        .to_owned();
+    let (cert, key) = local_identity()?;
+    let mut server = ServerConfig::builder_with_provider(Arc::new(psk_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| format!("psiphon quic psk versions: {error}"))?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        )
+        .map_err(|error| format!("psiphon quic psk certificate: {error}"))?;
+    server.ticketer = Arc::new(ObfuscatedTicketer { shared });
+    server.send_tls13_tickets = usize::from(count);
+    server.max_early_data_size = 0;
+    server.alpn_protocols = vec![b"h3".to_vec()];
+    let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(psk_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| format!("psiphon quic psk versions: {error}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier())
+        .with_client_cert_resolver(client_auth());
+    client.alpn_protocols = vec![b"h3".to_vec()];
+    client.resumption = Resumption::store(Arc::clone(store));
+    client.enable_early_data = false;
+    let mut client = rustls::ClientConnection::new(Arc::new(client), server_name)
+        .map_err(|error| format!("psiphon quic psk client: {error}"))?;
+    let mut server = ServerConnection::new(Arc::new(server))
+        .map_err(|error| format!("psiphon quic psk server: {error}"))?;
+    drive_handshake(&mut client, &mut server)
+}
+
+/// Move records between one in-memory client and server until both handshakes finish.
+fn drive_handshake(
+    client: &mut rustls::ClientConnection,
+    server: &mut ServerConnection,
+) -> Result<(), String> {
+    let mut to_server = Vec::new();
+    let mut to_client = Vec::new();
+    for _ in 0..32 {
+        let mut records = Vec::new();
+        client
+            .write_tls(&mut records)
+            .map_err(|error| format!("psiphon quic psk client write: {error}"))?;
+        to_server.extend_from_slice(&records);
+        let mut records = Vec::new();
+        server
+            .write_tls(&mut records)
+            .map_err(|error| format!("psiphon quic psk server write: {error}"))?;
+        to_client.extend_from_slice(&records);
+        if !to_server.is_empty() {
+            let mut cursor = Cursor::new(&to_server);
+            server
+                .read_tls(&mut cursor)
+                .map_err(|error| format!("psiphon quic psk server read: {error}"))?;
+            server
+                .process_new_packets()
+                .map_err(|error| format!("psiphon quic psk server handshake: {error}"))?;
+            to_server.clear();
+        }
+        if !to_client.is_empty() {
+            let mut cursor = Cursor::new(&to_client);
+            client
+                .read_tls(&mut cursor)
+                .map_err(|error| format!("psiphon quic psk client read: {error}"))?;
+            client
+                .process_new_packets()
+                .map_err(|error| format!("psiphon quic psk client handshake: {error}"))?;
+            to_client.clear();
+        }
+        if !client.is_handshaking()
+            && !server.is_handshaking()
+            && to_server.is_empty()
+            && to_client.is_empty()
+            && !client.wants_write()
+            && !server.wants_write()
+        {
+            return Ok(());
+        }
+    }
+    Err("psiphon quic psk: the local handshake did not finish".to_owned())
+}
+
+/// The AES-128-GCM suite the obfuscated ticket names, forced on both local ends.
+fn psk_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    provider
+}
+
+type LocalIdentity = (Vec<u8>, Vec<u8>);
+
+/// One self-signed certificate and key reused by every local mint.
+fn local_identity() -> Result<LocalIdentity, String> {
+    static IDENTITY: OnceLock<Result<LocalIdentity, String>> = OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+                .map_err(|error| format!("psiphon quic psk identity: {error}"))?;
+            Ok((
+                minted.cert.der().to_vec(),
+                minted.signing_key.serialize_der(),
+            ))
+        })
+        .clone()
+}
+
+/// Encrypts rustls' session state around the caller's key, keeping the handshake's secret and
+/// creation time so the client's PSK is the state the server can parse.
+struct ObfuscatedTicketer {
+    shared: [u8; 32],
+}
+
+impl std::fmt::Debug for ObfuscatedTicketer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObfuscatedTicketer(redacted)")
+    }
+}
+
+impl ProducesTickets for ObfuscatedTicketer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        7 * 24 * 60 * 60
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        let (secret, created) = server_session(plain)?;
+        ferrox_core::tls::ObfuscatedTicket::new(self.shared)
+            .encode(secret, true, false, created)
+            .ok()
+    }
+
+    fn decrypt(&self, _ciphertext: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// The master secret and creation time out of rustls' `ServerSessionValue` encoding.
+fn server_session(plain: &[u8]) -> Option<(&[u8], u64)> {
+    let mut at = 1usize;
+    if *plain.first()? == 1 {
+        at = at.checked_add(1 + usize::from(*plain.get(at)?))?;
+    }
+    at = at.checked_add(4)?;
+    let length = usize::from(*plain.get(at)?);
+    at = at.checked_add(1)?;
+    let secret = plain.get(at..at.checked_add(length)?)?;
+    at = at.checked_add(length + 1)?;
+    if *plain.get(at)? == 1 {
+        return None;
+    }
+    at = at.checked_add(1)?;
+    if *plain.get(at)? == 1 {
+        let length = usize::from(*plain.get(at + 1)?);
+        at = at.checked_add(2 + length)?;
+    } else {
+        at = at.checked_add(1)?;
+    }
+    let length = usize::from(u16::from_be_bytes([*plain.get(at)?, *plain.get(at + 1)?]));
+    at = at.checked_add(2 + length)?;
+    let created = u64::from_be_bytes(plain.get(at..at.checked_add(8)?)?.try_into().ok()?);
+    Some((secret, created))
 }
 
 impl QuicStream {
@@ -460,8 +677,9 @@ impl QuicStream {
             packet_key,
             shape,
         );
+        let psk = psk_key(server, shape);
         Self::connect_over(
-            udp, remote, timeout, proof_key, randomized, obfuscated, false, shape,
+            udp, remote, timeout, proof_key, randomized, obfuscated, false, psk, shape,
         )
     }
 
@@ -482,8 +700,9 @@ impl QuicStream {
             packet_key,
             shape,
         );
+        let psk = psk_key(server, shape);
         Self::connect_over(
-            udp, remote, timeout, proof_key, randomized, obfuscated, true, shape,
+            udp, remote, timeout, proof_key, randomized, obfuscated, true, psk, shape,
         )
     }
 
@@ -497,6 +716,7 @@ impl QuicStream {
         randomized: bool,
         obfuscated: bool,
         inproxy: bool,
+        psk: Option<[u8; 32]>,
         shape: &crate::psiphon_ssh::TlsShape,
     ) -> Result<Self, String> {
         let dial_early = coin(shape.quic_dial_early);
@@ -509,6 +729,14 @@ impl QuicStream {
             MAX_PACKET_SIZE
         };
         let name = quic_server_name(remote, proof_key);
+        let resume = psk.is_some_and(|shared| {
+            if let Err(error) = ensure_obfuscated_psk(&name, shared) {
+                eprintln!("psiphon quic: {error}; continuing without an obfuscated PSK");
+                false
+            } else {
+                true
+            }
+        });
         let mut engine = Engine::new(
             proof_key,
             randomized,
@@ -516,6 +744,7 @@ impl QuicStream {
             disable_path_mtu,
             packet_limit,
             name,
+            resume,
         )?;
         if engine.early() {
             engine.open_stream_early();
@@ -1014,7 +1243,11 @@ struct Engine {
 
 impl Engine {
     /// Build an engine and its initial packet keys for one server.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::fn_params_excessive_bools
+    )]
     fn new(
         key: &str,
         randomized: bool,
@@ -1022,8 +1255,9 @@ impl Engine {
         disable_path_mtu: bool,
         packet_limit: usize,
         name: String,
+        resume: bool,
     ) -> Result<Self, String> {
-        let config = client_config(randomized, dial_early)?;
+        let config = client_config(randomized, dial_early, resume)?;
         let mut scid = vec![0u8; CID_LEN];
         getrandom::fill(&mut scid).map_err(|error| format!("psiphon quic scid: {error}"))?;
         let params = transport_params(&scid, randomized);
@@ -1031,12 +1265,16 @@ impl Engine {
             .map_err(|error| format!("psiphon quic server name: {error}"))?
             .to_owned();
         let passthrough = tls_passthrough(key)?;
+        let order_seed =
+            randomized.then(|| u16::from_be_bytes(crate::psiphon_ssh::dial_random::<2>()));
         let tls = PENDING_RANDOM
             .with(|slot| {
                 *slot.borrow_mut() = Some(passthrough);
+                PENDING_ORDER_SEED.with(|seed| *seed.borrow_mut() = order_seed);
                 let created =
                     ClientConnection::new(Arc::new(config), Version::V1, server_name, params);
                 slot.borrow_mut().take();
+                PENDING_ORDER_SEED.with(|seed| seed.borrow_mut().take());
                 created
             })
             .map_err(|error| format!("psiphon quic tls: {error}"))?;
@@ -2419,7 +2657,11 @@ fn fail(shared: &Shared, why: impl Into<String>) {
 }
 
 /// Build the rustls client config shared by every QUIC dial.
-fn client_config(randomized: bool, early: bool) -> Result<rustls::ClientConfig, String> {
+fn client_config(
+    randomized: bool,
+    early: bool,
+    resume: bool,
+) -> Result<rustls::ClientConfig, String> {
     let mut provider = rustls::crypto::ring::default_provider();
     if randomized {
         randomize_cipher_suites(&mut provider);
@@ -2433,7 +2675,11 @@ fn client_config(randomized: bool, early: bool) -> Result<rustls::ClientConfig, 
         .with_custom_certificate_verifier(verifier())
         .with_client_cert_resolver(client_auth());
     tls.alpn_protocols = vec![b"h3".to_vec()];
-    tls.resumption = resumption();
+    tls.resumption = if resume {
+        resumption()
+    } else {
+        Resumption::disabled()
+    };
     tls.enable_early_data = early;
     Ok(tls)
 }
@@ -2448,6 +2694,12 @@ impl SecureRandom for PassthroughRandom {
         if buf.len() == 32 {
             if let Some(message) = PENDING_RANDOM.with(|slot| slot.borrow_mut().take()) {
                 buf.copy_from_slice(&message);
+                return Ok(());
+            }
+        }
+        if buf.len() == 2 {
+            if let Some(seed) = PENDING_ORDER_SEED.with(|slot| slot.borrow_mut().take()) {
+                buf.copy_from_slice(&seed.to_be_bytes());
                 return Ok(());
             }
         }
@@ -2722,12 +2974,16 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        get_varint, get_varint_byte, lock, noise_expand, quic_server_name, randomize_cipher_suites,
-        randomize_kx_groups, sessions, transport_params, Engine, ObfuscatedUdp, PacketIo,
-        QuicNoise, SentPacket, Udp, INITIAL_CWND, MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT,
-        PMTU_STEP,
+        get_varint, get_varint_byte, lock, mint_obfuscated_sessions, noise_expand,
+        quic_server_name, randomize_cipher_suites, randomize_kx_groups, sessions, transport_params,
+        Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, Udp, INITIAL_CWND, MAX_PACKET_SIZE,
+        OBFUSCATION_OVERHEAD, ONE_RTT, PASSTHROUGH_RANDOM, PENDING_ORDER_SEED, PMTU_STEP,
     };
+    use rustls::client::ClientSessionMemoryCache;
+    use rustls::crypto::SecureRandom as _;
+    use rustls::pki_types::ServerName;
     use std::net::{SocketAddr, UdpSocket};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn test_engine() -> Engine {
@@ -2738,6 +2994,7 @@ mod tests {
             true,
             MAX_PACKET_SIZE,
             "test.psiphon".to_owned(),
+            false,
         )
         .expect("engine")
     }
@@ -3205,6 +3462,25 @@ mod tests {
         assert_eq!(engine.stream_data, b"hello");
         assert_eq!(engine.bytes_in_flight, 0);
         assert!(engine.sent.is_empty());
+    }
+
+    #[test]
+    fn the_next_two_byte_draw_is_the_extension_order_seed() {
+        PENDING_ORDER_SEED.with(|slot| *slot.borrow_mut() = Some(0x1234));
+        let mut buf = [0u8; 2];
+        PASSTHROUGH_RANDOM.fill(&mut buf).expect("fills");
+        assert_eq!(buf, [0x12, 0x34]);
+        assert!(PENDING_ORDER_SEED.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn a_quic_obfuscated_psk_is_minted_into_a_fresh_store() {
+        use rustls::client::ClientSessionStore;
+        let name = "minted.example";
+        let store: Arc<dyn ClientSessionStore> = Arc::new(ClientSessionMemoryCache::new(8));
+        mint_obfuscated_sessions(name, [7u8; 32], &store, 1).expect("mints");
+        let server_name = ServerName::try_from(name).expect("name").to_owned();
+        assert!(store.take_tls13_ticket(&server_name).is_some());
     }
 
     #[test]

@@ -16,6 +16,17 @@ impl ObfuscatedTicket {
     pub fn new(key: [u8; 32]) -> Self {
         Self(key)
     }
+
+    /// Encodes and encrypts one state around a caller-supplied secret and creation time.
+    pub fn encode(
+        &self,
+        secret: &[u8],
+        tls13: bool,
+        ems: bool,
+        created: u64,
+    ) -> Result<Vec<u8>, TlsError> {
+        shaped::ticket::encode_state(&self.0, secret, tls13, ems, created)
+    }
 }
 
 impl fmt::Debug for ObfuscatedTicket {

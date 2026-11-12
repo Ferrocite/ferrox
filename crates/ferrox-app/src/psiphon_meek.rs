@@ -397,7 +397,9 @@ pub(crate) fn connect_inproxy(
         } else {
             Vec::new().into()
         };
-        let fingerprint = meek.shape.fingerprint();
+        let fingerprint = meek
+            .shape
+            .fingerprint(meek.fronted, meek.provider_id.as_deref());
         let config = TlsConfig {
             server_name,
             alpn: vec![b"http/1.1".to_vec()].into(),
@@ -1081,7 +1083,10 @@ impl MeekHttp {
         } else {
             Vec::new().into()
         };
-        let fingerprint = self.meek.shape.fingerprint();
+        let fingerprint = self
+            .meek
+            .shape
+            .fingerprint(self.meek.fronted, self.meek.provider_id.as_deref());
         let config = TlsConfig {
             server_name,
             alpn: alpn.into(),
