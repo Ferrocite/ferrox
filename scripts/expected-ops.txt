@@ -203,11 +203,18 @@ proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_read
 
 # Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
 # envelope lengths now take a straight path instead of the loop; the same row
-# read 86563 on the same base, so the loops took 13312 (15.4%) out. The
-# two-byte envelope path the 16375-byte payload uses is the same straight form,
-# but this probe's messages do not walk it. The messages, offsets, prefixes and
-# bytes are unchanged.
+# read 86563 on the same base, so the loops took 13312 (15.4%) out. This probe's
+# messages do not walk the two-byte envelope path; the wide probe below does.
+# The messages, offsets, prefixes and bytes are unchanged.
 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+# The wide probe reads the 16375-byte envelope and Hunk a relay read carries,
+# where both lengths take two bytes. Blessed 332283 by grpc-read-straight
+# (ops.yml run 43313013240): 4096 two-byte Hunk lengths of 16375 take the
+# straight read, against 430587
+# for the field walk in run 43298148854, so 98304 (22.8%) came out. The fast
+# read is compiled only into the wide monomorph, so the one-byte row above
+# keeps its 73251 walk.
+grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332283 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
 # Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
 # 16375 now take the direct write, against 118798 for the byte loop on the same
 # run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
