@@ -2405,7 +2405,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a temp dir");
         let path = dir.join("identity.json");
         std::fs::create_dir(&path).expect("a directory where the file should be");
-        let error = Identity::load(&path).err().expect("a read failure");
+        let error = Identity::load(&path).expect_err("a read failure");
         assert!(!error.corrupt(), "{error:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2416,7 +2416,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a temp dir");
         let path = dir.join("identity.json");
         std::fs::write(&path, b"not json").expect("a broken identity");
-        let error = Identity::load(&path).err().expect("a parse failure");
+        let error = Identity::load(&path).expect_err("a parse failure");
         assert!(error.corrupt(), "{error:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
