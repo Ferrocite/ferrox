@@ -27686,7 +27686,8 @@ fn relay_lanes(
     let mut forward = TcpCopy::new(client_read, target_write);
     forward.stall = forward_stall;
     forward.reply_idle = forward_stall;
-    lane_pool::submit(
+    lane_pool::submit_tagged(
+        "tcp-fwd",
         Box::new(move || forward.step(&first)),
         Box::new({
             let flow = Arc::clone(&flow);
@@ -27703,7 +27704,8 @@ fn relay_lanes(
     if let Some(answer) = answer {
         reply = reply.answering(answer);
     }
-    lane_pool::submit(
+    lane_pool::submit_tagged(
+        "tcp-bwd",
         Box::new(move || reply.step(&second)),
         Box::new({
             let flow = Arc::clone(&flow);
@@ -29056,6 +29058,35 @@ pub(crate) mod lane_pool {
         idle: u32,
         /// A relay lane's reads hand a timeout back to the step; a setup lane's own budget owns its wait.
         relay: bool,
+        tag: &'static str,
+    }
+
+    static ACTIVE: Mutex<
+        Option<
+            std::collections::HashMap<std::thread::ThreadId, (&'static str, std::time::Instant)>,
+        >,
+    > = Mutex::new(None);
+
+    struct ActiveTag(std::thread::ThreadId);
+
+    impl Drop for ActiveTag {
+        fn drop(&mut self) {
+            if let Ok(mut active) = ACTIVE.lock() {
+                if let Some(map) = active.as_mut() {
+                    map.remove(&self.0);
+                }
+            }
+        }
+    }
+
+    fn tag_active(tag: &'static str) -> ActiveTag {
+        let id = std::thread::current().id();
+        if let Ok(mut active) = ACTIVE.lock() {
+            active
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(id, (tag, std::time::Instant::now()));
+        }
+        ActiveTag(id)
     }
 
     impl Lane {
@@ -29065,6 +29096,7 @@ pub(crate) mod lane_pool {
                 crate::proxy::forget_wait_finish();
                 crate::proxy::forget_wait_idle();
             }
+            let _tag = tag_active(self.tag);
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
                 (self.step)()
@@ -30412,12 +30444,17 @@ pub(crate) mod lane_pool {
     }
 
     pub(crate) fn submit(step: Step, complete: Complete) {
-        submit_to(&pool(), step, complete);
+        submit_to_tagged(&pool(), "relay", step, complete);
+    }
+
+    /// A relay lane whose step is named, so a stalled worker says which direction it is in.
+    pub(crate) fn submit_tagged(tag: &'static str, step: Step, complete: Complete) {
+        submit_to_tagged(&pool(), tag, step, complete);
     }
 
     /// The demux of a muxed carrier, kept off the relay workers it feeds.
     pub(crate) fn submit_demux(step: Step, complete: Complete) {
-        submit_to(&demux_pool(), step, complete);
+        submit_to_tagged(&demux_pool(), "demux", step, complete);
     }
 
     /// A muxed stream's handshake: queued behind the accept path's setup lanes instead of taking a
@@ -30468,8 +30505,27 @@ pub(crate) mod lane_pool {
         let _ = submit_to_with(pool, step, complete, true);
     }
 
+    fn submit_to_tagged(
+        pool: &std::sync::Arc<Pool>,
+        tag: &'static str,
+        step: Step,
+        complete: Complete,
+    ) {
+        let _ = submit_to_tagged_with(pool, tag, step, complete, true);
+    }
+
     fn submit_to_with(
         pool: &std::sync::Arc<Pool>,
+        step: Step,
+        complete: Complete,
+        relay: bool,
+    ) -> Result<(), Lane> {
+        submit_to_tagged_with(pool, "lane", step, complete, relay)
+    }
+
+    fn submit_to_tagged_with(
+        pool: &std::sync::Arc<Pool>,
+        tag: &'static str,
         step: Step,
         complete: Complete,
         relay: bool,
@@ -30480,6 +30536,7 @@ pub(crate) mod lane_pool {
             complete: Some(complete),
             idle: 0,
             relay,
+            tag,
         };
         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
@@ -30533,8 +30590,22 @@ pub(crate) mod lane_pool {
         let len = |queue: &std::sync::Mutex<std::collections::VecDeque<Lane>>| {
             queue.lock().unwrap_or_else(PoisonError::into_inner).len()
         };
+        let active = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|map| {
+                let now = std::time::Instant::now();
+                let mut rows: Vec<_> = map
+                    .values()
+                    .map(|(tag, at)| format!("{tag}@{}ms", now.duration_since(*at).as_millis()))
+                    .collect();
+                rows.sort();
+                rows.join(",")
+            })
+            .unwrap_or_default();
         format!(
-            "relay workers={} idle={} ready={} parked={} waiting={} parks={} timer={} ready_parks={} | demux workers={} idle={} ready={} waiting={}",
+            "relay workers={} idle={} ready={} parked={} waiting={} parks={} timer={} ready_parks={} | demux workers={} idle={} ready={} waiting={} | active={active}",
             p.workers.load(std::sync::atomic::Ordering::Relaxed),
             p.idle.load(std::sync::atomic::Ordering::Relaxed),
             len(&p.ready),
@@ -32809,7 +32880,8 @@ where
         .read_window()
         .map_or_else(RelayBuf::new, RelayBuf::with_limit);
     let mut at = Forward::new();
-    lane_pool::submit(
+    lane_pool::submit_tagged(
+        "carrier-fwd",
         Box::new(move || {
             if let Some(next) = settle_lane(&uplink, &mut at) {
                 return next;
@@ -32853,7 +32925,8 @@ where
     let mut upload = Upload::new();
     // Every wait of this shape carries the named stall, armed once outside the byte loop.
     let _ = peer_write.set_write_timeout(Some(stall));
-    lane_pool::submit(
+    lane_pool::submit_tagged(
+        "carrier-bwd",
         Box::new(move || {
             let read = reader.read_window();
             let (next, timed_out) = match read {
