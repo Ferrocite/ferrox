@@ -1596,7 +1596,30 @@ pub(crate) fn echo_trace(stage: &str) {
             .elapsed()
             .as_millis();
         println!("echo-trace: t={at} {stage}");
+        if let Some(file) = echo_file() {
+            use std::io::Write as _;
+            let mut file = file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = writeln!(file, "echo-trace: t={at} {stage}");
+        }
     }
+}
+
+/// Test output is captured per thread, so a trace that must be read after a run is written to the file the workflow names.
+fn echo_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("FERROX_TRACE_FILE")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(std::sync::Mutex::new(file))
+    })
+    .as_ref()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8790,6 +8813,10 @@ fn sniff_xhttp<R: Read>(
         }
     }
     let _ = arm(&read, if sealed { Some(RELAY_POLL) } else { None });
+    if at < magic.len() && Instant::now() >= until {
+        echo_trace(&format!("sniff expired at={at}"));
+        return None;
+    }
     let h2 = at == magic.len() && magic == *crate::h2::MAGIC;
     echo_trace(&format!("sniff at={at} h2={h2}"));
     Some((

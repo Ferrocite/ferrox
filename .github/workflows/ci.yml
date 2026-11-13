@@ -183,13 +183,20 @@ jobs:
         shell: bash
         env:
           FERROX_ECHO_TRACE: "1"
-          FERROX_ECHO_H2: "1"
           RUST_TEST_THREADS: "1"
         run: |
+          mkdir -p target/ci
           for i in 1 2 3 4 5; do
             echo "=== run $i ==="
-            cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
+            FERROX_TRACE_FILE="target/ci/trace-$i.log" cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
           done
+      - name: upload the trace the run wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-trace
+          path: target/ci/trace-*.log
+          if-no-files-found: ignore
 
   test:
     name: test (${{ matrix.name }})
