@@ -501,7 +501,8 @@ mod tests {
     }
 
     /// A dial over the caller's socket carries the session, and closing it sets the stop flag
-    /// the socket's owner reads: the pair a tagged carrier depends on.
+    /// the socket's owner reads: the pair a tagged carrier depends on. The scheduler holds a
+    /// strong handle for one pass, so the flag arrives within that pass, not on the caller's thread.
     #[cfg_attr(miri, ignore = "binds loopback UDP sockets")]
     #[test]
     fn a_dial_with_rides_the_callers_socket_and_stops_on_close() {
@@ -542,6 +543,10 @@ mod tests {
             "a live dial leaves the socket to its caller"
         );
         drop(conn);
+        let wait = Instant::now();
+        while !stop.load(Ordering::Relaxed) && wait.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             stop.load(Ordering::Relaxed),
             "the closer stops the socket's owner"

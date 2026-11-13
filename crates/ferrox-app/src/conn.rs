@@ -186,12 +186,21 @@ impl Masked {
         if run.is_done() {
             return Ok(());
         }
+        // The relay arms a one-millisecond poll clock; the handshake's own reads take the handshake budget, and the clock comes back as it was.
+        let prior = self.stream.read_timeout().ok();
+        let _ = self
+            .stream
+            .set_read_timeout(Some(crate::budgets::handshake()));
         let mut source = HeaderWire {
             chain: &self.chain,
             read_chain: self.read_chain.as_deref(),
             stream: &self.stream,
         };
-        run.handshake(&mut source, mask_clock())
+        let result = run.handshake(&mut source, mask_clock());
+        if let Some(prior) = prior {
+            let _ = self.stream.set_read_timeout(prior);
+        }
+        result
     }
 
     /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
@@ -576,6 +585,21 @@ impl std::os::windows::io::AsRawSocket for Connection {
 impl ferrox_core::tls::RecordAlignment for Connection {}
 
 impl Connection {
+    /// Finish a masked handshake where the lane can spend the handshake budget, so a readiness
+    /// read never runs one and a split header is not read under the relay's poll clock.
+    pub(crate) fn start_mask(&self) -> io::Result<()> {
+        match self {
+            Connection::Masked(masked) => masked.ensure_header(),
+            Connection::Metered(metered) => metered.inner.start_mask(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.start_mask()
+            }
+            Connection::Tcp(_) => Ok(()),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => Ok(()),
+        }
+    }
+
     /// One relay read that never waits: an empty socket answers `WouldBlock` at once, and the lane
     /// parks on the descriptor its timeout names instead of spending the poll quantum in a worker.
     pub(crate) fn read_ready(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -2736,6 +2760,50 @@ mod tests {
             began.elapsed() < Duration::from_secs(1),
             "the read waited out its clock instead of handing the lane a park"
         );
+    }
+
+    /// A masked server's handshake reads the peer's first bytes: it takes the handshake budget, not
+    /// the relay's poll clock, and it puts the clock back when the header is done.
+    #[test]
+    fn a_masked_handshake_reads_past_the_poll_clock_and_restores_it() {
+        use ferrox_core::finalmask::{Chain, HeaderCustom, Item, MaskRole, Sequence};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connects");
+            std::thread::sleep(Duration::from_millis(25));
+            stream.write_all(b"abcd").expect("sends the header");
+        });
+        let (side, _) = listener.accept().expect("accepts");
+        side.set_read_timeout(Some(Duration::from_millis(1)))
+            .expect("arms the poll clock");
+        let clients = Item {
+            packet: Some(b"abcd".to_vec()),
+            ..Item::default()
+        };
+        let header = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![clients],
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("a mask the config can drive");
+        let mut chain = Chain::default();
+        chain.push_header_custom(header);
+        let connection = Connection::Tcp(side).with_mask_role(Some(&chain), MaskRole::Server);
+        connection
+            .start_mask()
+            .expect("the header handshake reads past the poll clock");
+        match &connection {
+            Connection::Masked(masked) => assert_eq!(
+                masked.stream.read_timeout().expect("reads the clock"),
+                Some(Duration::from_millis(1)),
+                "the relay's clock comes back after the handshake"
+            ),
+            other => panic!("a masked connection is expected: {other:?}"),
+        }
+        peer.join().expect("the peer joins");
     }
 
     /// A readiness read never runs the header handshake, so a pending header is left whole for the
