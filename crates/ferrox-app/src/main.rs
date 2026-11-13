@@ -160,6 +160,11 @@ fn usage() -> ! {
     eprintln!(
         "  ferrox-app psiphon-broker -c <config.json> [--sdp <file>]  send a client offer to the first broker"
     );
+    eprintln!(
+        "  ferrox-app psiphon-feedback -c <config.json> --diagnostics <file> [--upload-path <path>]"
+    );
+    eprintln!("  ferrox-app psiphon-exchange export -c <config.json>   print an exchange payload");
+    eprintln!("  ferrox-app psiphon-exchange import -c <config.json> <payload>   import one");
     std::process::exit(2);
 }
 
@@ -450,6 +455,136 @@ fn cmd_psiphon_tactics<I: Iterator<Item = String>>(args: &mut I) {
     }
 }
 
+fn read_psiphon_settings(path: &str, label: &str) -> Option<json::Json> {
+    let text = if path == "-" || path == "stdin:" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .unwrap_or_else(|error| {
+                eprintln!("{label}: stdin: {error}");
+                std::process::exit(1);
+            });
+        text
+    } else {
+        std::fs::read_to_string(path).unwrap_or_else(|error| {
+            eprintln!("{label}: {path}: {error}");
+            std::process::exit(1);
+        })
+    };
+    let root = json::parse(&text).unwrap_or_else(|error| {
+        eprintln!("{label}: {error}");
+        std::process::exit(1);
+    });
+    root.get("outbounds")
+        .and_then(json::Json::as_arr)
+        .and_then(|outbounds| {
+            outbounds.iter().find(|outbound| {
+                outbound.get("protocol").and_then(json::Json::as_str) == Some("psiphon")
+            })
+        })
+        .and_then(|outbound| outbound.get("settings"))
+        .cloned()
+}
+
+fn cmd_psiphon_feedback<I: Iterator<Item = String>>(args: &mut I) {
+    let mut path = String::new();
+    let mut diagnostics_path = String::new();
+    let mut upload_path = String::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "-config" | "--config" => {
+                path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--config=") => {
+                path.clear();
+                path.push_str(&other["--config=".len()..]);
+            }
+            "--diagnostics" => {
+                diagnostics_path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--diagnostics=") => {
+                diagnostics_path.clear();
+                diagnostics_path.push_str(&other["--diagnostics=".len()..]);
+            }
+            "--upload-path" => {
+                upload_path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--upload-path=") => {
+                upload_path.clear();
+                upload_path.push_str(&other["--upload-path=".len()..]);
+            }
+            _ => usage(),
+        }
+    }
+    if path.is_empty() || diagnostics_path.is_empty() {
+        usage();
+    }
+    let diagnostics = std::fs::read(&diagnostics_path).unwrap_or_else(|error| {
+        eprintln!("psiphon-feedback: {diagnostics_path}: {error}");
+        std::process::exit(1);
+    });
+    let settings = read_psiphon_settings(&path, "psiphon-feedback");
+    match psiphon::feedback(settings.as_ref(), &diagnostics, &upload_path) {
+        Ok(()) => println!("uploaded"),
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_psiphon_exchange<I: Iterator<Item = String>>(args: &mut I) {
+    let action = args.next().unwrap_or_else(|| usage());
+    let mut path = String::new();
+    let mut payload = String::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "-config" | "--config" => {
+                path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--config=") => {
+                path.clear();
+                path.push_str(&other["--config=".len()..]);
+            }
+            other if payload.is_empty() => payload.push_str(other),
+            _ => usage(),
+        }
+    }
+    if path.is_empty() {
+        usage();
+    }
+    let settings = read_psiphon_settings(&path, "psiphon-exchange");
+    match action.as_str() {
+        "export" => match psiphon::exchange_export(settings.as_ref()) {
+            Ok(payload) => println!("{payload}"),
+            Err(why) => {
+                eprintln!("{why}");
+                std::process::exit(1);
+            }
+        },
+        "import" => {
+            if payload.is_empty() || payload == "-" {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .unwrap_or_else(|error| {
+                        eprintln!("psiphon-exchange: stdin: {error}");
+                        std::process::exit(1);
+                    });
+                payload = text;
+            }
+            match psiphon::exchange_import(settings.as_ref(), &payload) {
+                Ok(host) => println!("{host}"),
+                Err(why) => {
+                    eprintln!("{why}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => usage(),
+    }
+}
+
 fn cmd_psiphon_broker<I: Iterator<Item = String>>(args: &mut I) {
     let mut path = String::new();
     let mut sdp_path = String::new();
@@ -605,6 +740,8 @@ fn main() {
         "psiphon-regions" => cmd_psiphon_regions(&mut args),
         "psiphon-tactics" => cmd_psiphon_tactics(&mut args),
         "psiphon-broker" => cmd_psiphon_broker(&mut args),
+        "psiphon-feedback" => cmd_psiphon_feedback(&mut args),
+        "psiphon-exchange" => cmd_psiphon_exchange(&mut args),
         "x25519" => {
             if args.next().is_some() {
                 usage();
