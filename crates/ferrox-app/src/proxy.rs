@@ -6187,8 +6187,13 @@ fn serve_sealed_split_with<R, W, C>(
             }
             let close = close_with_uplink(&closer, &uplink);
             if flow == Flow::Vision {
-                eprintln!("vless: vision over a carried encrypted session is not served yet");
-                close();
+                reader.arm_relay_poll();
+                let link = crate::vision::Link::switchable(
+                    JoinedHalves { reader, writer },
+                    &got,
+                    JoinedHalves::enter_direct_mode,
+                );
+                relay_link(&uplink, link, &close, None);
                 return;
             }
             relay_split(reader, writer, &uplink, &close);
@@ -6401,9 +6406,44 @@ fn relay_sealed<S: Read + Write + Send + 'static>(
     );
 }
 
-fn relay_link<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
+/// The two sealed halves behind one Vision link: framing reads the plaintext one half opens and writes seal through the other.
+struct JoinedHalves<R, W> {
+    reader: ferrox_core::vless_encryption::EncryptedReader<R>,
+    writer: ferrox_core::vless_encryption::EncryptedWriter<W>,
+}
+
+impl<R, W> JoinedHalves<R, W> {
+    fn enter_direct_mode(&mut self) {
+        self.reader.enter_direct_mode();
+        self.writer.enter_direct_mode();
+    }
+}
+
+impl<R: Read, W> Read for JoinedHalves<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl<R, W: Write> Write for JoinedHalves<R, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<R: Read, W: Write> ferrox_core::tls::RecordAlignment for JoinedHalves<R, W> {
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.writer.write_all_slices(parts)
+    }
+}
+
+fn relay_link<T: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
     plain: &Connection,
-    link: crate::vision::Link<crate::vision::Sealed<S>>,
+    link: crate::vision::Link<T>,
     close: &Arc<dyn Fn() + Send + Sync>,
     timeout: Option<Connection>,
 ) {
@@ -11328,7 +11368,7 @@ fn dial_sealed_carried<R, W>(
     close: &Arc<dyn Fn() + Send + Sync>,
 ) -> bool
 where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
 {
     dial_sealed_carried_armed(client, vless, header, reader, writer, close, |_, _| {})
@@ -11344,7 +11384,7 @@ fn dial_sealed_carried_armed<R, W, A>(
     armed: A,
 ) -> bool
 where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
     A: Fn(&mut R, bool),
 {
@@ -11370,14 +11410,19 @@ where
         close();
         return false;
     }
-    let Some((reader, writer)) = sealed.into_split() else {
+    let Some((mut reader, writer)) = sealed.into_split() else {
         close();
         return false;
     };
     if vless.flow == ferrox_core::vless::VISION_FLOW {
-        eprintln!("vless: vision over a carried encrypted session is not served yet");
-        close();
-        return false;
+        reader.arm_relay_poll();
+        let link = crate::vision::Link::switchable(
+            JoinedHalves { reader, writer },
+            &vless.id,
+            JoinedHalves::enter_direct_mode,
+        );
+        relay_link(client, link, close, None);
+        return true;
     }
     relay_split(reader, writer, client, close);
     true
@@ -19501,7 +19546,7 @@ where
 #[allow(clippy::too_many_lines)]
 /// What a VLESS xHTTP session does once its stream exists, whether the stream was just dialled or
 /// taken from the `xmux` pool.
-fn relay_vless_xhttp_session<R: WindowRead + Send + 'static>(
+fn relay_vless_xhttp_session<R: WindowRead + Send + RelayPoll + 'static>(
     server: &SocketAddr,
     client: &Connection,
     vless: &VlessOut,
@@ -40315,6 +40360,170 @@ mod tests {
     #[test]
     fn an_encrypted_vless_httpheader_session_echoes_over_loopback() {
         encrypted_vless_carried_echo(
+            Carrier::HttpHeader {
+                path: "/sealed".to_owned(),
+            },
+            "header.test",
+        );
+    }
+
+    /// Vision rides the sealed session above a carrier: the framing command, the padding and the
+    /// echo all cross the engine's records, which are themselves framed by the carrier.
+    #[cfg(unix)]
+    fn encrypted_vless_carried_vision_echo(carrier: Carrier, host: &str) {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x46u8; 16];
+        let server_carrier = carrier.clone();
+        thread::spawn(move || {
+            let user = VlessUser {
+                id,
+                flow: Flow::Vision,
+                email: String::new(),
+                level: 0,
+                reverse: None,
+            };
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                std::slice::from_ref(&user),
+                &server_carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier,
+            host: host.to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+                Ladder::global(),
+            );
+        });
+        let payload = vec![0x5Au8; 48 * 1024];
+        peer.write_all(&payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(got, payload);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_grpc_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Grpc(crate::config::GrpcSettings::path("/sealed")),
+            "127.0.0.1",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpupgrade_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::HttpUpgrade {
+                path: "/sealed".to_owned(),
+                host: "upgrade.test".to_owned(),
+            },
+            "upgrade.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_vision_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        encrypted_vless_carried_vision_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_h2_vision_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        settings.h2c = true;
+        encrypted_vless_carried_vision_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpheader_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
             Carrier::HttpHeader {
                 path: "/sealed".to_owned(),
             },
