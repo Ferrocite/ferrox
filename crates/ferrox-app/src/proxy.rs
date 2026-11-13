@@ -16888,7 +16888,9 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     if crate::browser_dialer::active() && vless.reality.is_none() {
         match &vless.carrier {
             Carrier::Ws { .. } | Carrier::Xhttp { .. } => {
-                return open_vless_browser_mux(vless, &server);
+                if let Some(uplink) = open_vless_browser_mux(vless, &server) {
+                    return Some(uplink);
+                }
             }
             _ => {}
         }
@@ -17455,7 +17457,9 @@ fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
     if crate::browser_dialer::active() && trojan.reality.is_none() {
         match &trojan.carrier {
             Carrier::Ws { .. } | Carrier::Xhttp { .. } => {
-                return open_trojan_browser_mux(trojan, &server);
+                if let Some(uplink) = open_trojan_browser_mux(trojan, &server) {
+                    return Some(uplink);
+                }
             }
             _ => {}
         }
