@@ -11,9 +11,9 @@ Every write that hands a payload to a socket from where it was read is **zero** 
 ```mermaid
 graph TD
     subgraph downlink["origin -> client"]
-        A["payload from the origin's read buffer"] --> B["encode the Keep metadata once<br/>per flow: id, status, option"]
-        B --> C["patch the 2-byte data length,<br/>write the metadata length, metadata"]
-        C --> D["one buffer: our header, then<br/>their payload, not copied"]
+        A["payload from the origin's read buffer"] --> B["encode the Keep header once<br/>per flow: id, status, option, length"]
+        B --> C["patch the 2-byte data length<br/>for this read"]
+        C --> D["the header and their payload<br/>are two parts, payload not copied"]
         D --> E["writev, 1 syscall"]
         E --> W(("wire"))
     end
