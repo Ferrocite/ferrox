@@ -11486,7 +11486,7 @@ fn dial_vless_browser(
             let first = if vless.encryption.is_some() {
                 &[][..]
             } else {
-                header.as_slice()
+                &header[..]
             };
             let Some((reader, writer)) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {

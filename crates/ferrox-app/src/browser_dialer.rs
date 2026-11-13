@@ -275,7 +275,7 @@ fn dial_ws_on(bridge: &Bridge, target: &WsTarget<'_>) -> Option<(WsReader<Connec
         "{scheme}://{}{path}",
         authority(target.host, target.port, target.tls)
     );
-    let mut slot = bridge.task(&task("WS", url, extra, true))?;
+    let slot = bridge.task(&task("WS", url, extra, true))?;
     if !early && !target.first.is_empty() && !slot.writer.send(target.first) {
         return None;
     }
