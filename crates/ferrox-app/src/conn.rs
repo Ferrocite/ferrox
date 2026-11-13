@@ -19,7 +19,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use libc::{SO_RCVTIMEO, SO_SNDTIMEO};
@@ -78,6 +79,13 @@ pub(crate) struct Masked {
     header: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::HeaderRun>>>,
 }
 
+/// The clock the captured-variable store stamps and expires with; the core takes it as a value so
+/// that a library read stays deterministic.
+fn mask_clock() -> Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
 impl Masked {
     /// Run the configured handshake before the first byte of the session moves.
     fn ensure_header(&self) -> io::Result<()> {
@@ -94,7 +102,7 @@ impl Masked {
             chain: &self.chain,
             stream: &self.stream,
         };
-        run.handshake(&mut source)
+        run.handshake(&mut source, mask_clock())
     }
 
     /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
@@ -183,7 +191,12 @@ impl Connection {
                 let local = stream.local_addr().ok();
                 let remote = stream.peer_addr().ok();
                 let header = chain.header().cloned().map(|header| {
-                    std::sync::Arc::new(std::sync::Mutex::new(header.open(role, local, remote)))
+                    std::sync::Arc::new(std::sync::Mutex::new(header.open(
+                        role,
+                        local,
+                        remote,
+                        mask_clock(),
+                    )))
                 });
                 Connection::Masked(Masked {
                     stream,

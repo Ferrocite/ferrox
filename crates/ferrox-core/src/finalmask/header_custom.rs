@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The captured variables live one handshake beyond the connection that wrote them, keyed by the
 /// socket pair, so a reused value survives a reconnect the way the reference's state store does.
@@ -101,12 +101,13 @@ impl HeaderCustom {
         role: MaskRole,
         local: Option<SocketAddr>,
         remote: Option<SocketAddr>,
+        now: Duration,
     ) -> HeaderRun {
         let vars = self
             .state
             .lock()
             .ok()
-            .and_then(|mut state| state.get(local, remote))
+            .and_then(|mut state| state.get(local, remote, now))
             .unwrap_or_default();
         HeaderRun {
             role,
@@ -119,9 +120,15 @@ impl HeaderCustom {
         }
     }
 
-    fn remember(&self, local: Option<SocketAddr>, remote: Option<SocketAddr>, vars: &Vars) {
+    fn remember(
+        &self,
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+        vars: &Vars,
+        now: Duration,
+    ) {
         if let Ok(mut state) = self.state.lock() {
-            state.set(local, remote, vars);
+            state.set(local, remote, vars, now);
         }
     }
 }
@@ -130,25 +137,35 @@ type Vars = HashMap<String, Vec<u8>>;
 
 #[derive(Debug, Default)]
 struct StateStore {
-    entries: HashMap<(Option<SocketAddr>, Option<SocketAddr>), (Vars, Instant)>,
+    entries: HashMap<(Option<SocketAddr>, Option<SocketAddr>), (Vars, Duration)>,
 }
 
 impl StateStore {
-    fn get(&mut self, local: Option<SocketAddr>, remote: Option<SocketAddr>) -> Option<Vars> {
+    fn get(
+        &mut self,
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+        now: Duration,
+    ) -> Option<Vars> {
         let key = (local, remote);
         let expired = self
             .entries
             .get(&key)
-            .is_some_and(|(_, at)| at.elapsed() > STATE_TTL);
+            .is_some_and(|(_, at)| now.saturating_sub(*at) > STATE_TTL);
         if expired {
             self.entries.remove(&key);
         }
         self.entries.get(&key).map(|(vars, _)| vars.clone())
     }
 
-    fn set(&mut self, local: Option<SocketAddr>, remote: Option<SocketAddr>, vars: &Vars) {
-        self.entries
-            .insert((local, remote), (vars.clone(), Instant::now()));
+    fn set(
+        &mut self,
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+        vars: &Vars,
+        now: Duration,
+    ) {
+        self.entries.insert((local, remote), (vars.clone(), now));
     }
 }
 
@@ -197,21 +214,21 @@ impl HeaderRun {
 
     /// Run the configured sequences once: the client writes then reads, the server reads then
     /// writes, and both stop on the first mismatch so a wrong peer never reaches the session.
-    pub fn handshake<T: Read + Write>(&mut self, raw: &mut T) -> io::Result<()> {
+    pub fn handshake<T: Read + Write>(&mut self, raw: &mut T, now: Duration) -> io::Result<()> {
         if self.done {
             return Ok(());
         }
         if self.failed {
             return Err(invalid("header auth failed"));
         }
-        let result = self.handshake_once(raw);
+        let result = self.handshake_once(raw, now);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn handshake_once<T: Read + Write>(&mut self, raw: &mut T) -> io::Result<()> {
+    fn handshake_once<T: Read + Write>(&mut self, raw: &mut T, now: Duration) -> io::Result<()> {
         let mut ctx = Context::new(self.local, self.remote, std::mem::take(&mut self.vars));
         match self.role {
             MaskRole::Client => {
@@ -248,7 +265,7 @@ impl HeaderRun {
                 }
             }
         }
-        self.mask.remember(self.local, self.remote, &ctx.vars);
+        self.mask.remember(self.local, self.remote, &ctx.vars, now);
         self.done = true;
         Ok(())
     }
@@ -764,10 +781,11 @@ mod tests {
         client.save = "txid".to_owned();
         let mut expected = item();
         expected.reuse = "txid".to_owned();
-        let run = mask(client, expected).open(MaskRole::Client, None, None);
+        let run = mask(client, expected).open(MaskRole::Client, None, None, Duration::ZERO);
         let mut wire = Wire::new(vec![0x2A, 0x2A]);
         let mut run = run;
-        run.handshake(&mut wire).expect("the answer matches");
+        run.handshake(&mut wire, Duration::ZERO)
+            .expect("the answer matches");
         assert_eq!(wire.output, vec![0x2A, 0x2A]);
         assert_eq!(wire.at, 2);
         assert_eq!(wire.writes, 1);
@@ -782,9 +800,10 @@ mod tests {
         client.save = "txid".to_owned();
         let mut answer = item();
         answer.packet = Some(vec![0x99, 0x01]);
-        let mut run = mask(client, answer).open(MaskRole::Server, None, None);
+        let mut run = mask(client, answer).open(MaskRole::Server, None, None, Duration::ZERO);
         let mut wire = Wire::new(vec![0x2A, 0x2A]);
-        run.handshake(&mut wire).expect("the client matches");
+        run.handshake(&mut wire, Duration::ZERO)
+            .expect("the client matches");
         assert_eq!(wire.output, vec![0x99, 0x01]);
         assert_eq!(wire.writes, 1);
     }
@@ -804,13 +823,43 @@ mod tests {
             Vec::new(),
         )
         .expect("config is valid");
-        let mut first = header.open(MaskRole::Client, None, None);
+        let mut first = header.open(MaskRole::Client, None, None, Duration::ZERO);
         first
-            .handshake(&mut Wire::new(Vec::new()))
+            .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
             .expect("the first handshake does not read");
-        let second = header.open(MaskRole::Client, None, None);
+        let second = header.open(MaskRole::Client, None, None, Duration::ZERO);
         assert_eq!(second.vars.len(), 1);
         assert_eq!(second.vars.get("tx"), Some(&vec![7, 7]));
+    }
+
+    #[test]
+    fn a_captured_value_expires_after_the_store_ttl() {
+        let mut client = item();
+        client.rand = 1;
+        client.rand_min = 7;
+        client.rand_max = 7;
+        client.save = "tx".to_owned();
+        let header = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![client],
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("config is valid");
+        let mut first = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        first
+            .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
+            .expect("the first handshake does not read");
+        let live = header.open(MaskRole::Client, None, None, STATE_TTL);
+        assert_eq!(live.vars.get("tx"), Some(&vec![7]));
+        let expired = header.open(
+            MaskRole::Client,
+            None,
+            None,
+            STATE_TTL + Duration::from_millis(1),
+        );
+        assert!(expired.vars.is_empty());
     }
 
     #[test]
@@ -829,14 +878,16 @@ mod tests {
             }],
         )
         .expect("config is valid");
-        let mut run = header.open(MaskRole::Server, None, None);
+        let mut run = header.open(MaskRole::Server, None, None, Duration::ZERO);
         let mut wire = Wire::new(vec![3, 4]);
-        let error = run.handshake(&mut wire).expect_err("the client differs");
+        let error = run
+            .handshake(&mut wire, Duration::ZERO)
+            .expect_err("the client differs");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(wire.output, vec![0xEE]);
         assert_eq!(wire.writes, 1);
         assert!(
-            run.handshake(&mut wire).is_err(),
+            run.handshake(&mut wire, Duration::ZERO).is_err(),
             "a failed handshake is final"
         );
         assert_eq!(wire.writes, 1, "and does not write the error twice");
