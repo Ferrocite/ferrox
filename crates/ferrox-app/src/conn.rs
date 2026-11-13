@@ -161,7 +161,7 @@ impl<R: ReadClock> std::io::Read for DeadlineReader<R> {
                     "xmc: handshake deadline passed",
                 ));
             }
-            self.reader.arm(Some(left))?;
+            self.reader.arm(Some(left.max(Duration::from_millis(1))))?;
         }
         self.reader.read(output)
     }
@@ -415,7 +415,8 @@ impl std::io::Read for HeaderWire<'_> {
                 "the header handshake deadline passed",
             ));
         }
-        self.stream.set_read_timeout(Some(left))?;
+        self.stream
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
         let Some(chain) = self.read_chain else {
             return (&*self.stream).read(buf);
         };
