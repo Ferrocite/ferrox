@@ -373,7 +373,23 @@ pub(crate) fn request(
 
 /// Head to the blank line, then the declared body shape; a TLS record costs a syscall, so the head is buffered.
 pub(crate) fn read_reply<S: Read>(io: &mut S, chunk: usize) -> Result<Reply, Failure> {
+    read_reply_limited(io, chunk, MAX_BODY)
+}
+
+/// The bounded-body form used by one-shot upgrade downloads, whose payload is larger than a page.
+pub(crate) fn read_reply_limited<S: Read>(
+    io: &mut S,
+    chunk: usize,
+    max_body: usize,
+) -> Result<Reply, Failure> {
     let mut io = BufReader::with_capacity(1024, io);
+    let mut reply = read_head(&mut io)?;
+    reply.body = read_body(&mut io, &reply.headers, chunk, max_body)?;
+    Ok(reply)
+}
+
+/// Read the status line and headers and leave the body unread, for a HEAD or a streamed GET.
+fn read_head<S: BufRead>(io: &mut S) -> Result<Reply, Failure> {
     let mut lines: Vec<String> = Vec::with_capacity(12);
     let mut total = 0usize;
     loop {
@@ -413,11 +429,10 @@ pub(crate) fn read_reply<S: Read>(io: &mut S, chunk: usize) -> Result<Reply, Fai
             line[colon + 1..].trim().to_owned(),
         ));
     }
-    let body = read_body(&mut io, &headers, chunk)?;
     Ok(Reply {
         status,
         headers,
-        body,
+        body: Vec::new(),
     })
 }
 
@@ -426,6 +441,7 @@ fn read_body<S: BufRead>(
     io: &mut S,
     headers: &[(String, String)],
     chunk: usize,
+    max_body: usize,
 ) -> Result<Vec<u8>, Failure> {
     let chunk = chunk.max(1);
     let header = |name: &str| {
@@ -448,11 +464,14 @@ fn read_body<S: BufRead>(
                 let _ = io.read_line(&mut trailer);
                 return Ok(body);
             }
-            if body.len() + size > MAX_BODY {
+            let Some(total) = body.len().checked_add(size) else {
+                return Err(Failure::Frame);
+            };
+            if total > max_body {
                 return Err(Failure::Frame);
             }
             let at = body.len();
-            body.resize(at + size, 0);
+            body.resize(total, 0);
             read_exact_chunked(io, &mut body[at..], chunk)?;
             let mut tail = [0u8; 2];
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
@@ -460,8 +479,10 @@ fn read_body<S: BufRead>(
     }
     let len = header("content-length")
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(MAX_BODY);
+        .unwrap_or(0);
+    if len > max_body {
+        return Err(Failure::Frame);
+    }
     let mut body = vec![0u8; len];
     read_exact_chunked(io, &mut body, chunk)?;
     Ok(body)
@@ -872,12 +893,38 @@ pub(crate) fn ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
+    ask_limited(endpoint, method, url, headers, body, MAX_BODY)
+}
+
+/// One request whose declared body may exceed the page-sized default.
+pub(crate) fn ask_limited(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    max_body: usize,
+) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
     tls.write_all(&request(method, &endpoint.origin(), url, headers, body))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
-    read_reply(&mut tls, DEFAULT_READ_CHUNK)
+    read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
         .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+}
+
+/// One HEAD request: read the status and headers and leave the declared body alone.
+pub(crate) fn ask_head(
+    endpoint: &Endpoint,
+    url: &str,
+    headers: &[(&str, &str)],
+) -> Result<Reply, String> {
+    let mut tls = endpoint.connect()?;
+    tls.write_all(&request("HEAD", &endpoint.origin(), url, headers, &[]))
+        .and_then(|()| tls.flush())
+        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
+    let mut io = BufReader::with_capacity(1024, &mut tls);
+    read_head(&mut io).map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
 }
 
 /// The browser plane's challenge only exists over HTTP/2 on the real Firefox host; every other host, and every pinned loopback edge, stays HTTP/1.1.

@@ -958,6 +958,8 @@ struct Inner {
     osl_seeded: Arc<AtomicBool>,
     last_osl: Mutex<Option<Instant>>,
     last_osl_failure: Mutex<Option<Instant>>,
+    upgrade_started: Arc<AtomicBool>,
+    last_upgrade_attempt: Mutex<Option<Instant>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
     affinity: Mutex<Option<(String, u16)>>,
@@ -1188,6 +1190,10 @@ struct Settings {
     osl_roots: Vec<TransferRoot>,
     remote_list_key: String,
     remote_list_retry: Duration,
+    enable_upgrade: bool,
+    upgrade_roots: Vec<TransferRoot>,
+    upgrade_version_header: String,
+    upgrade_retry: Duration,
     limit_cpu: bool,
     disable_api: bool,
     ssh_algorithms: Option<[String; 4]>,
@@ -1356,6 +1362,8 @@ impl PsiphonOut {
             osl_seeded,
             last_osl: Mutex::new(None),
             last_osl_failure: Mutex::new(None),
+            upgrade_started: Arc::new(AtomicBool::new(false)),
+            last_upgrade_attempt: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -1788,6 +1796,7 @@ impl Inner {
                         }
                     }
                     self.apply_handshake(&session);
+                    self.start_upgrade(&session);
                     let established = !lock(&self.sessions).is_empty();
                     if let Some(probe) = self.settings.liveness.spec(protocol, established) {
                         if let Err(why) = session.liveness_test(
@@ -1827,6 +1836,48 @@ impl Inner {
             }
         }
         Err(format!("psiphon: no server accepted the tunnel: {last}"))
+    }
+
+    /// Start a version-gated upgrade download off the handshake, at most one in flight.
+    fn start_upgrade(&self, session: &Session) {
+        if !self.settings.enable_upgrade || self.settings.upgrade_roots.is_empty() {
+            return;
+        }
+        if self.upgrade_started.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut last = lock(&self.last_upgrade_attempt);
+            if last.is_some_and(|at| at.elapsed() < self.settings.upgrade_retry) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        if self.upgrade_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let job = UpgradeJob {
+            state: self.settings.state.clone(),
+            roots: self.settings.upgrade_roots.clone(),
+            version_header: self.settings.upgrade_version_header.clone(),
+            client_version: self.settings.client_version.clone(),
+            tls_roots: self.settings.tls_shape.roots.clone(),
+            disable_system_roots: self.settings.tls_shape.disable_system_root_cas,
+        };
+        let version = session
+            .handshake()
+            .upgrade_client_version
+            .clone()
+            .unwrap_or_default();
+        let started = Arc::clone(&self.upgrade_started);
+        thread::spawn(move || match download_upgrade(&job, &version) {
+            Ok(false) => started.store(false, Ordering::Release),
+            Ok(true) => {}
+            Err(why) => {
+                eprintln!("psiphon: upgrade: {why}");
+                started.store(false, Ordering::Release);
+            }
+        });
     }
 
     /// Apply the server's handshake reply: a steering IP for the fronting provider and new entries.
@@ -3588,6 +3639,26 @@ impl Settings {
                 .unwrap_or(0)
                 .min(3_600_000),
         );
+        let enable_upgrade = flag(
+            settings,
+            "EnableUpgradeDownload",
+            "AETHER_PSIPHON_ENABLE_UPGRADE",
+        );
+        let upgrade_roots = upgrade_roots(settings);
+        let upgrade_version_header =
+            text(settings, "UpgradeDownloadClientVersionHeader").unwrap_or_default();
+        let upgrade_retry = Duration::from_millis(
+            number(settings, "FetchUpgradeRetryPeriodMilliseconds")
+                .unwrap_or(30_000)
+                .max(1),
+        );
+        if enable_upgrade && (upgrade_roots.is_empty() || upgrade_version_header.is_empty()) {
+            eprintln!(
+                "psiphon: EnableUpgradeDownload needs UpgradeDownloadURLs and UpgradeDownloadClientVersionHeader; upgrade checks stay off"
+            );
+        }
+        let enable_upgrade =
+            enable_upgrade && !upgrade_roots.is_empty() && !upgrade_version_header.is_empty();
         let disable_api = flag(settings, "DisableApi", "AETHER_PSIPHON_DISABLE_API");
         let ssh_algorithms = ssh_algorithms(settings);
         match text(settings, "TargetAPIProtocol").as_deref() {
@@ -3735,6 +3806,10 @@ impl Settings {
                 .or_else(|| env("AETHER_PSIPHON_REMOTE_LIST_KEY"))
                 .unwrap_or_else(|| ferrox_core::psiphon::SERVER_LIST_SIGNATURE_KEY.to_owned()),
             remote_list_retry,
+            enable_upgrade,
+            upgrade_roots,
+            upgrade_version_header,
+            upgrade_retry,
             limit_cpu,
             disable_api,
             ssh_algorithms,
@@ -4948,60 +5023,15 @@ fn string_list(settings: Option<&Json>, key: &str) -> Vec<String> {
 /// The OSL roots, preferring the plural list and falling back to the legacy single URL.
 fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
     let global = custom_headers(settings);
-    let mut roots = Vec::new();
-    if let Some(Json::Arr(items)) = settings.and_then(|settings| {
+    let listed = settings.and_then(|settings| {
         settings
             .get("ObfuscatedServerListRootURLs")
             .or_else(|| settings.get("obfuscatedServerListRootURLs"))
-    }) {
-        for item in items {
-            match item {
-                Json::Str(value) => {
-                    if let Some(url) = transfer_url(value) {
-                        roots.push(TransferRoot {
-                            url,
-                            skip_verify: false,
-                            headers: global.clone(),
-                        });
-                    }
-                }
-                Json::Obj(fields) => {
-                    let url = fields
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("URL"))
-                        .and_then(|(_, value)| value.as_str())
-                        .and_then(transfer_url);
-                    let Some(url) = url else {
-                        eprintln!("psiphon: ObfuscatedServerListRootURLs entry names no URL");
-                        continue;
-                    };
-                    let skip_verify = fields
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("SkipVerify"))
-                        .and_then(|(_, value)| value.as_bool())
-                        .unwrap_or(false);
-                    let local = fields
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("RequestHeaders"))
-                        .map(|(_, value)| header_fields(value))
-                        .unwrap_or_default();
-                    let mut headers = global.clone();
-                    headers.retain(|(name, _)| {
-                        !local
-                            .iter()
-                            .any(|(added, _)| added.eq_ignore_ascii_case(name))
-                    });
-                    headers.extend(local);
-                    roots.push(TransferRoot {
-                        url,
-                        skip_verify,
-                        headers,
-                    });
-                }
-                _ => eprintln!("psiphon: ObfuscatedServerListRootURLs entry is not an object"),
-            }
-        }
-    }
+    });
+    let mut roots = match listed {
+        Some(Json::Arr(items)) => transfer_roots(items, "ObfuscatedServerListRootURLs", &global),
+        _ => Vec::new(),
+    };
     if roots.is_empty() {
         if let Some(root) = text(settings, "ObfuscatedServerListRootURL") {
             if let Some(url) = transfer_url(root.trim()) {
@@ -5011,6 +5041,83 @@ fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
                     headers: global,
                 });
             }
+        }
+    }
+    roots
+}
+
+/// The upgrade roots, preferring the plural list and falling back to the legacy single URL.
+fn upgrade_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
+    let global = custom_headers(settings);
+    let listed = settings.and_then(|settings| settings.get("UpgradeDownloadURLs"));
+    let mut roots = match listed {
+        Some(Json::Arr(items)) => transfer_roots(items, "UpgradeDownloadURLs", &global),
+        _ => Vec::new(),
+    };
+    if roots.is_empty() {
+        if let Some(root) = text(settings, "UpgradeDownloadUrl") {
+            if let Some(url) = transfer_url(root.trim()) {
+                roots.push(TransferRoot {
+                    url,
+                    skip_verify: false,
+                    headers: global,
+                });
+            }
+        }
+    }
+    roots
+}
+
+/// Decode a list of transfer-URL strings or objects, folding global headers under each entry.
+fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> Vec<TransferRoot> {
+    let mut roots = Vec::new();
+    for item in items {
+        match item {
+            Json::Str(value) => {
+                if let Some(url) = transfer_url(value) {
+                    roots.push(TransferRoot {
+                        url,
+                        skip_verify: false,
+                        headers: global.to_vec(),
+                    });
+                } else {
+                    eprintln!("psiphon: {label} entry names no URL");
+                }
+            }
+            Json::Obj(fields) => {
+                let url = fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("URL"))
+                    .and_then(|(_, value)| value.as_str())
+                    .and_then(transfer_url);
+                let Some(url) = url else {
+                    eprintln!("psiphon: {label} entry names no URL");
+                    continue;
+                };
+                let skip_verify = fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("SkipVerify"))
+                    .and_then(|(_, value)| value.as_bool())
+                    .unwrap_or(false);
+                let local = fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("RequestHeaders"))
+                    .map(|(_, value)| header_fields(value))
+                    .unwrap_or_default();
+                let mut headers = global.to_vec();
+                headers.retain(|(name, _)| {
+                    !local
+                        .iter()
+                        .any(|(added, _)| added.eq_ignore_ascii_case(name))
+                });
+                headers.extend(local);
+                roots.push(TransferRoot {
+                    url,
+                    skip_verify,
+                    headers,
+                });
+            }
+            _ => eprintln!("psiphon: {label} entry is not an object"),
         }
     }
     roots
@@ -5200,6 +5307,11 @@ const KNOWN_SETTINGS: &[&str] = &[
     "RemoteServerListSignaturePublicKey",
     "ServerEntrySignaturePublicKey",
     "FetchRemoteServerListRetryPeriodMilliseconds",
+    "EnableUpgradeDownload",
+    "UpgradeDownloadURLs",
+    "UpgradeDownloadUrl",
+    "UpgradeDownloadClientVersionHeader",
+    "FetchUpgradeRetryPeriodMilliseconds",
     "ObfuscatedServerListRootURLs",
     "obfuscatedServerListRootURLs",
     "ObfuscatedServerListRootURL",
@@ -8255,14 +8367,7 @@ fn fetch_reply(
     insecure: bool,
     extra: &[(&str, &str)],
 ) -> Result<crate::foxy_account::Reply, String> {
-    let roots = if insecure {
-        Vec::new().into()
-    } else {
-        roots.load()?
-    };
-    let endpoint = crate::foxy_account::Endpoint::parse(url, roots)
-        .ok_or_else(|| format!("psiphon: {url} is not https"))?
-        .with_insecure(insecure);
+    let endpoint = transfer_endpoint(url, roots, insecure)?;
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(custom.len() + extra.len() + 1);
     headers.push(("Accept", "*/*"));
     headers.extend(
@@ -8372,6 +8477,170 @@ fn osl_body(
         }
     }
     Ok(body)
+}
+
+/// The largest upgrade package this lane will buffer in one download.
+const MAX_UPGRADE_BYTES: usize = 128 * 1024 * 1024;
+/// The file `UpgradeDownloadURLs` publishes once a complete package is downloaded.
+const UPGRADE_FILENAME: &str = "upgrade";
+
+#[derive(Clone)]
+struct UpgradeJob {
+    state: PathBuf,
+    roots: Vec<TransferRoot>,
+    version_header: String,
+    client_version: String,
+    tls_roots: crate::psiphon_ssh::TlsRoots,
+    disable_system_roots: bool,
+}
+
+/// Download a newer client package once, writing it beside the lane's state.
+fn download_upgrade(job: &UpgradeJob, handshake_version: &str) -> Result<bool, String> {
+    let destination = job.state.join(UPGRADE_FILENAME);
+    if destination.exists() {
+        return Ok(false);
+    }
+    let advertised = handshake_version.trim();
+    let version = if advertised.is_empty() {
+        let version = match upgrade_available(job) {
+            Ok(version) => version,
+            Err(why) => {
+                eprintln!("psiphon: upgrade check: {why}");
+                return Ok(false);
+            }
+        };
+        if !upgrade_is_newer(&job.client_version, &version)? {
+            return Ok(false);
+        }
+        version
+    } else {
+        advertised.to_owned()
+    };
+    let mut last = String::new();
+    for root in &job.roots {
+        match fetch_upgrade(job, root, &version, &destination) {
+            Ok(()) => {
+                eprintln!(
+                    "psiphon: downloaded client upgrade {version} to {}",
+                    destination.display()
+                );
+                return Ok(true);
+            }
+            Err(why) => last = why,
+        }
+    }
+    Err(if last.is_empty() {
+        "psiphon: UpgradeDownloadURLs names no URL".to_owned()
+    } else {
+        last
+    })
+}
+
+/// The reference's numeric gate: only a strict increase starts a `HEAD`-discovered download.
+fn upgrade_is_newer(client: &str, available: &str) -> Result<bool, String> {
+    let current = client
+        .parse::<u64>()
+        .map_err(|_| format!("psiphon: ClientVersion {client} is not a number"))?;
+    let available = available
+        .parse::<u64>()
+        .map_err(|_| format!("psiphon: upgrade version {available:?} is not a number"))?;
+    Ok(current < available)
+}
+
+fn upgrade_available(job: &UpgradeJob) -> Result<String, String> {
+    let mut last = String::new();
+    for root in &job.roots {
+        let endpoint = match transfer_endpoint(
+            &root.url,
+            &job.tls_roots,
+            job.disable_system_roots || root.skip_verify,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(why) => {
+                last = why;
+                continue;
+            }
+        };
+        match crate::foxy_account::ask_head(&endpoint, &endpoint.url(""), &transfer_headers(root)) {
+            Ok(reply) if reply.status == 200 => {
+                let Some(version) = reply.header(&job.version_header) else {
+                    last = format!(
+                        "psiphon: {} names no {} header",
+                        root.url, job.version_header
+                    );
+                    continue;
+                };
+                return Ok(version.to_owned());
+            }
+            Ok(reply) => last = format!("psiphon: {}: HTTP {}", root.url, reply.status),
+            Err(why) => last = why,
+        }
+    }
+    Err(if last.is_empty() {
+        "psiphon: UpgradeDownloadURLs names no URL".to_owned()
+    } else {
+        last
+    })
+}
+
+fn fetch_upgrade(
+    job: &UpgradeJob,
+    root: &TransferRoot,
+    version: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    let endpoint = transfer_endpoint(
+        &root.url,
+        &job.tls_roots,
+        job.disable_system_roots || root.skip_verify,
+    )?;
+    let reply = crate::foxy_account::ask_limited(
+        &endpoint,
+        "GET",
+        &endpoint.url(""),
+        &transfer_headers(root),
+        &[],
+        MAX_UPGRADE_BYTES,
+    )?;
+    if reply.status != 200 {
+        return Err(format!("psiphon: {}: HTTP {}", root.url, reply.status));
+    }
+    if reply.body.is_empty() {
+        return Err(format!("psiphon: {} returned an empty upgrade", root.url));
+    }
+    std::fs::create_dir_all(&job.state)
+        .map_err(|error| format!("psiphon: upgrade state directory: {error}"))?;
+    let part = job.state.join(format!("{UPGRADE_FILENAME}.{version}.part"));
+    std::fs::write(&part, &reply.body)
+        .map_err(|error| format!("psiphon: upgrade download {}: {error}", part.display()))?;
+    std::fs::rename(&part, destination)
+        .map_err(|error| format!("psiphon: upgrade rename {}: {error}", part.display()))
+}
+
+fn transfer_endpoint(
+    url: &str,
+    roots: &crate::psiphon_ssh::TlsRoots,
+    insecure: bool,
+) -> Result<crate::foxy_account::Endpoint, String> {
+    let roots = if insecure {
+        Vec::new().into()
+    } else {
+        roots.load()?
+    };
+    crate::foxy_account::Endpoint::parse(url, roots)
+        .ok_or_else(|| format!("psiphon: {url} is not https"))
+        .map(|endpoint| endpoint.with_insecure(insecure))
+}
+
+fn transfer_headers(root: &TransferRoot) -> Vec<(&str, &str)> {
+    let mut headers = Vec::with_capacity(root.headers.len() + 1);
+    headers.push(("Accept", "*/*"));
+    headers.extend(
+        root.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    headers
 }
 
 /// Download, authenticate and decrypt every seeded OSL under the configured roots.
@@ -11065,6 +11334,70 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_roots_decode_the_plural_list_and_legacy_url() {
+        let settings = json::parse(
+            r#"{"UpgradeDownloadURLs":["https://one.example/upgrade",{"URL":"https://two.example/upgrade","SkipVerify":true}]}"#,
+        )
+        .expect("settings");
+        let roots = upgrade_roots(Some(&settings));
+        let urls: Vec<&str> = roots.iter().map(|root| root.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://one.example/upgrade", "https://two.example/upgrade"]
+        );
+        assert!(roots[1].skip_verify);
+        let settings = json::parse(r#"{"UpgradeDownloadUrl":"https://legacy.example/upgrade"}"#)
+            .expect("settings");
+        assert_eq!(
+            upgrade_roots(Some(&settings))[0].url,
+            "https://legacy.example/upgrade"
+        );
+    }
+
+    #[test]
+    fn upgrade_settings_need_urls_and_the_version_header() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"EnableUpgradeDownload":true,"UpgradeDownloadURLs":["https://u.example"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(!settings.enable_upgrade);
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"EnableUpgradeDownload":true,"UpgradeDownloadURLs":["https://u.example"],"UpgradeDownloadClientVersionHeader":"X-Version"}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings.enable_upgrade);
+        assert_eq!(settings.upgrade_roots.len(), 1);
+        assert_eq!(settings.upgrade_version_header, "X-Version");
+        assert_eq!(settings.upgrade_retry, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn upgrade_version_gate_is_a_strict_increase() {
+        assert!(!upgrade_is_newer("999", "453").expect("an older version"));
+        assert!(!upgrade_is_newer("453", "453").expect("the same version"));
+        assert!(upgrade_is_newer("453", "454").expect("a newer version"));
+    }
+
+    #[test]
+    fn upgrade_download_trusts_a_handshake_version_and_needs_a_root() {
+        let job = UpgradeJob {
+            state: PathBuf::from("/nonexistent-ferrox-upgrade"),
+            roots: Vec::new(),
+            version_header: "X-Upgrade-Version".to_owned(),
+            client_version: "999".to_owned(),
+            tls_roots: crate::psiphon_ssh::TlsRoots::System,
+            disable_system_roots: false,
+        };
+        assert!(download_upgrade(&job, "453").is_err());
+    }
+
+    #[test]
     fn ssh_algorithms_accept_only_the_names_this_engine_carries() {
         let settings = json::parse(
             r#"{"ObfuscatedSSHAlgorithms":["curve25519-sha256","aes128-ctr","hmac-sha2-256","ssh-ed25519"]}"#,
@@ -12829,6 +13162,8 @@ mod tests {
             osl_seeded: Arc::new(AtomicBool::new(false)),
             last_osl: Mutex::new(None),
             last_osl_failure: Mutex::new(None),
+            upgrade_started: Arc::new(AtomicBool::new(false)),
+            last_upgrade_attempt: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -12891,6 +13226,8 @@ mod tests {
             osl_seeded: Arc::new(AtomicBool::new(false)),
             last_osl: Mutex::new(None),
             last_osl_failure: Mutex::new(None),
+            upgrade_started: Arc::new(AtomicBool::new(false)),
+            last_upgrade_attempt: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -13415,6 +13752,8 @@ mod tests {
             osl_seeded: Arc::new(AtomicBool::new(false)),
             last_osl: Mutex::new(None),
             last_osl_failure: Mutex::new(None),
+            upgrade_started: Arc::new(AtomicBool::new(false)),
+            last_upgrade_attempt: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(Some(affinity.clone())),
