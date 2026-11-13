@@ -751,11 +751,13 @@ fn int32(raw: u64) -> i32 {
 
 /// xray's `SocketConfig` as far as a stream reads it: the system dial this tree puts under
 /// `freedom` already resolves a name to an address, which is `USE_IP`; a transparent front's
-/// `tproxy` mode is carried, its original-destination marker is read, and every other socket
-/// option shapes a dial this tree does not carry and is refused by number.
+/// `tproxy` mode is carried, its original-destination marker is read, a named `dialer_proxy`
+/// tags the outbound socket, and every other option shapes a dial this tree does not carry
+/// and is refused by number.
 fn socket_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.SocketConfig");
     let mut tproxy = None;
+    let mut dialer_proxy = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (3, 0) => {
@@ -777,10 +779,18 @@ fn socket_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
                     return Err(reader.uncarried(&format!("socket domain strategy {strategy}")));
                 }
             }
+            (9, 2) => dialer_proxy = Some(account_text(&mut reader)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(tproxy.map(|tproxy| object(vec![("tproxy", Json::Str(tproxy.to_owned()))])))
+    let mut pairs = Vec::new();
+    if let Some(tproxy) = tproxy {
+        pairs.push(("tproxy", Json::Str(tproxy.to_owned())));
+    }
+    if let Some(dialer_proxy) = dialer_proxy.filter(|tag| !tag.is_empty()) {
+        pairs.push(("dialerProxy", Json::Str(dialer_proxy)));
+    }
+    Ok((!pairs.is_empty()).then(|| object(pairs)))
 }
 
 /// One stream policy as this tree's JSON dialect spells it: the network, and the security the
@@ -4864,6 +4874,54 @@ mod tests {
             error.contains("xray.transport.internet.SocketConfig"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_sender_socket_dialer_proxy_names_the_tagged_outbound() {
+        let socket = message(&[bytes_field(9, b"proxy")]);
+        let stream = message(&[bytes_field(6, &socket)]);
+        let sender = typed("xray.app.proxyman.SenderConfig", &bytes_field(2, &stream));
+        let outbound = message(&[
+            bytes_field(2, &sender),
+            bytes_field(3, &typed("xray.proxy.freedom.Config", &[])),
+        ]);
+        let bytes = message(&[
+            bytes_field(
+                1,
+                &http_inbound(&receiver(1080, Some(&[127, 0, 0, 1])), &[]),
+            ),
+            bytes_field(2, &outbound),
+        ]);
+        let json = to_json(&bytes).expect("dialerProxy decodes");
+        let sockopt = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("streamSettings")
+            .and_then(|stream| stream.get("sockopt"))
+            .expect("sockopt");
+        assert_eq!(
+            sockopt.get("dialerProxy").and_then(Json::as_str),
+            Some("proxy")
+        );
+        assert!(sockopt.get("tproxy").is_none());
+    }
+
+    #[test]
+    fn a_socket_dialer_proxy_and_tproxy_share_the_options() {
+        let socket = message(&[varint_field(3, 1), bytes_field(9, b"proxy")]);
+        let json = socket_settings(&socket).expect("decodes").expect("options");
+        assert_eq!(json.get("tproxy").and_then(Json::as_str), Some("tproxy"));
+        assert_eq!(
+            json.get("dialerProxy").and_then(Json::as_str),
+            Some("proxy")
+        );
+    }
+
+    #[test]
+    fn an_empty_socket_dialer_proxy_names_no_hop() {
+        let socket = message(&[bytes_field(9, b"")]);
+        assert!(socket_settings(&socket).expect("decodes").is_none());
     }
 
     #[test]
