@@ -52,7 +52,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | MASQUE transport | CONNECT-IP client and terminating server over h3 (row 77) and, on the same port, h2 (row 78), chosen by the configured ALPN |
 | XDrive (remote-storage carrier) | planned (row 35) |
 | Browser dialer | not scheduled |
-| Tagged connections / observatory webhooks | planned (rows 126, 125) |
+| Tagged connections | done (row 125, [engine-tagged](function/engine-tagged.md)); observatory webhooks planned |
 | UDP `transport/internet/udp` fullcone/NAT behavior | mux-cool carries XUDP; standalone UDP transport planned |
 | Unix sockets | done (row 33) |
 

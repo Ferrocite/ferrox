@@ -63,6 +63,7 @@ struct ClientSocket {
     config: Config,
     sessions: Mutex<HashMap<u16, Weak<Connection>>>,
     live: AtomicU16,
+    cached: bool,
 }
 
 static CLIENTS: Mutex<Vec<Arc<ClientSocket>>> = Mutex::new(Vec::new());
@@ -87,6 +88,7 @@ fn client_for(remote: SocketAddr, config: &Config) -> io::Result<Arc<ClientSocke
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
         live: AtomicU16::new(1),
+        cached: true,
     });
     let weak = Arc::downgrade(&client);
     thread::Builder::new()
@@ -99,6 +101,9 @@ fn client_for(remote: SocketAddr, config: &Config) -> io::Result<Arc<ClientSocke
 
 fn release_client(client: &Arc<ClientSocket>, conv: u16) {
     client.sessions.lock().unwrap().remove(&conv);
+    if !client.cached {
+        return;
+    }
     let mut clients = CLIENTS.lock().unwrap();
     if client.live.fetch_sub(1, Ordering::SeqCst) == 1 {
         clients.retain(|held| !Arc::ptr_eq(held, client));
@@ -144,12 +149,17 @@ fn feed_client(weak: &Weak<ClientSocket>) {
     }
 }
 
-pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Connection>> {
-    let client = client_for(addr, &config)?;
+fn start(
+    client: &Arc<ClientSocket>,
+    addr: SocketAddr,
+    config: Config,
+    conv: u16,
+    stop: Option<Arc<AtomicBool>>,
+) -> io::Result<Arc<Connection>> {
     let sock_w = match client.sock.try_clone() {
         Ok(sock) => sock,
         Err(e) => {
-            release_client(&client, conv);
+            release_client(client, conv);
             return Err(e);
         }
     };
@@ -165,8 +175,13 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
             sock_w.send(wire).map(|_| ())
         })
     };
-    let closer_client = Arc::clone(&client);
-    let closer = Box::new(move || release_client(&closer_client, conv));
+    let closer_client = Arc::clone(client);
+    let closer = Box::new(move || {
+        release_client(&closer_client, conv);
+        if let Some(stop) = stop.as_ref() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
     let connection = Connection::new_unstarted(
         ConnMetadata {
             local: client.local,
@@ -184,6 +199,51 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
         .insert(conv, Arc::downgrade(&connection));
     connection.start();
     Ok(connection)
+}
+
+pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Connection>> {
+    let client = client_for(addr, &config)?;
+    start(&client, addr, config, conv, None)
+}
+
+/// A dial over a socket this tree already opened, so a carrier can ride a named outbound
+/// instead of binding its own. The socket must already be connected to the carrier, and it is
+/// put on a 50 ms read timeout so the feed thread can notice a session that has gone.
+pub fn dial_with(
+    sock: UdpSocket,
+    addr: SocketAddr,
+    config: Config,
+    conv: u16,
+    stop: Arc<AtomicBool>,
+) -> io::Result<Arc<Connection>> {
+    let local = sock.local_addr().inspect_err(|_| {
+        stop.store(true, Ordering::Relaxed);
+    })?;
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .inspect_err(|_| {
+            stop.store(true, Ordering::Relaxed);
+        })?;
+    let client = Arc::new(ClientSocket {
+        sock,
+        local,
+        remote: addr,
+        config: config.clone(),
+        sessions: Mutex::new(HashMap::new()),
+        live: AtomicU16::new(1),
+        cached: false,
+    });
+    let weak = Arc::downgrade(&client);
+    thread::Builder::new()
+        .name("kcp-feed".to_owned())
+        .spawn(move || feed_client(&weak))
+        .map_err(|e| {
+            stop.store(true, Ordering::Relaxed);
+            io::Error::other(format!("kcp feed thread: {e}"))
+        })?;
+    let fail_stop = Arc::clone(&stop);
+    start(&client, addr, config, conv, Some(stop)).inspect_err(|_| {
+        fail_stop.store(true, Ordering::Relaxed);
+    })
 }
 
 #[must_use]
@@ -437,6 +497,55 @@ mod tests {
         conn.set_read_deadline(Instant::now() + Duration::from_secs(5));
         let m = conn.read(&mut buf).expect("client echo");
         assert_eq!(&buf[..m], payload);
+        listener.close();
+    }
+
+    /// A dial over the caller's socket carries the session, and closing it sets the stop flag
+    /// the socket's owner reads: the pair a tagged carrier depends on.
+    #[cfg_attr(miri, ignore = "binds loopback UDP sockets")]
+    #[test]
+    fn a_dial_with_rides_the_callers_socket_and_stops_on_close() {
+        let config = Config::default();
+        let listener =
+            Arc::new(Listener::bind(([127, 0, 0, 1], 0).into(), config.clone()).expect("bind"));
+        let sock = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        sock.connect(listener.local_addr()).expect("connect");
+        let stop = Arc::new(AtomicBool::new(false));
+        let conn = dial_with(
+            sock,
+            listener.local_addr(),
+            config,
+            fresh_conversation(),
+            Arc::clone(&stop),
+        )
+        .expect("dial");
+        let payload = b"the quick brown kcp";
+        conn.write(payload).expect("write");
+        let (accepted, session) = mpsc::channel();
+        let _acceptor = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || {
+                if let Ok(session) = listener.accept() {
+                    let _ = accepted.send(session);
+                }
+            })
+        };
+        let session = session
+            .recv_timeout(Duration::from_secs(5))
+            .expect("session accepted");
+        let mut buf = [0u8; 256];
+        session.set_read_deadline(Instant::now() + Duration::from_secs(5));
+        let n = session.read(&mut buf).expect("server read");
+        assert_eq!(&buf[..n], payload);
+        assert!(
+            !stop.load(Ordering::Relaxed),
+            "a live dial leaves the socket to its caller"
+        );
+        drop(conn);
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "the closer stops the socket's owner"
+        );
         listener.close();
     }
 

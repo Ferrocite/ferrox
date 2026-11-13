@@ -1055,3 +1055,14 @@ warp masque-sweep-seeds 10 warp_scan::tests::the_reference_sweep_counts_are_the_
 warp masque-sweep-ports 7 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
 warp last-edge-cap 8 warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier_and_is_bounded
 warp ironclad-status 204 warp::tests::an_http_status_line_is_read_not_guessed
+
+# --- tagged outbound --------------------------------------------------------
+engine-tagged ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-tagged syscalls-per-tagged-datagram UNBLESSED scripts/count-ops.sh
+engine-tagged copies-per-tagged-datagram UNBLESSED scripts/count-ops.sh
+engine-tagged seconds-per-tagged-dial UNBLESSED CI conformance.yml (feature_test.go)
+engine-tagged tcp-dialer-proxy-hops 1 ferrox-app-proxy::tests::a_dialer_proxy_hop_carries_the_outbound_dial
+engine-tagged tagged-udp-hops 1 ferrox-app-proxy::tests::a_tagged_udp_dial_reaches_the_named_hop
+engine-tagged kcp-tagged-carrier-echoes 1 ferrox-app-proxy::tests::a_kcp_dial_rides_the_tagged_hop_to_its_server
+engine-tagged kcp-dial-with-stops-on-close 1 ferrox-core-kcp::listener::tests::a_dial_with_rides_the_callers_socket_and_stops_on_close
+engine-tagged pb-dialer-proxy-fields-decoded 1 ferrox-app-xray_pb::tests::a_sender_socket_dialer_proxy_names_the_tagged_outbound
