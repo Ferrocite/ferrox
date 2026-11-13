@@ -86,10 +86,12 @@ pub(crate) struct Masked {
 struct XmcState {
     config: ferrox_core::finalmask::xmc::Config,
     role: ferrox_core::finalmask::MaskRole,
-    session: std::sync::OnceLock<Result<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>, String>>,
+    session: XmcSlot,
 }
 
 type XmcSession<R, W> = ferrox_core::finalmask::xmc::Session<R, W>;
+type Xmc = std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>;
+type XmcSlot = std::sync::OnceLock<Result<Xmc, String>>;
 
 #[derive(Debug)]
 struct XmcWriter {
@@ -100,6 +102,70 @@ struct XmcWriter {
 /// A handshake that outlives a peer's interest is a stalled connection, not a slow one; the
 /// reference's own bound is two minutes.
 const XMC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A read source whose clock can be re-armed for one read, so a handshake can hold a single
+/// deadline across every read it makes instead of restarting a per-read timeout.
+trait ReadClock: std::io::Read {
+    fn arm(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl ReadClock for TcpStream {
+    fn arm(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+/// One absolute deadline shared by the reader a handshake reads through.
+#[derive(Debug, Clone, Default)]
+struct HandshakeDeadline(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
+
+impl HandshakeDeadline {
+    fn begin(budget: Duration) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            std::time::Instant::now() + budget,
+        ))))
+    }
+
+    fn gate(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn end(&self) {
+        *self.gate() = None;
+    }
+}
+
+/// Reads never wait past the shared deadline: each read is clocked to the time that is left,
+/// and a deadline that has passed fails the read instead of arming another clock.
+#[derive(Debug)]
+struct DeadlineReader<R> {
+    reader: R,
+    deadline: HandshakeDeadline,
+}
+
+impl<R: ReadClock> DeadlineReader<R> {
+    fn new(reader: R, deadline: HandshakeDeadline) -> Self {
+        Self { reader, deadline }
+    }
+}
+
+impl<R: ReadClock> std::io::Read for DeadlineReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if let Some(at) = *self.deadline.gate() {
+            let left = at.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "xmc: handshake deadline passed",
+                ));
+            }
+            self.reader.arm(Some(left))?;
+        }
+        self.reader.read(output)
+    }
+}
 
 impl std::io::Write for XmcWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -119,14 +185,15 @@ impl XmcState {
         &self,
         stream: &TcpStream,
         chain: &std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
-    ) -> io::Result<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>> {
+    ) -> io::Result<Xmc> {
         let result = self.session.get_or_init(|| {
             let saved_read = stream.read_timeout().ok().flatten();
             let saved_write = stream.write_timeout().ok().flatten();
             let _ = stream.set_read_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
-                let reader = stream.try_clone()?;
+                let deadline = HandshakeDeadline::begin(XMC_HANDSHAKE_TIMEOUT);
+                let reader = DeadlineReader::new(stream.try_clone()?, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
                     chain: std::sync::Arc::clone(chain),
@@ -139,6 +206,7 @@ impl XmcState {
                         XmcSession::server(reader, writer, &self.config)?
                     }
                 };
+                deadline.end();
                 Ok::<_, io::Error>(std::sync::Arc::new(session))
             })();
             let _ = stream.set_read_timeout(saved_read);
@@ -158,7 +226,7 @@ impl Masked {
         self.xmc_session().map(|_| ())
     }
 
-    fn xmc_session(&self) -> io::Result<Option<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>>> {
+    fn xmc_session(&self) -> io::Result<Option<Xmc>> {
         self.ensure_header()?;
         match &self.xmc {
             Some(state) => state.session(&self.stream, &self.chain).map(Some),
@@ -186,12 +254,21 @@ impl Masked {
         if run.is_done() {
             return Ok(());
         }
+        // The relay arms a one-millisecond poll clock; the handshake's own reads take the handshake budget, and the clock comes back as it was.
+        let prior = self.stream.read_timeout().ok();
+        let _ = self
+            .stream
+            .set_read_timeout(Some(crate::budgets::handshake()));
         let mut source = HeaderWire {
             chain: &self.chain,
             read_chain: self.read_chain.as_deref(),
             stream: &self.stream,
         };
-        run.handshake(&mut source, mask_clock())
+        let result = run.handshake(&mut source, mask_clock());
+        if let Some(prior) = prior {
+            let _ = self.stream.set_read_timeout(prior);
+        }
+        result
     }
 
     /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
@@ -576,6 +653,21 @@ impl std::os::windows::io::AsRawSocket for Connection {
 impl ferrox_core::tls::RecordAlignment for Connection {}
 
 impl Connection {
+    /// Finish a masked handshake where the lane can spend the handshake budget, so a readiness
+    /// read never runs one and a split header is not read under the relay's poll clock.
+    pub(crate) fn start_mask(&self) -> io::Result<()> {
+        match self {
+            Connection::Masked(masked) => masked.ensure_header(),
+            Connection::Metered(metered) => metered.inner.start_mask(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.start_mask()
+            }
+            Connection::Tcp(_) => Ok(()),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => Ok(()),
+        }
+    }
+
     /// One relay read that never waits: an empty socket answers `WouldBlock` at once, and the lane
     /// parks on the descriptor its timeout names instead of spending the poll quantum in a worker.
     pub(crate) fn read_ready(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -2738,6 +2830,50 @@ mod tests {
         );
     }
 
+    /// A masked server's handshake reads the peer's first bytes: it takes the handshake budget, not
+    /// the relay's poll clock, and it puts the clock back when the header is done.
+    #[test]
+    fn a_masked_handshake_reads_past_the_poll_clock_and_restores_it() {
+        use ferrox_core::finalmask::{Chain, HeaderCustom, Item, MaskRole, Sequence};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connects");
+            std::thread::sleep(Duration::from_millis(25));
+            stream.write_all(b"abcd").expect("sends the header");
+        });
+        let (side, _) = listener.accept().expect("accepts");
+        side.set_read_timeout(Some(Duration::from_millis(1)))
+            .expect("arms the poll clock");
+        let clients = Item {
+            packet: Some(b"abcd".to_vec()),
+            ..Item::default()
+        };
+        let header = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![clients],
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("a mask the config can drive");
+        let mut chain = Chain::default();
+        chain.push_header_custom(header);
+        let connection = Connection::Tcp(side).with_mask_role(Some(&chain), MaskRole::Server);
+        connection
+            .start_mask()
+            .expect("the header handshake reads past the poll clock");
+        match &connection {
+            Connection::Masked(masked) => assert_eq!(
+                masked.stream.read_timeout().expect("reads the clock"),
+                Some(Duration::from_millis(1)),
+                "the relay's clock comes back after the handshake"
+            ),
+            other => panic!("a masked connection is expected: {other:?}"),
+        }
+        peer.join().expect("the peer joins");
+    }
+
     /// A readiness read never runs the header handshake, so a pending header is left whole for the
     /// blocking path instead of being read part way and failed on the readiness lane.
     #[cfg(unix)]
@@ -3409,5 +3545,53 @@ mod tests {
             "a second connect reports an error, and the socket it already had is the answer",
         );
         accept.join().expect("joins");
+    }
+
+    struct StalledReader {
+        armed: std::sync::Arc<std::sync::Mutex<Option<Duration>>>,
+    }
+
+    impl std::io::Read for StalledReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
+
+    impl ReadClock for StalledReader {
+        fn arm(&self, timeout: Option<Duration>) -> io::Result<()> {
+            *self.armed.lock().expect("the clock") = timeout;
+            Ok(())
+        }
+    }
+
+    /// A peer cannot hold a worker by dribbling a byte per clock: every handshake read is clocked
+    /// to what is left of one deadline, and a read past it fails instead of arming another.
+    #[test]
+    fn a_read_past_the_handshake_deadline_never_arms_another_clock() {
+        let armed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let deadline = HandshakeDeadline::begin(Duration::from_millis(30));
+        let mut reader = DeadlineReader::new(
+            StalledReader {
+                armed: std::sync::Arc::clone(&armed),
+            },
+            deadline.clone(),
+        );
+        let mut byte = [0u8; 1];
+        let first = reader.read(&mut byte).expect_err("nothing arrives");
+        assert_eq!(first.kind(), io::ErrorKind::WouldBlock);
+        let clock = armed.lock().expect("the clock").expect("a clock is armed");
+        assert!(!clock.is_zero() && clock <= Duration::from_millis(30));
+
+        std::thread::sleep(Duration::from_millis(40));
+        let past = reader.read(&mut byte).expect_err("the deadline passed");
+        assert_eq!(past.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            armed.lock().expect("the clock").is_some(),
+            "the clock is left alone once the deadline has passed"
+        );
+
+        deadline.end();
+        let after = reader.read(&mut byte).expect_err("nothing arrives");
+        assert_eq!(after.kind(), io::ErrorKind::WouldBlock);
     }
 }

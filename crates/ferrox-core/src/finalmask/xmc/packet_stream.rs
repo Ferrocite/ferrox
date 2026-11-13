@@ -165,7 +165,10 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
 
         loop {
             let packet = reader.next_packet().map_err(|error| {
-                io::Error::other(format!("read minecraft packet stream: {error}"))
+                io::Error::new(
+                    error.kind(),
+                    format!("read minecraft packet stream: {error}"),
+                )
             })?;
             if packet.id == self.remote_custom_payload_id() {
                 let Some(payload) = parse_custom_payload(&packet)? else {

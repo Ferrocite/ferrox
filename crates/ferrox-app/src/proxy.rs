@@ -4587,7 +4587,10 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
             lane_pool::submit_setup(
                 Box::new(move || {
                     if let Some((role, stream, sniffing)) = work.take() {
-                        role.serve_polled_tls(stream, sniffing);
+                        // The header handshake reads the peer's first bytes; the lane spends the handshake budget before the peek arms its own clock.
+                        if stream.start_mask().is_ok() {
+                            role.serve_polled_tls(stream, sniffing);
+                        }
                     }
                     lane_pool::Next::Done
                 }),
@@ -4660,6 +4663,10 @@ fn serve_accepted(
         .with_mask_role(role.tcp_mask(), ferrox_core::finalmask::MaskRole::Server)
         .with_meter(crate::stats::inbound(tag))
         .with_policy(Some(crate::policy::flow(0)));
+    // A server's header handshake reads the peer's first bytes here, before the relay arms a one-millisecond poll clock.
+    if stream.start_mask().is_err() {
+        return;
+    }
     front_dispatch(stream, role);
 }
 
