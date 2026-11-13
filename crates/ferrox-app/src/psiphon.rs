@@ -8,6 +8,7 @@ use crate::psiphon_ssh::{
     MAX_PADDING, MIN_PADDING,
 };
 use crate::socks::{Credential, Destination, Version};
+use crypto_secretbox::aead::{Aead as _, KeyInit as _};
 use ferrox_core::tls::shaped::{Body, Ext, Profile};
 use ferrox_core::tls::Fingerprint;
 use flate2::read::ZlibDecoder;
@@ -1335,6 +1336,7 @@ struct Settings {
     server_lists_explicit: bool,
     remote_fetch_disabled: bool,
     server_list_key: String,
+    signature_key: String,
     osl_roots: Vec<TransferRoot>,
     remote_list_key: String,
     remote_list_retry: Duration,
@@ -1342,6 +1344,13 @@ struct Settings {
     upgrade_roots: Vec<TransferRoot>,
     upgrade_version_header: String,
     upgrade_retry: Duration,
+    enable_feedback: bool,
+    feedback_roots: Vec<TransferRoot>,
+    feedback_key: String,
+    feedback_attempts: usize,
+    feedback_retry_min: Duration,
+    feedback_retry_max: Duration,
+    exchange_key: String,
     limit_cpu: bool,
     disable_api: bool,
     ssh_algorithms: Option<[String; 4]>,
@@ -1416,6 +1425,8 @@ struct TransferRoot {
     url: String,
     skip_verify: bool,
     headers: Vec<(String, String)>,
+    key: Option<String>,
+    only_after: usize,
 }
 
 fn regex_matches_any(patterns: &[regex::Regex], values: &[&str]) -> bool {
@@ -1463,6 +1474,7 @@ impl PsiphonOut {
         if entries.is_empty() {
             return Err("psiphon: the server list holds no SSH entries".to_owned());
         }
+        let affinity = affinity_host(&settings).map(|host| (host, 0));
         let slok_path = state_is_ours(&settings.state).then(|| settings.state.join("osl-sloks"));
         let sloks = crate::psiphon_osl::SlokStore::open(slok_path);
         let osl_seeded = Arc::new(AtomicBool::new(false));
@@ -1517,7 +1529,7 @@ impl PsiphonOut {
             self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
-            affinity: Mutex::new(None),
+            affinity: Mutex::new(affinity),
             moved_to_front: Mutex::new(HashSet::new()),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
@@ -1703,6 +1715,7 @@ impl Inner {
             .and_then(|(name, port)| port.parse().ok().map(|port| (name, port)));
         if let Some((name, port)) = affinity {
             *lock(&self.affinity) = Some((name.to_owned(), port));
+            save_affinity(&self.settings, name);
         }
         let mut guard = lock(&self.entries);
         let max = self.settings.server_entry_max_move_to_front;
@@ -4022,6 +4035,36 @@ impl Settings {
         }
         let enable_upgrade =
             enable_upgrade && !upgrade_roots.is_empty() && !upgrade_version_header.is_empty();
+        let enable_feedback = flag(
+            settings,
+            "EnableFeedbackUpload",
+            "AETHER_PSIPHON_ENABLE_FEEDBACK",
+        );
+        let feedback_roots = feedback_roots(settings);
+        let feedback_key = text(settings, "FeedbackEncryptionPublicKey").unwrap_or_default();
+        if enable_feedback && (feedback_roots.is_empty() || feedback_key.is_empty()) {
+            return Err(
+                "psiphon: EnableFeedbackUpload needs FeedbackUploadURLs and FeedbackEncryptionPublicKey"
+                    .to_owned(),
+            );
+        }
+        let feedback_attempts = usize::try_from(
+            number(settings, "FeedbackUploadMaxAttempts")
+                .unwrap_or(5)
+                .max(1),
+        )
+        .unwrap_or(5);
+        let feedback_retry_min = Duration::from_secs(
+            number(settings, "FeedbackUploadRetryMinDelaySeconds").unwrap_or(60),
+        );
+        let feedback_retry_max = Duration::from_secs(
+            number(settings, "FeedbackUploadRetryMaxDelaySeconds")
+                .unwrap_or(300)
+                .max(1),
+        )
+        .max(feedback_retry_min);
+        let exchange_key = text(settings, "ExchangeObfuscationKey").unwrap_or_default();
+        let signature_key = text(settings, "ServerEntrySignaturePublicKey").unwrap_or_default();
         let disable_api = flag(settings, "DisableApi", "AETHER_PSIPHON_DISABLE_API");
         let ssh_algorithms = ssh_algorithms(settings);
         match text(settings, "TargetAPIProtocol").as_deref() {
@@ -4163,6 +4206,7 @@ impl Settings {
                 .or_else(|| text(settings, "remoteServerListSignaturePublicKey"))
                 .or_else(|| env("AETHER_PSIPHON_SERVER_LIST_KEY"))
                 .unwrap_or_else(|| ferrox_core::psiphon::SERVER_LIST_SIGNATURE_KEY.to_owned()),
+            signature_key,
             osl_roots: osl_roots(settings),
             remote_list_key: text(settings, "RemoteServerListSignaturePublicKey")
                 .or_else(|| text(settings, "remoteServerListSignaturePublicKey"))
@@ -4173,6 +4217,13 @@ impl Settings {
             upgrade_roots,
             upgrade_version_header,
             upgrade_retry,
+            enable_feedback,
+            feedback_roots,
+            feedback_key,
+            feedback_attempts,
+            feedback_retry_min,
+            feedback_retry_max,
+            exchange_key,
             limit_cpu,
             disable_api,
             ssh_algorithms,
@@ -5402,6 +5453,8 @@ fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
                     url,
                     skip_verify: false,
                     headers: global,
+                    key: None,
+                    only_after: 0,
                 });
             }
         }
@@ -5424,11 +5477,23 @@ fn upgrade_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
                     url,
                     skip_verify: false,
                     headers: global,
+                    key: None,
+                    only_after: 0,
                 });
             }
         }
     }
     roots
+}
+
+fn feedback_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
+    let global = custom_headers(settings);
+    settings
+        .and_then(|settings| settings.get("FeedbackUploadURLs"))
+        .and_then(Json::as_arr)
+        .map_or_else(Vec::new, |items| {
+            transfer_roots(items, "FeedbackUploadURLs", &global)
+        })
 }
 
 /// Decode a list of transfer-URL strings or objects, folding global headers under each entry.
@@ -5442,6 +5507,8 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                         url,
                         skip_verify: false,
                         headers: global.to_vec(),
+                        key: None,
+                        only_after: 0,
                     });
                 } else {
                     eprintln!("psiphon: {label} entry names no URL");
@@ -5462,6 +5529,17 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                     .find(|(name, _)| name.eq_ignore_ascii_case("SkipVerify"))
                     .and_then(|(_, value)| value.as_bool())
                     .unwrap_or(false);
+                let key = fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("B64EncodedPublicKey"))
+                    .and_then(|(_, value)| value.as_str())
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_owned);
+                let only_after = fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("OnlyAfterAttempts"))
+                    .and_then(|(_, value)| value.as_i64())
+                    .unwrap_or(0);
                 let local = fields
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("RequestHeaders"))
@@ -5478,6 +5556,8 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                     url,
                     skip_verify,
                     headers,
+                    key,
+                    only_after: usize::try_from(only_after).unwrap_or(0),
                 });
             }
             _ => eprintln!("psiphon: {label} entry is not an object"),
@@ -5675,6 +5755,13 @@ const KNOWN_SETTINGS: &[&str] = &[
     "UpgradeDownloadUrl",
     "UpgradeDownloadClientVersionHeader",
     "FetchUpgradeRetryPeriodMilliseconds",
+    "EnableFeedbackUpload",
+    "FeedbackUploadURLs",
+    "FeedbackEncryptionPublicKey",
+    "FeedbackUploadMaxAttempts",
+    "FeedbackUploadRetryMinDelaySeconds",
+    "FeedbackUploadRetryMaxDelaySeconds",
+    "ExchangeObfuscationKey",
     "ObfuscatedServerListRootURLs",
     "obfuscatedServerListRootURLs",
     "ObfuscatedServerListRootURL",
@@ -6866,6 +6953,7 @@ fn load_source_entries(
             Err(error) => eprintln!("psiphon: server entries {}: {error}", path.display()),
         }
     }
+    absorb_exchanged(settings, &mut servers, &mut seen, include_inproxy);
     let fetch_remote =
         !settings.remote_fetch_disabled && (settings.server_lists_explicit || servers.is_empty());
     for url in settings.server_lists.iter().filter(|_| fetch_remote) {
@@ -9017,6 +9105,423 @@ fn fetch_upgrade(
         .map_err(|error| format!("psiphon: upgrade rename {}: {error}", part.display()))
 }
 
+const FEEDBACK_MAX_BODY: usize = 1024 * 1024;
+
+/// Encrypt diagnostics with the configured RSA key and PUT them to the first upload root that accepts them.
+pub(crate) fn feedback(
+    settings: Option<&Json>,
+    diagnostics: &[u8],
+    upload_path: &str,
+) -> Result<(), String> {
+    let settings = Settings::from_json(settings)?;
+    if !settings.enable_feedback {
+        return Err("psiphon: EnableFeedbackUpload is off".to_owned());
+    }
+    if diagnostics.is_empty() {
+        return Err("psiphon: feedback diagnostics are empty".to_owned());
+    }
+    let upload_path = upload_path.trim_matches('/');
+    let upload_id = hex(&random::<8>());
+    let mut last = String::new();
+    for attempt in 0..settings.feedback_attempts {
+        let Some(root) = select_feedback_root(&settings.feedback_roots, attempt) else {
+            return Err("psiphon: FeedbackUploadURLs names no first-round URL".to_owned());
+        };
+        let key = root.key.as_deref().unwrap_or(&settings.feedback_key);
+        let body = encrypt_feedback(diagnostics, key)?;
+        let endpoint = match transfer_endpoint(
+            &root.url,
+            &settings.tls_shape.roots,
+            settings.tls_shape.disable_system_root_cas || root.skip_verify,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(why) => {
+                last = why;
+                if attempt + 1 < settings.feedback_attempts {
+                    thread::sleep(feedback_retry_delay(&settings));
+                }
+                continue;
+            }
+        };
+        let path = if upload_path.is_empty() {
+            format!("/{upload_id}")
+        } else {
+            format!("/{upload_path}/{upload_id}")
+        };
+        let path = endpoint.url(&path);
+        let agent = format!(
+            "psiphon-tunnel-core/{} ({})",
+            settings.client_version, settings.platform
+        );
+        let mut headers: Vec<(&str, &str)> = root
+            .headers
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("User-Agent"))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        headers.push(("User-Agent", agent.as_str()));
+        match crate::foxy_account::ask_limited(
+            &endpoint,
+            "PUT",
+            &path,
+            &headers,
+            &body,
+            FEEDBACK_MAX_BODY,
+        ) {
+            Ok(reply) if reply.status == 200 => return Ok(()),
+            Ok(reply) => last = format!("psiphon: {}: HTTP {}", root.url, reply.status),
+            Err(why) => last = why,
+        }
+        if attempt + 1 < settings.feedback_attempts {
+            thread::sleep(feedback_retry_delay(&settings));
+        }
+    }
+    Err(if last.is_empty() {
+        "psiphon: feedback upload failed".to_owned()
+    } else {
+        last
+    })
+}
+
+fn select_feedback_root(roots: &[TransferRoot], attempt: usize) -> Option<&TransferRoot> {
+    let eligible: Vec<&TransferRoot> = roots
+        .iter()
+        .filter(|root| root.only_after <= attempt)
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    let pick = usize::from(random::<1>()[0]) % eligible.len();
+    eligible.get(pick).copied()
+}
+
+fn feedback_retry_delay(settings: &Settings) -> Duration {
+    let span = settings
+        .feedback_retry_max
+        .saturating_sub(settings.feedback_retry_min)
+        .as_millis();
+    let draw = u128::from(u32::from_le_bytes(random::<4>()));
+    let jitter = if span == 0 { 0 } else { draw % (span + 1) };
+    settings.feedback_retry_min + Duration::from_millis(u64::try_from(jitter).unwrap_or(0))
+}
+
+fn encrypt_feedback(diagnostics: &[u8], public_key: &str) -> Result<Vec<u8>, String> {
+    let key = ferrox_core::b64::decode(public_key.as_bytes())
+        .ok_or_else(|| "psiphon: FeedbackEncryptionPublicKey is not base64".to_owned())?;
+    let body = aes_cbc(diagnostics)?;
+    let (mac, mac_key) = feedback_hmac(&body.iv, &body.ciphertext);
+    let wrapped_key = rsa_oaep(&key, &body.key)?;
+    let wrapped_mac = rsa_oaep(&key, &mac_key)?;
+    let secure = Json::Obj(vec![
+        (
+            "iv".to_owned(),
+            Json::Str(ferrox_core::b64::encode(&body.iv)),
+        ),
+        (
+            "contentCiphertext".to_owned(),
+            Json::Str(ferrox_core::b64::encode(&body.ciphertext)),
+        ),
+        (
+            "wrappedEncryptionKey".to_owned(),
+            Json::Str(ferrox_core::b64::encode(&wrapped_key)),
+        ),
+        (
+            "contentMac".to_owned(),
+            Json::Str(ferrox_core::b64::encode(mac.as_ref())),
+        ),
+        (
+            "wrappedMacKey".to_owned(),
+            Json::Str(ferrox_core::b64::encode(&wrapped_mac)),
+        ),
+    ]);
+    let mut out = String::new();
+    json::write(&secure, &mut out);
+    Ok(out.into_bytes())
+}
+
+struct FeedbackBody {
+    iv: Vec<u8>,
+    key: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+fn aes_cbc(plaintext: &[u8]) -> Result<FeedbackBody, String> {
+    use aes::cipher::{BlockCipherEncrypt as _, KeyInit as _};
+    let iv = random::<16>();
+    let key = random::<16>();
+    let padding = 16 - (plaintext.len() % 16);
+    let mut ciphertext = Vec::with_capacity(plaintext.len() + padding);
+    ciphertext.extend_from_slice(plaintext);
+    ciphertext.extend(std::iter::repeat_n(padding as u8, padding));
+    let cipher = aes::Aes128::new_from_slice(&key)
+        .map_err(|_| "psiphon: feedback AES key is invalid".to_owned())?;
+    let mut previous = iv;
+    for block in ciphertext.as_chunks_mut::<16>().0 {
+        for (byte, chain) in block.iter_mut().zip(previous.iter().copied()) {
+            *byte ^= chain;
+        }
+        cipher.encrypt_block(block.into());
+        previous.copy_from_slice(block);
+    }
+    Ok(FeedbackBody {
+        iv: iv.to_vec(),
+        key: key.to_vec(),
+        ciphertext,
+    })
+}
+
+fn feedback_hmac(iv: &[u8], ciphertext: &[u8]) -> (ring::hmac::Tag, Vec<u8>) {
+    let key = random::<16>();
+    let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key);
+    let mut context = ring::hmac::Context::with_key(&hmac_key);
+    context.update(iv);
+    context.update(ciphertext);
+    (context.sign(), key.to_vec())
+}
+
+fn rsa_oaep(public_key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+    use boring::rsa::Padding;
+    let key = boring::pkey::PKey::public_key_from_der(public_key)
+        .and_then(|key| key.rsa())
+        .map_err(|_| "psiphon: feedback key is not an RSA public key".to_owned())?;
+    let mut out = vec![0u8; usize::try_from(key.size()).unwrap_or(0)];
+    let len = key
+        .public_encrypt(message, &mut out, Padding::PKCS1_OAEP)
+        .map_err(|_| "psiphon: feedback RSA encryption failed".to_owned())?;
+    out.truncate(len);
+    Ok(out)
+}
+
+/// Box the affinity entry with the exchange key, as the reference exports it.
+pub(crate) fn exchange_export(settings: Option<&Json>) -> Result<String, String> {
+    let settings = Settings::from_json(settings)?;
+    let key = exchange_key(&settings)?;
+    let mut entry = affinity_entry(&settings)
+        .ok_or_else(|| "psiphon: no signed server entry is available for exchange".to_owned())?;
+    remove_unsigned_fields(&mut entry);
+    verify_entry_signature(&entry, &settings.signature_key)?;
+    let payload = Json::Obj(vec![
+        ("ServerEntryFields".to_owned(), entry),
+        ("ExchangedDialParameters".to_owned(), Json::Null),
+    ]);
+    let mut plaintext = String::new();
+    json::write(&payload, &mut plaintext);
+    let nonce = random::<24>();
+    let cipher = crypto_secretbox::XSalsa20Poly1305::new_from_slice(&key)
+        .map_err(|_| "psiphon: ExchangeObfuscationKey is invalid".to_owned())?;
+    let sealed = cipher
+        .encrypt(
+            crypto_secretbox::Nonce::from_slice(&nonce),
+            plaintext.as_bytes(),
+        )
+        .map_err(|_| "psiphon: server entry exchange encryption failed".to_owned())?;
+    let mut boxed = Vec::with_capacity(24 + sealed.len());
+    boxed.extend_from_slice(&nonce);
+    boxed.extend_from_slice(&sealed);
+    Ok(ferrox_core::b64::encode(&boxed))
+}
+
+/// Verify and store an exported entry, then make it the next affinity.
+pub(crate) fn exchange_import(settings: Option<&Json>, payload: &str) -> Result<String, String> {
+    let settings = Settings::from_json(settings)?;
+    let key = exchange_key(&settings)?;
+    let boxed = ferrox_core::b64::decode(payload.trim().as_bytes())
+        .ok_or_else(|| "psiphon: exchange payload is not base64".to_owned())?;
+    if boxed.len() <= 24 {
+        return Err("psiphon: exchange payload is too short".to_owned());
+    }
+    let cipher = crypto_secretbox::XSalsa20Poly1305::new_from_slice(&key)
+        .map_err(|_| "psiphon: ExchangeObfuscationKey is invalid".to_owned())?;
+    let plaintext = cipher
+        .decrypt(
+            crypto_secretbox::Nonce::from_slice(&boxed[..24]),
+            &boxed[24..],
+        )
+        .map_err(|_| "psiphon: exchange payload did not open".to_owned())?;
+    let document = json::parse(&String::from_utf8_lossy(&plaintext))
+        .map_err(|_| "psiphon: exchange payload is not JSON".to_owned())?;
+    let mut entry = document
+        .get("ServerEntryFields")
+        .cloned()
+        .ok_or_else(|| "psiphon: exchange payload has no server entry".to_owned())?;
+    remove_unsigned_fields(&mut entry);
+    verify_entry_signature(&entry, &settings.signature_key)?;
+    let host = entry
+        .get("ipAddress")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "psiphon: exchanged entry names no ipAddress".to_owned())?;
+    if server_from_entry_json(&entry, true, &settings.conduit_protocols).is_none() {
+        return Err("psiphon: exchanged entry has no usable transport".to_owned());
+    }
+    save_exchanged(&settings, &entry)?;
+    save_affinity(&settings, host);
+    Ok(host.to_owned())
+}
+
+fn exchange_key(settings: &Settings) -> Result<[u8; 32], String> {
+    let key = ferrox_core::b64::decode(settings.exchange_key.as_bytes())
+        .ok_or_else(|| "psiphon: ExchangeObfuscationKey is not base64".to_owned())?;
+    key.try_into().map_err(|_| {
+        "psiphon: ExchangeObfuscationKey must be a 32-byte NaCl secretbox key".to_owned()
+    })
+}
+
+fn affinity_entry(settings: &Settings) -> Option<Json> {
+    let affinity = affinity_host(settings);
+    let entries = raw_entries(settings);
+    affinity
+        .as_deref()
+        .and_then(|host| {
+            entries
+                .iter()
+                .find(|entry| entry.get("ipAddress").and_then(Json::as_str) == Some(host))
+        })
+        .or_else(|| entries.first())
+        .cloned()
+}
+
+fn raw_entries(settings: &Settings) -> Vec<Json> {
+    let mut texts = Vec::new();
+    if let Some(path) = settings.entries.as_deref() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            texts.push(text);
+        }
+    }
+    if state_is_ours(&settings.state) {
+        if let Ok(text) = std::fs::read_to_string(cache_path(settings)) {
+            texts.push(text);
+        }
+        if let Ok(text) = std::fs::read_to_string(exchanged_path(settings)) {
+            texts.push(text);
+        }
+    }
+    texts
+        .iter()
+        .flat_map(|text| text.lines())
+        .filter_map(entry_line_json)
+        .collect()
+}
+
+fn entry_line_json(line: &str) -> Option<Json> {
+    let line = line.trim();
+    if line.starts_with('{') {
+        return json::parse(line).ok();
+    }
+    let decoded = hex_decode(line)?;
+    let parts: Vec<&[u8]> = decoded.splitn(5, |byte| *byte == b' ').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    json::parse(&String::from_utf8_lossy(parts[4])).ok()
+}
+
+fn remove_unsigned_fields(entry: &mut Json) {
+    let Json::Obj(fields) = entry else {
+        return;
+    };
+    let local_tag = fields
+        .iter()
+        .find(|(name, _)| name == "isLocalDerivedTag")
+        .and_then(|(_, value)| value.as_bool())
+        .unwrap_or(false);
+    fields.retain(|(name, _)| {
+        !(matches!(
+            name.as_str(),
+            "localSource" | "localTimestamp" | "isLocalDerivedTag"
+        ) || local_tag && name == "tag")
+    });
+}
+
+fn verify_entry_signature(entry: &Json, public_key: &str) -> Result<(), String> {
+    if public_key.is_empty() {
+        return Err("psiphon: ServerEntrySignaturePublicKey is missing".to_owned());
+    }
+    let signature = entry
+        .get("signature")
+        .and_then(Json::as_str)
+        .and_then(|value| ferrox_core::b64::decode(value.as_bytes()))
+        .ok_or_else(|| "psiphon: server entry has no signature".to_owned())?;
+    if signature.len() != 8 + 64 {
+        return Err("psiphon: server entry signature length is invalid".to_owned());
+    }
+    let key = ferrox_core::b64::decode(public_key.as_bytes())
+        .ok_or_else(|| "psiphon: ServerEntrySignaturePublicKey is not base64".to_owned())?;
+    let digest = Sha256::digest(&key);
+    if signature[..8] != digest[..8] {
+        return Err("psiphon: server entry signature names another key".to_owned());
+    }
+    let mut fields = entry.clone();
+    remove_unsigned_fields(&mut fields);
+    if let Json::Obj(pairs) = &mut fields {
+        pairs.retain(|(name, _)| name != "signature");
+    }
+    let canonical = json::canonical(&fields);
+    signature::UnparsedPublicKey::new(&signature::ED25519, &key)
+        .verify(canonical.as_bytes(), &signature[8..])
+        .map_err(|_| "psiphon: server entry signature is invalid".to_owned())
+}
+
+fn exchanged_path(settings: &Settings) -> PathBuf {
+    settings.state.join("exchanged.jsonl")
+}
+
+fn save_exchanged(settings: &Settings, entry: &Json) -> Result<(), String> {
+    let _ = std::fs::create_dir_all(&settings.state);
+    let mut text = String::new();
+    json::write(entry, &mut text);
+    text.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(exchanged_path(settings))
+        .map_err(|error| format!("psiphon: exchanged entry store: {error}"))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("psiphon: exchanged entry store: {error}"))
+}
+
+fn affinity_host(settings: &Settings) -> Option<String> {
+    if !state_is_ours(&settings.state) {
+        return None;
+    }
+    std::fs::read_to_string(settings.state.join("affinity.txt"))
+        .ok()
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+}
+
+fn save_affinity(settings: &Settings, host: &str) {
+    let _ = std::fs::create_dir_all(&settings.state);
+    let _ = std::fs::write(settings.state.join("affinity.txt"), host);
+}
+
+fn absorb_exchanged(
+    settings: &Settings,
+    servers: &mut Vec<Server>,
+    seen: &mut HashSet<(IpAddr, u16)>,
+    include_inproxy: bool,
+) {
+    if !state_is_ours(&settings.state) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(exchanged_path(settings)) else {
+        return;
+    };
+    for entry in text.lines().filter_map(entry_line_json) {
+        if !settings.signature_key.is_empty()
+            && verify_entry_signature(&entry, &settings.signature_key).is_err()
+        {
+            continue;
+        }
+        if let Some(server) =
+            server_from_entry_json(&entry, include_inproxy, &settings.conduit_protocols)
+        {
+            if seen.insert((server.address, server.port)) {
+                servers.push(server);
+            }
+        }
+    }
+}
+
 fn transfer_endpoint(
     url: &str,
     roots: &crate::psiphon_ssh::TlsRoots,
@@ -9794,9 +10299,9 @@ pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
 /// The entry an affinity names, compared by host and port.
 fn affinity_index(entries: &[Server], affinity: Option<&(String, u16)>) -> Option<usize> {
     affinity.and_then(|affinity| {
-        entries
-            .iter()
-            .position(|entry| entry.host == affinity.0 && entry.port == affinity.1)
+        entries.iter().position(|entry| {
+            entry.host == affinity.0 && (affinity.1 == 0 || entry.port == affinity.1)
+        })
     })
 }
 
@@ -12144,6 +12649,8 @@ mod tests {
             url: "https://osl.example".to_owned(),
             skip_verify: true,
             headers: Vec::new(),
+            key: None,
+            only_after: 0,
         };
         assert!(
             osl_insecure(&skipped, &plain),
@@ -12193,6 +12700,165 @@ mod tests {
         assert_eq!(settings.upgrade_roots.len(), 1);
         assert_eq!(settings.upgrade_version_header, "X-Version");
         assert_eq!(settings.upgrade_retry, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn feedback_roots_take_public_key_and_schedule() {
+        let roots = feedback_roots(Some(
+            &json::parse(
+                r#"{"FeedbackUploadURLs":[{"URL":"https://one.example/feedback","B64EncodedPublicKey":"abc","OnlyAfterAttempts":2},{"URL":"https://two.example/feedback"}]}"#,
+            )
+            .expect("settings"),
+        ));
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].key.as_deref(), Some("abc"));
+        assert_eq!(roots[0].only_after, 2);
+        assert!(roots[1].key.is_none());
+        assert_eq!(roots[1].only_after, 0);
+    }
+
+    #[test]
+    fn feedback_settings_need_urls_and_a_key() {
+        let error = Settings::from_json(Some(
+            &json::parse(
+                r#"{"EnableFeedbackUpload":true,"FeedbackUploadURLs":["https://f.example"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .err()
+        .expect("a missing key is refused");
+        assert!(error.contains("FeedbackEncryptionPublicKey"));
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"EnableFeedbackUpload":true,"FeedbackUploadURLs":["https://f.example"],"FeedbackEncryptionPublicKey":"abc","FeedbackUploadMaxAttempts":7,"FeedbackUploadRetryMinDelaySeconds":2,"FeedbackUploadRetryMaxDelaySeconds":4}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings.enable_feedback);
+        assert_eq!(settings.feedback_attempts, 7);
+        assert_eq!(settings.feedback_retry_min, Duration::from_secs(2));
+        assert_eq!(settings.feedback_retry_max, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn feedback_envelope_opens_with_the_configured_key() {
+        use aes::cipher::{BlockCipherDecrypt as _, KeyInit as _};
+        use boring::rsa::Rsa;
+        let private = Rsa::generate(2048).expect("rsa");
+        let public = boring::pkey::PKey::from_rsa(private.clone())
+            .expect("pkey")
+            .public_key_to_der()
+            .expect("der");
+        let body = encrypt_feedback(b"hello", &ferrox_core::b64::encode(&public)).expect("encrypt");
+        let document = json::parse(&String::from_utf8(body).expect("utf8")).expect("feedback json");
+        let field = |name: &str| {
+            ferrox_core::b64::decode(
+                document
+                    .get(name)
+                    .and_then(Json::as_str)
+                    .expect(name)
+                    .as_bytes(),
+            )
+            .expect(name)
+        };
+        let iv = field("iv");
+        let ciphertext = field("contentCiphertext");
+        let content_mac = field("contentMac");
+        let mut signed = iv.clone();
+        signed.extend_from_slice(&ciphertext);
+        ring::hmac::verify(
+            &ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                &open_wrapped(&private, &field("wrappedMacKey")),
+            ),
+            &signed,
+            &content_mac,
+        )
+        .expect("mac");
+        let key = open_wrapped(&private, &field("wrappedEncryptionKey"));
+        let cipher = aes::Aes128::new_from_slice(&key).expect("aes key");
+        let mut plaintext = ciphertext;
+        let mut previous = [0u8; 16];
+        previous.copy_from_slice(&iv);
+        for block in plaintext.as_chunks_mut::<16>().0 {
+            let current = *block;
+            cipher.decrypt_block(block.into());
+            for (byte, chain) in block.iter_mut().zip(previous.iter().copied()) {
+                *byte ^= chain;
+            }
+            previous = current;
+        }
+        assert_eq!(
+            plaintext,
+            b"hello\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b".to_vec()
+        );
+    }
+
+    fn open_wrapped(private: &boring::rsa::Rsa<boring::pkey::Private>, wrapped: &[u8]) -> Vec<u8> {
+        use boring::rsa::Padding;
+        let mut out = vec![0u8; usize::try_from(private.size()).expect("rsa size")];
+        let len = private
+            .private_decrypt(wrapped, &mut out, Padding::PKCS1_OAEP)
+            .expect("oaep");
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn exchange_round_trip_verifies_and_promotes_a_signed_entry() {
+        use ring::signature::KeyPair as _;
+        let seed = [7u8; 32];
+        let keypair = signature::Ed25519KeyPair::from_seed_unchecked(&seed).expect("keypair");
+        let public = keypair.public_key().as_ref().to_vec();
+        let unsigned = json::parse(
+            r#"{"ipAddress":"192.0.2.10","sshPort":22,"sshUsername":"u","sshPassword":"p","sshHostKey":"AAAA","region":"US"}"#,
+        )
+        .expect("entry");
+        let canonical = json::canonical(&unsigned);
+        let mut field = Sha256::digest(&public)[..8].to_vec();
+        field.extend_from_slice(keypair.sign(canonical.as_bytes()).as_ref());
+        let Json::Obj(mut fields) = unsigned else {
+            unreachable!("an object")
+        };
+        fields.push((
+            "signature".to_owned(),
+            Json::Str(ferrox_core::b64::encode(&field)),
+        ));
+        let signed = Json::Obj(fields);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-psiphon-exchange-{}-{}",
+            std::process::id(),
+            hex(&random::<8>())
+        ));
+        std::fs::create_dir_all(&dir).expect("state");
+        let entries = dir.join("entries");
+        let mut line = String::new();
+        json::write(&signed, &mut line);
+        std::fs::write(&entries, line).expect("entries");
+
+        let exchange_key = ferrox_core::b64::encode(&[3u8; 32]);
+        let config = json::parse(&format!(
+            r#"{{"serverEntries":{:?},"state":{:?},"ExchangeObfuscationKey":"{}","ServerEntrySignaturePublicKey":"{}"}}"#,
+            entries.to_string_lossy(),
+            dir.to_string_lossy(),
+            exchange_key,
+            ferrox_core::b64::encode(&public)
+        ))
+        .expect("settings");
+        let payload = exchange_export(Some(&config)).expect("export");
+        assert!(!payload.contains("192.0.2.10"));
+        assert_eq!(
+            exchange_import(Some(&config), &payload).expect("import"),
+            "192.0.2.10"
+        );
+        let settings = Settings::from_json(Some(&config)).expect("settings");
+        assert_eq!(affinity_host(&settings).as_deref(), Some("192.0.2.10"));
+        assert!(raw_entries(&settings)
+            .iter()
+            .any(|entry| entry.get("ipAddress").and_then(Json::as_str) == Some("192.0.2.10")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

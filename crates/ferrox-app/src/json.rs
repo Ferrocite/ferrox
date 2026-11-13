@@ -217,6 +217,88 @@ pub(crate) fn write(value: &Json, out: &mut String) {
     }
 }
 
+/// Go's `encoding/json` map order and HTML escaping, the shape a signed server entry is verified over.
+pub(crate) fn canonical(value: &Json) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &Json, out: &mut String) {
+    match value {
+        Json::Str(text) => write_canonical_string(text, out),
+        Json::Arr(items) => {
+            out.push('[');
+            for (at, item) in items.iter().enumerate() {
+                if at > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        Json::Obj(pairs) => {
+            let mut sorted: Vec<&(String, Json)> = pairs.iter().collect();
+            sorted.sort_by(|left, right| left.0.cmp(&right.0));
+            out.push('{');
+            for (at, (key, item)) in sorted.into_iter().enumerate() {
+                if at > 0 {
+                    out.push(',');
+                }
+                write_canonical(&Json::Str(key.clone()), out);
+                out.push(':');
+                write_canonical(item, out);
+            }
+            out.push('}');
+        }
+        Json::Num(number) => write_canonical_number(*number, out),
+        other => write(other, out),
+    }
+}
+
+fn write_canonical_number(number: f64, out: &mut String) {
+    let magnitude = number.abs();
+    if magnitude != 0.0 && (magnitude < 1e-6 || magnitude >= 1e21) {
+        let text = format!("{number:e}");
+        let (mantissa, exponent) = text.split_once('e').expect("exponent");
+        let _ = write!(out, "{mantissa}e");
+        if !exponent.starts_with(['-', '+']) {
+            out.push('+');
+        }
+        out.push_str(exponent);
+    } else {
+        let _ = write!(out, "{number}");
+    }
+}
+
+fn write_canonical_string(text: &str, out: &mut String) {
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            character if character <= '\u{1f}' => {
+                out.push_str("\\u00");
+                let byte = character as u8;
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+}
+
 fn write_string(text: &str, out: &mut String) {
     out.push('"');
     let bytes = text.as_bytes();
@@ -646,6 +728,25 @@ mod tests {
 
     fn item_port(item: &Json) -> u32 {
         item.get("port").and_then(Json::as_u32).expect("port")
+    }
+
+    #[test]
+    fn canonical_orders_keys_and_escapes_like_go() {
+        let value =
+            parse(r#"{"b":"<&>\u2028","a":{"d":1,"c":"\b\f"},"arr":[true,null]}"#).expect("parses");
+        assert_eq!(
+            canonical(&value),
+            "{\"a\":{\"c\":\"\\b\\f\",\"d\":1},\"arr\":[true,null],\"b\":\"\\u003c\\u0026\\u003e\\u2028\"}"
+        );
+    }
+
+    #[test]
+    fn canonical_numbers_match_go() {
+        let value = parse("[1.5,1e-6,1e-7,1e21,1e20,1.23e21,1.23e-7,-1e-7]").expect("parses");
+        assert_eq!(
+            canonical(&value),
+            "[1.5,0.000001,1e-7,1e+21,100000000000000000000,1.23e+21,1.23e-7,-1e-7]"
+        );
     }
 
     #[derive(Debug, Clone)]

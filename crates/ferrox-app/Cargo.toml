@@ -26,6 +26,7 @@ mlua = { version = "0.12", features = ["lua51", "vendored", "send"] }
 regex = "1"
 ring = "0.17"
 base64 = "0.23"
+boring = "5.4"
 ctr = "0.10"
 flate2 = "1"
 rustls-native-certs = "0.8"
