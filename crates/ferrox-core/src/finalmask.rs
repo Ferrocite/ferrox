@@ -486,6 +486,7 @@ pub struct Chain {
     stages: Vec<Stage>,
     filters: Vec<SourceFilter>,
     header: Option<Arc<HeaderCustom>>,
+    xmc: Option<Arc<xmc::Config>>,
 }
 
 /// One configured stage. `fragment` is write-only, `sudoku` carries a reader too.
@@ -568,7 +569,7 @@ impl Chain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stages.is_empty() && self.header.is_none()
+        self.stages.is_empty() && self.header.is_none() && self.xmc.is_none()
     }
 
     /// One `header-custom` handshake outside the byte stages; the first entry owns it.
@@ -581,6 +582,16 @@ impl Chain {
         self.header.as_deref()
     }
 
+    /// One `xmc` handshake outside the byte stages; the first entry owns it.
+    pub fn set_xmc(&mut self, config: xmc::Config) {
+        self.xmc = Some(Arc::new(config));
+    }
+
+    /// The xmc handshake the config armed, if any.
+    pub fn xmc(&self) -> Option<&xmc::Config> {
+        self.xmc.as_deref()
+    }
+
     /// The same chain without its handshake, which the byte stages own separately.
     #[must_use]
     pub fn without_header(&self) -> Self {
@@ -588,6 +599,7 @@ impl Chain {
             stages: self.stages.clone(),
             filters: self.filters.clone(),
             header: None,
+            xmc: None,
         }
     }
 
@@ -612,11 +624,13 @@ impl Chain {
             stages: self.stages.iter().map(|s| s.opened(role, true)).collect(),
             filters: Vec::new(),
             header: None,
+            xmc: None,
         };
         let read = self.stages.iter().any(Stage::is_codec).then(|| Chain {
             stages: self.stages.iter().map(|s| s.opened(role, false)).collect(),
             filters: Vec::new(),
             header: None,
+            xmc: None,
         });
         OpenChain { write, read }
     }

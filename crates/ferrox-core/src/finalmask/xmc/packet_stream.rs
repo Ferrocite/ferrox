@@ -1,6 +1,9 @@
 #[cfg(test)]
 use super::protocol::write_long;
-use super::protocol::{read_long, read_packet, read_string, write_packet, write_string, Packet};
+use super::protocol::{
+    decode_packet_body, read_long, read_string, read_varint_with_length, write_packet,
+    write_string, Packet, MAX_PACKET_BODY_LENGTH,
+};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,12 +21,61 @@ const KEEPALIVE_POLL: Duration = Duration::from_millis(100);
 const KEEPALIVE_POLLS: usize = 150;
 
 pub struct PacketStream<R, W> {
-    reader: R,
+    reader: Mutex<ReadState<R>>,
     writer: Arc<Mutex<W>>,
     is_client: bool,
-    pending: Vec<u8>,
     stop: Arc<AtomicBool>,
     keepalive: Option<JoinHandle<()>>,
+}
+
+struct ReadState<R> {
+    reader: R,
+    buffer: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+impl<R: Read> ReadState<R> {
+    fn next_packet(&mut self) -> io::Result<Packet> {
+        loop {
+            if let Some((packet, length)) = buffered_packet(&self.buffer)? {
+                self.buffer.drain(..length);
+                return Ok(packet);
+            }
+            let mut chunk = [0u8; 8192];
+            match self.reader.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "minecraft packet stream closed",
+                    ))
+                }
+                Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn buffered_packet(buffer: &[u8]) -> io::Result<Option<(Packet, usize)>> {
+    let mut data = buffer;
+    let (length, prefix) = match read_varint_with_length(&mut data) {
+        Ok(field) => field,
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if length < 1 || length as usize > MAX_PACKET_BODY_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("read packet: bad length: {length}"),
+        ));
+    }
+    let total = prefix + length as usize;
+    if buffer.len() < total {
+        return Ok(None);
+    }
+    let packet = decode_packet_body(&buffer[prefix..total])?;
+    Ok(Some((packet, total)))
 }
 
 impl<R, W> PacketStream<R, W>
@@ -39,10 +91,13 @@ where
             Some(spawn_keepalive(Arc::clone(&writer), Arc::clone(&stop)))
         };
         Self {
-            reader,
+            reader: Mutex::new(ReadState {
+                reader,
+                buffer: Vec::new(),
+                pending: Vec::new(),
+            }),
             writer,
             is_client,
-            pending: Vec::new(),
             stop,
             keepalive,
         }
@@ -85,22 +140,31 @@ impl<R, W: Write> PacketStream<R, W> {
         write_packet(&mut *writer, KEEPALIVE_PACKET, &id.to_be_bytes())
             .map_err(|error| io::Error::other(format!("write minecraft keep-alive: {error}")))
     }
+
+    #[cfg(test)]
+    pub(crate) fn send_keepalive(&self, id: i64) -> io::Result<()> {
+        self.write_keepalive(id)
+    }
 }
 
-impl<R: Read, W: Write> Read for PacketStream<R, W> {
+impl<R: Read, W: Write> Read for &PacketStream<R, W> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
             return Ok(0);
         }
-        if !self.pending.is_empty() {
-            let taken = output.len().min(self.pending.len());
-            output[..taken].copy_from_slice(&self.pending[..taken]);
-            self.pending.drain(..taken);
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| io::Error::other("packet stream reader poisoned"))?;
+        if !reader.pending.is_empty() {
+            let taken = output.len().min(reader.pending.len());
+            output[..taken].copy_from_slice(&reader.pending[..taken]);
+            reader.pending.drain(..taken);
             return Ok(taken);
         }
 
         loop {
-            let packet = read_packet(&mut self.reader).map_err(|error| {
+            let packet = reader.next_packet().map_err(|error| {
                 io::Error::other(format!("read minecraft packet stream: {error}"))
             })?;
             if packet.id == self.remote_custom_payload_id() {
@@ -113,7 +177,7 @@ impl<R: Read, W: Write> Read for PacketStream<R, W> {
                 let taken = output.len().min(payload.len());
                 output[..taken].copy_from_slice(&payload[..taken]);
                 if taken < payload.len() {
-                    self.pending.extend_from_slice(&payload[taken..]);
+                    reader.pending.extend_from_slice(&payload[taken..]);
                 }
                 return Ok(taken);
             }
@@ -131,7 +195,13 @@ impl<R: Read, W: Write> Read for PacketStream<R, W> {
     }
 }
 
-impl<R, W: Write> Write for PacketStream<R, W> {
+impl<R: Read, W: Write> Read for PacketStream<R, W> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        (&*self).read(output)
+    }
+}
+
+impl<R, W: Write> Write for &PacketStream<R, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
             return Ok(0);
@@ -163,6 +233,16 @@ impl<R, W: Write> Write for PacketStream<R, W> {
     }
 }
 
+impl<R, W: Write> Write for PacketStream<R, W> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        (&*self).write(input)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
+    }
+}
+
 impl<R, W> Drop for PacketStream<R, W> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -177,7 +257,14 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
         formatter
             .debug_struct("PacketStream")
             .field("is_client", &self.is_client)
-            .field("pending", &self.pending.len())
+            .field(
+                "pending",
+                &self
+                    .reader
+                    .try_lock()
+                    .map(|reader| reader.pending.len())
+                    .ok(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -220,7 +307,7 @@ fn spawn_keepalive<W: Write + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalmask::xmc::protocol::{encode_packet, read_varint_with_length};
+    use crate::finalmask::xmc::protocol::{encode_packet, read_packet, read_varint_with_length};
     use std::collections::VecDeque;
 
     #[derive(Clone)]
@@ -366,6 +453,23 @@ mod tests {
         assert_eq!(data.len(), length as usize, "only the keepalive is echoed");
 
         client.shutdown();
+    }
+
+    #[test]
+    fn a_server_can_send_a_keepalive() {
+        let out = Pipe::new();
+        let mut server = PacketStream::new(Pipe::new(), out.clone(), false);
+        server.send_keepalive(9).expect("keepalive");
+
+        let wire = out.collected();
+        let mut data = wire.as_slice();
+        let packet = read_packet(&mut data).expect("packet");
+        assert_eq!(packet.id, KEEPALIVE_PACKET);
+        let mut body = packet.data.as_slice();
+        assert_eq!(read_long(&mut body).expect("id"), 9);
+        assert_eq!(data, b"");
+
+        server.shutdown();
     }
 
     #[test]

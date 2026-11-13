@@ -5,6 +5,7 @@ pub mod padding;
 pub mod padding_preset;
 pub mod profile;
 pub mod protocol;
+pub mod session;
 
 pub use cfb8::Cfb8;
 pub use derivation::{derive_rsa_key, private_key_der, public_key_der};
@@ -19,3 +20,4 @@ pub use protocol::{
     write_disconnect_packet, write_long, write_packet, write_packet_with_length, write_remaining,
     write_string, write_unsigned_short, write_uuid, write_varint, Long, Packet, UnsignedShort,
 };
+pub use session::{Config, Session};

@@ -83,6 +83,30 @@ pub fn run<R: Read, W: Write>(
     Ok(())
 }
 
+pub(crate) fn run_stream<S: Read + Write>(
+    stream: &mut S,
+    is_client: bool,
+    first_turn_prefix_length: i64,
+    schedule: &[Turn],
+) -> io::Result<()> {
+    validate_schedule(schedule, first_turn_prefix_length)?;
+    let prefix = usize::try_from(first_turn_prefix_length).unwrap_or(usize::MAX);
+
+    for (index, turn) in schedule.iter().enumerate() {
+        let turn_prefix = if index == 0 { prefix } else { 0 };
+        let local_sends = is_client == (turn.direction == Direction::ClientToServer);
+        if local_sends {
+            write_turn(stream, turn, turn_prefix).map_err(|error| {
+                io::Error::other(format!("write padding turn {index}: {error}"))
+            })?;
+        } else {
+            read_turn(stream, turn, turn_prefix)
+                .map_err(|error| io::Error::other(format!("read padding turn {index}: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_schedule(schedule: &[Turn], first_turn_prefix_length: i64) -> io::Result<()> {
     if schedule.is_empty() {
         return Err(invalid_input("empty padding schedule"));
