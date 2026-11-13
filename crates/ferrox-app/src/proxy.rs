@@ -11517,11 +11517,7 @@ fn dial_vless_browser(
                     first,
                 })
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             relay_vless_ws(
                 client,
@@ -18087,11 +18083,7 @@ fn dial_vmess_browser(
                     first: carried.0.as_slice(),
                 })
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             relay_vmess_ws(client, reader, writer, carried, ladder, Rung::Ws, false);
             true
@@ -18454,11 +18446,7 @@ fn dial_trojan_browser(
                     first: &header[..],
                 })
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             note_success(ladder, Rung::Ws, Stage::RequestSent, false);
             reader.set_poll(Some(RELAY_POLL));
@@ -19113,6 +19101,9 @@ impl crate::xhttp::PacketPost for BrowserPost {
         let Some(parts) = crate::browser_dialer::head_parts(&head) else {
             return false;
         };
+        if !parts.cookies.is_empty() {
+            return false;
+        }
         let url = crate::browser_dialer::http_url(&self.authority, self.tls, &parts.target);
         crate::browser_dialer::dial_packet(&parts.method, url, &parts, body.unwrap_or(&[]))
     }
@@ -19134,6 +19125,10 @@ fn browser_xhttp_pair(
     let session = settings.session_id();
     let head = crate::xhttp::downlink_head(host, settings, &session);
     let parts = crate::browser_dialer::head_parts(&head)?;
+    if !parts.cookies.is_empty() {
+        eprintln!("browser dialer: xhttp cookies cannot reach the target from the page; using the normal dial");
+        return None;
+    }
     let authority = crate::browser_dialer::authority(host, port, tls);
     let url = crate::browser_dialer::http_url(&authority, tls, &parts.target);
     let mut reader = crate::browser_dialer::dial_get(url, &parts)?;
@@ -21441,11 +21436,7 @@ fn dial_ss_browser(
                     first: &[][..],
                 })
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
@@ -33182,6 +33173,9 @@ pub(crate) trait FrameWrite: Write + Send {
 
     /// Arms the writer's clock so a peer that drains nothing parks the lane instead of the thread.
     fn arm_write(&mut self, _timeout: Duration) {}
+
+    /// Clears the clock so an established relay waits on the peer rather than a task budget.
+    fn clear_write_timeout(&mut self) {}
 }
 
 impl FrameWrite for Connection {
@@ -33200,6 +33194,10 @@ impl FrameWrite for Connection {
 
     fn arm_write(&mut self, timeout: Duration) {
         let _ = self.set_write_timeout(Some(timeout));
+    }
+
+    fn clear_write_timeout(&mut self) {
+        let _ = self.set_write_timeout(None);
     }
 }
 

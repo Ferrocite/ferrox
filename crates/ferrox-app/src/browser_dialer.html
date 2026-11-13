@@ -6,9 +6,12 @@
 const token = "csrfToken";
 const endpoint = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/websocket?token=${token}`;
 const IDLE = 8;
+const LIVE_MAX = 64;
+const HIGH_WATER = 1 << 20;
 const RECONNECT_MIN = 100;
 const RECONNECT_MAX = 5000;
 let reconnect = RECONNECT_MIN;
+let live = 0;
 
 function initFor(task) {
   const init = {};
@@ -21,25 +24,13 @@ function initFor(task) {
     } catch (_) {}
   }
   if (extra.headers) init.headers = extra.headers;
-  if (extra.cookies) init.credentials = "include";
   return init;
 }
 
-function setCookies(task) {
-  const extra = task.extra || {};
-  if (!extra.cookies) return;
-  const url = new URL(task.url);
-  for (const [name, value] of Object.entries(extra.cookies)) {
-    document.cookie = encodeURIComponent(name) + "=" + encodeURIComponent(value) + "; path=" + url.pathname;
-  }
-}
-
-function clearCookies(task) {
-  const extra = task.extra || {};
-  if (!extra.cookies) return;
-  const url = new URL(task.url);
-  for (const name of Object.keys(extra.cookies)) {
-    document.cookie = encodeURIComponent(name) + "=; path=" + url.pathname + "; Max-Age=0";
+async function drain(ws) {
+  while (ws.bufferedAmount > HIGH_WATER) {
+    if (ws.readyState !== WebSocket.OPEN) throw new Error("closed");
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
@@ -61,37 +52,44 @@ async function run(ws, task) {
         try { target.send(event.data); } catch (_) { target.close(); }
       }
     };
-    target.onopen = () => { open = true; ws.send("ok"); };
+    target.onopen = () => { open = true; try { ws.send("ok"); } catch (_) { target.close(); } };
     target.onmessage = (event) => ws.send(event.data);
     target.onclose = () => ws.close();
-    target.onerror = () => { if (!open) ws.send("fail"); target.close(); };
-    ws.onclose = () => { target.close(); respawn(); };
+    target.onerror = () => { if (!open) try { ws.send("fail"); } catch (_) {} target.close(); };
+    ws.onclose = () => { target.close(); closed(ws); };
     return;
   }
 
   if (task.method === "GET" && task.streamResponse) {
-    ws.send("ok");
     const init = initFor(task);
     const abort = new AbortController();
     let reader = null;
+    let acknowledged = false;
     init.signal = abort.signal;
     ws.onclose = () => {
       try { reader && reader.cancel(); } catch (_) {}
       try { abort.abort(); } catch (_) {}
-      respawn();
+      closed(ws);
     };
     try {
-      setCookies(task);
       const response = await fetch(task.url, init);
+      if (!response.ok || !response.body) throw new Error("downlink refused");
+      ws.send("ok");
+      acknowledged = true;
       reader = response.body.getReader();
       for (;;) {
         const { done, value } = await reader.read();
-        if (value) ws.send(value);
+        if (value) {
+          await drain(ws);
+          ws.send(value);
+        }
         if (done) break;
       }
     } catch (_) {
+      if (!acknowledged && ws.readyState === WebSocket.OPEN) {
+        try { ws.send("fail"); } catch (_) {}
+      }
     } finally {
-      try { clearCookies(task); } catch (_) {}
       ws.close();
     }
     return;
@@ -104,13 +102,11 @@ async function run(ws, task) {
     ws.onmessage = async (event) => {
       try {
         if (event.data.byteLength > 0) init.body = event.data;
-        setCookies(task);
         const response = await fetch(task.url, init);
         ws.send(response.ok ? "ok" : "fail");
       } catch (_) {
         try { ws.send("fail"); } catch (_) {}
       } finally {
-        try { clearCookies(task); } catch (_) {}
         ws.close();
       }
     };
@@ -121,6 +117,13 @@ async function run(ws, task) {
   ws.close();
 }
 
+function closed(ws) {
+  if (ws.closed) return;
+  ws.closed = true;
+  live -= 1;
+  if (!ws.replaced) respawn();
+}
+
 function respawn() {
   const wait = reconnect;
   reconnect = Math.min(reconnect * 2, RECONNECT_MAX);
@@ -128,16 +131,24 @@ function respawn() {
 }
 
 function connect() {
+  if (live >= LIVE_MAX) return false;
   let ws;
   try {
     ws = new WebSocket(endpoint);
   } catch (_) {
     respawn();
-    return;
+    return false;
   }
+  live += 1;
+  ws.closed = false;
+  ws.consumed = false;
+  ws.replaced = false;
   ws.binaryType = "arraybuffer";
   ws.onopen = () => { reconnect = RECONNECT_MIN; };
   ws.onmessage = (event) => {
+    if (ws.consumed) return;
+    ws.consumed = true;
+    ws.replaced = connect();
     let task;
     try {
       task = JSON.parse(event.data);
@@ -153,8 +164,9 @@ function connect() {
       ws.close();
     }
   };
-  ws.onclose = respawn;
+  ws.onclose = () => closed(ws);
   ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  return true;
 }
 
 for (let i = 0; i < IDLE; i++) connect();

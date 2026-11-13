@@ -209,16 +209,28 @@ impl Bridge {
                 return None;
             }
             slot.reader.set_poll(Some(left.min(TASK)));
+            slot.reader.set_handshake_budget(Some(deadline));
+            slot.writer.set_write_timeout(Some(left.min(TASK)));
             if !slot.writer.send_text(text.as_bytes()) {
+                slot.writer.set_write_timeout(None);
                 slot.writer.close();
                 continue;
             }
-            let ok = read_ok(&mut slot.reader);
+            let ack = read_ack(&mut slot.reader);
+            slot.writer.set_write_timeout(None);
             slot.reader.set_poll(None);
-            if ok {
-                return Some(slot);
+            slot.reader.set_handshake_budget(None);
+            match ack {
+                Ack::Ok => return Some(slot),
+                Ack::Fail => {
+                    slot.writer.close();
+                    return None;
+                }
+                Ack::Closed => {
+                    slot.writer.close();
+                    continue;
+                }
             }
-            slot.writer.close();
         }
     }
 }
@@ -271,16 +283,26 @@ fn http_extra(parts: &HeadParts) -> Option<Json> {
     }
 }
 
-fn read_ok(reader: &mut WsReader<Connection>) -> bool {
+enum Ack {
+    Ok,
+    Fail,
+    Closed,
+}
+
+fn read_ack(reader: &mut WsReader<Connection>) -> Ack {
     let mut buf = [0u8; 2];
     let mut at = 0;
     while at < buf.len() {
         match reader.read(&mut buf[at..]) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return Ack::Closed,
             Ok(n) => at += n,
         }
     }
-    buf == *b"ok"
+    if buf == *b"ok" {
+        Ack::Ok
+    } else {
+        Ack::Fail
+    }
 }
 
 pub(crate) struct WsTarget<'a> {
@@ -319,8 +341,13 @@ fn dial_ws_on(bridge: &Bridge, target: &WsTarget<'_>) -> Option<(WsReader<Connec
         authority(target.host, target.port, target.tls)
     );
     let slot = bridge.task(&task("WS", url, extra, true))?;
-    if !early && !target.first.is_empty() && !slot.writer.send(target.first) {
-        return None;
+    if !early && !target.first.is_empty() {
+        slot.writer.set_write_timeout(Some(TASK));
+        let sent = slot.writer.send(target.first);
+        slot.writer.set_write_timeout(None);
+        if !sent {
+            return None;
+        }
     }
     Some((slot.reader, slot.writer))
 }
@@ -339,9 +366,15 @@ pub(crate) fn dial_packet(method: &str, url: String, parts: &HeadParts, payload:
         return false;
     };
     slot.reader.set_poll(Some(TASK));
-    if !slot.writer.send(payload) || !read_ok(&mut slot.reader) {
+    slot.reader
+        .set_handshake_budget(Some(Instant::now() + TASK_TOTAL));
+    slot.writer.set_write_timeout(Some(TASK));
+    let sent = slot.writer.send(payload);
+    slot.writer.set_write_timeout(None);
+    if !sent || !matches!(read_ack(&mut slot.reader), Ack::Ok) {
         return false;
     }
+    slot.reader.set_handshake_budget(None);
     slot.writer.close();
     true
 }

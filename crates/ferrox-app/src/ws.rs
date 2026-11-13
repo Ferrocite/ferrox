@@ -663,6 +663,17 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
 }
 
 impl WsWriter {
+    /// Arm the write side for one bounded task send; `None` hands the socket back to the relay.
+    pub(crate) fn set_write_timeout(&self, timeout: Option<std::time::Duration>) {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return;
+        };
+        match timeout {
+            Some(timeout) => stream.arm_write(timeout),
+            None => stream.clear_write_timeout(),
+        }
+    }
+
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
