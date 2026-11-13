@@ -171,22 +171,12 @@ fn read_exact_within(stream: &mut impl Read, buf: &mut [u8], until: Instant) -> 
         }
         match stream.read(&mut buf[at..]) {
             Ok(0) => return None,
-            Ok(n) => {
-                at += n;
-                if Instant::now() >= until {
-                    return None;
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {
-                if Instant::now() >= until {
-                    return None;
-                }
-            }
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if Instant::now() >= until {
-                    return None;
-                }
-            }
+            Ok(n) => at += n,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
             Err(_) => return None,
         }
     }
@@ -218,15 +208,6 @@ fn skip_bound<R: Read>(stream: &mut R, atyp: u8, until: Instant) -> Option<()> {
         _ => return None,
     }
     Some(())
-}
-
-/// The address a reply's type byte named: one edge the RFC gives the bound address.
-enum Bound {
-    /// An IP address and port, read as the server sent them.
-    Ip(SocketAddr),
-    /// A domain name and port; the association dials the name the way the
-    /// reference's dialer does, the TCP tunnel uses nothing it named.
-    Name(String, u16),
 }
 
 /// A SOCKS5 client session over one connection.
@@ -284,50 +265,6 @@ impl<S: Read + Write> Session<S> {
         Some(head[3])
     }
 
-    /// Read the address the server bound, which the reply's type byte names.
-    ///
-    /// RFC 1928 gives the bound address three forms and the reference reads all
-    /// three: `addrParser.ReadAddressPort` is the reader the request used, so the
-    /// reply accepts every type the request can carry a destination in. What the
-    /// caller makes of it differs: a TCP tunnel uses nothing the reply bound
-    /// (`proxy/socks/client.go` substitutes an address for UDP only), a UDP
-    /// association dials the relay — through the name, where the server bound one.
-    fn read_bound(&mut self, atyp: u8) -> Option<Bound> {
-        match atyp {
-            socks::ATYP_IPV4 => {
-                let mut body = [0u8; 6];
-                read_exact_within(&mut self.stream, &mut body, self.until)?;
-                let mut octets = [0u8; 4];
-                octets.copy_from_slice(&body[..4]);
-                Some(Bound::Ip(SocketAddr::from((
-                    octets,
-                    u16::from_be_bytes([body[4], body[5]]),
-                ))))
-            }
-            socks::ATYP_IPV6 => {
-                let mut body = [0u8; 18];
-                read_exact_within(&mut self.stream, &mut body, self.until)?;
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&body[..16]);
-                Some(Bound::Ip(SocketAddr::from((
-                    octets,
-                    u16::from_be_bytes([body[16], body[17]]),
-                ))))
-            }
-            socks::ATYP_DOMAIN => {
-                let mut len = [0u8; 1];
-                read_exact_within(&mut self.stream, &mut len, self.until)?;
-                let name_len = usize::from(len[0]);
-                let mut body = vec![0u8; name_len + 2];
-                read_exact_within(&mut self.stream, &mut body, self.until)?;
-                let name = String::from_utf8_lossy(&body[..name_len]).into_owned();
-                let port = u16::from_be_bytes([body[name_len], body[name_len + 1]]);
-                Some(Bound::Name(name, port))
-            }
-            _ => None,
-        }
-    }
-
     /// Ask for a TCP tunnel to one destination.
     ///
     /// The address the server bound is not what the caller asked for and is not needed,
@@ -339,13 +276,42 @@ impl<S: Read + Write> Session<S> {
     }
 
     /// Ask for a UDP association and read the relay the datagrams go to.
+    ///
+    /// The bound address has the three forms RFC 1928 gives it. An address is the relay;
+    /// a name is handed to the bounded resolver as the bytes that arrived, so the reply
+    /// builds no `Vec` and no `String` for a relay it only dials.
     pub(crate) fn associate(&mut self) -> Option<SocketAddr> {
         // RFC 1928's associate request names no destination: the address is `0.0.0.0:0` — `hev-socks5-core` sends the same all-zero IPv4 address, and `xray-core`'s `ClientHandshake` writes `{1, 0, 0, 0, 0, 0, 0}` for a UDP request.
         let atyp = self.send(socks::CMD_UDP_ASSOCIATE, &Destination::V4([0, 0, 0, 0], 0))?;
-        match self.read_bound(atyp)? {
-            Bound::Ip(relay) => Some(relay),
-            // The server's relay is dialled, not refused: the reference resolves the name its dialer is handed.
-            Bound::Name(name, port) => crate::proxy::resolve_endpoint(name.as_str(), port),
+        match atyp {
+            socks::ATYP_IPV4 => {
+                let mut body = [0u8; 6];
+                read_exact_within(&mut self.stream, &mut body, self.until)?;
+                Some(SocketAddr::from((
+                    [body[0], body[1], body[2], body[3]],
+                    u16::from_be_bytes([body[4], body[5]]),
+                )))
+            }
+            socks::ATYP_IPV6 => {
+                let mut body = [0u8; 18];
+                read_exact_within(&mut self.stream, &mut body, self.until)?;
+                let octets: [u8; 16] = body[..16].try_into().ok()?;
+                Some(SocketAddr::from((
+                    octets,
+                    u16::from_be_bytes([body[16], body[17]]),
+                )))
+            }
+            socks::ATYP_DOMAIN => {
+                let mut len = [0u8; 1];
+                read_exact_within(&mut self.stream, &mut len, self.until)?;
+                let name_len = usize::from(len[0]);
+                let mut body = [0u8; 257];
+                read_exact_within(&mut self.stream, &mut body[..name_len + 2], self.until)?;
+                let name = std::str::from_utf8(&body[..name_len]).ok()?;
+                let port = u16::from_be_bytes([body[name_len], body[name_len + 1]]);
+                crate::proxy::resolve_endpoint(name, port)
+            }
+            _ => None,
         }
     }
 
@@ -980,6 +946,28 @@ mod tests {
             ]),
             b"PING"
         );
+    }
+
+    /// The bound name a UDP association reads is handed to the resolver from the read's
+    /// own stack room: the reply builds no `Vec` and no `String` for a relay it only dials.
+    #[test]
+    fn an_association_bound_name_is_read_without_a_heap_buffer() {
+        let (client, _written) = pair(|server, _seen| {
+            let mut greeting = [0u8; 3];
+            server.read_exact(&mut greeting).expect("the greeting");
+            server.write_all(&[5, 0]).expect("the method reply");
+            let mut request = [0u8; 10];
+            server.read_exact(&mut request).expect("the request");
+            let name = b"127.0.0.1";
+            let mut reply = vec![5, 0, 0, 3, name.len() as u8];
+            reply.extend_from_slice(name);
+            reply.extend_from_slice(&53u16.to_be_bytes());
+            server.write_all(&reply).expect("the reply");
+        });
+        let mut session = Session::open(client, &Credential::default()).expect("a session");
+        let (relay, counts) = ferrox_core::alloc_count::measure(|| session.associate());
+        assert_eq!(relay.expect("a relay").port(), 53);
+        assert_eq!(counts.allocs, 0, "the bound name is read on the stack");
     }
 
     /// The relay a server binds with a name is dialled, not refused: the reference
