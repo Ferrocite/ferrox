@@ -343,27 +343,27 @@ fn walk_extensions(mut protocol: u8, mut body: &[u8]) -> Option<(u8, &[u8])> {
     }
 }
 
-/// The flow a quoted packet names, read from the header plus the four port bytes an ICMP error carries. The quoted total length is usually larger than what arrived, so this does not ask the full-packet walk to accept it.
+/// The flow a quoted packet names, read from the header plus the four port bytes an ICMP error carries. The quote is the packet this handler wrote to the device — remote to client — so its source is the flow's destination and its two ports are reversed. The quoted total length is usually larger than what arrived, so this does not ask the full-packet walk to accept it.
 fn quoted_flow(quoted: &[u8]) -> Option<FlowKey> {
     let first = *quoted.first()?;
-    let (protocol, destination, transport) = if first >> 4 == 4 {
+    let (protocol, remote, transport) = if first >> 4 == 4 {
         let header = usize::from(first & 0x0f) * 4;
         if header < IPV4_HEADER || header > quoted.len() {
             return None;
         }
-        let destination = *quoted.get(16..20)?.first_chunk::<4>()?;
+        let remote = *quoted.get(12..16)?.first_chunk::<4>()?;
         (
             *quoted.get(9)?,
-            IpAddr::V4(Ipv4Addr::from(destination)),
+            IpAddr::V4(Ipv4Addr::from(remote)),
             quoted.get(header..)?,
         )
     } else if first >> 4 == 6 {
         if quoted.len() < IPV6_HEADER {
             return None;
         }
-        let destination = *quoted.get(24..40)?.first_chunk::<16>()?;
+        let remote = *quoted.get(8..24)?.first_chunk::<16>()?;
         let (protocol, transport) = walk_extensions(*quoted.get(6)?, quoted.get(IPV6_HEADER..)?)?;
-        (protocol, IpAddr::V6(Ipv6Addr::from(destination)), transport)
+        (protocol, IpAddr::V6(Ipv6Addr::from(remote)), transport)
     } else {
         return None;
     };
@@ -371,9 +371,9 @@ fn quoted_flow(quoted: &[u8]) -> Option<FlowKey> {
         return None;
     }
     Some(FlowKey {
-        source_port: u16::from_be_bytes([transport[0], transport[1]]),
-        destination,
-        destination_port: u16::from_be_bytes([transport[2], transport[3]]),
+        source_port: u16::from_be_bytes([transport[2], transport[3]]),
+        destination: remote,
+        destination_port: u16::from_be_bytes([transport[0], transport[1]]),
     })
 }
 
@@ -431,7 +431,13 @@ impl Device {
         {
             use std::os::unix::io::IntoRawFd;
             #[cfg(target_os = "linux")]
-            let (device, offload, _) = crate::tun_stack::build(spec, false, true)?;
+            let (device, offload, _) = match crate::tun_stack::build(spec, false, true) {
+                Ok(built) => built,
+                Err(error) if offload_refused(&error) => {
+                    crate::tun_stack::build(spec, false, false)?
+                }
+                Err(error) => return Err(error),
+            };
             #[cfg(target_os = "macos")]
             let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
             #[cfg(target_os = "linux")]
@@ -679,6 +685,18 @@ fn inherited_handle() -> Option<std::fs::File> {
         let _ = fd;
         None
     }
+}
+
+/// A Linux open refused the optional offload, so the same spec is retried without it.
+#[cfg(target_os = "linux")]
+fn offload_refused(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    ) || matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EOPNOTSUPP || code == libc::ENOTSUP
+    )
 }
 
 /// The pseudo-header checksum a GSO segment carries into the kernel: the field holds the folded sum before the segment, and the kernel folds the payload onto it.
@@ -1487,6 +1505,17 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([header[8], header[9]]), 16);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_offload_refusal_is_retried_without_it() {
+        assert!(offload_refused(&io::Error::from_raw_os_error(libc::EINVAL)));
+        assert!(offload_refused(&io::Error::new(
+            io::ErrorKind::Unsupported,
+            "offload"
+        )));
+        assert!(!offload_refused(&io::Error::from_raw_os_error(libc::EPERM)));
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_inherited_descriptor_does_not_claim_gso() {
@@ -1520,14 +1549,15 @@ mod tests {
         quoted[0] = 0x60;
         quoted[6] = 0;
         quoted[7] = 64;
+        quoted[8..24].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
         quoted[24..40].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
         quoted[40] = TCP_PROTO;
-        quoted[48..50].copy_from_slice(&12345u16.to_be_bytes());
-        quoted[50..52].copy_from_slice(&443u16.to_be_bytes());
+        quoted[48..50].copy_from_slice(&443u16.to_be_bytes());
+        quoted[50..52].copy_from_slice(&12345u16.to_be_bytes());
         let flow = quoted_flow(&quoted).unwrap();
         assert_eq!(flow.source_port, 12345);
         assert_eq!(flow.destination_port, 443);
-        assert_eq!(flow.destination, "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(flow.destination, "2001:db8::2".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -1574,22 +1604,34 @@ mod tests {
 
     #[test]
     fn an_icmp_error_quotes_the_flow_it_ends() {
-        let source: IpAddr = "2001:db8::2".parse().unwrap();
-        let destination: IpAddr = "2001:db8::1".parse().unwrap();
-        let quoted = build_ipv6_tcp_packet(
-            (source, 5555),
-            (destination, 443),
+        let remote: IpAddr = "2001:db8::2".parse().unwrap();
+        let client: IpAddr = "2001:db8::1".parse().unwrap();
+        let quoted =
+            build_ipv6_tcp_packet((remote, 443), (client, 5555), 9, 10, FLAG_ACK, 4096, b"");
+        let mut body = vec![2, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&quoted[..IPV6_HEADER + 8]);
+        let key = icmp_error_flow(ICMPV6_PROTO, &body).unwrap();
+        assert_eq!(key.source_port, 5555);
+        assert_eq!(key.destination, remote);
+        assert_eq!(key.destination_port, 443);
+    }
+
+    #[test]
+    fn a_v4_icmp_error_quotes_the_flow_it_ends() {
+        let quoted = build_tcp_packet(
+            ([203, 0, 113, 7], 443),
+            ([10, 0, 0, 2], 5555),
             9,
             10,
             FLAG_ACK,
             4096,
             b"",
         );
-        let mut body = vec![2, 0, 0, 0, 0, 0, 0, 0];
-        body.extend_from_slice(&quoted[..IPV6_HEADER + 8]);
-        let key = icmp_error_flow(ICMPV6_PROTO, &body).unwrap();
+        let mut body = vec![3, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&quoted[..IPV4_HEADER + 8]);
+        let key = icmp_error_flow(ICMP_PROTO, &body).unwrap();
         assert_eq!(key.source_port, 5555);
-        assert_eq!(key.destination, destination);
+        assert_eq!(key.destination, IpAddr::V4([203, 0, 113, 7].into()));
         assert_eq!(key.destination_port, 443);
     }
 
