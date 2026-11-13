@@ -2596,6 +2596,69 @@ mod tests {
         );
     }
 
+    /// A readiness read never runs the header handshake, so a pending header is left whole for the
+    /// blocking path instead of being read part way and failed on the readiness lane.
+    #[cfg(unix)]
+    #[test]
+    fn a_readiness_read_leaves_a_pending_header_to_the_blocking_path() {
+        use ferrox_core::finalmask::{Chain, HeaderCustom, Item, MaskRole, Sequence};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let client = TcpStream::connect(address).expect("connects");
+        let (mut server, _) = listener.accept().expect("accepts");
+        let header = Item {
+            packet: Some(vec![7]),
+            save: "tx".to_owned(),
+            ..Item::default()
+        };
+        let answer = Item {
+            reuse: "tx".to_owned(),
+            ..Item::default()
+        };
+        let mask = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![header],
+            }],
+            vec![Sequence {
+                items: vec![answer],
+            }],
+            Vec::new(),
+        )
+        .expect("config is valid");
+        let mut chain = Chain::default();
+        chain.push_header_custom(mask);
+        let mut client = Connection::Tcp(client).with_mask_role(Some(&chain), MaskRole::Client);
+
+        server.set_nonblocking(true).expect("nonblocking");
+        let mut probe = [0u8; 8];
+        let error = client
+            .read_ready(&mut probe)
+            .expect_err("the header is pending");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let unseen = server.peek(&mut probe).expect_err("nothing was sent");
+        assert_eq!(
+            unseen.kind(),
+            io::ErrorKind::WouldBlock,
+            "the readiness lane did not start the handshake"
+        );
+
+        server.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || {
+            let mut sent = [0u8; 1];
+            server.read_exact(&mut sent).expect("reads the header");
+            assert_eq!(sent, [7]);
+            server.write_all(&[7]).expect("answers the header");
+            server.write_all(&[42]).expect("writes the session");
+        });
+        let mut session = [0u8; 1];
+        client
+            .read_exact(&mut session)
+            .expect("the blocking read finishes the handshake and reads the session");
+        assert_eq!(session, [42]);
+        server.join().expect("server finishes");
+    }
+
     /// A full socket answers the relay's offer at once instead of spending a worker in the send
     /// clock, and the lane learns which descriptor the reactor must watch for a write.
     #[cfg(unix)]
