@@ -15368,7 +15368,10 @@ mod tests {
         assert_eq!(lock(&placeholders).len(), 1);
         expire_dsl_placeholder(&placeholders, "c", 22, Duration::ZERO);
         assert_eq!(lock(&placeholders).len(), 1);
-        let old = lock(&placeholders)[0].created - Duration::from_secs(2);
+        let old = lock(&placeholders)[0]
+            .created
+            .checked_sub(Duration::from_secs(2))
+            .expect("recent instant");
         lock(&placeholders)[0].created = old;
         expire_dsl_placeholder(&placeholders, "c", 22, Duration::from_secs(1));
         assert!(lock(&placeholders).is_empty());
