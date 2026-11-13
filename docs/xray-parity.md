@@ -21,7 +21,6 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 
 | xray-core | ferrox state |
 | --- | --- |
-| VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | both roles, both framing sets, and UDP over raw/ws/gRPC/xhttp/http header/httpUpgrade/KCP/Xdrive/QUIC/Hysteria with each carrier's TLS where it has one; the HTTP/2 transport carrier is not dialled |
 | Trojan share-link `trojan://` parser | implemented (`ferrox_core::trojan::TrojanLink`; `check`/`run` accept it beside `vless://`) |
 | Dokodemo transparent inbound | done (row 27): tcp/udp rewrite, `portMap`, `followRedirect` over `SO_ORIGINAL_DST`/`DIOCNATLOOK` and Linux `TPROXY`, UDP ancillary original-destination replies on Linux, `finalmask.tcp` fragment chain, JSON and protobuf config including the protobuf `tproxy` mode and receiver marker; Windows, macOS UDP, the non-follow missing-rewrite fallback, and partial `portMap` spellings are named open |
 | Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 163, 166) |
