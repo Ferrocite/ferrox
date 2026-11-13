@@ -1,8 +1,8 @@
 #[cfg(test)]
 use super::protocol::write_long;
 use super::protocol::{
-    decode_packet_body, read_long, read_string, read_varint_with_length, write_packet,
-    write_string, Packet, MAX_PACKET_BODY_LENGTH,
+    decode_packet_body, read_long, read_varint_with_length, write_packet, write_string, Packet,
+    MAX_PACKET_BODY_LENGTH, MAX_STRING_LENGTH,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -275,13 +275,38 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
 
 fn parse_custom_payload(packet: &Packet) -> io::Result<Option<&[u8]>> {
     let mut data = packet.data.as_slice();
-    let channel = read_string(&mut data).map_err(|error| {
+    let (length, _) = read_varint_with_length(&mut data).map_err(|error| {
         io::Error::other(format!("read minecraft custom payload channel: {error}"))
+    })?;
+    let length = usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "read minecraft custom payload channel: read string: bad length",
+        )
+    })?;
+    if length > MAX_STRING_LENGTH as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("read minecraft custom payload channel: read string: bad length: {length}"),
+        ));
+    }
+    if length > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read minecraft custom payload channel: failed to fill whole buffer",
+        ));
+    }
+    let (channel, rest) = data.split_at(length);
+    let channel = std::str::from_utf8(channel).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "read minecraft custom payload channel: read string: invalid utf-8",
+        )
     })?;
     if channel != CHANNEL {
         return Ok(None);
     }
-    Ok(Some(data))
+    Ok(Some(rest))
 }
 
 fn spawn_keepalive<W: Write + Send + 'static>(
@@ -415,6 +440,29 @@ mod tests {
         }
         assert_eq!(frames, 3);
         assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn a_custom_payload_is_a_slice_of_its_frame() {
+        let mut data = Vec::new();
+        write_string(&mut data, CHANNEL).expect("channel");
+        data.extend_from_slice(b"hello");
+        let packet = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data,
+        };
+        let (payload, counts) = crate::alloc_count::measure(|| {
+            parse_custom_payload(&packet)
+                .expect("payload")
+                .expect("channel")
+        });
+        assert_eq!(payload, b"hello");
+        assert_eq!(
+            payload.as_ptr(),
+            packet.data[packet.data.len() - payload.len()..].as_ptr(),
+            "the payload is the frame's own bytes"
+        );
+        assert_eq!(counts.allocs, 0, "reading the channel takes no heap");
     }
 
     #[test]
