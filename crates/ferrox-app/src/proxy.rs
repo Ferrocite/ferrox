@@ -77753,7 +77753,8 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 Some(dest.resolved(local, &port_map))
             };
             let Some(asked) = asked else { return };
-            let (dial, target, tag) = sniff_lane(&out, &asked, &stream, None, None);
+            let level = Some(door_account.level);
+            let (dial, target, tag) = sniff_lane(&out, &asked, &stream, None, level);
             let dest = dial.as_ref().unwrap_or(&asked);
             serve_connect(
                 stream,
@@ -77763,7 +77764,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 &[],
                 tag.as_deref(),
                 FlowFacts {
-                    level: Some(door_account.level),
+                    level,
                     ..FlowFacts::default()
                 },
             );
