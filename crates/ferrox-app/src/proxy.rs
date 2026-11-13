@@ -11428,6 +11428,111 @@ pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     resolve_name(address.as_ref(), port, true)
 }
 
+fn open_vless_browser_mux(vless: &VlessOut, server: &SocketAddr) -> Option<MuxUplink> {
+    let header = vless_mux_header(&vless.id);
+    match &vless.carrier {
+        Carrier::Ws { path, ed } => {
+            let (read, writer) =
+                crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
+                    host: &vless.host,
+                    port: server.port(),
+                    tls: vless.tls.is_some(),
+                    path,
+                    ed: *ed,
+                    first: &[][..],
+                })?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.close()),
+                &header,
+            )
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (read, writer) =
+                browser_xhttp_pair(&vless.host, server.port(), vless.tls.is_some(), settings)?;
+            let closer = writer.clone();
+            vless_mux_carried(
+                vless,
+                read,
+                writer,
+                Arc::new(move || closer.finish()),
+                &header,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn dial_vless_browser(
+    client: &Connection,
+    server: &SocketAddr,
+    vless: &VlessOut,
+    target: Option<&Destination>,
+    ladder: &'static Ladder,
+) -> bool {
+    if vless.reality.is_some() {
+        return false;
+    }
+    let Some(header) = vless_request_header(vless, target) else {
+        note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+        return true;
+    };
+    let tls = vless.tls.is_some();
+    match &vless.carrier {
+        Carrier::Ws { path, ed } => {
+            let first = if vless.encryption.is_some() {
+                &[][..]
+            } else {
+                header.as_slice()
+            };
+            let Some((reader, writer)) =
+                crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
+                    host: &vless.host,
+                    port: server.port(),
+                    tls,
+                    path,
+                    ed: *ed,
+                    first,
+                })
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            relay_vless_ws(
+                client,
+                vless,
+                &header,
+                reader,
+                writer,
+                ladder,
+                Rung::Ws,
+                false,
+            );
+            true
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Some((reader, writer)) =
+                browser_xhttp_pair(&vless.host, server.port(), tls, settings)
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            relay_vless_xhttp_session(server, client, vless, &header, reader, writer);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn dial_vless(
     client: &Connection,
     server: &SocketAddr,
@@ -11435,6 +11540,10 @@ fn dial_vless(
     target: Option<&Destination>,
     ladder: &'static Ladder,
 ) {
+    if crate::browser_dialer::active() && dial_vless_browser(client, server, vless, target, ladder)
+    {
+        return;
+    }
     if let Some(encryption) = &vless.encryption {
         if vless.tls.is_some() {
             dial_vless_tls(client, server, vless, target);
@@ -11667,6 +11776,66 @@ fn dial_vless_headed(
     true
 }
 
+fn relay_vless_ws(
+    client: &Connection,
+    vless: &VlessOut,
+    header: &[u8],
+    reader: crate::ws::WsReader<Connection>,
+    writer: crate::ws::WsWriter,
+    ladder: &'static Ladder,
+    rung: Rung,
+    explicit: bool,
+) -> bool {
+    if vless.encryption.is_some() {
+        let close = writer.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
+        if dial_sealed_carried_armed(
+            client,
+            vless,
+            header,
+            reader,
+            writer,
+            &close,
+            |reader, arm| {
+                if arm {
+                    reader.set_poll(Some(RELAY_POLL));
+                    reader.set_handshake_budget(Some(Instant::now() + crate::budgets::handshake()));
+                } else {
+                    reader.set_handshake_budget(None);
+                }
+            },
+        ) {
+            note_success(ladder, rung, Stage::FirstByte, explicit);
+            return true;
+        }
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    let mut reader = reader;
+    reader.set_poll(Some(RELAY_POLL));
+    let until = Instant::now() + crate::budgets::handshake();
+    reader.set_handshake_budget(Some(until));
+    let pump = Pump::to_sink(client, &writer);
+    let progress = pump.progress_flag();
+    let mut bounded = WsAnswerDeadline {
+        reader: &mut reader,
+        progress,
+        seen: progress.load(Ordering::Relaxed),
+    };
+    let answered = read_vless_response_deferred(&mut bounded, progress).is_some();
+    let sent = pump.end();
+    reader.set_handshake_budget(None);
+    if !answered {
+        if sent {
+            return true;
+        }
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    note_success(ladder, rung, Stage::FirstByte, explicit);
+    reader.set_poll(Some(RELAY_POLL));
+    crate::proxy::relay_sink_ws(reader, &writer, client);
+    true
+}
+
 #[allow(clippy::too_many_lines)]
 fn dial_vless_rung(
     client: &Connection,
@@ -11695,57 +11864,16 @@ fn dial_vless_rung(
             ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if vless.encryption.is_some() {
-                let close = writer.clone();
-                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried_armed(
-                    client,
-                    vless,
-                    header,
-                    reader,
-                    writer,
-                    &close,
-                    |reader, arm| {
-                        if arm {
-                            reader.set_poll(Some(RELAY_POLL));
-                            reader.set_handshake_budget(Some(
-                                Instant::now() + crate::budgets::handshake(),
-                            ));
-                        } else {
-                            reader.set_handshake_budget(None);
-                        }
-                    },
-                ) {
-                    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
-                    return true;
-                }
-                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-            }
-            let mut reader = reader;
-            reader.set_poll(Some(RELAY_POLL));
-            let until = Instant::now() + crate::budgets::handshake();
-            reader.set_handshake_budget(Some(until));
-            let pump = Pump::to_sink(client, &writer);
-            let progress = pump.progress_flag();
-            let mut bounded = WsAnswerDeadline {
-                reader: &mut reader,
-                progress,
-                seen: progress.load(Ordering::Relaxed),
-            };
-            let answered = read_vless_response_deferred(&mut bounded, progress).is_some();
-            let sent = pump.end();
-            reader.set_handshake_budget(None);
-            if !answered {
-                // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
-                if sent {
-                    return true;
-                }
-                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-            }
-            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
-            reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_ws(reader, &writer, client);
-            true
+            relay_vless_ws(
+                client,
+                vless,
+                header,
+                reader,
+                writer,
+                ladder,
+                rung,
+                attempt.explicit,
+            )
         }
         Rung::HttpUpgrade => {
             let first = if vless.encryption.is_some() {
@@ -16749,6 +16877,14 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     }
     let server = resolve_outbound(&vless.address, vless.port)?;
     let mask = vless.carrier.tcp_mask();
+    if crate::browser_dialer::active() && vless.reality.is_none() {
+        match &vless.carrier {
+            Carrier::Ws { .. } | Carrier::Xhttp { .. } => {
+                return open_vless_browser_mux(vless, &server);
+            }
+            _ => {}
+        }
+    }
     if let Some(cfg) = vless.tls.as_deref() {
         if let Carrier::Xhttp { settings } = &vless.carrier {
             if crate::xhttp_h3::is_h3(&cfg.alpn) {
@@ -17308,6 +17444,14 @@ fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
     }
     let server = resolve_outbound(&trojan.address, trojan.port)?;
     let mask = trojan.carrier.tcp_mask();
+    if crate::browser_dialer::active() && trojan.reality.is_none() {
+        match &trojan.carrier {
+            Carrier::Ws { .. } | Carrier::Xhttp { .. } => {
+                return open_trojan_browser_mux(trojan, &server);
+            }
+            _ => {}
+        }
+    }
     if let Some(cfg) = trojan.reality.as_deref() {
         let session = dial_reality_session(&server, cfg, mask)?;
         return trojan_mux_session(&server, trojan, session, || {
@@ -17839,7 +17983,7 @@ fn dial_vmess_ws(
     let rung = attempt.rung;
     let path = attempt.path;
     let ed = attempt.ed;
-    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+    let Some(carried) = crate::vmess::client_request(
         &vmess.id,
         vmess.cipher,
         vmess.auth_len,
@@ -17854,13 +17998,34 @@ fn dial_vmess_ws(
         &vmess.host,
         path,
         ed,
-        &request,
+        &carried.0,
         &vmess.headers,
         vmess.heartbeat,
     ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
-    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+    relay_vmess_ws(
+        client,
+        reader,
+        writer,
+        carried,
+        ladder,
+        rung,
+        attempt.explicit,
+    )
+}
+
+fn relay_vmess_ws(
+    client: &Connection,
+    reader: crate::ws::WsReader<Connection>,
+    writer: crate::ws::WsWriter,
+    carried: crate::vmess::ClientRequest,
+    ladder: &Ladder,
+    rung: Rung,
+    explicit: bool,
+) -> bool {
+    let (_, send, recv, response_key, response_iv, auth) = carried;
+    note_success(ladder, rung, Stage::FirstByte, explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     crate::vmess::pump_relay_carried(
@@ -17875,6 +18040,82 @@ fn dial_vmess_ws(
     true
 }
 
+fn dial_vmess_browser(
+    client: &Connection,
+    server: &SocketAddr,
+    vmess: &VmessOut,
+    target: &Destination,
+    ladder: &Ladder,
+) -> bool {
+    if vmess.reality.is_some() {
+        return false;
+    }
+    let Some(carried) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+        return true;
+    };
+    let tls = vmess.tls.is_some();
+    match &vmess.carrier {
+        Carrier::Ws { path, ed } => {
+            let Some((reader, writer)) =
+                crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
+                    host: &vmess.host,
+                    port: server.port(),
+                    tls,
+                    path,
+                    ed: *ed,
+                    first: carried.0.as_slice(),
+                })
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            relay_vmess_ws(client, reader, writer, carried, ladder, Rung::Ws, false);
+            true
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Some((reader, writer)) =
+                browser_xhttp_pair(&vmess.host, server.port(), tls, settings)
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            if !writer.send(&carried.0) {
+                note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+                return true;
+            }
+            let (_, send, recv, response_key, response_iv, auth) = carried;
+            note_success(ladder, Rung::Xhttp, Stage::FirstByte, false);
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                writer,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 fn dial_vmess(
     client: &Connection,
     server: &SocketAddr,
@@ -17882,6 +18123,10 @@ fn dial_vmess(
     target: &Destination,
     ladder: &Ladder,
 ) {
+    if crate::browser_dialer::active() && dial_vmess_browser(client, server, vmess, target, ladder)
+    {
+        return;
+    }
     if vmess.reality.is_some() {
         dial_vmess_reality(client, server, vmess, target);
         return;
@@ -18138,6 +18383,101 @@ fn trojan_header(key: &[u8; 56], cmd: u8, target: &Destination) -> TrojanHeader 
     }
 }
 
+fn open_trojan_browser_mux(trojan: &TrojanOut, server: &SocketAddr) -> Option<MuxUplink> {
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    match &trojan.carrier {
+        Carrier::Ws { path, ed } => {
+            let (read, writer) =
+                crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
+                    host: &trojan.host,
+                    port: server.port(),
+                    tls: trojan.tls.is_some(),
+                    path,
+                    ed: *ed,
+                    first: &header[..],
+                })?;
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.close()),
+            })
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (read, writer) =
+                browser_xhttp_pair(&trojan.host, server.port(), trojan.tls.is_some(), settings)?;
+            if !writer.send(&header) {
+                return None;
+            }
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.finish()),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn dial_trojan_browser(
+    client: &Connection,
+    server: &SocketAddr,
+    trojan: &TrojanOut,
+    target: &Destination,
+    ladder: &Ladder,
+) -> bool {
+    if trojan.reality.is_some() {
+        return false;
+    }
+    let header = trojan_header(&trojan.key, 1, target);
+    let tls = trojan.tls.is_some();
+    match &trojan.carrier {
+        Carrier::Ws { path, ed } => {
+            let Some((mut reader, writer)) =
+                crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
+                    host: &trojan.host,
+                    port: server.port(),
+                    tls,
+                    path,
+                    ed: *ed,
+                    first: &header[..],
+                })
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            note_success(ladder, Rung::Ws, Stage::RequestSent, false);
+            reader.set_poll(Some(RELAY_POLL));
+            crate::proxy::relay_sink_ws(reader, &writer, client);
+            true
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Some((mut reader, writer)) =
+                browser_xhttp_pair(&trojan.host, server.port(), tls, settings)
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            if !writer.send(&header) {
+                note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+                return true;
+            }
+            note_success(ladder, Rung::Xhttp, Stage::RequestSent, false);
+            reader.set_poll(Some(RELAY_POLL));
+            crate::proxy::relay_sink_xhttp_drained(reader, &writer, client);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn dial_trojan(
     client: &Connection,
     server: &SocketAddr,
@@ -18145,6 +18485,11 @@ fn dial_trojan(
     target: &Destination,
     ladder: &Ladder,
 ) {
+    if crate::browser_dialer::active()
+        && dial_trojan_browser(client, server, trojan, target, ladder)
+    {
+        return;
+    }
     let header = trojan_header(&trojan.key, 1, target);
     if trojan.reality.is_some() {
         dial_trojan_reality(client, server, trojan, &header);
@@ -18682,6 +19027,7 @@ fn dial_tls_carried_stream(
 pub(crate) enum XhttpPairRead {
     H1(crate::xhttp::Reader<Connection>),
     H2(crate::xhttp_h2::H2StreamReader),
+    Browser(Box<dyn WindowRead + Send>),
 }
 
 impl XhttpPairRead {
@@ -18698,14 +19044,16 @@ impl Read for XhttpPairRead {
         match self {
             Self::H1(reader) => reader.read(buf),
             Self::H2(reader) => reader.read(buf),
+            Self::Browser(reader) => reader.read(buf),
         }
     }
 }
 
 impl RelayPoll for XhttpPairRead {
     fn arm_relay_poll(&mut self) {
-        if let Self::H1(reader) = self {
-            reader.arm_relay_poll();
+        match self {
+            Self::H1(reader) => reader.arm_relay_poll(),
+            Self::Browser(_) | Self::H2(_) => {}
         }
     }
 }
@@ -18715,6 +19063,7 @@ impl WindowRead for XhttpPairRead {
         match self {
             Self::H1(reader) => reader.read_window(),
             Self::H2(reader) => reader.read_window(),
+            Self::Browser(reader) => reader.read_window(),
         }
     }
 
@@ -18722,6 +19071,7 @@ impl WindowRead for XhttpPairRead {
         match self {
             Self::H1(reader) => reader.parks_on_timeout(),
             Self::H2(reader) => reader.parks_on_timeout(),
+            Self::Browser(reader) => reader.parks_on_timeout(),
         }
     }
 
@@ -18729,6 +19079,7 @@ impl WindowRead for XhttpPairRead {
         match self {
             Self::H1(reader) => reader.set_head_progress(progress),
             Self::H2(reader) => reader.set_head_progress(progress),
+            Self::Browser(reader) => reader.set_head_progress(progress),
         }
     }
 
@@ -18736,8 +19087,60 @@ impl WindowRead for XhttpPairRead {
         match self {
             Self::H1(reader) => reader.awaits_head(),
             Self::H2(reader) => reader.awaits_head(),
+            Self::Browser(reader) => reader.awaits_head(),
         }
     }
+}
+
+struct BrowserPost {
+    authority: String,
+    tls: bool,
+    host: String,
+    settings: crate::xhttp::XhttpSettings,
+    session: String,
+}
+
+impl crate::xhttp::PacketPost for BrowserPost {
+    fn post(&mut self, seq: u64, piece: &[u8]) -> bool {
+        let (head, body) =
+            crate::xhttp::packet_head(&self.host, &self.settings, &self.session, seq, piece);
+        let Some(parts) = crate::browser_dialer::head_parts(&head) else {
+            return false;
+        };
+        let url = crate::browser_dialer::http_url(&self.authority, self.tls, &parts.target);
+        crate::browser_dialer::dial_packet(&parts.method, url, &parts, body.unwrap_or(&[]))
+    }
+}
+
+fn browser_xhttp_pair(
+    host: &str,
+    port: u16,
+    tls: bool,
+    settings: &crate::xhttp::XhttpSettings,
+) -> Option<(XhttpPairRead, crate::xhttp::XhttpWriter)> {
+    if settings.mode != crate::xhttp::XhttpMode::PacketUp {
+        eprintln!(
+            "browser dialer: xhttp {:?} needs a bidirectional stream, which the browser cannot carry",
+            settings.mode
+        );
+        return None;
+    }
+    let session = settings.session_id();
+    let head = crate::xhttp::downlink_head(host, settings, &session);
+    let parts = crate::browser_dialer::head_parts(&head)?;
+    let authority = crate::browser_dialer::authority(host, port, tls);
+    let url = crate::browser_dialer::http_url(&authority, tls, &parts.target);
+    let mut reader = crate::browser_dialer::dial_get(url, &parts)?;
+    reader.set_poll(Some(RELAY_POLL));
+    let post = BrowserPost {
+        authority,
+        tls,
+        host: host.to_owned(),
+        settings: settings.clone(),
+        session,
+    };
+    let writer = crate::xhttp::XhttpWriter::packets_with(Box::new(post), settings);
+    Some((XhttpPairRead::Browser(Box::new(reader)), writer))
 }
 
 /// xHTTP outside TLS: stream-one replaces the whole session; the session shapes dial a second plain transport for the GET downlink (`dialer.go:411`).
@@ -21008,6 +21411,60 @@ fn dial_vmess_reality(
     }
 }
 
+fn dial_ss_browser(
+    client: &Connection,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    ladder: &Ladder,
+) -> bool {
+    if ss.reality.is_some() {
+        return false;
+    }
+    let tls = ss.tls.is_some();
+    match &ss.carrier {
+        Carrier::Ws { path, ed } => {
+            let Some((reader, writer)) =
+                crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
+                    host: &ss.host,
+                    port: server.port(),
+                    tls,
+                    path,
+                    ed: *ed,
+                    first: &[][..],
+                })
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            note_success(ladder, Rung::Ws, Stage::RequestSent, false);
+            ss_client_relay(client, reader, writer, &close, ss, target);
+            true
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Some((reader, writer)) = browser_xhttp_pair(&ss.host, server.port(), tls, settings)
+            else {
+                note_dial_failure(
+                    server,
+                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
+                );
+                return true;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            note_success(ladder, Rung::Xhttp, Stage::RequestSent, false);
+            ss_client_relay(client, reader, writer, &close, ss, target);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn dial_shadowsocks(
     client: &Connection,
     server: &SocketAddr,
@@ -21015,6 +21472,9 @@ fn dial_shadowsocks(
     target: &Destination,
     ladder: &Ladder,
 ) {
+    if crate::browser_dialer::active() && dial_ss_browser(client, server, ss, target, ladder) {
+        return;
+    }
     let params = stream_params(&ss.carrier);
     let explicit = rung_of(&ss.carrier);
     if explicit.is_none() {
