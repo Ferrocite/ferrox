@@ -297,7 +297,5 @@ ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pi
 # The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
 # head, seven 8 KiB payload records, trailer) through an AES engine and a discard
 # sink. A record wholly inside the payload part is sealed from that part, so only
-# the two records that cross a part boundary are copied into the staging buffer.
-ferrox_core::vless_encryption::tests::sealed_write_probe UNBLESSED vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
-ferrox_core::vless_encryption::WriteSide::write_all_slices UNBLESSED vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
-ferrox_core::vless_encryption::copy_from_parts UNBLESSED vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+# the two records that cross a part boundary are copied; 50871336 is 198716.2 per turn.
+ferrox_core::vless_encryption::tests::sealed_write_probe 50871336 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy

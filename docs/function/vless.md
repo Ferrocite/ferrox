@@ -53,7 +53,7 @@ Both directions ride the relay lanes, and one direction ending does not end the 
 | sealed-record-sizes-swept | 12 | ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written |
 | sealed-record-writes-per-batch | 1 | ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes |
 | sealed-record-copies | 2 | ferrox-core-vless::tests::a_record_inside_one_part_is_sealed_from_that_part |
-| sealed-record-write-instructions | UNBLESSED | scripts/count-ops.sh |
+| sealed-record-write-instructions | 50871336 | scripts/count-ops.sh |
 <!-- counts:end -->
 
 The relay buffer's zero-fills are prose, not a row. A row needs a checker that sees the thing it names, and the only counter that sees a fill is `alloc_zeroed`: the counting `GlobalAlloc` that could watch one `RelayBuf`'s whole life (`new()` and one promotion) has to be installed by the test binary that runs the gate, and this crate's test binary is where the tree's one blessed instruction count lives. CI measured the collision — `der_to_pem` went `2653 → 2743` because every allocation it makes grew a thread-local test — and a harness cost is not a change to the product, so the allocator stays in `ferrox-core`'s own test binary, where nothing is blessed, and the shape it proves is `alloc_count::tests::an_uninitialised_tail_is_allocated_but_not_filled`: capacity plus `set_len` and `vec![0u8; n]` are the same allocation and the same bytes, and the fill is the only difference. The promotion's 240 KiB was never visible to any counter here anyway — growing with `resize(.., 0)` writes the tail with `write_bytes`, which is not `alloc_zeroed` — and the only counter that would see it is an instruction count, which is the `UNBLESSED` row above.
