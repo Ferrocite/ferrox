@@ -22374,6 +22374,7 @@ fn serve_trojan_xhttp_accepted(
     key: &[[u8; 56]],
     freedom: bool,
 ) {
+    echo_trace("session xhttp accepted");
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
     let mut bounded = crate::proxy::HandshakeRead::new(creader, crate::budgets::handshake());
     let decoded = decode_trojan_request(&mut bounded, key);

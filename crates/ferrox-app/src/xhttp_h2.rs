@@ -2441,6 +2441,7 @@ fn open_stream(
     block: &[u8],
     end_stream: bool,
 ) -> bool {
+    crate::proxy::echo_trace(&format!("open stream {sid} end={end_stream}"));
     let (method, target, lines) = {
         let mut decoder = conn.decoder.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut method, mut target, mut lines) = (Vec::new(), Vec::new(), Vec::new());
@@ -2471,10 +2472,12 @@ fn open_stream(
         (method, target, lines)
     };
     if conn.goaway.load(Ordering::SeqCst) {
+        crate::proxy::echo_trace(&format!("open goaway {sid}"));
         conn.reset_stream(sid);
         return false;
     }
     let Some(state) = conn.attach_stream(sid, end_stream) else {
+        crate::proxy::echo_trace(&format!("open attach refused {sid}"));
         conn.reset_stream(sid);
         return false;
     };
@@ -2515,6 +2518,7 @@ fn open_stream(
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
+        crate::proxy::echo_trace(&format!("open handler {sid}"));
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
@@ -2525,9 +2529,13 @@ fn open_stream(
             None,
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
+                crate::proxy::echo_trace(&format!("served session {sid}"));
                 serve(ureader, xwriter, decryption);
             }
-            _ => h2out.end(),
+            _ => {
+                crate::proxy::echo_trace(&format!("served other {sid}"));
+                h2out.end();
+            }
         }
     });
     true
