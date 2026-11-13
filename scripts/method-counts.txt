@@ -519,6 +519,8 @@ kcp send-payload-buffers-per-window 1 ferrox-core-kcp::window::tests::the_arena_
 kcp send-payload-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
 kcp send-payload-staging-copies-per-segment 0 ferrox-core-kcp::window::tests::the_writer_gets_the_arena_range_and_not_a_copy_of_it
 kcp receive-payload-reallocations-per-window 0 ferrox-core-kcp::connection::tests::the_receive_pool_serves_every_segment_without_growing
+kcp receive-window-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_receive_window_indexes_a_fixed_ring
+kcp receive-window-allocations-per-segment 0 ferrox-core-kcp::window::tests::the_receive_window_does_not_allocate_per_segment
 kcp receive-parse-allocations-per-segment 0 ferrox-core-kcp::segment::tests::a_data_segment_is_parsed_into_the_lent_buffer
 kcp ack-number-list-reallocations-per-flush 0 ferrox-core-kcp::window::tests::the_ack_list_reuses_its_scratch_across_flushes
 kcp ack-numbers-reallocations-per-cycle 0 ferrox-core-kcp::segment::tests::a_received_ack_reuses_its_number_list

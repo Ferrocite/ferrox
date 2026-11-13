@@ -1,5 +1,4 @@
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use super::segment::{
     write_data_header, AckSegment, DataSegment, OutgoingHeader, SegmentOption,
@@ -197,34 +196,56 @@ impl SendingWindow {
     }
 }
 
-#[derive(Debug, Default)]
+/// Out-of-order receive slots, indexed by segment number modulo the window size.
+#[derive(Debug)]
 pub struct ReceivingWindow {
-    cache: HashMap<u32, DataSegment>,
+    slots: Vec<Option<DataSegment>>,
+    size: u32,
 }
 
 impl ReceivingWindow {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(size: u32) -> Self {
+        Self {
+            slots: Vec::new(),
+            size: size.max(1),
+        }
+    }
+
+    fn index(&self, id: u32) -> usize {
+        (id % self.size) as usize
+    }
+
+    fn ensure_allocated(&mut self) {
+        if self.slots.is_empty() {
+            self.slots.resize_with(self.size as usize, || None);
+        }
     }
 
     pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
-        match self.cache.entry(id) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(slot) => {
-                slot.insert(value);
-                true
-            }
+        self.ensure_allocated();
+        let slot = &mut self.slots[self.index(id)];
+        if slot.is_some() {
+            return false;
         }
+        *slot = Some(value);
+        true
     }
 
     #[must_use]
     pub fn has(&self, id: u32) -> bool {
-        self.cache.contains_key(&id)
+        !self.slots.is_empty() && self.slots[self.index(id)].is_some()
     }
 
     pub fn remove(&mut self, id: u32) -> Option<DataSegment> {
-        self.cache.remove(&id)
+        if self.slots.is_empty() {
+            return None;
+        }
+        self.slots[self.index(id)].take()
+    }
+
+    pub fn release(&mut self) {
+        self.slots = Vec::new();
     }
 }
 
@@ -674,5 +695,87 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].numbers, vec![1, 2]);
         assert_eq!(emitted[0].timestamp, 110);
+    }
+
+    fn receive_segment(number: u32) -> DataSegment {
+        DataSegment {
+            conv: 0,
+            option: SegmentOption::NONE,
+            timestamp: 0,
+            number,
+            sending_next: 0,
+            payload: Vec::new(),
+            timeout: 0,
+            transmit: 0,
+        }
+    }
+
+    /// The receive window is a fixed ring, not a growable map: one allocation
+    /// on the first segment, then the same base and capacity through a full
+    /// window and the next lap. A map would grow its bucket array, and a
+    /// per-segment buffer would move the base, so identity is the witness.
+    #[test]
+    fn the_receive_window_indexes_a_fixed_ring() {
+        let mut w = ReceivingWindow::new(8);
+        assert!(w.slots.is_empty(), "the ring is allocated on first use");
+        assert!(w.set(0, receive_segment(0)));
+        let base = w.slots.as_ptr();
+        let capacity = w.slots.capacity();
+        assert_eq!(w.slots.len(), 8);
+        for number in 1..8 {
+            assert!(w.set(number, receive_segment(number)));
+        }
+        assert_eq!(w.slots.as_ptr(), base, "a full window moved the ring");
+        assert_eq!(w.slots.capacity(), capacity);
+        assert!(
+            !w.set(3, receive_segment(3)),
+            "a duplicate must be refused"
+        );
+        for number in 0..8 {
+            assert!(w.has(number));
+            assert_eq!(w.remove(number).map(|seg| seg.number), Some(number));
+        }
+        for number in 8..16 {
+            assert!(w.set(number, receive_segment(number)));
+        }
+        assert_eq!(w.slots.as_ptr(), base, "the second lap reallocated the ring");
+        assert_eq!(w.slots.capacity(), capacity);
+    }
+
+    /// Numbers wrap; the slot is chosen by the wrapped number's residue, so a
+    /// run across `u32::MAX` must still occupy eight distinct slots and keep
+    /// each segment under its own number.
+    #[test]
+    fn the_ring_keeps_wrapped_numbers_in_their_slot() {
+        let mut w = ReceivingWindow::new(8);
+        let start = u32::MAX - 3;
+        for offset in 0..8 {
+            let number = start.wrapping_add(offset);
+            assert!(w.set(number, receive_segment(number)));
+        }
+        assert!(!w.set(start, receive_segment(start)));
+        for offset in 0..8 {
+            let number = start.wrapping_add(offset);
+            assert!(w.has(number));
+            assert_eq!(w.remove(number).map(|seg| seg.number), Some(number));
+        }
+        assert!(w.slots.iter().all(Option::is_none));
+    }
+
+    /// The ring's set/remove path is the hot receive path: after the one-time
+    /// slot allocation it must not allocate at all, which is what keeps a
+    /// datagram's segment from paying a bucket insert and a probe.
+    #[test]
+    fn the_receive_window_does_not_allocate_per_segment() {
+        let mut w = ReceivingWindow::new(8);
+        w.set(0, receive_segment(0));
+        w.remove(0);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for number in 0..64 {
+                assert!(w.set(number, receive_segment(number)));
+                assert!(w.remove(number).is_some());
+            }
+        });
+        assert_eq!(counts.allocs, 0, "a segment allocated in the ring");
     }
 }
