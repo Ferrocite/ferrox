@@ -226,10 +226,7 @@ impl Bridge {
                     slot.writer.close();
                     return None;
                 }
-                Ack::Closed => {
-                    slot.writer.close();
-                    continue;
-                }
+                Ack::Closed => slot.writer.close(),
             }
         }
     }
