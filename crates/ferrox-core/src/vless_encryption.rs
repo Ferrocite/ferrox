@@ -1433,7 +1433,7 @@ fn copy_from_parts(parts: &[&[u8]], mut at: usize, mut len: usize, out: &mut Vec
 
 /// The record `[at, at + len)` when one caller part holds all of it, so the seal can read that
 /// part instead of copying it into the staging buffer first.
-fn part_slice(parts: &[&[u8]], at: usize, len: usize) -> Option<&[u8]> {
+fn part_slice<'a>(parts: &[&'a [u8]], at: usize, len: usize) -> Option<&'a [u8]> {
     let mut base = 0;
     for part in parts {
         let end = base + part.len();
