@@ -1001,9 +1001,7 @@ pub(crate) fn verify_endpoint(
             tunnel.send(now.as_millis() as u64, &packet, &mut events);
             next_ask = now + VERIFY_ASK_GAP;
         }
-        let Some(wait) = poll_wait(timeout.saturating_sub(started.elapsed())) else {
-            return None;
-        };
+        let wait = poll_wait(timeout.saturating_sub(started.elapsed()))?;
         socket.set_read_timeout(Some(wait)).ok()?;
         if let Ok((read, source)) = socket.recv_from(&mut buf) {
             tunnel.receive(
