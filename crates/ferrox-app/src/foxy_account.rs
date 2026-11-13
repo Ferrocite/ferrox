@@ -574,7 +574,7 @@ impl Endpoint {
         verify_name: Option<&str>,
         pins: Vec<String>,
     ) -> Self {
-        self.host = dial.to_owned();
+        dial.clone_into(&mut self.host);
         self.port = port;
         self.address = edge_peer(dial, port);
         self.host_header = Some(host_header.to_owned());

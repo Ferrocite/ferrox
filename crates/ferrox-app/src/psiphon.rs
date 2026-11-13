@@ -4162,12 +4162,9 @@ impl Settings {
                     .to_owned(),
             );
         }
-        let feedback_attempts = usize::try_from(
-            number(settings, "FeedbackUploadMaxAttempts")
-                .unwrap_or(5)
-                .max(0),
-        )
-        .unwrap_or(5);
+        let feedback_attempts =
+            usize::try_from(number(settings, "FeedbackUploadMaxAttempts").unwrap_or(5))
+                .unwrap_or(5);
         let feedback_retry_min = Duration::from_secs(
             number(settings, "FeedbackUploadRetryMinDelaySeconds").unwrap_or(60),
         );
