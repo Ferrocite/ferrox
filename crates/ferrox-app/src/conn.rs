@@ -86,12 +86,12 @@ pub(crate) struct Masked {
 struct XmcState {
     config: ferrox_core::finalmask::xmc::Config,
     role: ferrox_core::finalmask::MaskRole,
-    session: std::sync::OnceLock<
-        Result<std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>, String>,
-    >,
+    session: XmcSlot,
 }
 
 type XmcSession<R, W> = ferrox_core::finalmask::xmc::Session<R, W>;
+type Xmc = std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>;
+type XmcSlot = std::sync::OnceLock<Result<Xmc, String>>;
 
 #[derive(Debug)]
 struct XmcWriter {
@@ -185,7 +185,7 @@ impl XmcState {
         &self,
         stream: &TcpStream,
         chain: &std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
-    ) -> io::Result<std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>> {
+    ) -> io::Result<Xmc> {
         let result = self.session.get_or_init(|| {
             let saved_read = stream.read_timeout().ok().flatten();
             let saved_write = stream.write_timeout().ok().flatten();
@@ -226,9 +226,7 @@ impl Masked {
         self.xmc_session().map(|_| ())
     }
 
-    fn xmc_session(
-        &self,
-    ) -> io::Result<Option<std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>>> {
+    fn xmc_session(&self) -> io::Result<Option<Xmc>> {
         self.ensure_header()?;
         match &self.xmc {
             Some(state) => state.session(&self.stream, &self.chain).map(Some),
