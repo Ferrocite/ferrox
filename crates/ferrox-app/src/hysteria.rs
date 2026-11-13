@@ -175,6 +175,7 @@ impl Driver {
         let local_now = Arc::clone(&session.local_now);
         let peer = session.peer;
         let net = Arc::clone(&session.net);
+        let migrated = Arc::clone(&session.migrated);
         let keep_alive = session.keep_alive;
         let pump = Arc::clone(self);
         self.alive.store(true, Ordering::Relaxed);
@@ -186,6 +187,7 @@ impl Driver {
                 local_now,
                 peer,
                 net,
+                migrated,
                 udp_supported: false,
                 driver: None,
                 send_wake: None,
