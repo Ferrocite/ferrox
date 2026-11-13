@@ -186,7 +186,7 @@ jobs:
           FERROX_ECHO_H2: "1"
           RUST_TEST_THREADS: "1"
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             echo "=== run $i ==="
             cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
           done

@@ -8769,23 +8769,29 @@ fn sniff_xhttp<R: Read>(
     let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
     let mut at = 0;
+    echo_trace("sniff entry");
     while at < magic.len() {
         match read.read(&mut magic[at..]) {
-            Ok(0) => break,
+            Ok(0) => {
+                echo_trace(&format!("sniff eof at={at}"));
+                break;
+            }
             Ok(n) => at += n,
             Err(error) if is_timeout(&error) => {
                 if Instant::now() >= until {
+                    echo_trace(&format!("sniff timeout at={at}"));
                     break;
                 }
             }
-            Err(_) => break,
+            Err(error) => {
+                echo_trace(&format!("sniff err at={at} {error:?}"));
+                break;
+            }
         }
     }
     let _ = arm(&read, if sealed { Some(RELAY_POLL) } else { None });
-    if at < magic.len() && Instant::now() >= until {
-        return None;
-    }
     let h2 = at == magic.len() && magic == *crate::h2::MAGIC;
+    echo_trace(&format!("sniff at={at} h2={h2}"));
     Some((
         crate::xhttp::ChainReader::new(magic[..at].to_vec(), read),
         h2,
@@ -22341,12 +22347,16 @@ fn serve_trojan_xhttp_carrier_now<
     freedom: bool,
     arm: A,
 ) {
+    echo_trace("carrier now entry");
     let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
+        echo_trace("carrier now sniff none");
         return;
     };
     if !h2 {
+        echo_trace("carrier now h1");
         return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
     }
+    echo_trace("carrier now h2");
     #[cfg(test)]
     if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
         paths.push(settings.path.clone());
