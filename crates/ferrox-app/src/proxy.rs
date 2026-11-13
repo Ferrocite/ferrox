@@ -34822,12 +34822,17 @@ fn inbound_id(inbound: &Json) -> [u8; 16] {
         .unwrap_or([0u8; 16])
 }
 
-/// Every vmess account the inbound names, with the email `RemoveUser` selects.
+/// Every vmess account the inbound names, with the email `RemoveUser` selects; `clients` is the
+/// reference's alias for `users` and names the whole table when it is present.
 fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
     let entries = inbound
         .get("settings")
-        .and_then(|settings| settings.get("clients"))
-        .and_then(Json::as_arr)
+        .and_then(|settings| {
+            settings
+                .get("clients")
+                .and_then(Json::as_arr)
+                .or_else(|| settings.get("users").and_then(Json::as_arr))
+        })
         .map(|clients| {
             clients
                 .iter()
@@ -49176,6 +49181,35 @@ mod tests {
             "security none without an experiment is still the reference's auto"
         );
         let _ = std::fs::remove_file(&ca);
+    }
+
+    /// `infra/conf/vmess.go` (`VMessInboundConfig.Build`) aliases `users` to `clients` when
+    /// `clients` is present; a config the reference serves cannot lose an account here.
+    #[test]
+    fn vmess_inbound_serves_every_user_under_either_spelling() {
+        let users = crate::json::parse(
+            r#"{"settings":{"users":[
+                {"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","email":"a","level":1,
+                    "experiments":"NoTerminationSignal"},
+                {"id":"11111111-2222-3333-4444-555555555555","email":"b","level":2}
+            ]}}"#,
+        )
+        .expect("parses");
+        let rows = inbound_vmess_users(&users).list();
+        assert_eq!(rows.len(), 2, "every settings.users entry is served");
+        assert_eq!((rows[0].email.as_str(), rows[0].level), ("a", 1));
+        assert!(rows[0].no_termination);
+        assert_eq!((rows[1].email.as_str(), rows[1].level), ("b", 2));
+        let both = crate::json::parse(
+            r#"{"settings":{
+                "users":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","email":"a"}],
+                "clients":[{"id":"11111111-2222-3333-4444-555555555555","email":"c"}]
+            }}"#,
+        )
+        .expect("parses");
+        let rows = inbound_vmess_users(&both).list();
+        assert_eq!(rows.len(), 1, "clients names the whole table when present");
+        assert_eq!(rows[0].email, "c");
     }
 
     #[test]
