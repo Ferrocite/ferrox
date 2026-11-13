@@ -297,8 +297,10 @@ struct AckEntry {
 
 // Upstream bounds an ack's number list and the deferred-candidate buffer separately, and they are separate limits that happen to share a value.
 const FLUSH_CANDIDATES: usize = 128;
+const ACK_ENTRY_LIMIT: usize = 1024;
+const ACK_DUPLICATE_ALLOWANCE: usize = 128;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AckList {
     entries: Vec<AckEntry>,
     candidates: Vec<u32>,
@@ -307,6 +309,13 @@ pub struct AckList {
     /// keeps one allocation instead of a fresh `Vec<u32>` per emitted ack.
     scratch: AckSegment,
     dirty: bool,
+    limit: usize,
+}
+
+impl Default for AckList {
+    fn default() -> Self {
+        Self::with_limit(ACK_ENTRY_LIMIT)
+    }
 }
 
 impl AckList {
@@ -315,13 +324,23 @@ impl AckList {
         Self::default()
     }
 
+    #[must_use]
+    pub(crate) fn for_window(window_size: u32) -> Self {
+        Self::with_limit(window_size as usize + ACK_DUPLICATE_ALLOWANCE)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            candidates: Vec::new(),
+            scratch: AckSegment::default(),
+            dirty: false,
+            limit: limit.max(1),
+        }
+    }
+
     pub fn add(&mut self, number: u32, timestamp: u32) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.number == number) {
-            if timestamp.wrapping_sub(entry.timestamp) < 0x7FFF_FFFF {
-                entry.timestamp = timestamp;
-            }
-            entry.next_flush = 0;
-            self.dirty = true;
+        if self.entries.len() >= self.limit {
             return;
         }
         self.entries.push(AckEntry {
@@ -367,6 +386,7 @@ impl AckList {
             candidates,
             scratch,
             dirty,
+            ..
         } = self;
         scratch.begin(limit);
         let timeout = (rto / 2).max(20);
@@ -645,37 +665,47 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_segment_refreshes_its_ack_instead_of_growing_the_list() {
+    fn a_duplicate_segment_is_acknowledged_again_like_the_reference() {
+        use std::fmt::Write as _;
+
         let mut l = AckList::new();
         l.add(7, 100);
-        let mut emitted = Vec::new();
-        l.flush(0, 100, 300, &mut |seg: &mut AckSegment| {
-            emitted.push(seg.numbers.clone());
-        });
-        assert_eq!(emitted, vec![vec![7]]);
-        for _ in 0..64 {
-            l.add(7, 200);
-        }
+        l.add(7, 200);
         assert_eq!(
             l.entries.len(),
-            1,
-            "a repeated segment added a second entry"
+            2,
+            "the reference appends a repeated segment"
         );
-        assert_eq!(l.entries[0].timestamp, 200);
-        l.add(7, 100);
-        assert_eq!(
-            l.entries[0].timestamp, 200,
-            "a late older retransmission rewound the timestamp"
-        );
-        assert_eq!(
-            l.entries[0].next_flush, 0,
-            "a repeated segment is due again"
-        );
-        emitted.clear();
-        l.flush(1, 100, 300, &mut |seg: &mut AckSegment| {
-            emitted.push(seg.numbers.clone());
+        assert_eq!(l.entries[0].timestamp, 100);
+        assert_eq!(l.entries[1].timestamp, 200);
+        let mut numbers = Vec::new();
+        let mut wire = Vec::new();
+        l.flush(0, 100, 300, &mut |seg: &mut AckSegment| {
+            numbers.push(seg.numbers.clone());
+            seg.serialize(&mut wire);
         });
-        assert_eq!(emitted, vec![vec![7]], "the repeated segment re-acked once");
+        assert_eq!(numbers, vec![vec![7, 7]]);
+        let mut wire_hex = String::new();
+        for byte in &wire {
+            write!(wire_hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(
+            wire_hex,
+            "000000000000000000000000000000c8020000000700000007"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_flood_is_bounded_by_the_ack_list_limit() {
+        let mut l = AckList::for_window(1);
+        for timestamp in 0..=ACK_DUPLICATE_ALLOWANCE as u32 + 1 {
+            l.add(7, timestamp);
+        }
+        assert_eq!(l.entries.len(), 1 + ACK_DUPLICATE_ALLOWANCE);
+        assert_eq!(
+            l.entries.last().unwrap().timestamp,
+            ACK_DUPLICATE_ALLOWANCE as u32
+        );
     }
 
     #[test]
