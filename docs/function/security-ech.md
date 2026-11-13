@@ -25,7 +25,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | aes256-gcm-seal-retired-instructions | 14957 | scripts/count-ops.sh |
-| aes256-gcm-open-retired-instructions | 15301 | scripts/count-ops.sh |
+| aes256-gcm-open-retired-instructions | 15329 | scripts/count-ops.sh |
 | syscalls-per-ech-handshake | UNBLESSED | scripts/count-ops.sh |
 | user-space-copies-per-ech-handshake | UNBLESSED | no copy checker yet |
 | seconds-per-ech-handshake | UNBLESSED | CI bench.yml (no cell yet) |
@@ -54,7 +54,7 @@ The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key
   'ferrox_core::tls::hpke::Context::open'
 ```
 
-The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, under a fixed hello and fixed inner length. The rows price `Context::seal_owned` and `Context::open`, including call costs attributed to those frames, but exclude the HPKE context setup `Context::new` performs; the AEAD body is attributed to a separate frame in this binary's thin-LTO layout. `ops.yml` on this head reports `seal_owned` 14957, down from 15414 when the cover was sealed through a fresh ciphertext buffer, and `open` 15301, whose code is unchanged and whose frame moved again with this offer's layout; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
+The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, under a fixed hello and fixed inner length. The rows price `Context::seal_owned` and `Context::open`, including call costs attributed to those frames, but exclude the HPKE context setup `Context::new` performs; the AEAD body is attributed to a separate frame in this binary's thin-LTO layout. `ops.yml` on this head reports `seal_owned` 14957, down from 15414 when the cover was sealed through a fresh ciphertext buffer, and `open` 15329, whose AES-GCM code is unchanged and whose frame moved 28 Ir with this offer's allocation shape: the cipher-list reserve takes two reallocations out of `enable_ech`, and the open's fallback allocation lands on a different allocator path. This host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
 
 ## Time
 
