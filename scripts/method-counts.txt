@@ -673,7 +673,7 @@ security-tls-options server-curve-lists-picked-by-the-shaped-lane 1 ferrox-core-
 
 # --- ECH -------------------------------------------------------------------
 security-ech aes256-gcm-seal-retired-instructions 14957 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 15329 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15298 scripts/count-ops.sh
 security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
 security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
 security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)
