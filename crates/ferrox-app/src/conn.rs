@@ -415,7 +415,7 @@ impl std::io::Read for HeaderWire<'_> {
                 "the header handshake deadline passed",
             ));
         }
-        let _ = self.stream.set_read_timeout(Some(left));
+        self.stream.set_read_timeout(Some(left))?;
         let Some(chain) = self.read_chain else {
             return (&*self.stream).read(buf);
         };
