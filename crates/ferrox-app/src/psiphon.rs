@@ -974,6 +974,7 @@ struct Inner {
     next_session: AtomicUsize,
     affinity: Mutex<Option<(String, u16)>>,
     moved_to_front: Mutex<HashSet<String>>,
+    dsl_placeholders: Arc<Mutex<Vec<DslPlaceholder>>>,
     connecting: Mutex<()>,
     session_id: String,
     stopping: AtomicBool,
@@ -1159,6 +1160,73 @@ struct DslTag {
     prioritize: bool,
 }
 
+struct DslPlaceholder {
+    host: String,
+    port: u16,
+    created: Instant,
+}
+
+fn dsl_placeholder_position(
+    placeholders: &[DslPlaceholder],
+    host: &str,
+    port: u16,
+) -> Option<usize> {
+    placeholders
+        .iter()
+        .position(|placeholder| placeholder.host == host && placeholder.port == port)
+}
+
+fn expire_dsl_placeholder(
+    placeholders: &Mutex<Vec<DslPlaceholder>>,
+    host: &str,
+    port: u16,
+    ttl: Duration,
+) {
+    if ttl.is_zero() {
+        return;
+    }
+    lock(placeholders).retain(|placeholder| {
+        !(placeholder.host == host
+            && placeholder.port == port
+            && placeholder.created.elapsed() >= ttl)
+    });
+}
+
+fn clear_dsl_placeholder(placeholders: &Mutex<Vec<DslPlaceholder>>, host: &str, port: u16) {
+    let mut list = lock(placeholders);
+    if let Some(at) = dsl_placeholder_position(&list, host, port) {
+        list.remove(at);
+    }
+}
+
+fn retain_dsl_placeholder(
+    placeholders: &Mutex<Vec<DslPlaceholder>>,
+    host: &str,
+    port: u16,
+    retain: f64,
+) {
+    if coin(retain) {
+        return;
+    }
+    clear_dsl_placeholder(placeholders, host, port);
+}
+
+fn promote_dsl_placeholders(
+    placeholders: &Mutex<Vec<DslPlaceholder>>,
+    entries: &mut Vec<Server>,
+    moved: &mut HashSet<String>,
+    max: i64,
+) {
+    for placeholder in lock(placeholders).iter() {
+        if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
+            break;
+        }
+        if move_to_front(entries, &placeholder.host, placeholder.port) {
+            moved.insert(format!("{}:{}", placeholder.host, placeholder.port));
+        }
+    }
+}
+
 impl Dsl {
     fn resolved(config: Option<&Json>, tactics: Option<&Json>) -> Self {
         let mut dsl = Self::default();
@@ -1314,6 +1382,8 @@ struct Settings {
     compress_tactics: bool,
     server_entry_max_move_to_front: i64,
     server_entry_reset_probability: f64,
+    dsl_retain_failed: f64,
+    dsl_placeholder_ttl: Duration,
     restrict_direct_regions: Vec<(String, Vec<String>)>,
     restrict_direct_probability: f64,
     restrict_inproxy_regions: Vec<(String, Vec<String>)>,
@@ -1531,6 +1601,7 @@ impl PsiphonOut {
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(affinity),
             moved_to_front: Mutex::new(HashSet::new()),
+            dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint,
@@ -1699,6 +1770,17 @@ impl Inner {
                 shuffle(entries.as_mut_slice());
                 lock(&self.moved_to_front).clear();
             }
+            let has_placeholders = { !lock(&self.dsl_placeholders).is_empty() };
+            if has_placeholders {
+                let entries = Arc::make_mut(&mut *guard);
+                let mut moved = lock(&self.moved_to_front);
+                promote_dsl_placeholders(
+                    &self.dsl_placeholders,
+                    entries,
+                    &mut moved,
+                    self.settings.server_entry_max_move_to_front,
+                );
+            }
             Arc::clone(&*guard)
         };
         let affinity = lock(&self.affinity);
@@ -1863,6 +1945,9 @@ impl Inner {
             let ssh_algorithms = self.settings.ssh_algorithms.clone();
             let config_state = self.config_state;
             let replay = Arc::clone(&self.replay);
+            let dsl_placeholders = Arc::clone(&self.dsl_placeholders);
+            let dsl_retain_failed = self.settings.dsl_retain_failed;
+            let dsl_placeholder_ttl = self.settings.dsl_placeholder_ttl;
             let conduit =
                 if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
                     match self.conduit() {
@@ -1881,6 +1966,12 @@ impl Inner {
                 let lease = replay.begin(server, config_state);
                 let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());
                 let selected = lease.server();
+                expire_dsl_placeholder(
+                    &dsl_placeholders,
+                    &server.host,
+                    server.port,
+                    dsl_placeholder_ttl,
+                );
                 let timeout = if conduit.is_some() && selected.inproxy.is_some() {
                     conduit_timeout
                 } else {
@@ -1917,8 +2008,17 @@ impl Inner {
                     Some(Arc::clone(&requests)),
                     burst,
                 ) {
-                    Ok(session) => Ok((session, lease)),
+                    Ok(session) => {
+                        clear_dsl_placeholder(&dsl_placeholders, &server.host, server.port);
+                        Ok((session, lease))
+                    }
                     Err(why) => {
+                        retain_dsl_placeholder(
+                            &dsl_placeholders,
+                            &server.host,
+                            server.port,
+                            dsl_retain_failed,
+                        );
                         lease.failed();
                         Err(why)
                     }
@@ -2221,7 +2321,7 @@ impl Inner {
         Ok(added)
     }
 
-    /// Move one DSL-prioritized entry to the dial head, under the same cap as a live server.
+    /// Record a DSL-prioritized entry; the next dial round promotes it under the live-server cap.
     fn prioritize_tag(&self, tag: &str) {
         if tag.is_empty() {
             return;
@@ -2230,22 +2330,23 @@ impl Inner {
         if max == 0 {
             return;
         }
-        let mut entries = lock(&self.entries);
-        let mut moved = lock(&self.moved_to_front);
-        if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
-            return;
-        }
-        let list = Arc::make_mut(&mut *entries);
-        let Some(at) = list.iter().position(|entry| entry.dsl_tag() == tag) else {
+        let entries = lock(&self.entries);
+        let Some(entry) = entries.iter().find(|entry| entry.dsl_tag() == tag) else {
             return;
         };
-        if at == 0 {
-            return;
+        let host = entry.host.clone();
+        let port = entry.port;
+        drop(entries);
+        let mut placeholders = lock(&self.dsl_placeholders);
+        if let Some(at) = dsl_placeholder_position(&placeholders, &host, port) {
+            placeholders[at].created = Instant::now();
+        } else {
+            placeholders.push(DslPlaceholder {
+                host,
+                port,
+                created: Instant::now(),
+            });
         }
-        let entry = list.remove(at);
-        let key = format!("{}:{}", entry.host, entry.port);
-        list.insert(0, entry);
-        moved.insert(key);
     }
 
     /// Apply the server's handshake reply: a steering IP for the fronting provider and new entries.
@@ -4156,6 +4257,11 @@ impl Settings {
             )
             .unwrap_or(1.0)
             .clamp(0.0, 1.0),
+            dsl_retain_failed: decimal(settings, "DSLPrioritizeDialRetainFailedProbability")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            dsl_placeholder_ttl: number(settings, "DSLPrioritizeDialPlaceholderTTLSeconds")
+                .map_or(Duration::from_hours(24), Duration::from_secs),
             restrict_direct_regions: key_strings(settings, "RestrictDirectProviderRegions"),
             restrict_direct_probability: decimal(
                 settings,
@@ -5830,6 +5936,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "DisableDSLFetcher",
     "DSLPrioritizeDialNewServerEntryProbability",
     "DSLPrioritizeDialExistingServerEntryProbability",
+    "DSLPrioritizeDialRetainFailedProbability",
+    "DSLPrioritizeDialPlaceholderTTLSeconds",
     "ServerEntryIteratorMaxMoveToFront",
     "ServerEntryIteratorResetProbability",
     "RestrictDirectProviderIDsClientProbability",
@@ -14658,6 +14766,7 @@ mod tests {
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
+            dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -14725,6 +14834,7 @@ mod tests {
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
+            dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -15222,6 +15332,114 @@ mod tests {
         assert!(!off.compress_tactics);
     }
 
+    #[test]
+    fn the_dsl_placeholder_knobs_are_read() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"DSLPrioritizeDialPlaceholderTTLSeconds":7,"DSLPrioritizeDialRetainFailedProbability":0.25}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.dsl_placeholder_ttl, Duration::from_secs(7));
+        assert!((settings.dsl_retain_failed - 0.25).abs() < f64::EPSILON);
+        let defaults =
+            Settings::from_json(Some(&json::parse("{}").expect("settings"))).expect("settings");
+        assert_eq!(defaults.dsl_placeholder_ttl, Duration::from_hours(24));
+        assert!((defaults.dsl_retain_failed - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_dsl_placeholder_promotes_and_expires() {
+        let mut entries = vec![test_server(false), test_server(false), test_server(false)];
+        for (at, entry) in entries.iter_mut().enumerate() {
+            entry.host = char::from(b'a' + u8::try_from(at).expect("index")).to_string();
+        }
+        let placeholders = Mutex::new(vec![DslPlaceholder {
+            host: "c".to_owned(),
+            port: 22,
+            created: Instant::now(),
+        }]);
+        let mut moved = HashSet::new();
+        promote_dsl_placeholders(&placeholders, &mut entries, &mut moved, -1);
+        assert_eq!(entries[0].host, "c");
+        assert!(moved.contains("c:22"));
+        expire_dsl_placeholder(&placeholders, "c", 22, Duration::from_hours(24));
+        assert_eq!(lock(&placeholders).len(), 1);
+        expire_dsl_placeholder(&placeholders, "c", 22, Duration::ZERO);
+        assert_eq!(lock(&placeholders).len(), 1);
+        let old = lock(&placeholders)[0].created - Duration::from_secs(2);
+        lock(&placeholders)[0].created = old;
+        expire_dsl_placeholder(&placeholders, "c", 22, Duration::from_secs(1));
+        assert!(lock(&placeholders).is_empty());
+        lock(&placeholders).push(DslPlaceholder {
+            host: "c".to_owned(),
+            port: 22,
+            created: Instant::now(),
+        });
+        retain_dsl_placeholder(&placeholders, "c", 22, 1.0);
+        assert_eq!(lock(&placeholders).len(), 1);
+        retain_dsl_placeholder(&placeholders, "c", 22, 0.0);
+        assert!(lock(&placeholders).is_empty());
+    }
+
+    #[test]
+    fn a_dsl_placeholder_reaches_the_start_of_the_next_round() {
+        let mut entries = vec![test_server(false), test_server(false), test_server(false)];
+        for (at, entry) in entries.iter_mut().enumerate() {
+            entry.host = char::from(b'a' + u8::try_from(at).expect("index")).to_string();
+        }
+        let placeholders = Arc::new(Mutex::new(vec![DslPlaceholder {
+            host: "c".to_owned(),
+            port: 22,
+            created: Instant::now(),
+        }]));
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"ServerEntryIteratorResetProbability":0}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let inner = Inner {
+            session_id: String::new(),
+            settings,
+            config_state: 0,
+            entries: Mutex::new(Arc::new(entries)),
+            sloks: crate::psiphon_osl::SlokStore::open(None),
+            requests: Arc::new(crate::psiphon_osl::ServerEvents {
+                sloks: crate::psiphon_osl::SlokStore::open(None),
+                seeded: Arc::new(AtomicBool::new(false)),
+                emit_alerts: false,
+                emit_sloks: false,
+            }),
+            osl_seeded: Arc::new(AtomicBool::new(false)),
+            last_osl: Mutex::new(None),
+            last_osl_failure: Mutex::new(None),
+            upgrade_started: Arc::new(AtomicBool::new(false)),
+            last_upgrade_attempt: Mutex::new(None),
+            dsl_running: AtomicBool::new(false),
+            dsl_last_fetch: Mutex::new(None),
+            self_ref: Mutex::new(Weak::new()),
+            sessions: Mutex::new(Vec::new()),
+            next_session: AtomicUsize::new(0),
+            affinity: Mutex::new(None),
+            moved_to_front: Mutex::new(HashSet::new()),
+            dsl_placeholders: Arc::clone(&placeholders),
+            connecting: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+            endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
+            http_endpoint: None,
+            udpgw: Mutex::new(None),
+            conduit: Mutex::new(None),
+            split_untunneled: Mutex::new(HashMap::new()),
+            replay: Arc::new(crate::psiphon_replay::Cache::new(
+                crate::psiphon_replay::Settings::default(),
+            )),
+            light: None,
+        };
+        let (at, _) = inner.start();
+        assert_eq!(at, 0);
+        assert_eq!(lock(&inner.entries)[0].host, "c");
+    }
+
     /// The affinity lookup compares the entry's own fields, so a dial does not
     /// format a `host:port` string for every server it scans past.
     #[test]
@@ -15260,6 +15478,7 @@ mod tests {
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(Some(affinity.clone())),
             moved_to_front: Mutex::new(HashSet::new()),
+            dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
