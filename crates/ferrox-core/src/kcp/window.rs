@@ -224,7 +224,8 @@ impl ReceivingWindow {
 
     pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
         self.ensure_allocated();
-        let slot = &mut self.slots[self.index(id)];
+        let index = self.index(id);
+        let slot = &mut self.slots[index];
         if slot.is_some() {
             return false;
         }
@@ -241,7 +242,8 @@ impl ReceivingWindow {
         if self.slots.is_empty() {
             return None;
         }
-        self.slots[self.index(id)].take()
+        let index = self.index(id);
+        self.slots[index].take()
     }
 
     pub fn release(&mut self) {
@@ -727,10 +729,7 @@ mod tests {
         }
         assert_eq!(w.slots.as_ptr(), base, "a full window moved the ring");
         assert_eq!(w.slots.capacity(), capacity);
-        assert!(
-            !w.set(3, receive_segment(3)),
-            "a duplicate must be refused"
-        );
+        assert!(!w.set(3, receive_segment(3)), "a duplicate must be refused");
         for number in 0..8 {
             assert!(w.has(number));
             assert_eq!(w.remove(number).map(|seg| seg.number), Some(number));
@@ -738,7 +737,11 @@ mod tests {
         for number in 8..16 {
             assert!(w.set(number, receive_segment(number)));
         }
-        assert_eq!(w.slots.as_ptr(), base, "the second lap reallocated the ring");
+        assert_eq!(
+            w.slots.as_ptr(),
+            base,
+            "the second lap reallocated the ring"
+        );
         assert_eq!(w.slots.capacity(), capacity);
     }
 
