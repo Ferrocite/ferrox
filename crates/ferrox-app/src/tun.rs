@@ -2105,11 +2105,13 @@ mod tests {
     #[test]
     fn a_packet_too_big_shrinks_the_response_segment() {
         let (a, b) = unix_socketpair().unwrap();
-        let mut handler = Handler::new(
-            Device::from_handle(a, DEFAULT_MTU),
-            Arc::new(|_conn, _dest| Ok(())),
-            no_associate(),
-        );
+        let (_release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(std::sync::Mutex::new(hold));
+        let relay: Relay = Arc::new(move |_conn, _dest| {
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        });
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut peer = b;
         let client = ([10, 0, 0, 2], 44444);
         let endpoint = ([10, 0, 0, 1], 8080);
@@ -2160,11 +2162,13 @@ mod tests {
     #[test]
     fn a_v6_packet_too_big_shrinks_the_response_segment() {
         let (a, b) = unix_socketpair().unwrap();
-        let mut handler = Handler::new(
-            Device::from_handle(a, DEFAULT_MTU),
-            Arc::new(|_conn, _dest| Ok(())),
-            no_associate(),
-        );
+        let (_release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(std::sync::Mutex::new(hold));
+        let relay: Relay = Arc::new(move |_conn, _dest| {
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        });
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut peer = b;
         let client: IpAddr = "2001:db8::2".parse().unwrap();
         let endpoint: IpAddr = "2001:db8::1".parse().unwrap();
