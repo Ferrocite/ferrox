@@ -275,6 +275,7 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # The record bytes are the same as the merge-copy path this replaced.
 ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
-# the port, written in one match with the vector's room reserved exactly once.
-# The oracle test replays the pinned Go writer's bytes.
-ferrox_core::socks::request 867 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+# the port, written in one match with the vector's room reserved exactly once,
+# through `spare_capacity_mut` and `MaybeUninit::write` so no reference is formed
+# over uninitialized memory. The oracle test replays the pinned Go writer's bytes.
+ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes

@@ -50,7 +50,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 867 | scripts/count-ops.sh |
+| ops-retired-instructions | 895 | scripts/count-ops.sh |
 | socks-raw-down-8-client-mib-per-second | 2658 | CI benchmark-matrix.yml run 43292720499 |
 | socks-raw-down-8-server-mib-per-second | 2808 | CI benchmark-matrix.yml run 43292720499 |
 | oracle-lines-matching-the-pinned-go | 8 | ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes |
