@@ -2,7 +2,7 @@
 
 `tlsSettings.echConfigList` carries an ECH config list as raw base64 or as `name+udp://…` / `name+https://…/dns-query`, and one list feeds both client lanes: the stock rustls dial in `crates/ferrox-core/src/tls/rustls_backend.rs` and the shaped dial in `crates/ferrox-core/src/tls/shaped/client.rs`. `tlsSettings.echServerKeys` is the base64 `u16 key || u16 config` TLV a TLS listener answers through BoringSSL. A QUIC listener hands the same keys to quiche's BoringSSL context, and a QUIC dial offers the same list before its first packet, so this method carries both roles on both transports. `echSockopt` (also read as `echSocketSettings`) marks the socket that carries the ECH DNS query.
 
-The HPKE lane accepts X25519 with HKDF-SHA256 and AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305, so every suite an xray or sing-box key names is one this tree can answer. A bad config list fails the dial closed; a bad server key set refuses the inbound. A server that rejects an offer names its retry list, and the stock dial repeats the TCP and TLS handshake once with that list. The shaped lane reports the same list to the same one-retry caller. This is a setup path, not a per-record one.
+The HPKE lane accepts X25519 with HKDF-SHA256 and AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305, so every suite an xray or sing-box key names is one this tree can answer. A bad config list fails the dial closed; a bad server key set refuses the inbound. A BoringSSL server that rejects an offer names its retry list, and the stock dial repeats the TCP and TLS handshake once with that list. The shaped lane reports the same list to the same one-retry caller. That retry is a deliberate superset: Go's `SendAsRetry=false` leaves xray's rejected answer without a list, while every xray and sing-box client here can use one. This is a setup path, not a per-record one.
 
 ## Data path
 
@@ -15,7 +15,7 @@ graph TD
     T --> S["Server: BoringSSL answers<br/>or rejects with a retry list"]
     Q --> S
     S -->|accepted| W(("inner handshake<br/>on the wire"))
-    S -->|rejected| D["one redial with<br/>the retry list"]
+    S -->|rejected| D["one redial with<br/>the retry list (superset)"]
     D --> W
 ```
 
@@ -58,7 +58,7 @@ The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals th
 
 ## Time
 
-No matrix cell isolates ECH: the bench cells time a relay after the handshake, and an ECH dial does one extra TCP/TLS handshake only when the server rejects the offer. No duration is quoted here. The byte order is the gate: accepted offers keep xray's inner handshake, while a rejected offer follows this tree's one-retry path rather than xray's `SendAsRetry=false`.
+No matrix cell isolates ECH: the bench cells time a relay after the handshake, and an ECH dial does one extra TCP/TLS handshake only when the server rejects the offer. No duration is quoted here. The byte order is the gate: accepted offers keep xray's inner handshake, while a rejected offer follows this tree's one-retry path with the list BoringSSL returns where xray's `SendAsRetry=false` sends none.
 
 ## What we removed
 
@@ -71,7 +71,7 @@ No matrix cell isolates ECH: the bench cells time a relay after the handshake, a
 - **A config rebuild for the retry.** The rejected offer clones the parsed `TlsConfig`, replaces its `ech_config_list` `Arc`, and reuses every other field; no text is parsed again and no server name is resolved again.
 - **A second accept loop for QUIC.** The listener's BoringSSL context is built once per identity and shared with quiche; the dial sets the list on the connection it already made.
 
-What was **not** removed: the retry costs one extra connection when a server rejects, and BoringSSL requires at least one retry config where Go/xray's `SendAsRetry=false` sends none, so a rejection's retry-list bytes differ from the reference even though an accepted offer does not.
+What was **not** removed: the retry costs one extra connection when a server rejects, and BoringSSL requires at least one retry config where Go/xray's `SendAsRetry=false` sends none. That list is kept on purpose: it lets an xray or sing-box client recover without a second DNS query, so the rejected answer is a superset of xray's rather than a byte-for-byte copy, while an accepted offer is unchanged.
 
 ## Pins
 
