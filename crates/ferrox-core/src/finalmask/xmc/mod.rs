@@ -1,4 +1,5 @@
 pub mod cfb8;
+pub mod deadline;
 pub mod derivation;
 pub mod packet_stream;
 pub mod padding;
@@ -8,6 +9,7 @@ pub mod protocol;
 pub mod session;
 
 pub use cfb8::Cfb8;
+pub use deadline::{DeadlineReader, HandshakeDeadline, ReadClock};
 pub use derivation::{derive_rsa_key, private_key_der, public_key_der};
 pub use packet_stream::PacketStream;
 pub use padding::{run, validate_schedule, DelayRange, Direction, Turn, Variant};

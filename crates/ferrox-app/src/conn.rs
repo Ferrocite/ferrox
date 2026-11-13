@@ -86,10 +86,14 @@ pub(crate) struct Masked {
 struct XmcState {
     config: ferrox_core::finalmask::xmc::Config,
     role: ferrox_core::finalmask::MaskRole,
-    session: std::sync::OnceLock<Result<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>, String>>,
+    session: std::sync::OnceLock<
+        Result<std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>, String>,
+    >,
 }
 
 type XmcSession<R, W> = ferrox_core::finalmask::xmc::Session<R, W>;
+type DeadlineReader<R> = ferrox_core::finalmask::xmc::DeadlineReader<R>;
+type HandshakeDeadline = ferrox_core::finalmask::xmc::HandshakeDeadline;
 
 #[derive(Debug)]
 struct XmcWriter {
@@ -119,7 +123,7 @@ impl XmcState {
         &self,
         stream: &TcpStream,
         chain: &std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
-    ) -> io::Result<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>> {
+    ) -> io::Result<std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>> {
         let result = self.session.get_or_init(|| {
             let saved_read = stream.read_timeout().ok().flatten();
             let saved_write = stream.write_timeout().ok().flatten();
@@ -127,6 +131,8 @@ impl XmcState {
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
                 let reader = stream.try_clone()?;
+                let deadline = HandshakeDeadline::begin(XMC_HANDSHAKE_TIMEOUT);
+                let reader = DeadlineReader::new(reader, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
                     chain: std::sync::Arc::clone(chain),
@@ -139,6 +145,7 @@ impl XmcState {
                         XmcSession::server(reader, writer, &self.config)?
                     }
                 };
+                deadline.end();
                 Ok::<_, io::Error>(std::sync::Arc::new(session))
             })();
             let _ = stream.set_read_timeout(saved_read);
@@ -158,7 +165,9 @@ impl Masked {
         self.xmc_session().map(|_| ())
     }
 
-    fn xmc_session(&self) -> io::Result<Option<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>>> {
+    fn xmc_session(
+        &self,
+    ) -> io::Result<Option<std::sync::Arc<XmcSession<DeadlineReader<TcpStream>, XmcWriter>>>> {
         self.ensure_header()?;
         match &self.xmc {
             Some(state) => state.session(&self.stream, &self.chain).map(Some),
