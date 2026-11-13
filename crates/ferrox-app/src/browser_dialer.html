@@ -6,6 +6,9 @@
 const token = "csrfToken";
 const endpoint = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/websocket?token=${token}`;
 const IDLE = 8;
+const RECONNECT_MIN = 100;
+const RECONNECT_MAX = 5000;
+let reconnect = RECONNECT_MIN;
 
 function initFor(task) {
   const init = {};
@@ -43,10 +46,21 @@ function clearCookies(task) {
 async function run(ws, task) {
   if (task.method === "WS") {
     const extra = task.extra || {};
-    const target = new WebSocket(task.url, extra.protocol || undefined);
+    let target;
+    try {
+      target = new WebSocket(task.url, extra.protocol || undefined);
+    } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+      return;
+    }
     target.binaryType = "arraybuffer";
     let open = false;
-    ws.onmessage = (event) => target.send(event.data);
+    ws.onmessage = (event) => {
+      if (target.readyState === WebSocket.OPEN) {
+        try { target.send(event.data); } catch (_) { target.close(); }
+      }
+    };
     target.onopen = () => { open = true; ws.send("ok"); };
     target.onmessage = (event) => ws.send(event.data);
     target.onclose = () => ws.close();
@@ -69,7 +83,6 @@ async function run(ws, task) {
     try {
       setCookies(task);
       const response = await fetch(task.url, init);
-      clearCookies(task);
       reader = response.body.getReader();
       for (;;) {
         const { done, value } = await reader.read();
@@ -78,6 +91,7 @@ async function run(ws, task) {
       }
     } catch (_) {
     } finally {
+      try { clearCookies(task); } catch (_) {}
       ws.close();
     }
     return;
@@ -92,11 +106,11 @@ async function run(ws, task) {
         if (event.data.byteLength > 0) init.body = event.data;
         setCookies(task);
         const response = await fetch(task.url, init);
-        clearCookies(task);
         ws.send(response.ok ? "ok" : "fail");
       } catch (_) {
         try { ws.send("fail"); } catch (_) {}
       } finally {
+        try { clearCookies(task); } catch (_) {}
         ws.close();
       }
     };
@@ -108,15 +122,39 @@ async function run(ws, task) {
 }
 
 function respawn() {
-  setTimeout(connect, 100);
+  const wait = reconnect;
+  reconnect = Math.min(reconnect * 2, RECONNECT_MAX);
+  setTimeout(connect, wait);
 }
 
 function connect() {
-  const ws = new WebSocket(endpoint);
+  let ws;
+  try {
+    ws = new WebSocket(endpoint);
+  } catch (_) {
+    respawn();
+    return;
+  }
   ws.binaryType = "arraybuffer";
-  ws.onmessage = (event) => run(ws, JSON.parse(event.data));
+  ws.onopen = () => { reconnect = RECONNECT_MIN; };
+  ws.onmessage = (event) => {
+    let task;
+    try {
+      task = JSON.parse(event.data);
+    } catch (_) {
+      ws.close();
+      return;
+    }
+    try {
+      const pending = run(ws, task);
+      if (pending && pending.catch) pending.catch(() => ws.close());
+    } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+    }
+  };
   ws.onclose = respawn;
-  ws.onerror = () => ws.close();
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };
 }
 
 for (let i = 0; i < IDLE; i++) connect();

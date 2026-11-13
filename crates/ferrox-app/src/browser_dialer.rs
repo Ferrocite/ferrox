@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,8 @@ use crate::ws::{WsReader, WsWriter};
 const PAGE: &str = include_str!("browser_dialer.html");
 const POOL: usize = 256;
 const TASK: Duration = Duration::from_secs(8);
+const TASK_TOTAL: Duration = Duration::from_secs(16);
+const CONNECTIONS: usize = 512;
 const HEAD_LIMIT: usize = 16 * 1024;
 
 static BRIDGE: OnceLock<Option<Arc<Bridge>>> = OnceLock::new();
@@ -45,6 +48,14 @@ struct Slot {
     writer: WsWriter,
 }
 
+struct Live(Arc<Bridge>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct Bridge {
     #[cfg_attr(not(test), allow(dead_code, reason = "the page port is a test hook"))]
     addr: SocketAddr,
@@ -52,6 +63,7 @@ pub(crate) struct Bridge {
     page: String,
     queue: Mutex<VecDeque<Slot>>,
     ready: Condvar,
+    live: AtomicUsize,
 }
 
 impl Bridge {
@@ -65,6 +77,7 @@ impl Bridge {
             token,
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
+            live: AtomicUsize::new(0),
         });
         let worker = Arc::clone(&bridge);
         std::thread::Builder::new()
@@ -82,12 +95,29 @@ impl Bridge {
     fn accept(self: Arc<Self>, listener: &TcpListener) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
+                std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
+            if self
+                .live
+                .try_update(Ordering::AcqRel, Ordering::Relaxed, |live| {
+                    (live < CONNECTIONS).then_some(live + 1)
+                })
+                .is_err()
+            {
+                continue;
+            }
             let this = Arc::clone(&self);
-            let _ = std::thread::Builder::new()
+            if std::thread::Builder::new()
                 .name("browser-page".to_owned())
-                .spawn(move || this.serve(Connection::Tcp(stream)));
+                .spawn(move || {
+                    let live = Live(this);
+                    live.0.serve(Connection::Tcp(stream));
+                })
+                .is_err()
+            {
+                self.live.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -102,6 +132,16 @@ impl Bridge {
         let Some(target) = request_target(&head[..at]) else {
             return;
         };
+        if self.addr.ip().is_loopback() {
+            let allowed = request_host(&head[..at]).is_some_and(host_is_loopback);
+            if !allowed {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+        }
         if target.split('?').next() == Some("/websocket") {
             if !has_token(target, &self.token) {
                 let _ = stream.write_all(
@@ -118,7 +158,7 @@ impl Bridge {
             return;
         }
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; connect-src http: https: ws: wss:\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             self.page.len(),
             self.page
         );
@@ -139,8 +179,7 @@ impl Bridge {
         self.ready.notify_one();
     }
 
-    fn take(&self) -> Option<Slot> {
-        let deadline = Instant::now() + TASK;
+    fn take(&self, deadline: Instant) -> Option<Slot> {
         let mut queue = self.queue.lock().ok()?;
         loop {
             if let Some(slot) = queue.pop_front() {
@@ -161,9 +200,15 @@ impl Bridge {
     fn task(&self, task: &Json) -> Option<Slot> {
         let mut text = String::new();
         json::write(task, &mut text);
+        let deadline = Instant::now() + TASK_TOTAL;
         loop {
-            let mut slot = self.take()?;
-            slot.reader.set_poll(Some(TASK));
+            let mut slot = self.take(deadline)?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                slot.writer.close();
+                return None;
+            }
+            slot.reader.set_poll(Some(left.min(TASK)));
             if !slot.writer.send_text(text.as_bytes()) {
                 slot.writer.close();
                 continue;
@@ -395,16 +440,53 @@ fn request_target(head: &[u8]) -> Option<&str> {
     text.split("\r\n").next()?.split(' ').nth(1)
 }
 
+fn request_host(head: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(head).ok()?;
+    text.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then_some(value.trim())
+    })
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let name = host
+        .rsplit_once(':')
+        .filter(|(_, port)| port.parse::<u16>().is_ok())
+        .map_or(host, |(name, _)| name);
+    let name = name
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(name);
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn has_token(target: &str, token: &str) -> bool {
     let Some((_, query)) = target.split_once('?') else {
         return false;
     };
-    query.split('&').any(|pair| {
+    let mut found = 0u8;
+    for pair in query.split('&') {
         let Some((name, value)) = pair.split_once('=') else {
-            return false;
+            continue;
         };
-        name == "token" && value == token
-    })
+        if name == "token" {
+            found |= u8::from(constant_time_eq(value.as_bytes(), token.as_bytes()));
+        }
+    }
+    found != 0
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 fn uuid_v4() -> Option<String> {
@@ -451,6 +533,14 @@ mod tests {
     }
 
     #[test]
+    fn only_loopback_hosts_reach_a_loopback_bridge() {
+        assert!(host_is_loopback("localhost:8080"));
+        assert!(host_is_loopback("127.0.0.1:8080"));
+        assert!(host_is_loopback("[::1]:8080"));
+        assert!(!host_is_loopback("evil.example:8080"));
+    }
+
+    #[test]
     fn head_parts_move_the_referrer_and_cookies_out_of_headers() {
         let parts = head_parts(
             "POST /a?b=c HTTP/1.1\r\nHost: example.com\r\nReferer: https://example.com/x\r\nCookie: a=1; b=2\r\nX-Test: yes\r\n\r\n",
@@ -471,7 +561,7 @@ mod tests {
         let bridge = Bridge::start("127.0.0.1:0").expect("starts");
         let page = std::net::TcpStream::connect(bridge.addr()).expect("connects");
         let mut page = Connection::Tcp(page);
-        page.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        page.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .expect("writes");
         let mut response = String::new();
         page.read_to_string(&mut response).expect("reads");
@@ -480,7 +570,7 @@ mod tests {
 
         let mut wrong = std::net::TcpStream::connect(bridge.addr()).expect("connects");
         wrong
-            .write_all(b"GET /websocket?token=nope HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(b"GET /websocket?token=nope HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .expect("writes");
         let mut status = [0u8; 12];
         wrong.read_exact(&mut status).expect("reads");

@@ -11428,13 +11428,31 @@ pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     resolve_name(address.as_ref(), port, true)
 }
 
+fn browser_host<'a>(
+    host: &'a str,
+    tls: Option<&ferrox_core::tls::TlsConfig>,
+    server: &'a SocketAddr,
+) -> std::borrow::Cow<'a, str> {
+    if !host.is_empty() {
+        return std::borrow::Cow::Borrowed(host);
+    }
+    if let Some(name) = tls
+        .map(|tls| tls.server_name.as_str())
+        .filter(|name| !name.is_empty())
+    {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    std::borrow::Cow::Owned(server.ip().to_string())
+}
+
 fn open_vless_browser_mux(vless: &VlessOut, server: &SocketAddr) -> Option<MuxUplink> {
     let header = vless_mux_header(&vless.id);
+    let host = browser_host(&vless.host, vless.tls.as_deref(), server);
     match &vless.carrier {
         Carrier::Ws { path, ed } => {
             let (read, writer) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
-                    host: &vless.host,
+                    host: &host,
                     port: server.port(),
                     tls: vless.tls.is_some(),
                     path,
@@ -11452,7 +11470,7 @@ fn open_vless_browser_mux(vless: &VlessOut, server: &SocketAddr) -> Option<MuxUp
         }
         Carrier::Xhttp { settings, .. } => {
             let (read, writer) =
-                browser_xhttp_pair(&vless.host, server.port(), vless.tls.is_some(), settings)?;
+                browser_xhttp_pair(&host, server.port(), vless.tls.is_some(), settings)?;
             let closer = writer.clone();
             vless_mux_carried(
                 vless,
@@ -11481,6 +11499,7 @@ fn dial_vless_browser(
         return true;
     };
     let tls = vless.tls.is_some();
+    let host = browser_host(&vless.host, vless.tls.as_deref(), server);
     match &vless.carrier {
         Carrier::Ws { path, ed } => {
             let first = if vless.encryption.is_some() {
@@ -11490,7 +11509,7 @@ fn dial_vless_browser(
             };
             let Some((reader, writer)) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
-                    host: &vless.host,
+                    host: &host,
                     port: server.port(),
                     tls,
                     path,
@@ -11521,8 +11540,7 @@ fn dial_vless_browser(
             true
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) =
-                browser_xhttp_pair(&vless.host, server.port(), tls, settings)
+            let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
                 note_dial_failure(
                     server,
@@ -18056,11 +18074,12 @@ fn dial_vmess_browser(
         return true;
     };
     let tls = vmess.tls.is_some();
+    let host = browser_host(&vmess.host, vmess.tls.as_deref(), server);
     match &vmess.carrier {
         Carrier::Ws { path, ed } => {
             let Some((reader, writer)) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
-                    host: &vmess.host,
+                    host: &host,
                     port: server.port(),
                     tls,
                     path,
@@ -18078,8 +18097,7 @@ fn dial_vmess_browser(
             true
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) =
-                browser_xhttp_pair(&vmess.host, server.port(), tls, settings)
+            let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
                 note_dial_failure(
                     server,
@@ -18379,11 +18397,12 @@ fn trojan_header(key: &[u8; 56], cmd: u8, target: &Destination) -> TrojanHeader 
 
 fn open_trojan_browser_mux(trojan: &TrojanOut, server: &SocketAddr) -> Option<MuxUplink> {
     let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    let host = browser_host(&trojan.host, trojan.tls.as_deref(), server);
     match &trojan.carrier {
         Carrier::Ws { path, ed } => {
             let (read, writer) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
-                    host: &trojan.host,
+                    host: &host,
                     port: server.port(),
                     tls: trojan.tls.is_some(),
                     path,
@@ -18399,7 +18418,7 @@ fn open_trojan_browser_mux(trojan: &TrojanOut, server: &SocketAddr) -> Option<Mu
         }
         Carrier::Xhttp { settings, .. } => {
             let (read, writer) =
-                browser_xhttp_pair(&trojan.host, server.port(), trojan.tls.is_some(), settings)?;
+                browser_xhttp_pair(&host, server.port(), trojan.tls.is_some(), settings)?;
             if !writer.send(&header) {
                 return None;
             }
@@ -18426,11 +18445,12 @@ fn dial_trojan_browser(
     }
     let header = trojan_header(&trojan.key, 1, target);
     let tls = trojan.tls.is_some();
+    let host = browser_host(&trojan.host, trojan.tls.as_deref(), server);
     match &trojan.carrier {
         Carrier::Ws { path, ed } => {
             let Some((mut reader, writer)) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
-                    host: &trojan.host,
+                    host: &host,
                     port: server.port(),
                     tls,
                     path,
@@ -18451,7 +18471,7 @@ fn dial_trojan_browser(
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((mut reader, writer)) =
-                browser_xhttp_pair(&trojan.host, server.port(), tls, settings)
+                browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
                 note_dial_failure(
                     server,
@@ -21416,11 +21436,12 @@ fn dial_ss_browser(
         return false;
     }
     let tls = ss.tls.is_some();
+    let host = browser_host(&ss.host, ss.tls.as_deref(), server);
     match &ss.carrier {
         Carrier::Ws { path, ed } => {
             let Some((reader, writer)) =
                 crate::browser_dialer::dial_ws(&crate::browser_dialer::WsTarget {
-                    host: &ss.host,
+                    host: &host,
                     port: server.port(),
                     tls,
                     path,
@@ -21441,7 +21462,7 @@ fn dial_ss_browser(
             true
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = browser_xhttp_pair(&ss.host, server.port(), tls, settings)
+            let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
                 note_dial_failure(
                     server,
