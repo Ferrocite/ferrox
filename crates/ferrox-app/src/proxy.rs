@@ -32677,6 +32677,17 @@ where
     let Ok(peer_write) = peer.try_clone() else {
         return None;
     };
+    // The header handshake is the blocking path's, finished before a readiness lane can ask for bytes.
+    if peer.masked() {
+        let saved = peer.read_timeout().unwrap_or(None);
+        let _ = peer.set_read_timeout(Some(crate::budgets::handshake()));
+        let completed = peer.complete_header();
+        let _ = peer.set_read_timeout(saved);
+        if let Err(error) = completed {
+            echo_trace(&format!("relay header handshake failed: {error:?}"));
+            return None;
+        }
+    }
     // The stall the buffered copy already arms, once per leg outside the byte loop: a peer that reads none of the download would otherwise pin this leg's read, and the join behind it, for the life of the process.
     let stall = budgets::relay_stall();
     // A parked lane read polls instead of waiting, and asks whether its sibling ended.

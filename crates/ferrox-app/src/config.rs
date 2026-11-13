@@ -2084,6 +2084,10 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
 /// one source of bytes is refused rather than guessed.
 pub(crate) fn header_custom(conf: Option<&Json>) -> Option<ferrox_core::finalmask::HeaderCustom> {
     use ferrox_core::finalmask::HeaderCustom;
+    match conf {
+        None | Some(Json::Null | Json::Obj(_)) => {}
+        Some(_) => return None,
+    }
     HeaderCustom::new(
         header_sequences(conf, "clients")?,
         header_sequences(conf, "servers")?,
@@ -2122,6 +2126,11 @@ fn header_sequences(
 
 fn header_item(node: &Json) -> Option<ferrox_core::finalmask::Item> {
     use ferrox_core::finalmask::Item;
+    match node {
+        Json::Obj(_) => {}
+        Json::Null => return Some(Item::default()),
+        _ => return None,
+    }
     let rand = match node.get("rand") {
         None | Some(Json::Null) => 0,
         Some(value) => i32::try_from(value.as_i64()?).ok()?,
@@ -3601,7 +3610,7 @@ mod tests {
             }}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{
                 "clients":[[{"transform":{"op":"concat","args":[
-                    {"u64":1},
+                    {"type":"hex","bytes":"01"},
                     {"transform":{"op":"le16","args":[{"u64":258}]}},
                     {"type":"hex","bytes":"c0de"}
                 ]},"capture":"tx"}]],
@@ -3621,12 +3630,17 @@ mod tests {
     #[test]
     fn a_header_custom_stage_refuses_a_mixed_or_underivable_sequence() {
         let refused = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":5}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":"empty"}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[5]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[["packet"]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"packet":[1],"reuse":"x"}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"rand":1,"capture":"bad-name"}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"rand":1,"randRange":"0-256"}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"rand":1,"randRange":"-1-4"}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"","args":[{"u64":1}]}}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"concat","args":[]}}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"concat","args":[{"u64":1}]}}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"concat","args":[{"u64":1,"reuse":"x"}]}}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"type":"bogus","packet":"x"}]]}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"packet":[1,2]},{"rand":1}]]}},{"type":"header-custom","settings":{}}]}}"#,

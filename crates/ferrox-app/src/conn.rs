@@ -133,10 +133,18 @@ impl Masked {
         }
     }
 
-    /// One nonblocking read after the handshake, which a server runs on its first read.
+    /// One nonblocking read after the handshake. The handshake itself is the blocking path's: a
+    /// pending header answers `WouldBlock` instead of running it, so a readiness lane never waits.
     #[cfg(unix)]
     fn recv_ready(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.ensure_header()?;
+        if let Some(header) = &self.header {
+            let Ok(run) = header.lock() else {
+                return Err(io::Error::other("the header handshake is gone"));
+            };
+            if !run.is_done() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+        }
         recv_ready(&self.stream, buf)
     }
 
@@ -226,6 +234,21 @@ impl Connection {
         Connection::Proxied {
             inner: Box::new(self),
             peer,
+        }
+    }
+
+    /// Complete a pending header handshake on the blocking path, before a readiness lane asks.
+    /// A readiness read never runs it, so admission must finish it first.
+    pub(crate) fn complete_header(&self) -> io::Result<()> {
+        match self {
+            Connection::Masked(masked) => masked.ensure_header(),
+            Connection::Metered(metered) => metered.inner.complete_header(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.complete_header()
+            }
+            Connection::Tcp(_) => Ok(()),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => Ok(()),
         }
     }
 
@@ -2489,6 +2512,69 @@ mod tests {
             began.elapsed() < Duration::from_secs(1),
             "the read waited out its clock instead of handing the lane a park"
         );
+    }
+
+    /// A readiness read never runs the header handshake, so a pending header is left whole for the
+    /// blocking path instead of being read part way and failed on the readiness lane.
+    #[cfg(unix)]
+    #[test]
+    fn a_readiness_read_leaves_a_pending_header_to_the_blocking_path() {
+        use ferrox_core::finalmask::{Chain, HeaderCustom, Item, MaskRole, Sequence};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let client = TcpStream::connect(address).expect("connects");
+        let (mut server, _) = listener.accept().expect("accepts");
+        let header = Item {
+            packet: Some(vec![7]),
+            save: "tx".to_owned(),
+            ..Item::default()
+        };
+        let answer = Item {
+            reuse: "tx".to_owned(),
+            ..Item::default()
+        };
+        let mask = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![header],
+            }],
+            vec![Sequence {
+                items: vec![answer],
+            }],
+            Vec::new(),
+        )
+        .expect("config is valid");
+        let mut chain = Chain::default();
+        chain.push_header_custom(mask);
+        let mut client = Connection::Tcp(client).with_mask_role(Some(&chain), MaskRole::Client);
+
+        server.set_nonblocking(true).expect("nonblocking");
+        let mut probe = [0u8; 8];
+        let error = client
+            .read_ready(&mut probe)
+            .expect_err("the header is pending");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let unseen = server.peek(&mut probe).expect_err("nothing was sent");
+        assert_eq!(
+            unseen.kind(),
+            io::ErrorKind::WouldBlock,
+            "the readiness lane did not start the handshake"
+        );
+
+        server.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || {
+            let mut sent = [0u8; 1];
+            server.read_exact(&mut sent).expect("reads the header");
+            assert_eq!(sent, [7]);
+            server.write_all(&[7]).expect("answers the header");
+            server.write_all(&[42]).expect("writes the session");
+        });
+        let mut session = [0u8; 1];
+        client
+            .read_exact(&mut session)
+            .expect("the blocking read finishes the handshake and reads the session");
+        assert_eq!(session, [42]);
+        server.join().expect("server finishes");
     }
 
     /// A full socket answers the relay's offer at once instead of spending a worker in the send
