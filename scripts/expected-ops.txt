@@ -182,10 +182,10 @@ append_pem 562
 # Re-blessed 51893238 by the cover re-base: the in-place cover shifts this
 # probe's frame back; dns.rs is untouched and the five decisions still walk
 # 4096 times. ops.yml run 43378506875.
-# Re-blessed 51893360 on the merged 4b61284f tree: main measures this frame too
-# (ops.yml run 43395821216); dns.rs is untouched and the five decisions still
-# walk 4096 times. ops.yml run 43398937708.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893360 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 51893198 on a clean build of a1096b05: the 4b61284f rebless came
+# from cache-built runs and does not reproduce from an empty ops cache; dns.rs
+# is untouched and the five decisions still walk 4096 times. ops.yml run 43409130740.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893198 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -278,10 +278,10 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shad
 # Re-blessed 47621526 on main 96d147c9: the carried vless-encryption layout moved it; psiphon_shadowsocks.rs is untouched. ops.yml run 43373102520.
 # Re-blessed 47621538 by the cover re-base: the same frame shift in the
 # ferrox-app bin; psiphon_shadowsocks.rs is untouched. ops.yml run 43378506875.
-# Re-blessed 47621526 on the merged 4b61284f tree: main measures this frame too
-# (ops.yml run 43395821216); psiphon_shadowsocks.rs is untouched. ops.yml run
-# 43398937708.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47621538 on a clean build of a1096b05: the same cache-built rebless
+# does not reproduce from an empty ops cache; psiphon_shadowsocks.rs is untouched.
+# ops.yml run 43409130740.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is
