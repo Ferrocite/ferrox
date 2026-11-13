@@ -638,6 +638,8 @@ mod tests {
 
     #[test]
     fn a_duplicate_segment_is_acknowledged_again_like_the_reference() {
+        use std::fmt::Write as _;
+
         let mut l = AckList::new();
         l.add(7, 100);
         l.add(7, 200);
@@ -655,8 +657,11 @@ mod tests {
             seg.serialize(&mut wire);
         });
         assert_eq!(numbers, vec![vec![7, 7]]);
-        let wire: String = wire.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(wire, "000000000000000000000000000000c8020000000700000007");
+        let mut wire_hex = String::new();
+        for byte in &wire {
+            write!(wire_hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(wire_hex, "000000000000000000000000000000c8020000000700000007");
     }
 
     #[test]
