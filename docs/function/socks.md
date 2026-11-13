@@ -34,7 +34,7 @@ graph TD
     C --> G0["greeting: [5, 1, method] on the stack,<br/>one method, the one the client will use"]
     G0 --> E{"a credential configured?"}
     E -- "yes" --> F1["RFC 1929 block: [1, ulen, user, plen, pass]"]
-    E -- "no" --> G["request: [5, cmd, 0, atyp, addr, port]"]
+    E -- "no" --> G["request: [5, cmd, 0, atyp, addr, port]<br/>written into the vector's spare capacity"]
     F1 --> G
     G --> T["the tunnel: the relay's own copy per byte"]
     SC --> I["UDP ASSOCIATE: the same request with cmd 3,<br/>the all-zero IPv4 address RFC 1928 names"]
@@ -145,7 +145,7 @@ A datagram whose literal header is the one the tree would have written goes on a
 
 Syscalls: a no-auth TCP dial writes **twice** — the greeting, then the request after the method reply — and reads three (the method reply, the request reply's head, the bound address); a credentialed dial writes three (the greeting, the credential block, the request) and reads four (the method reply, the credential status, the reply head, the bound address). The exact shape is counted by an in-memory server (`a_no_auth_connect_writes_the_greeting_then_the_request`: two writes, three reads, zero allocations; `a_credentialed_connect_writes_the_greeting_credential_and_request`: three writes, four reads, zero allocations), not by a loopback duration.
 
-Copies: the handshake's bytes are built once — the greeting on the stack, the credential block and the request in one buffer each — and the payload is the relay's own copy, the same one every other lane pays; on the device front the payload is the device's own and goes to the socket by pointer. Time: the matrix's `socks-raw-down-8` cell, below.
+Copies: the handshake's bytes are built once — the greeting on the stack, the credential block and the request in one buffer each — and the address is written into the request vector's own spare capacity (`spare_capacity_mut` and `MaybeUninit::write`) before the length is raised, so no reference is formed over uninitialized memory and no zero pass or staging scratch is paid. The payload is the relay's own copy, the same one every other lane pays; on the device front the payload is the device's own and goes to the socket by pointer. Time: the matrix's `socks-raw-down-8` cell, below.
 
 ## Ops
 
@@ -154,7 +154,7 @@ Copies: the handshake's bytes are built once — the greeting on the stack, the 
   socks::tests::the_client_writes_the_bytes_the_pinned_go_writes 'ferrox_core::socks::request'
 ```
 
-`867` is the `ops.yml` report of run `43305275099` (commit `634ad66`); the same command on main's run `43253246183` reports `929`. The report also holds `Target::encode_into` at **301** against **401** on main and `datagram` at **736** against **1006**. macOS/aarch64 ships no `valgrind`, so the gate runs in CI there; the number in `scripts/expected-ops.txt` is what the check compares.
+`895` is the `ops.yml` report of run `43339705363` (commit `023b938c`); the same command on main's run `43253246183` reports `929`. The report also holds `datagram` at **762** against **1006** on main. `Target::encode_into` is inlined into both callers now — the artifact reports `inlined-not-a-frame` — so the request and the datagram frames carry its match. macOS/aarch64 ships no `valgrind`, so the gate runs in CI there; the number in `scripts/expected-ops.txt` is what the check compares.
 
 ## Time
 
@@ -162,8 +162,8 @@ The matrix's `socks-raw-down-8` cell is 8 concurrent 256 MiB downloads through o
 
 ## What we removed
 
-- **Two matches per address write.** `Target::encode_into` and `Bound::encode_into` walked the address three times: `wire_len` matched the variant, `atyp` matched it again for the type byte, and the write matched it a third time. One match now writes the type byte, the address and the port; the bytes are the oracle's (`the_client_writes_the_bytes_the_pinned_go_writes`). The `ops.yml` report of run `43256551985` holds `Target::encode_into` at **301** against **401** on main's run `43253246183`, and the request that calls it at **867** against **929**.
-- **The datagram writer's staging scratch, and then its zero pass.** `datagram` built the address into a zeroed 260-byte stack buffer and copied it into the caller's vector. It writes the address into the vector's own room now, so the scratch and the copy are gone; that took it from **1006** on main to **890** on run `43256551985`. The room it used to zero for the header is initialized by that write now, so the zero pass went too: run `43305275099` reports **736**. The frame is the oracle's (`the_datagram_frame_is_rfc_1928`).
+- **Two matches per address write.** `Target::encode_into` and `Bound::encode_into` walked the address three times: `wire_len` matched the variant, `atyp` matched it again for the type byte, and the write matched it a third time. One match now writes the type byte, the address and the port; the bytes are the oracle's (`the_client_writes_the_bytes_the_pinned_go_writes`). The `ops.yml` report of run `43339705363` holds the request at **895** against **929** on main's run `43253246183`; `Target::encode_into` is inlined into its callers, so the artifact reports it as `inlined-not-a-frame` and the request's count carries its work.
+- **The datagram writer's staging scratch, and then its zero pass.** `datagram` built the address into a zeroed 260-byte stack buffer and copied it into the caller's vector. It writes the address into the vector's own room now, so the scratch and the copy are gone; that took it from **1006** on main to **890** on run `43256551985`. The room it used to zero for the header is initialized by that write now, so the zero pass went too: run `43305275099` reported **736**. The write now goes through the vector's spare capacity as `MaybeUninit` bytes, so no reference is formed over uninitialized memory; the byte-wise write costs **26** more than the old `set_len`-then-`encode_into` path, and run `43339705363` reports **762** against **1006** on main. The frame is the oracle's (`the_datagram_frame_is_rfc_1928`).
 - **The bound relay name's owned `String`.** `associate` parsed the server's bound address into a `Bound` enum whose name arm owned a `String`; it reads IPv4, IPv6 and a domain into stack blocks now and hands the name to the resolver as a borrowed `&str`. `socks5-association-bound-name-allocations 0` is the witness (`an_association_bound_name_is_read_without_a_heap_buffer`), and the reply bytes are unchanged.
 - **The split lane's per-datagram key and destination.** `serve_socks_udp_split` turned the routing key into an owned `String` and cloned the classified destination for every datagram. It borrows the key now — a `String` is made only when a new lane is inserted — and moves the destination instead of cloning it; the split-path tests still carry the same frames (`an_association_the_rules_could_split_runs_one_lane_per_tag`, `a_split_udp_association_names_the_process_from_the_datagram_sender`).
 - **Three probes of the deadline per handshake read.** `read_exact_within` read the clock after `Ok`, after `Interrupted` and after `WouldBlock`/`TimedOut` as well as at the top of the loop and once after it; each inner probe answered what the next one answers, so the loop probes once per read now. The bytes and the call counts are unchanged (`socks5-connect-write-calls 2`, `socks5-connect-read-calls 3`, `socks5-credentialed-connect-read-calls 4`).
