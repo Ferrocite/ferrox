@@ -1371,6 +1371,8 @@ impl<R: Read> Read for Wire<R> {
 pub(crate) struct CarriedReader<R> {
     wire: Wire<R>,
     recv: Flow,
+    pending: Vec<u8>,
+    at: usize,
 }
 
 impl<R: Read> CarriedReader<R> {
@@ -1378,18 +1380,36 @@ impl<R: Read> CarriedReader<R> {
         Self {
             wire: Wire::new(carrier),
             recv,
+            pending: Vec::new(),
+            at: 0,
         }
     }
 }
 
 impl<R: Read> Read for CarriedReader<R> {
     fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
-        if self.wire.buffered() == 0 && self.wire.batch(&mut self.recv).is_none() {
+        if dst.is_empty() {
             return Ok(0);
         }
-        let take = self.wire.buffered().min(dst.len());
-        dst[..take].copy_from_slice(&self.wire.held[self.wire.start..self.wire.start + take]);
-        self.wire.start += take;
+        if self.at == self.pending.len() {
+            self.pending.clear();
+            self.at = 0;
+            let Some(batch) = self.wire.batch(&mut self.recv) else {
+                return Ok(0);
+            };
+            if batch.is_empty() {
+                return Ok(0);
+            }
+            let take = batch.len().min(dst.len());
+            dst[..take].copy_from_slice(&batch[..take]);
+            if take < batch.len() {
+                self.pending.extend_from_slice(&batch[take..]);
+            }
+            return Ok(take);
+        }
+        let take = (self.pending.len() - self.at).min(dst.len());
+        dst[..take].copy_from_slice(&self.pending[self.at..self.at + take]);
+        self.at += take;
         Ok(take)
     }
 }
@@ -1416,6 +1436,9 @@ impl<W: Write> CarriedWriter<W> {
 
 impl<W: Write> Write for CarriedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if !write_frame(
             &mut self.out,
             &mut self.send,
@@ -5009,6 +5032,28 @@ mod tests {
             "and it is the window the leg reads into"
         );
         drop(window);
+    }
+
+    #[test]
+    fn a_carried_reader_serves_the_batch_its_wire_has_already_decoded() {
+        let (sealed, plain, recv) = frames(&[16, 8, 4]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let mut reader = CarriedReader::new(carrier, recv);
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 7];
+        loop {
+            let n = reader.read(&mut chunk).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(got, plain, "the decoded batch is served before end");
     }
 
     #[test]
