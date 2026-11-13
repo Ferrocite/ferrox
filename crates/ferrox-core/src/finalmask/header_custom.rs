@@ -147,15 +147,10 @@ impl StateStore {
         remote: Option<SocketAddr>,
         now: Duration,
     ) -> Option<Vars> {
-        let key = (local, remote);
-        let expired = self
-            .entries
-            .get(&key)
-            .is_some_and(|(_, at)| now.saturating_sub(*at) > STATE_TTL);
-        if expired {
-            self.entries.remove(&key);
-        }
-        self.entries.get(&key).map(|(vars, _)| vars.clone())
+        self.prune(now);
+        self.entries
+            .get(&(local, remote))
+            .map(|(vars, _)| vars.clone())
     }
 
     fn set(
@@ -165,7 +160,18 @@ impl StateStore {
         vars: &Vars,
         now: Duration,
     ) {
-        self.entries.insert((local, remote), (vars.clone(), now));
+        self.prune(now);
+        let key = (local, remote);
+        if vars.is_empty() {
+            self.entries.remove(&key);
+        } else {
+            self.entries.insert(key, (vars.clone(), now));
+        }
+    }
+
+    fn prune(&mut self, now: Duration) {
+        self.entries
+            .retain(|_, (_, at)| now.saturating_sub(*at) <= STATE_TTL);
     }
 }
 
@@ -181,18 +187,57 @@ fn valid_var(name: &str) -> bool {
 }
 
 fn validate_expr(expr: &Expr) -> Option<()> {
-    if expr.op.is_empty() || expr.args.is_empty() {
+    (expr_kind(expr)? == ExprKind::Bytes).then_some(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprKind {
+    Bytes,
+    U64,
+}
+
+fn expr_kind(expr: &Expr) -> Option<ExprKind> {
+    use ExprKind::{Bytes, U64};
+    match expr.op.as_str() {
+        "concat" if !expr.args.is_empty() => {
+            for arg in &expr.args {
+                if arg_kind(arg)? != Bytes {
+                    return None;
+                }
+            }
+            Some(Bytes)
+        }
+        "slice" => args_kind(expr, &[Bytes, U64, U64]).map(|()| Bytes),
+        "xor16" | "xor32" => args_kind(expr, &[U64, U64]).map(|()| U64),
+        "be16" | "be32" | "le16" | "le32" | "le64" => args_kind(expr, &[U64]).map(|()| Bytes),
+        "pad" => args_kind(expr, &[Bytes, U64, Bytes]).map(|()| Bytes),
+        "truncate" => args_kind(expr, &[Bytes, U64]).map(|()| Bytes),
+        "add" | "sub" | "and" | "or" | "shl" | "shr" => args_kind(expr, &[U64, U64]).map(|()| U64),
+        _ => None,
+    }
+}
+
+fn args_kind(expr: &Expr, want: &[ExprKind]) -> Option<()> {
+    if expr.args.len() != want.len() {
         return None;
     }
-    for arg in &expr.args {
-        match arg {
-            ExprArg::Bytes(_) | ExprArg::U64(_) | ExprArg::Metadata(_) => {}
-            ExprArg::Var(name) if !name.is_empty() && valid_var(name) => {}
-            ExprArg::Var(_) => return None,
-            ExprArg::Expr(nested) => validate_expr(nested)?,
+    for (arg, kind) in expr.args.iter().zip(want) {
+        if arg_kind(arg)? != *kind {
+            return None;
         }
     }
     Some(())
+}
+
+fn arg_kind(arg: &ExprArg) -> Option<ExprKind> {
+    match arg {
+        ExprArg::Bytes(_) => Some(ExprKind::Bytes),
+        ExprArg::U64(_) => Some(ExprKind::U64),
+        ExprArg::Var(name) if !name.is_empty() && valid_var(name) => Some(ExprKind::Bytes),
+        ExprArg::Metadata(name) if !name.is_empty() => Some(ExprKind::U64),
+        ExprArg::Var(_) | ExprArg::Metadata(_) => None,
+        ExprArg::Expr(expr) => expr_kind(expr),
+    }
 }
 
 /// One connection's pending handshake, shared by its read and write handles.
@@ -860,6 +905,62 @@ mod tests {
             STATE_TTL + Duration::from_millis(1),
         );
         assert!(expired.vars.is_empty());
+    }
+
+    #[test]
+    fn expired_socket_pairs_are_reclaimed_on_the_next_lookup() {
+        let mut client = item();
+        client.packet = Some(vec![7]);
+        client.save = "tx".to_owned();
+        let header = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![client],
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("config is valid");
+        for port in 0..64u16 {
+            let local: SocketAddr = format!("127.0.0.1:{port}").parse().expect("local");
+            let remote: SocketAddr = format!("127.0.0.2:{port}").parse().expect("remote");
+            let mut run = header.open(MaskRole::Client, Some(local), Some(remote), Duration::ZERO);
+            run.handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
+                .expect("the handshake writes only");
+        }
+        assert_eq!(
+            header.state.lock().expect("state").entries.len(),
+            64,
+            "every captured pair is held"
+        );
+        let local: SocketAddr = "127.0.0.1:4000".parse().expect("local");
+        let remote: SocketAddr = "127.0.0.2:4000".parse().expect("remote");
+        let expired = header.open(
+            MaskRole::Client,
+            Some(local),
+            Some(remote),
+            STATE_TTL + Duration::from_millis(1),
+        );
+        assert!(expired.vars.is_empty());
+        assert!(
+            header.state.lock().expect("state").entries.is_empty(),
+            "a lookup past the ttl reclaims every stale pair"
+        );
+    }
+
+    #[test]
+    fn an_empty_capture_drops_the_entry_for_its_pair() {
+        let local: SocketAddr = "127.0.0.1:7000".parse().expect("local");
+        let remote: SocketAddr = "127.0.0.2:8000".parse().expect("remote");
+        let mut store = StateStore::default();
+        let mut vars = Vars::default();
+        vars.insert("tx".to_owned(), vec![7]);
+        store.set(Some(local), Some(remote), &vars, Duration::ZERO);
+        assert_eq!(store.entries.len(), 1);
+        store.set(Some(local), Some(remote), &Vars::default(), Duration::ZERO);
+        assert!(
+            store.entries.is_empty(),
+            "an empty capture removes the stale entry and stores nothing"
+        );
     }
 
     #[test]
