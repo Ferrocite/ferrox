@@ -182,7 +182,7 @@ append_pem 562
 # Re-blessed 51893238 by the cover re-base: the in-place cover shifts this
 # probe's frame back; dns.rs is untouched and the five decisions still walk
 # 4096 times. ops.yml run 43378506875.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893238 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893198 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
