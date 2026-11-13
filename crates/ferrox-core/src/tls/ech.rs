@@ -168,43 +168,45 @@ impl<'a> Iterator for Configs<'a> {
     type Item = Result<Config<'a>, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        if self.at >= self.end {
-            self.done = true;
-            return (self.seen == 0)
-                .then(|| Err("ech: no supported config in the list".to_owned()));
-        }
-        if self.end - self.at < 4 {
-            self.done = true;
-            return Some(Err("ech: short config header".to_owned()));
-        }
-        let version = u16::from_be_bytes([self.bytes[self.at], self.bytes[self.at + 1]]);
-        let length = usize::from(u16::from_be_bytes([
-            self.bytes[self.at + 2],
-            self.bytes[self.at + 3],
-        ]));
-        let Some(config_end) = self
-            .at
-            .checked_add(4 + length)
-            .filter(|config_end| *config_end <= self.end)
-        else {
-            self.done = true;
-            return Some(Err("ech: config length past the end".to_owned()));
-        };
-        if version != VERSION {
+        loop {
+            if self.done {
+                return None;
+            }
+            if self.at >= self.end {
+                self.done = true;
+                return (self.seen == 0)
+                    .then(|| Err("ech: no supported config in the list".to_owned()));
+            }
+            if self.end - self.at < 4 {
+                self.done = true;
+                return Some(Err("ech: short config header".to_owned()));
+            }
+            let version = u16::from_be_bytes([self.bytes[self.at], self.bytes[self.at + 1]]);
+            let length = usize::from(u16::from_be_bytes([
+                self.bytes[self.at + 2],
+                self.bytes[self.at + 3],
+            ]));
+            let Some(config_end) = self
+                .at
+                .checked_add(4 + length)
+                .filter(|config_end| *config_end <= self.end)
+            else {
+                self.done = true;
+                return Some(Err("ech: config length past the end".to_owned()));
+            };
+            if version != VERSION {
+                self.at = config_end;
+                continue;
+            }
+            let mut at = self.at + 4;
             self.at = config_end;
-            return self.next();
+            self.seen += 1;
+            let config = Config::decode_contents(self.bytes, &mut at, config_end);
+            if config.is_err() {
+                self.done = true;
+            }
+            return Some(config);
         }
-        let mut at = self.at + 4;
-        self.at = config_end;
-        self.seen += 1;
-        let config = Config::decode_contents(self.bytes, &mut at, config_end);
-        if config.is_err() {
-            self.done = true;
-        }
-        Some(config)
     }
 }
 
@@ -470,6 +472,23 @@ mod tests {
         let configs = parsed(&bytes);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].public_name, b"example.com");
+    }
+
+    #[test]
+    fn a_long_run_of_unsupported_versions_is_walked_without_recursion() {
+        let count = 16_000u16;
+        let mut body = Vec::with_capacity(usize::from(count) * 4);
+        for _ in 0..count {
+            body.extend_from_slice(&[0xfe, 0x0e, 0x00, 0x00]);
+        }
+        let mut bytes = (body.len() as u16).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        let mut configs = parse_config_list(&bytes).unwrap();
+        match configs.next() {
+            Some(Err(err)) => assert_eq!(err, "ech: no supported config in the list"),
+            _ => panic!("a list of unknown versions has no supported config"),
+        }
+        assert!(configs.next().is_none());
     }
 
     #[test]
