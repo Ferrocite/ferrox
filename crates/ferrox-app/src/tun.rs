@@ -40,6 +40,10 @@ const ICMPV6_PROTO: u8 = 58;
 /// An ICMP echo request is type 8 (128 over IPv6); its answer flips that to 0 (129) and carries the message back.
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
+/// A path-MTU report carries no usable MTU below the version's smallest link, and no TCP segment is worth less than this.
+const IPV4_SMALLEST_MTU: u32 = 576;
+const IPV6_SMALLEST_MTU: u32 = 1280;
+const SMALLEST_MSS: u32 = 48;
 #[cfg(all(test, unix))]
 const ICMP_ECHO_REPLY: u8 = 0;
 #[cfg(test)]
@@ -384,6 +388,31 @@ fn icmp_error_flow(protocol: u8, body: &[u8]) -> Option<FlowKey> {
         _ => return None,
     };
     quoted_flow(quoted)
+}
+
+/// The path MTU a packet-too-big message reports: v4 fragmentation-needed (type 3 code 4) or v6 type 2, clamped to the smallest link each version allows.
+fn reported_mtu(protocol: u8, body: &[u8]) -> Option<u32> {
+    match (protocol, body.first().copied()) {
+        (ICMP_PROTO, Some(3)) if body.get(1) == Some(&4) => {
+            let mtu = u32::from(u16::from_be_bytes(body.get(6..8)?.try_into().ok()?));
+            Some(mtu.max(IPV4_SMALLEST_MTU))
+        }
+        (ICMPV6_PROTO, Some(2)) => {
+            let mtu = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
+            Some(mtu.max(IPV6_SMALLEST_MTU))
+        }
+        _ => None,
+    }
+}
+
+/// The segment size a path MTU leaves after the IP and TCP headers, never below the floor the references believe.
+fn path_mss(mtu: u32, ipv6: bool) -> u32 {
+    let header = if ipv6 {
+        (IPV6_HEADER + 20) as u32
+    } else {
+        (IPV4_HEADER + 20) as u32
+    };
+    mtu.saturating_sub(header).max(SMALLEST_MSS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -908,6 +937,8 @@ struct Flow {
     last_acked: u32,
     local: (IpAddr, u16),
     remote: (IpAddr, u16),
+    /// The largest payload the response thread may put in one segment; a path-MTU report lowers it.
+    mss: Arc<AtomicU32>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
 }
@@ -1129,7 +1160,7 @@ impl Handler {
         let local_port = tcp.destination_port;
         let remote_port = tcp.source_port;
         let syn_seq = tcp.seq;
-        let mss = self.device.mss(remote_ip);
+        let mss = Arc::new(AtomicU32::new(self.device.mss(remote_ip)));
 
         let mut emit = std::mem::take(&mut self.emit);
         render_tcp_packet_ip(
@@ -1176,6 +1207,7 @@ impl Handler {
                 last_acked: syn_seq.wrapping_add(1),
                 local: (local_ip, local_port),
                 remote: (remote_ip, remote_port),
+                mss: Arc::clone(&mss),
                 signaled: Arc::clone(&signaled),
             },
         );
@@ -1196,18 +1228,24 @@ impl Handler {
 
         std::thread::spawn(move || {
             let gso_capable = dev_writer.gso();
-            let max = (mss as usize).max(1);
+            let initial = (mss.load(Relaxed) as usize).max(1);
             let mut buf = vec![
                 0u8;
                 if gso_capable {
                     MAX_PACKET - IPV6_HEADER - 20
                 } else {
-                    max
+                    initial
                 }
             ];
-            let mut pkt = Vec::with_capacity(IPV6_HEADER + 20 + max);
+            let mut pkt = Vec::with_capacity(if gso_capable {
+                MAX_PACKET
+            } else {
+                IPV6_HEADER + 20 + initial
+            });
             let end = loop {
-                match read_half.read(&mut buf) {
+                let max = (mss.load(Relaxed) as usize).max(1);
+                let limit = max.min(buf.len());
+                match read_half.read(&mut buf[..limit]) {
                     Ok(0) => {
                         // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
                         let clean = match outcome_rx.try_recv() {
@@ -1298,9 +1336,22 @@ impl Handler {
             return wrote;
         }
         if let Some(key) = icmp_error_flow(ip.protocol, body) {
-            self.close_flow(key, Some(FLAG_RST | FLAG_ACK));
+            if let Some(mtu) = reported_mtu(ip.protocol, body) {
+                self.shrink_flow(key, mtu);
+            } else {
+                self.close_flow(key, Some(FLAG_RST | FLAG_ACK));
+            }
         }
         Ok(())
+    }
+
+    /// Take a path-MTU report for the rest of a flow: only a smaller segment size is believed, and the floor keeps a forged report from stopping the flow.
+    fn shrink_flow(&mut self, key: FlowKey, mtu: u32) {
+        if let Some(flow) = self.flows.get(&key) {
+            let mss = path_mss(mtu, flow.remote.0.is_ipv6());
+            let current = flow.mss.load(Relaxed);
+            flow.mss.store(current.min(mss), Relaxed);
+        }
     }
 
     fn close_flow(&mut self, key: FlowKey, signal: Option<u8>) {
@@ -1633,6 +1684,22 @@ mod tests {
         assert_eq!(key.source_port, 5555);
         assert_eq!(key.destination, IpAddr::V4([203, 0, 113, 7].into()));
         assert_eq!(key.destination_port, 443);
+    }
+
+    #[test]
+    fn a_path_mtu_report_names_the_segment_size_left_for_the_path() {
+        let v4 = [3, 4, 0, 0, 0, 0, 0x04, 0xb0];
+        assert_eq!(reported_mtu(ICMP_PROTO, &v4), Some(1200));
+        assert_eq!(
+            reported_mtu(ICMP_PROTO, &[3, 3, 0, 0, 0, 0, 0x04, 0xb0]),
+            None
+        );
+        let v6 = [2, 0, 0, 0, 0, 0, 0x04, 0xb0];
+        assert_eq!(reported_mtu(ICMPV6_PROTO, &v6), Some(1280));
+        assert_eq!(reported_mtu(ICMPV6_PROTO, &[1, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(path_mss(1200, false), 1160);
+        assert_eq!(path_mss(1200, true), 1140);
+        assert_eq!(path_mss(40, true), SMALLEST_MSS);
     }
 
     #[test]
@@ -2032,6 +2099,124 @@ mod tests {
         );
         assert_eq!(&rbody[4..8], &[0x12, 0x34, 0x00, 0x07]);
         assert_eq!(&rbody[8..], b"ping data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_packet_too_big_shrinks_the_response_segment() {
+        let (a, b) = unix_socketpair().unwrap();
+        let mut handler = Handler::new(
+            Device::from_handle(a, DEFAULT_MTU),
+            Arc::new(|_conn, _dest| Ok(())),
+            no_associate(),
+        );
+        let mut peer = b;
+        let client = ([10, 0, 0, 2], 44444);
+        let endpoint = ([10, 0, 0, 1], 8080);
+        let syn = build_tcp_packet(client, endpoint, 1000, 0, FLAG_SYN, 65535, &[]);
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let key = FlowKey {
+            source_port: 44444,
+            destination: IpAddr::V4(endpoint.0.into()),
+            destination_port: 8080,
+        };
+        assert_eq!(
+            handler.flows.get(&key).unwrap().mss.load(Relaxed),
+            (DEFAULT_MTU - IPV4_HEADER - 20) as u32
+        );
+
+        let quoted = build_tcp_packet(
+            (endpoint.0, 8080),
+            (client.0, 44444),
+            1001,
+            1001,
+            FLAG_ACK,
+            65535,
+            &[],
+        );
+        let mut pkt = vec![0u8; IPV4_HEADER + 8 + IPV4_HEADER + 8];
+        let len = pkt.len() as u16;
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&len.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = ICMP_PROTO;
+        pkt[12..16].copy_from_slice(&endpoint.0);
+        pkt[16..20].copy_from_slice(&client.0);
+        let body = &mut pkt[IPV4_HEADER..];
+        body[0] = 3;
+        body[1] = 4;
+        body[6..8].copy_from_slice(&1200u16.to_be_bytes());
+        body[8..8 + IPV4_HEADER + 8].copy_from_slice(&quoted[..IPV4_HEADER + 8]);
+        handler.dispatch(&pkt).unwrap();
+
+        assert_eq!(handler.flows.get(&key).unwrap().mss.load(Relaxed), 1160);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_v6_packet_too_big_shrinks_the_response_segment() {
+        let (a, b) = unix_socketpair().unwrap();
+        let mut handler = Handler::new(
+            Device::from_handle(a, DEFAULT_MTU),
+            Arc::new(|_conn, _dest| Ok(())),
+            no_associate(),
+        );
+        let mut peer = b;
+        let client: IpAddr = "2001:db8::2".parse().unwrap();
+        let endpoint: IpAddr = "2001:db8::1".parse().unwrap();
+        let syn = build_ipv6_tcp_packet(
+            (client, 44444),
+            (endpoint, 8080),
+            1000,
+            0,
+            FLAG_SYN,
+            65535,
+            &[],
+        );
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let key = FlowKey {
+            source_port: 44444,
+            destination: endpoint,
+            destination_port: 8080,
+        };
+        assert_eq!(
+            handler.flows.get(&key).unwrap().mss.load(Relaxed),
+            (DEFAULT_MTU - IPV6_HEADER - 20) as u32
+        );
+
+        let quoted = build_ipv6_tcp_packet(
+            (endpoint, 8080),
+            (client, 44444),
+            1001,
+            1001,
+            FLAG_ACK,
+            65535,
+            &[],
+        );
+        let mut pkt = vec![0u8; IPV6_HEADER + 8 + IPV6_HEADER + 8];
+        let payload = (pkt.len() - IPV6_HEADER) as u16;
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&payload.to_be_bytes());
+        pkt[6] = ICMPV6_PROTO;
+        pkt[7] = 64;
+        let (from, to) = octets(endpoint, client);
+        pkt[8..24].copy_from_slice(&from);
+        pkt[24..40].copy_from_slice(&to);
+        let body = &mut pkt[IPV6_HEADER..];
+        body[0] = 2;
+        body[4..8].copy_from_slice(&1200u32.to_be_bytes());
+        body[8..8 + IPV6_HEADER + 8].copy_from_slice(&quoted[..IPV6_HEADER + 8]);
+        handler.dispatch(&pkt).unwrap();
+
+        assert_eq!(handler.flows.get(&key).unwrap().mss.load(Relaxed), 1220);
     }
 
     #[cfg(unix)]
