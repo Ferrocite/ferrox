@@ -64,6 +64,37 @@ struct EchOffer {
     maximum_name_length: usize,
 }
 
+/// The ECH extension body: a fixed inner marker, or a cover written field by field.
+#[derive(Clone, Copy)]
+enum Ech<'a> {
+    Fixed(&'a [u8]),
+    Cover {
+        suite: (u16, u16),
+        config_id: u8,
+        enc: &'a [u8],
+        payload_len: usize,
+    },
+}
+
+impl<'a> Ech<'a> {
+    fn source(self) -> Source<'a> {
+        match self {
+            Self::Fixed(body) => Source::Fixed(body),
+            Self::Cover {
+                suite,
+                config_id,
+                enc,
+                payload_len,
+            } => Source::EchCover {
+                suite,
+                config_id,
+                enc,
+                payload_len,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Prepared<'a> {
     version: u16,
@@ -340,9 +371,18 @@ impl Hello {
         let (encoded, transcript) = self.inner_hello(offer, shares, cookie);
         offer.transcript = transcript;
         let enc: &[u8] = if retry { &[] } else { &offer.enc };
-        let cover = ech_cover(offer.suite, offer.config_id, enc, encoded.len() + 16);
-        let entries =
-            self.extension_entries(shares, cookie, self.sni.as_deref(), Some(&cover), true);
+        let entries = self.extension_entries(
+            shares,
+            cookie,
+            self.sni.as_deref(),
+            Some(Ech::Cover {
+                suite: offer.suite,
+                config_id: offer.config_id,
+                enc,
+                payload_len: encoded.len() + 16,
+            }),
+            true,
+        );
         if entries.last().map(|entry| entry.kind) != Some(0xfe0d) {
             return Err(TlsError::Other(
                 "ech: profile has no ECH payload".to_owned(),
@@ -381,7 +421,7 @@ impl Hello {
             shares,
             cookie,
             offer.inner_name.as_deref(),
-            Some(&INNER_ECH),
+            Some(Ech::Fixed(&INNER_ECH)),
             true,
         );
         for entry in &mut entries {
@@ -684,7 +724,7 @@ impl Hello {
             shares,
             cookie,
             self.sni.as_deref(),
-            self.ech.as_deref(),
+            self.ech.as_deref().map(Ech::Fixed),
             false,
         );
         self.pad_entries(&mut entries);
@@ -798,7 +838,7 @@ impl Hello {
         shares: &[Share],
         cookie: Option<&'a [u8]>,
         sni: Option<&'a str>,
-        ech: Option<&'a [u8]>,
+        ech: Option<Ech<'a>>,
         ech_last: bool,
     ) -> Vec<Entry<'a>> {
         let mut entries: Vec<Entry<'a>> = Vec::with_capacity(self.profile.exts.len() + 1);
@@ -831,7 +871,7 @@ impl Hello {
         // A stock profile has no GREASE slot, so the real offer is appended where RFC 9849 puts it.
         if self.ech_slot && !entries.iter().any(|entry| entry.kind == 0xfe0d) {
             if let Some(ech) = ech {
-                let source = Source::Fixed(ech);
+                let source = ech.source();
                 let len = self.width_of(&source, shares);
                 entries.push(Entry::new(0xfe0d, len, false, source));
             }
@@ -874,7 +914,7 @@ impl Hello {
         shares: &[Share],
         grease_exts: &mut usize,
         sni: Option<&'a str>,
-        ech: Option<&'a [u8]>,
+        ech: Option<Ech<'a>>,
     ) -> Option<Entry<'a>> {
         let (kind, invariant, source) = match &ext.body {
             Body::Grease => {
@@ -919,7 +959,7 @@ impl Hello {
             ),
             Body::KeyShare { .. } if shares.is_empty() || !self.offers_tls13() => return None,
             Body::KeyShare { .. } => (0x0033, false, Source::Shares),
-            Body::Ech { .. } => (0xfe0d, false, Source::Fixed(ech?)),
+            Body::Ech { .. } => (0xfe0d, false, ech?.source()),
             Body::Raw(_)
                 if ext.kind == SESSION_TICKET && self.psk.as_ref().is_some_and(|t| !t.tls13) =>
             {
@@ -962,6 +1002,21 @@ impl Hello {
             Source::Alpn(list) => alpn_body(out, list),
             Source::StockAlpn(list) => stock_alpn_body(out, list),
             Source::Fixed(body) => out.put(body),
+            Source::EchCover {
+                suite,
+                config_id,
+                enc,
+                payload_len,
+            } => {
+                out.put(&[0]);
+                out.put(&suite.0.to_be_bytes());
+                out.put(&suite.1.to_be_bytes());
+                out.put(&[config_id]);
+                out.put(&(enc.len() as u16).to_be_bytes());
+                out.put(enc);
+                out.put(&(payload_len as u16).to_be_bytes());
+                out.zeros(payload_len);
+            }
             Source::Ticket(ticket) => out.put(ticket),
             Source::Psk(ticket) => {
                 let identities = ticket.bytes.len() + 6;
@@ -1085,6 +1140,12 @@ enum Source<'a> {
     Alpn(&'a [&'a [u8]]),
     StockAlpn(&'a [Vec<u8>]),
     Fixed(&'a [u8]),
+    EchCover {
+        suite: (u16, u16),
+        config_id: u8,
+        enc: &'a [u8],
+        payload_len: usize,
+    },
     Ticket(&'a [u8]),
     Psk(&'a Ticket),
     Shares,
@@ -1291,7 +1352,8 @@ fn handshake(kind: u8, body: &[u8]) -> Vec<u8> {
     msg
 }
 
-/// Builds one ECH cover with the picked suite, config id, encapsulation and zero payload length.
+/// The staged cover the in-place writer has to match.
+#[cfg(test)]
 fn ech_cover(suite: (u16, u16), config_id: u8, enc: &[u8], payload_len: usize) -> Vec<u8> {
     let mut body = Vec::with_capacity(12 + enc.len() + payload_len);
     body.push(0);
@@ -1553,7 +1615,7 @@ mod tests {
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 15, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 14, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
@@ -1710,6 +1772,44 @@ mod tests {
         assert_eq!(retry_ech[11], 0, "a retry carries no encapsulation");
     }
 
+    /// The cover's header and zero payload are written straight into the hello, so the bytes a staged
+    /// cover would hold are the bytes on the wire.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_real_ech_cover_matches_the_staged_bytes() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
+        hello.enable_ech(&list).expect("ech");
+        let body = &hello.msg[4..];
+        let outer = extensions(body)
+            .into_iter()
+            .find(|ext| kind(ext) == 0xfe0d)
+            .expect("ech extension");
+        let suite = (
+            u16::from_be_bytes([outer[5], outer[6]]),
+            u16::from_be_bytes([outer[7], outer[8]]),
+        );
+        let enc_len = usize::from(u16::from_be_bytes([outer[10], outer[11]]));
+        let enc = &outer[12..12 + enc_len];
+        let payload_len = usize::from(u16::from_be_bytes([
+            outer[12 + enc_len],
+            outer[13 + enc_len],
+        ]));
+        let cover = ech_cover(suite, outer[9], enc, payload_len);
+        assert_eq!(
+            &outer[4..14 + enc_len],
+            &cover[..10 + enc_len],
+            "the in-place cover header is byte-identical to the staged one"
+        );
+        assert_eq!(
+            outer.len(),
+            14 + enc_len + payload_len,
+            "the payload is the sealed inner hello, one tag longer than its plaintext"
+        );
+    }
+
     #[test]
     fn a_retry_outside_the_configured_groups_is_refused() {
         let profile = Fingerprint::resolve("chrome")
@@ -1845,7 +1945,7 @@ mod tests {
             &hello.shares,
             None,
             hello.sni.as_deref(),
-            hello.ech.as_deref(),
+            hello.ech.as_deref().map(Ech::Fixed),
             false,
         );
         let ((), counts) = crate::alloc_count::measure(|| shuffle(&mut entries));

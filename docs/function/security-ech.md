@@ -39,7 +39,7 @@ graph TD
 | heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
 | heap-buffers-for-a-shaped-sealer | 0 | ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations |
 | heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
-| heap-buffers-for-a-real-ech-offer | 15 | ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place |
+| heap-buffers-for-a-real-ech-offer | 14 | ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place |
 | seal-plaintext-buffer-moves | 0 | ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay |
 <!-- counts:end -->
 
@@ -63,6 +63,7 @@ No matrix cell isolates ECH: the bench cells time a relay after the handshake, a
 ## What we removed
 
 - **A boxed sealer and its encapsulation buffer.** The shaped offer keeps the 32-byte encapsulation and the sealer's context on the stack, and the cover's zero payload is written in place rather than staged.
+- **The real offer's staged cover.** The cover header and its zero payload are written straight into the outer hello, so the offer no longer allocates a cover buffer or copies it in.
 - **The inner hello's ciphertext buffer and the plaintext copy into it.** The inner body is reserved with room for its padding and tag, then sealed where it lies; the tag is appended and the caller copies one ciphertext into the cover instead of allocating a second buffer and copying the plaintext through it.
 - **The parse copies and staged hello frames.** The config list is read where it lies, the HPKE info is built in one buffer, and the inner transcript and outer hello are framed where they are written.
 - **A config rebuild for the retry.** The rejected offer clones the parsed `TlsConfig`, replaces its `ech_config_list` `Arc`, and reuses every other field; no text is parsed again and no server name is resolved again.
