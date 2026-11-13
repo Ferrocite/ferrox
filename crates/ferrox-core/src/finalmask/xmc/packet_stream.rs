@@ -275,38 +275,34 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
 
 fn parse_custom_payload(packet: &Packet) -> io::Result<Option<&[u8]>> {
     let mut data = packet.data.as_slice();
-    let (length, _) = read_varint_with_length(&mut data).map_err(|error| {
+    let channel = read_channel(&mut data).map_err(|error| {
         io::Error::other(format!("read minecraft custom payload channel: {error}"))
-    })?;
-    let length = usize::try_from(length).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "read minecraft custom payload channel: read string: bad length",
-        )
-    })?;
-    if length > MAX_STRING_LENGTH as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("read minecraft custom payload channel: read string: bad length: {length}"),
-        ));
-    }
-    if length > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "read minecraft custom payload channel: failed to fill whole buffer",
-        ));
-    }
-    let (channel, rest) = data.split_at(length);
-    let channel = std::str::from_utf8(channel).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "read minecraft custom payload channel: read string: invalid utf-8",
-        )
     })?;
     if channel != CHANNEL {
         return Ok(None);
     }
-    Ok(Some(rest))
+    Ok(Some(data))
+}
+
+fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a str> {
+    let (length, _) = read_varint_with_length(data)?;
+    if !(0..=MAX_STRING_LENGTH).contains(&length) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("read string: bad length: {length}"),
+        ));
+    }
+    let length = length as usize;
+    if length > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ));
+    }
+    let (channel, rest) = data.split_at(length);
+    *data = rest;
+    std::str::from_utf8(channel)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read string: invalid utf-8"))
 }
 
 fn spawn_keepalive<W: Write + Send + 'static>(
@@ -472,21 +468,21 @@ mod tests {
             data: vec![1, 0xff],
         };
         let error = parse_custom_payload(&invalid_utf8).expect_err("invalid utf-8");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read string: invalid utf-8"));
 
         let too_long = Packet {
             id: CLIENTBOUND_CUSTOM_PAYLOAD,
             data: vec![0x81, 0x20],
         };
         let error = parse_custom_payload(&too_long).expect_err("length over the string cap");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read string: bad length: 4097"));
 
         let truncated = Packet {
             id: CLIENTBOUND_CUSTOM_PAYLOAD,
             data: vec![8, b'x'],
         };
         let error = parse_custom_payload(&truncated).expect_err("short channel");
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("failed to fill whole buffer"));
 
         let overlong = Packet {
             id: CLIENTBOUND_CUSTOM_PAYLOAD,
