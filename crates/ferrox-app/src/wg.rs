@@ -939,6 +939,8 @@ impl Drop for WireGuardOut {
     }
 }
 
+const VERIFY_ASK_GAP: Duration = Duration::from_millis(600);
+
 /// Open one handshake against a candidate endpoint and ask a DNS question
 /// through it, without the stack, so a sweep does not spend two threads per
 /// edge.
@@ -965,7 +967,7 @@ pub(crate) fn verify_endpoint(
     let query = build_query(id, b"one.one.one.one.", 1, None)?;
     let source = ip_bytes(IpAddr::V4(local));
     let destination = ip_bytes(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-    let mut asked = false;
+    let mut next_ask = Duration::ZERO;
     let mut buf = [0u8; 4096];
     loop {
         let now = started.elapsed();
@@ -978,7 +980,7 @@ pub(crate) fn verify_endpoint(
             }
         }
         tunnel.poll(now.as_millis() as u64, &mut events);
-        if !asked && tunnel.established(now.as_millis() as u64) {
+        if tunnel.established(now.as_millis() as u64) && now >= next_ask {
             let mut packet = Vec::with_capacity(IPV4_HEADER + UDP_HEADER + query.len());
             if !udp_datagram(
                 &UdpDatagram {
@@ -993,7 +995,7 @@ pub(crate) fn verify_endpoint(
                 return None;
             }
             tunnel.send(now.as_millis() as u64, &packet, &mut events);
-            asked = true;
+            next_ask = now + VERIFY_ASK_GAP;
         }
         if let Ok((read, source)) = socket.recv_from(&mut buf) {
             tunnel.receive(
