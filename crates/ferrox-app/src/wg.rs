@@ -940,6 +940,13 @@ impl Drop for WireGuardOut {
 }
 
 const VERIFY_ASK_GAP: Duration = Duration::from_millis(600);
+/// The longest a probe's receive parks, so the loop drains events and rechecks the deadline.
+const VERIFY_POLL: Duration = Duration::from_millis(100);
+
+/// The receive wait left before the caller's deadline, capped by the poll.
+fn poll_wait(left: Duration) -> Option<Duration> {
+    (!left.is_zero()).then(|| left.min(VERIFY_POLL))
+}
 
 /// Open one handshake against a candidate endpoint and ask a DNS question
 /// through it, without the stack, so a sweep does not spend two threads per
@@ -953,9 +960,6 @@ pub(crate) fn verify_endpoint(
     timeout: Duration,
 ) -> Option<Duration> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .ok()?;
     let started = Instant::now();
     let mut tunnel = Tunnel::new(private, peer, [0; 32], endpoint, 0, reserved, tai64n_now());
     let mut events = Vec::new();
@@ -997,6 +1001,10 @@ pub(crate) fn verify_endpoint(
             tunnel.send(now.as_millis() as u64, &packet, &mut events);
             next_ask = now + VERIFY_ASK_GAP;
         }
+        let Some(wait) = poll_wait(timeout.saturating_sub(started.elapsed())) else {
+            return None;
+        };
+        socket.set_read_timeout(Some(wait)).ok()?;
         if let Ok((read, source)) = socket.recv_from(&mut buf) {
             tunnel.receive(
                 now.as_millis() as u64,
@@ -2429,6 +2437,16 @@ mod tests {
         destination: IpAddr,
     ) -> Option<usize> {
         routes.peer_for(peers, destination)
+    }
+
+    #[test]
+    fn a_probe_waits_no_longer_than_the_deadline_or_the_poll() {
+        assert_eq!(poll_wait(Duration::ZERO), None);
+        assert_eq!(poll_wait(Duration::from_secs(30)), Some(VERIFY_POLL));
+        assert_eq!(
+            poll_wait(Duration::from_millis(40)),
+            Some(Duration::from_millis(40))
+        );
     }
 
     /// The prefix table answers every lookup the peer scan answered, including
