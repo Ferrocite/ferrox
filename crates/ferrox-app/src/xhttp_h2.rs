@@ -1199,7 +1199,7 @@ impl H2Conn {
                                 .unwrap_or_else(PoisonError::into_inner);
                             *conn > 0 && *window > 0
                         },
-                        false,
+                        crate::proxy::relay_step_owns_poll(),
                     ),
                     Pumped::Alive
                 ) {
