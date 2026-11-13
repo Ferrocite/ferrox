@@ -11542,11 +11542,7 @@ fn dial_vless_browser(
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             relay_vless_xhttp_session(server, client, vless, &header, reader, writer);
             true
@@ -18099,11 +18095,7 @@ fn dial_vmess_browser(
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             if !writer.send(&carried.0) {
                 note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -18473,11 +18465,7 @@ fn dial_trojan_browser(
             let Some((mut reader, writer)) =
                 browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             if !writer.send(&header) {
                 note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -21464,11 +21452,7 @@ fn dial_ss_browser(
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
             else {
-                note_dial_failure(
-                    server,
-                    Failure::new(Stage::SocketConnected, Kind::Unreachable),
-                );
-                return true;
+                return false;
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
