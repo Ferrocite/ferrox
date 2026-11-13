@@ -75,12 +75,15 @@ impl AddressSink for [u8] {
 
 impl AddressSink for [core::mem::MaybeUninit<u8>] {
     fn put(&mut self, at: usize, bytes: &[u8]) {
-        debug_assert!(at + bytes.len() <= self.len(), "address write out of room");
-        // SAFETY: the caller passes spare capacity with `at + bytes.len()` inside it, and each byte initializes its slot.
+        let end = at
+            .checked_add(bytes.len())
+            .expect("address write out of room");
+        let dst = &mut self[at..end];
+        // SAFETY: `dst` has exactly `bytes.len()` slots, each initialized by this copy; `bytes` is a separate borrow, so the ranges cannot overlap.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                self.as_mut_ptr().add(at).cast::<u8>(),
+                dst.as_mut_ptr().cast::<u8>(),
                 bytes.len(),
             );
         }

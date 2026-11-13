@@ -8448,6 +8448,11 @@ fn fetch_cached(
     }
 }
 
+/// Whether an OSL transfer skips verification: the root's own `SkipVerify` or the config-wide `DisableSystemRootCAs`, the same pair a signed-list download honours.
+fn osl_insecure(root: &TransferRoot, settings: &Settings) -> bool {
+    root.skip_verify || settings.tls_shape.disable_system_root_cas
+}
+
 /// Return a seeded OSL body from the cache when its registry MD5 still matches, else fetch it.
 fn osl_body(
     key: &str,
@@ -8467,7 +8472,7 @@ fn osl_body(
             key,
             &root.headers,
             &settings.tls_shape.roots,
-            root.skip_verify,
+            osl_insecure(root, settings),
             cache,
         )?
     };
@@ -8664,7 +8669,7 @@ fn fetch_osl_entries(
             &format!("{base}/osl-registry"),
             &root.headers,
             &settings.tls_shape.roots,
-            root.skip_verify,
+            osl_insecure(root, settings),
             registry_cache,
         ) {
             Ok(body) => body,
@@ -11330,6 +11335,41 @@ mod tests {
                 ("X-Both".to_owned(), "local".to_owned()),
                 ("X-Local".to_owned(), "v".to_owned())
             ]
+        );
+    }
+
+    /// `DisableSystemRootCAs` is the config-wide switch the signed-list download honours, and an
+    /// OSL registry or file download is the same download: a root that names no `SkipVerify`
+    /// still skips verification when the config says so.
+    #[test]
+    fn an_osl_transfer_honours_the_config_wide_system_root_flag() {
+        let config = json::parse(
+            r#"{"DisableSystemRootCAs":true,"ObfuscatedServerListRootURLs":[{"URL":"https://osl.example"}]}"#,
+        )
+        .expect("config");
+        let settings = Settings::from_json(Some(&config)).expect("settings");
+        let roots = osl_roots(Some(&config));
+        assert!(!roots[0].skip_verify, "the root names no SkipVerify");
+        assert!(
+            osl_insecure(&roots[0], &settings),
+            "a config-wide DisableSystemRootCAs did not reach an OSL download"
+        );
+        let plain = Settings::from_json(Some(
+            &json::parse(r#"{"DisableSystemRootCAs":false}"#).expect("config"),
+        ))
+        .expect("settings");
+        assert!(
+            !osl_insecure(&roots[0], &plain),
+            "a plain config verified nothing to skip"
+        );
+        let skipped = TransferRoot {
+            url: "https://osl.example".to_owned(),
+            skip_verify: true,
+            headers: Vec::new(),
+        };
+        assert!(
+            osl_insecure(&skipped, &plain),
+            "a root's own SkipVerify was dropped"
         );
     }
 
