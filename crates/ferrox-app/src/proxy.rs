@@ -4595,7 +4595,7 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
                             return lane_pool::Next::Done;
                         }
                         let _cap = budgets::cap_handshake(budget.saturating_sub(waited));
-                        if stream.start_mask().is_ok() {
+                        if stream.start_mask().is_ok() && stream.complete_xmc().is_ok() {
                             role.serve_polled_tls(stream, sniffing);
                         }
                     }
@@ -4670,8 +4670,8 @@ fn serve_accepted(
         .with_mask_role(role.tcp_mask(), ferrox_core::finalmask::MaskRole::Server)
         .with_meter(crate::stats::inbound(tag))
         .with_policy(Some(crate::policy::flow(0)));
-    // A server's header handshake reads the peer's first bytes here, before the relay arms a one-millisecond poll clock.
-    if stream.start_mask().is_err() {
+    // A server's handshakes read the peer's first bytes here, before the relay arms a one-millisecond poll clock.
+    if stream.start_mask().is_err() || stream.complete_xmc().is_err() {
         return;
     }
     front_dispatch(stream, role);
@@ -60412,6 +60412,7 @@ mod tests {
                 Some(&server_chain),
                 ferrox_core::finalmask::MaskRole::Server,
             );
+            peer.start_mask().expect("arms the mask on admission");
             let mut ping = [0u8; 4];
             peer.read_exact(&mut ping).expect("reads the session");
             assert_eq!(&ping, b"ping");
@@ -60449,6 +60450,9 @@ mod tests {
                 Some(&server_chain),
                 ferrox_core::finalmask::MaskRole::Server,
             );
+            peer.start_mask().expect("arms the mask on admission");
+            peer.complete_xmc()
+                .expect("finishes the xmc login before the session moves");
             let mut ping = [0u8; 4];
             peer.read_exact(&mut ping).expect("reads the session");
             assert_eq!(&ping, b"ping");
