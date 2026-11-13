@@ -19,7 +19,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use libc::{SO_RCVTIMEO, SO_SNDTIMEO};
@@ -75,12 +76,39 @@ pub(crate) struct Metered {
 pub(crate) struct Masked {
     stream: TcpStream,
     chain: std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
+    header: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::HeaderRun>>>,
+}
+
+/// The clock the captured-variable store stamps and expires with; the core takes it as a value so
+/// that a library read stays deterministic.
+fn mask_clock() -> Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
 }
 
 impl Masked {
+    /// Run the configured handshake before the first byte of the session moves.
+    fn ensure_header(&self) -> io::Result<()> {
+        let Some(header) = &self.header else {
+            return Ok(());
+        };
+        let Ok(mut run) = header.lock() else {
+            return Err(io::Error::other("the header handshake is gone"));
+        };
+        if run.is_done() {
+            return Ok(());
+        }
+        let mut source = HeaderWire {
+            chain: &self.chain,
+            stream: &self.stream,
+        };
+        run.handshake(&mut source, mask_clock())
+    }
+
     /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
     /// makes a writer, so a leg drained by reference masks exactly as one moved by value.
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.ensure_header()?;
         // A stage never panics while held, so a poisoned lock is a broken process, not a wire state.
         let Ok(mut chain) = self.chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
@@ -92,27 +120,100 @@ impl Masked {
     fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         bufs.first().map_or(Ok(0), |first| self.send(first))
     }
+
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_header()?;
+        (&self.stream).read(buf)
+    }
+
+    fn recv_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        match bufs.iter_mut().find(|part| !part.is_empty()) {
+            Some(first) => self.recv(first),
+            None => Ok(0),
+        }
+    }
+
+    /// One nonblocking read after the handshake, which a server runs on its first read.
+    #[cfg(unix)]
+    fn recv_ready(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_header()?;
+        recv_ready(&self.stream, buf)
+    }
+
+    fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_header()?;
+        self.stream.peek(buf)
+    }
+}
+
+/// The handshake writes through the stages beneath its mask, as the reference's wrapped conn does,
+/// while a read stays the socket's own because a fragment writes and never decodes.
+struct HeaderWire<'a> {
+    chain: &'a std::sync::Mutex<ferrox_core::finalmask::Chain>,
+    stream: &'a TcpStream,
+}
+
+impl std::io::Write for HeaderWire<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(std::io::Error::other("the mask chain is gone"));
+        };
+        chain.write(&mut &*self.stream, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl std::io::Read for HeaderWire<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.stream).read(buf)
+    }
 }
 
 impl Connection {
     /// The same socket with this chain's clone beneath it; `None`, or a chain with no stage, leaves
     /// the stream exactly as it came, which is the ordinary case.
     pub(crate) fn with_mask(self, mask: Option<&ferrox_core::finalmask::Chain>) -> Self {
+        self.with_mask_role(mask, ferrox_core::finalmask::MaskRole::Client)
+    }
+
+    /// The same socket with the chain armed for the side this connection plays. A header handshake
+    /// is asymmetric, so a server must not open a client's sequences.
+    pub(crate) fn with_mask_role(
+        self,
+        mask: Option<&ferrox_core::finalmask::Chain>,
+        role: ferrox_core::finalmask::MaskRole,
+    ) -> Self {
         match (self, mask.filter(|chain| !chain.is_empty())) {
-            (Connection::Tcp(stream), Some(chain)) => Connection::Masked(Masked {
-                stream,
-                chain: std::sync::Arc::new(std::sync::Mutex::new(chain.clone())),
-            }),
+            (Connection::Tcp(stream), Some(chain)) => {
+                let local = stream.local_addr().ok();
+                let remote = stream.peer_addr().ok();
+                let header = chain.header().cloned().map(|header| {
+                    std::sync::Arc::new(std::sync::Mutex::new(header.open(
+                        role,
+                        local,
+                        remote,
+                        mask_clock(),
+                    )))
+                });
+                Connection::Masked(Masked {
+                    stream,
+                    chain: std::sync::Arc::new(std::sync::Mutex::new(chain.without_header())),
+                    header,
+                })
+            }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
-                inner: Box::new(metered.inner.with_mask(mask)),
+                inner: Box::new(metered.inner.with_mask_role(mask, role)),
                 meter: metered.meter,
             }),
             (Connection::Proxied { inner, peer }, mask) => Connection::Proxied {
-                inner: Box::new(inner.with_mask(mask)),
+                inner: Box::new(inner.with_mask_role(mask, role)),
                 peer,
             },
             (Connection::Policied { inner, flow }, mask) => Connection::Policied {
-                inner: Box::new(inner.with_mask(mask)),
+                inner: Box::new(inner.with_mask_role(mask, role)),
                 flow,
             },
             (this, _) => this,
@@ -270,7 +371,7 @@ impl Connection {
         {
             let result = match self {
                 Connection::Tcp(stream) => recv_ready(stream, buf),
-                Connection::Masked(masked) => recv_ready(&masked.stream, buf),
+                Connection::Masked(masked) => masked.recv_ready(buf),
                 Connection::Metered(metered) => match metered.inner.read_ready(buf) {
                     Ok(n) => {
                         metered.meter.read(n);
@@ -408,7 +509,7 @@ impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let result = match self {
             Connection::Tcp(stream) => stream.read(buf),
-            Connection::Masked(masked) => masked.stream.read(buf),
+            Connection::Masked(masked) => masked.recv(buf),
             Connection::Metered(metered) => match metered.inner.read(buf) {
                 Ok(n) => {
                     metered.meter.read(n);
@@ -432,7 +533,7 @@ impl Read for Connection {
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
         let result = match self {
             Connection::Tcp(stream) => stream.read_vectored(bufs),
-            Connection::Masked(masked) => masked.stream.read_vectored(bufs),
+            Connection::Masked(masked) => masked.recv_vectored(bufs),
             Connection::Metered(metered) => match metered.inner.read_vectored(bufs) {
                 Ok(n) => {
                     metered.meter.read(n);
@@ -509,10 +610,7 @@ impl Read for &Connection {
                 let mut inner = stream;
                 inner.read(buf)
             }
-            Connection::Masked(masked) => {
-                let mut inner = &masked.stream;
-                inner.read(buf)
-            }
+            Connection::Masked(masked) => masked.recv(buf),
             Connection::Metered(ref metered) => {
                 let mut inner = &*metered.inner;
                 match inner.read(buf) {
@@ -545,10 +643,7 @@ impl Read for &Connection {
                 let mut inner = stream;
                 inner.read_vectored(bufs)
             }
-            Connection::Masked(masked) => {
-                let mut inner = &masked.stream;
-                inner.read_vectored(bufs)
-            }
+            Connection::Masked(masked) => masked.recv_vectored(bufs),
             Connection::Metered(ref metered) => {
                 let mut inner = &*metered.inner;
                 match inner.read_vectored(bufs) {
@@ -665,6 +760,7 @@ impl Connection {
                 Connection::Masked(Masked {
                     stream,
                     chain: std::sync::Arc::clone(&masked.chain),
+                    header: masked.header.as_ref().map(std::sync::Arc::clone),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -710,7 +806,7 @@ impl Connection {
     pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Connection::Tcp(stream) => stream.peek(buf),
-            Connection::Masked(masked) => masked.stream.peek(buf),
+            Connection::Masked(masked) => masked.peek(buf),
             Connection::Metered(metered) => metered.inner.peek(buf),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 inner.peek(buf)

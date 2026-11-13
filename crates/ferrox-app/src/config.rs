@@ -2073,6 +2073,12 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
             .as_deref()
         {
             Some("fragment") => chain.push(fragment(conf)?),
+            Some("header-custom") => {
+                if !chain.without_header().is_empty() || chain.header().is_some() {
+                    return None;
+                }
+                chain.push_header_custom(header_custom(conf)?);
+            }
             Some("filter") => {
                 if let Some(stage) = source_filter(conf).ok()? {
                     chain.set_filter(stage);
@@ -2082,6 +2088,246 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
         }
     }
     Some(chain)
+}
+
+/// One `header-custom` handshake. The lists are the reference's `clients`, `servers` and `errors`,
+/// each an ordered set of byte sequences; a missing list is empty, and an item that names more than
+/// one source of bytes is refused rather than guessed.
+pub(crate) fn header_custom(conf: Option<&Json>) -> Option<ferrox_core::finalmask::HeaderCustom> {
+    use ferrox_core::finalmask::HeaderCustom;
+    HeaderCustom::new(
+        header_sequences(conf, "clients")?,
+        header_sequences(conf, "servers")?,
+        header_sequences(conf, "errors")?,
+    )
+}
+
+fn header_sequences(
+    conf: Option<&Json>,
+    key: &str,
+) -> Option<Vec<ferrox_core::finalmask::Sequence>> {
+    use ferrox_core::finalmask::Sequence;
+    let Some(node) = conf.and_then(|c| c.get(key)) else {
+        return Some(Vec::new());
+    };
+    match node {
+        Json::Null => Some(Vec::new()),
+        Json::Arr(groups) => {
+            let mut out = Vec::with_capacity(groups.len());
+            for group in groups {
+                let items = match group {
+                    Json::Null => &[][..],
+                    group => group.as_arr()?,
+                };
+                let mut sequence = Vec::with_capacity(items.len());
+                for item in items {
+                    sequence.push(header_item(item)?);
+                }
+                out.push(Sequence { items: sequence });
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn header_item(node: &Json) -> Option<ferrox_core::finalmask::Item> {
+    use ferrox_core::finalmask::Item;
+    let rand = match node.get("rand") {
+        None | Some(Json::Null) => 0,
+        Some(value) => i32::try_from(value.as_i64()?).ok()?,
+    };
+    let (rand_min, rand_max) = match node.get("randRange") {
+        None | Some(Json::Null) => (0, 255),
+        Some(value) => {
+            let range = int32_range(value)?;
+            if range.low < 0 || range.high > 255 {
+                return None;
+            }
+            (
+                i32::try_from(range.low).ok()?,
+                i32::try_from(range.high).ok()?,
+            )
+        }
+    };
+    let delay = match node.get("delay") {
+        None | Some(Json::Null) => (0, 0),
+        Some(value) => {
+            let range = int32_range(value)?;
+            (range.low, range.high)
+        }
+    };
+    let packet = match node.get("packet") {
+        None => None,
+        Some(packet) => Some(header_bytes(
+            packet,
+            node.get("type").and_then(Json::as_str).unwrap_or(""),
+        )?),
+    };
+    let transform = match header_transform(node.get("transform"))? {
+        Transform::Absent => None,
+        Transform::Present(expr) => Some(expr),
+    };
+    Some(Item {
+        delay,
+        rand,
+        rand_min,
+        rand_max,
+        packet,
+        save: header_text(node, "capture")?.to_owned(),
+        reuse: header_text(node, "reuse")?.to_owned(),
+        transform,
+    })
+}
+
+enum Transform {
+    Absent,
+    Present(ferrox_core::finalmask::Expr),
+}
+
+fn header_transform(node: Option<&Json>) -> Option<Transform> {
+    use ferrox_core::finalmask::Expr;
+    match node {
+        None | Some(Json::Null) => Some(Transform::Absent),
+        Some(node) => {
+            let op = node.get("op").and_then(Json::as_str).unwrap_or("");
+            if op.is_empty() {
+                return None;
+            }
+            let args = node.get("args")?.as_arr()?;
+            if args.is_empty() {
+                return None;
+            }
+            let mut parsed = Vec::with_capacity(args.len());
+            for arg in args {
+                parsed.push(header_expr_arg(arg)?);
+            }
+            Some(Transform::Present(Expr {
+                op: op.to_owned(),
+                args: parsed,
+            }))
+        }
+    }
+}
+
+fn header_expr_arg(node: &Json) -> Option<ferrox_core::finalmask::ExprArg> {
+    use ferrox_core::finalmask::ExprArg;
+    let present = |key: &str| {
+        node.get(key)
+            .is_some_and(|value| !matches!(value, Json::Null))
+    };
+    let bytes = node.get("bytes").is_some();
+    let u64 = present("u64");
+    let reuse = present("reuse");
+    let metadata = present("metadata");
+    let transform = present("transform");
+    if usize::from(bytes)
+        + usize::from(u64)
+        + usize::from(reuse)
+        + usize::from(metadata)
+        + usize::from(transform)
+        != 1
+    {
+        return None;
+    }
+    match node.get("type").and_then(Json::as_str).unwrap_or("") {
+        _ if bytes => Some(ExprArg::Bytes(header_bytes(
+            node.get("bytes")?,
+            node.get("type").and_then(Json::as_str).unwrap_or(""),
+        )?)),
+        _ if u64 => Some(ExprArg::U64(json_u64(node.get("u64")?)?)),
+        _ if reuse => Some(ExprArg::Var(
+            node.get("reuse")?
+                .as_str()
+                .filter(|name| !name.is_empty())?
+                .to_owned(),
+        )),
+        _ if metadata => Some(ExprArg::Metadata(
+            node.get("metadata")?
+                .as_str()
+                .filter(|name| !name.is_empty())?
+                .to_owned(),
+        )),
+        _ => match header_transform(node.get("transform"))? {
+            Transform::Present(expr) => Some(ExprArg::Expr(expr)),
+            Transform::Absent => None,
+        },
+    }
+}
+
+fn header_bytes(node: &Json, kind: &str) -> Option<Vec<u8>> {
+    match kind.to_ascii_lowercase().as_str() {
+        "" | "array" => match node {
+            Json::Null => Some(Vec::new()),
+            Json::Arr(items) => items.iter().map(json_byte).collect(),
+            _ => None,
+        },
+        "base64" => match node {
+            Json::Null => Some(Vec::new()),
+            Json::Str(text) => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.decode(text).ok()
+            }
+            _ => None,
+        },
+        "str" => match node {
+            Json::Null => Some(Vec::new()),
+            Json::Str(text) => Some(text.as_bytes().to_vec()),
+            _ => None,
+        },
+        "hex" => match node {
+            Json::Null => Some(Vec::new()),
+            Json::Str(text) => header_hex(text),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn header_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().as_chunks::<2>().0 {
+        let high = header_hex_digit(pair[0])?;
+        let low = header_hex_digit(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Some(out)
+}
+
+fn header_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn header_text<'a>(node: &'a Json, key: &str) -> Option<&'a str> {
+    match node.get(key) {
+        None | Some(Json::Null) => Some(""),
+        Some(Json::Str(text)) => Some(text),
+        Some(_) => None,
+    }
+}
+
+fn json_u64(node: &Json) -> Option<u64> {
+    match node {
+        Json::Num(value) if value.fract() == 0.0 && *value >= 0.0 => Some(*value as u64),
+        _ => None,
+    }
+}
+
+fn json_byte(node: &Json) -> Option<u8> {
+    match node {
+        Json::Num(value) if value.fract() == 0.0 && (0.0..=255.0).contains(value) => {
+            Some(*value as u8)
+        }
+        _ => None,
+    }
 }
 
 /// One `fragment` stage. `packets` picks the writes it cuts; `lengths` and `delays` fall back to
@@ -3348,6 +3594,62 @@ mod tests {
             source_filter(null.get("settings")).is_ok_and(|stage| stage.is_none()),
             "null settings filter nothing, as absent ones do"
         );
+    }
+
+    #[test]
+    fn a_header_custom_stage_reads_every_packet_spelling_and_holds_its_handshake() {
+        let docs = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[null],"servers":null}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{
+                "clients":[[{"rand":2,"randRange":"16-32","capture":"seed"},{"packet":[1,2],"type":"array","capture":"head"}]],
+                "servers":[[{"reuse":"seed"},{"type":"hex","packet":"aabb"}]],
+                "errors":[[{"type":"str","packet":"nope"}]]
+            }}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{
+                "clients":[[{"type":"base64","packet":"AQI="}]],
+                "servers":[[{"packet":"aabb","type":"hex"}]]
+            }}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{
+                "clients":[[{"transform":{"op":"concat","args":[
+                    {"u64":1},
+                    {"transform":{"op":"le16","args":[{"u64":258}]}},
+                    {"type":"hex","bytes":"c0de"}
+                ]},"capture":"tx"}]],
+                "servers":[[{"reuse":"tx"},{"transform":{"op":"pad","args":[{"reuse":"tx"},{"u64":8},{"type":"str","bytes":"x"}]}}]]
+            }}]}}"#,
+        ];
+        for doc in docs {
+            let settings = crate::json::parse(doc).expect("parses");
+            let carrier = stream_carrier(Some(&settings));
+            let Carrier::Raw(chain) = &carrier else {
+                panic!("{doc} must arm a raw chain");
+            };
+            assert!(chain.header().is_some(), "{doc} must keep the handshake");
+        }
+    }
+
+    #[test]
+    fn a_header_custom_stage_refuses_a_mixed_or_underivable_sequence() {
+        let refused = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"packet":[1],"reuse":"x"}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"rand":1,"capture":"bad-name"}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"rand":1,"randRange":"0-256"}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"rand":1,"randRange":"-1-4"}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"","args":[{"u64":1}]}}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"concat","args":[]}}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"transform":{"op":"concat","args":[{"u64":1,"reuse":"x"}]}}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"type":"bogus","packet":"x"}]]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"packet":[1,2]},{"rand":1}]]}},{"type":"header-custom","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"lengths":[1]}},{"type":"header-custom","settings":{}}]}}"#,
+        ];
+        for doc in refused {
+            let settings = crate::json::parse(doc).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Unknown { .. }),
+                "{doc} must be refused"
+            );
+        }
     }
 
     #[test]
