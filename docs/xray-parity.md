@@ -21,7 +21,6 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 
 | xray-core | ferrox state |
 | --- | --- |
-| VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | both roles, both framing sets, and UDP over raw/ws/gRPC/xhttp/http header/httpUpgrade/KCP/Xdrive/QUIC/Hysteria with each carrier's TLS where it has one; the HTTP/2 transport carrier is not dialled |
 | Trojan share-link `trojan://` parser | implemented (`ferrox_core::trojan::TrojanLink`; `check`/`run` accept it beside `vless://`) |
 | Dokodemo transparent inbound | done (row 27): tcp/udp rewrite, `portMap`, `followRedirect` over `SO_ORIGINAL_DST`/`DIOCNATLOOK` and Linux `TPROXY`, UDP ancillary original-destination replies on Linux, `finalmask.tcp` fragment chain, JSON and protobuf config including the protobuf `tproxy` mode and receiver marker; Windows, macOS UDP, the non-follow missing-rewrite fallback, and partial `portMap` spellings are named open |
 | Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 163, 166) |
@@ -44,7 +43,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | --- | --- |
 | TCP | done |
 | WebSocket (`?ed=` both roles) | done |
-| gRPC | done, own HTTP/2; the multi-mode dial (`multiMode`) and the reference's method-path derivation not carried ([carrier-grpc](function/carrier-grpc.md)) |
+| gRPC | done, own HTTP/2; the multi-mode dial (`multiMode`), the reference's method-path derivation and the TLS authority fallback are carried, and a custom service without a split serves both message shapes on its one path ([carrier-grpc](function/carrier-grpc.md)) |
 | HTTPUpgrade | done, both roles, `?ed=N` carried (row 17) |
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | all three modes both roles: the dial resolves an unstated `mode` and mints the session the hub validates, packets split at `uplinkChunkSize` into body or `X-Data-{i}`/cookie parts, posts paced by `scMinPostsIntervalMs`, and a relay half-close ends the request body ([carrier-xhttp](function/carrier-xhttp.md)) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask `fragment` done (row 34), other mask types planned |
@@ -52,7 +51,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | MASQUE transport | CONNECT-IP client and terminating server over h3 (row 77) and, on the same port, h2 (row 78), chosen by the configured ALPN |
 | XDrive (remote-storage carrier) | planned (row 35) |
 | Browser dialer | not scheduled |
-| Tagged connections / observatory webhooks | planned (rows 126, 125) |
+| Tagged connections | done (row 125, [engine-tagged](function/engine-tagged.md)); observatory webhooks planned |
 | UDP `transport/internet/udp` fullcone/NAT behavior | mux-cool carries XUDP; standalone UDP transport planned |
 | Unix sockets | done (row 33) |
 

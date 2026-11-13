@@ -2,11 +2,12 @@
 //! layer (`transport/internet/finalmask`, `fragment/conn.go`), so the records a handshake emits
 //! reach the wire as the pieces the config asked for.
 //!
-//! [`Fragment`] cuts records without changing an octet; [`Sudoku`] replaces each plaintext octet
-//! with four hint octets, so it is a stream codec in both directions and changes what the peer
-//! reads. `header-custom` and `xmc` are still refused by name at config, never dialled unmasked.
-//! Splitting a handshake record is legal TLS — a handshake message may span records — so the peer's
-//! own stack reassembles it, which is what the pinned interop rows assert.
+//! [`Fragment`] cuts session writes, [`Sudoku`] replaces each plaintext octet with four hint octets
+//! in both directions, and [`HeaderCustom`] runs a configured ping-pong handshake before them; `xmc`
+//! is still refused by name at config, never dialled unmasked. A fragment mask rewrites nothing: the
+//! octets a session writes are the octets the peer reads, cut at different record ends. Splitting a
+//! handshake record is legal TLS — a handshake message may span records — so the peer's own stack
+//! reassembles it, which is what the pinned interop rows assert.
 //!
 //! Stages compose in config order on the write path: the first configured entry sees the session's
 //! whole, and what it hands on is the next stage's whole, the last stage nearest the socket. That is
@@ -14,16 +15,19 @@
 //! stages from the socket end, so a codec's bytes are unwrapped before the stage above it sees them.
 
 mod go_rand;
+mod header_custom;
 mod sudoku;
 
+pub use header_custom::{Expr, ExprArg, HeaderCustom, HeaderRun, Item, Sequence};
 pub use sudoku::Sudoku;
 
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// The side a connection plays. The reference's sudoku directions are asymmetric: a client writes
-/// the pure stream and reads the packed one, a server writes the packed one and reads the pure one.
+/// The side a connection plays. Sudoku's directions are asymmetric and a header handshake expects
+/// the other side's sequences, so the same config must be armed differently on a dial and an accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskRole {
     Client,
@@ -475,6 +479,7 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 pub struct Chain {
     stages: Vec<Stage>,
     filters: Vec<SourceFilter>,
+    header: Option<Arc<HeaderCustom>>,
 }
 
 /// One configured stage. `fragment` is write-only, `sudoku` carries a reader too.
@@ -557,7 +562,27 @@ impl Chain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stages.is_empty()
+        self.stages.is_empty() && self.header.is_none()
+    }
+
+    /// One `header-custom` handshake outside the byte stages; the first entry owns it.
+    pub fn push_header_custom(&mut self, header: HeaderCustom) {
+        self.header = Some(Arc::new(header));
+    }
+
+    /// The handshake the config armed, if any.
+    pub fn header(&self) -> Option<&HeaderCustom> {
+        self.header.as_deref()
+    }
+
+    /// The same chain without its handshake, which the byte stages own separately.
+    #[must_use]
+    pub fn without_header(&self) -> Self {
+        Self {
+            stages: self.stages.clone(),
+            filters: self.filters.clone(),
+            header: None,
+        }
     }
 
     /// Attach one more source filter; every stage's verdict is a separate gate.
@@ -580,10 +605,12 @@ impl Chain {
         let write = Chain {
             stages: self.stages.iter().map(|s| s.opened(role, true)).collect(),
             filters: Vec::new(),
+            header: None,
         };
         let read = self.stages.iter().any(Stage::is_codec).then(|| Chain {
             stages: self.stages.iter().map(|s| s.opened(role, false)).collect(),
             filters: Vec::new(),
+            header: None,
         });
         OpenChain { write, read }
     }

@@ -160,6 +160,8 @@ enum Method {
     Hunk,
     /// `rpc TunMulti`: one `MultiHunk` per message, a batch of elements in each.
     MultiHunk,
+    /// One custom path for both names: a batch arrives as a `MultiHunk` and every reply stays one element per message, so neither peer truncates the other.
+    Both,
 }
 
 /// What a header block answers, read while it decodes: each name the gates use is judged at its first field, so a head costs no allocation and no buffer outlives the block.
@@ -169,7 +171,7 @@ struct Gate {
     status: Option<bool>,
     /// The first `:path` names one of the two served methods.
     served: Option<bool>,
-    /// and which of them, so the reply is read as a `MultiHunk` rather than silently truncated to the last element of every message.
+    /// and which of them, so the reply is read as a `MultiHunk` rather than silently truncated to the last element of every message; `None` is one custom path naming both.
     multi: Option<bool>,
     /// The first `:method` was `POST`.
     posted: Option<bool>,
@@ -184,7 +186,7 @@ impl Gate {
             5 if name.eq_ignore_ascii_case(b":path") => {
                 if self.served.is_none() {
                     let multi = multi_path != path && value == multi_path.as_bytes();
-                    self.multi = Some(multi);
+                    self.multi = (multi_path != path).then_some(multi);
                     self.served = Some(multi || value == path.as_bytes());
                 }
             }
@@ -203,6 +205,14 @@ impl Gate {
             }
             _ => {}
         }
+    }
+}
+
+fn served_method(gate: &Gate) -> Method {
+    match gate.multi {
+        Some(true) => Method::MultiHunk,
+        Some(false) => Method::Hunk,
+        None => Method::Both,
     }
 }
 
@@ -438,11 +448,7 @@ impl<R: Read> GrpcReader<R> {
             self.refuse(id);
             return None;
         }
-        self.method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        self.method = served_method(gate);
         let block = block_encode(&[
             (":status", "200"),
             ("content-type", "application/grpc"),
@@ -650,7 +656,7 @@ impl<R: Read> GrpcReader<R> {
     fn decode(&mut self) -> Option<()> {
         match self.method {
             Method::Hunk => self.decode_hunk(),
-            Method::MultiHunk => self.decode_multi(),
+            Method::MultiHunk | Method::Both => self.decode_multi(),
         }
     }
 
@@ -1677,21 +1683,22 @@ fn message_payload(max_frame: usize) -> usize {
 
 /// The largest `MultiHunk` element whose complete envelope — the gRPC prefix, the field tag and
 /// its length — fits `cap` bytes, so one element is never split for a margin it does not owe.
+/// A cap below the eight-byte floor has no element to fit; the caller waits it out, so the floor
+/// is returned rather than zero. `limit` is what the six envelope bytes leave; subtracting the
+/// length at that limit's own width lands on a payload that fits, and a narrower varint can admit
+/// at most one byte more.
 fn multi_payload(cap: u64) -> usize {
     let max = usize::try_from(cap).unwrap_or(usize::MAX);
     if max < 8 {
         return 1;
     }
-    let mut payload = max - 6;
-    loop {
-        let total = 6 + varint_len(payload as u64) + payload;
-        if total <= max {
-            return payload;
-        }
-        payload = payload.saturating_sub(1);
-        if payload == 0 {
-            return 1;
-        }
+    let limit = max.saturating_sub(6);
+    let payload = limit.saturating_sub(varint_len(limit as u64));
+    let next = payload + 1;
+    if next + varint_len(next as u64) <= limit {
+        next
+    } else {
+        payload
     }
 }
 
@@ -2254,11 +2261,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -2381,11 +2384,7 @@ impl crate::xhttp_h2::H2Service for VmGrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -2494,11 +2493,7 @@ impl crate::xhttp_h2::H2Service for TrGrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -2606,11 +2601,7 @@ impl crate::xhttp_h2::H2Service for SsGrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -3710,6 +3701,14 @@ mod tests {
         path: &str,
         frames: &[(u8, Vec<u8>)],
     ) -> Option<GrpcReader<std::io::Cursor<Vec<u8>>>> {
+        served_with(&GrpcSettings::path("/TunnelService/Tun"), path, frames)
+    }
+
+    fn served_with(
+        settings: &GrpcSettings,
+        path: &str,
+        frames: &[(u8, Vec<u8>)],
+    ) -> Option<GrpcReader<std::io::Cursor<Vec<u8>>>> {
         let mut wire = MAGIC.to_vec();
         wire.extend_from_slice(&frame(
             T_HEADERS,
@@ -3724,11 +3723,8 @@ mod tests {
         for (flags, body) in frames {
             wire.extend_from_slice(&frame(T_DATA, *flags, 1, body));
         }
-        let (reader, writer) = accept_split(
-            std::io::Cursor::new(wire),
-            Sink::default(),
-            "/TunnelService/Tun",
-        )?;
+        let (reader, writer) =
+            accept_split_with(std::io::Cursor::new(wire), Sink::default(), settings)?;
         drop(writer);
         Some(reader)
     }
@@ -3821,6 +3817,21 @@ mod tests {
             let mut reader = served(path, &frames).expect("serves");
             assert_eq!(drain_all(&mut reader).0, want, "{path}");
         }
+        let custom = GrpcSettings {
+            path: "/svc/tun".to_owned(),
+            multi_path: "/svc/tun".to_owned(),
+            ..GrpcSettings::default()
+        };
+        let mut single =
+            served_with(&custom, "/svc/tun", &[(F_END, message(b"ping"))]).expect("serves");
+        assert_eq!(drain_all(&mut single).0, b"ping".to_vec());
+        let mut multi = served_with(
+            &custom,
+            "/svc/tun",
+            &[(F_END, multi_message(&[b"pi", b"n"]))],
+        )
+        .expect("serves");
+        assert_eq!(drain_all(&mut multi).0, b"pin".to_vec());
         assert!(served("/TunnelService/TunExtra", &[]).is_none());
     }
 
@@ -4532,12 +4543,98 @@ mod tests {
         );
     }
 
+    /// The walk the fixed point replaces: one byte at a time until the envelope fits.
+    fn multi_payload_walk(cap: u64) -> usize {
+        let max = usize::try_from(cap).unwrap_or(usize::MAX);
+        if max < 8 {
+            return 1;
+        }
+        let mut payload = max - 6;
+        loop {
+            let total = 6 + varint_len(payload as u64) + payload;
+            if total <= max {
+                return payload;
+            }
+            payload = payload.saturating_sub(1);
+            if payload == 0 {
+                return 1;
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn multi_payload_probe() -> usize {
+        let mut sum = 0usize;
+        for i in 0..4096u64 {
+            sum = sum.wrapping_add(multi_payload(std::hint::black_box(65_535 + (i & 3))));
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn multi_payload_walk_probe() -> usize {
+        let mut sum = 0usize;
+        for i in 0..4096u64 {
+            sum = sum.wrapping_add(multi_payload_walk(std::hint::black_box(65_535 + (i & 3))));
+        }
+        sum
+    }
+
+    /// The fit and the walk choose the same payload across every cap the writer can see, and the
+    /// sweep covers the varint edges — `127`/`128`, `134`/`135`, `16_383`/`16_384`, `16_390`/`16_392`
+    /// — where the envelope width changes.
+    #[test]
+    fn the_multi_payload_fixed_point_matches_the_walk() {
+        for cap in 0u64..=7 {
+            assert_eq!(multi_payload(cap), multi_payload_walk(cap), "cap {cap}");
+        }
+        for cap in [
+            8u64, 9, 127, 128, 134, 135, 16_383, 16_384, 16_390, 16_392, 40_000, 65_535,
+        ] {
+            assert_eq!(multi_payload(cap), multi_payload_walk(cap), "cap {cap}");
+        }
+        for cap in 8u64..=70_000 {
+            assert_eq!(multi_payload(cap), multi_payload_walk(cap), "cap {cap}");
+        }
+    }
+
+    /// The ops probe the page's `multi-payload-probe-ops` row names: the fit and the walk over the
+    /// same `4096` caps, so the two counts are the same work and only the sizing differs.
+    #[test]
+    fn the_multi_payload_fixed_point_costs_less_than_the_walk() {
+        assert_eq!(multi_payload_probe(), multi_payload_walk_probe());
+    }
+
+    /// The fit stays maximal at the top of `usize`, where the walk's `6 + len + payload` would
+    /// overflow: the chosen payload fits and the next byte does not.
+    #[test]
+    fn the_multi_payload_fit_holds_at_the_top_of_the_space() {
+        for max in [
+            usize::MAX,
+            usize::MAX - 1,
+            usize::MAX - 7,
+            usize::MAX - 15,
+            1usize << (usize::BITS - 1),
+            (1usize << (usize::BITS - 1)) - 1,
+        ] {
+            let payload = multi_payload(max as u64);
+            let fits = 6u128 + varint_len(payload as u64) as u128 + payload as u128;
+            assert!(
+                fits <= max as u128,
+                "max {max} leaves payload {payload} at {fits}"
+            );
+            let next = payload + 1;
+            let over = 6u128 + varint_len(next as u64) as u128 + next as u128;
+            assert!(over > max as u128, "max {max} still fits payload {next}");
+        }
+    }
+
     /// Every element leaves in the largest envelope the room pays for, and one byte more does not
     /// fit; a fixed frame-width margin would leave room unused.
     #[test]
     fn a_multi_element_uses_the_envelope_the_peer_pays_for() {
         for cap in [
-            8u64, 9, 127, 128, 134, 16_383, 16_384, 16_390, 40_000, 65_535,
+            8u64, 9, 127, 128, 134, 135, 16_383, 16_384, 16_390, 16_392, 40_000, 65_535,
         ] {
             let payload = multi_payload(cap);
             let fits = 6 + varint_len(payload as u64) + payload;

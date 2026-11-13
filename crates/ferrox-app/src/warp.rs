@@ -5,12 +5,15 @@
 //! three calls produce is saved once and reused, so a restart does not create
 //! a second account.
 
-use std::io::Write as _;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
+use std::collections::HashSet;
+use std::io::{Read as _, Write as _};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::warp_scan::{self, Cooldowns, LastEdge, ScanMode};
 
 use base64::Engine as _;
 
@@ -36,6 +39,18 @@ const CLIENT_VERSION: &str = "a-6.35-4471";
 const PROBE_HOST: &str = "one.one.one.one";
 /// The name's port: only the answer matters, not a connection.
 const PROBE_PORT: u16 = 53;
+/// The name an ironclad edge must carry a real HTTP response for.
+const HTTP_PROBE_HOST: &str = "www.gstatic.com";
+/// The path whose `204` the reference's ironclad check reads.
+const HTTP_PROBE_PATH: &str = "/generate_204";
+/// How long an ironclad edge waits for that response.
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+/// The port an ironclad scan asks, unless `ironcladPort` or the environment moves it.
+const IRONCLAD_PORT: u16 = 80;
+/// How long a failed edge is left out of a rescan.
+const COOLDOWN_SECS: u64 = 300;
+/// The cap a cooldown or a stale timeout may not pass.
+const SCAN_CAP_SECS: u64 = 86_400;
 /// How long the race waits for a first successful answer.
 const RACE_DEADLINE: Duration = Duration::from_secs(8);
 /// The MTU WARP's own clients use.
@@ -122,6 +137,81 @@ struct WarpSpec {
     masque_server_name: String,
     masque_host: String,
     masque_path: String,
+    scan: Option<ScanMode>,
+    peer: Option<SocketAddr>,
+    wg_peer: Option<SocketAddr>,
+    ironclad_port: u16,
+    quick_reconnect: bool,
+    last_edge: Option<PathBuf>,
+    stale: Option<Duration>,
+    cooldown: Duration,
+}
+
+struct EdgeSpec {
+    scan: Option<ScanMode>,
+    peer: Option<SocketAddr>,
+    wg_peer: Option<SocketAddr>,
+    ironclad_port: u16,
+    quick_reconnect: bool,
+    last_edge: Option<PathBuf>,
+    stale: Option<Duration>,
+    cooldown: Duration,
+}
+
+impl EdgeSpec {
+    fn from(settings: &crate::json::Json) -> Result<Self, String> {
+        let scan = match settings.get("scan") {
+            Some(crate::json::Json::Str(text)) => scan_mode(text),
+            Some(crate::json::Json::Bool(true)) => Some(ScanMode::Balanced),
+            Some(crate::json::Json::Bool(false)) => None,
+            _ => std::env::var("AETHER_SCAN")
+                .ok()
+                .as_deref()
+                .and_then(scan_mode),
+        };
+        let peer = peer_setting(settings, "peer", "AETHER_PEER")?;
+        let wg_peer = peer_setting(settings, "wgPeer", "AETHER_WG_PEER")?;
+        let ironclad_port = settings
+            .get("ironcladPort")
+            .and_then(crate::json::Json::as_port)
+            .or_else(|| env_u64("AETHER_IRONCLAD_PORT").and_then(|port| u16::try_from(port).ok()))
+            .unwrap_or(IRONCLAD_PORT);
+        let quick_reconnect = settings
+            .get("quickReconnect")
+            .and_then(crate::json::Json::as_bool)
+            .or_else(|| env_bool("AETHER_QUICK_RECONNECT"))
+            .unwrap_or(false);
+        let last_edge = settings
+            .get("lastEdge")
+            .and_then(crate::json::Json::as_str)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let stale = settings
+            .get("stale")
+            .and_then(crate::json::Json::as_u32)
+            .map(u64::from)
+            .or_else(|| env_u64("AETHER_WG_STALE_SECS"))
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(seconds.min(SCAN_CAP_SECS)));
+        let cooldown = settings
+            .get("cooldown")
+            .and_then(crate::json::Json::as_u32)
+            .map(u64::from)
+            .or_else(|| env_u64("AETHER_WG_ENDPOINT_COOLDOWN_SECS"))
+            .map_or(Duration::from_secs(COOLDOWN_SECS), |seconds| {
+                Duration::from_secs(seconds.min(SCAN_CAP_SECS))
+            });
+        Ok(Self {
+            scan,
+            peer,
+            wg_peer,
+            ironclad_port,
+            quick_reconnect,
+            last_edge,
+            stale,
+            cooldown,
+        })
+    }
 }
 
 impl WarpSpec {
@@ -194,6 +284,7 @@ impl WarpSpec {
         };
         let (masque_address, masque_port, masque_server_name, masque_host, masque_path) =
             masque_settings(settings.get("masque"));
+        let edge = EdgeSpec::from(settings)?;
         Ok(Self {
             mode,
             register,
@@ -212,6 +303,14 @@ impl WarpSpec {
             masque_server_name,
             masque_host,
             masque_path,
+            scan: edge.scan,
+            peer: edge.peer,
+            wg_peer: edge.wg_peer,
+            ironclad_port: edge.ironclad_port,
+            quick_reconnect: edge.quick_reconnect,
+            last_edge: edge.last_edge,
+            stale: edge.stale,
+            cooldown: edge.cooldown,
         })
     }
 
@@ -305,7 +404,81 @@ impl WarpSpec {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            scan: None,
+            peer: None,
+            wg_peer: None,
+            ironclad_port: IRONCLAD_PORT,
+            quick_reconnect: false,
+            last_edge: None,
+            stale: None,
+            cooldown: Duration::from_secs(COOLDOWN_SECS),
         }
+    }
+
+    fn last_edge_path(&self) -> PathBuf {
+        if let Some(path) = &self.last_edge {
+            return path.clone();
+        }
+        let Some(identity) = &self.identity_file else {
+            return PathBuf::from("warp-lastconn.json");
+        };
+        let name = identity.file_stem().map_or_else(
+            || "warp-identity.lastconn.json".to_owned(),
+            |stem| format!("{}.lastconn.json", stem.to_string_lossy()),
+        );
+        identity.with_file_name(name)
+    }
+}
+
+fn scan_mode(text: &str) -> Option<ScanMode> {
+    let text = text.trim();
+    if text.is_empty()
+        || ["off", "none", "false", "0"]
+            .iter()
+            .any(|off| text.eq_ignore_ascii_case(off))
+    {
+        return None;
+    }
+    Some(ScanMode::parse(text).unwrap_or(ScanMode::Balanced))
+}
+
+fn peer_setting(
+    settings: &crate::json::Json,
+    key: &str,
+    environment: &str,
+) -> Result<Option<SocketAddr>, String> {
+    let text = settings
+        .get(key)
+        .and_then(crate::json::Json::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(environment)
+                .ok()
+                .filter(|text| !text.is_empty())
+        });
+    text.map(|text| parse_endpoint(&text).ok_or_else(|| format!("warp: `{key}` is not host:port")))
+        .transpose()
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let text = std::env::var(name).ok()?;
+    if ["1", "true", "on", "yes"]
+        .iter()
+        .any(|on| text.trim().eq_ignore_ascii_case(on))
+    {
+        Some(true)
+    } else if ["0", "false", "off", "no"]
+        .iter()
+        .any(|off| text.trim().eq_ignore_ascii_case(off))
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1160,6 +1333,298 @@ fn address_json(addresses: &[IpAddr]) -> crate::json::Json {
     )
 }
 
+#[allow(clippy::too_many_lines)]
+fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), String> {
+    let mut wireguard = spec.wg_peer.or(spec.endpoint);
+    let mut masque = spec.peer;
+    if let Some(edge) = wireguard {
+        identity.wireguard.endpoint = edge;
+        println!("[+] using forced peer {edge} (probe skipped)");
+    }
+    if let Some(edge) = masque {
+        set_masque_edge(spec, edge);
+        println!("[+] using forced peer {edge} (probe skipped)");
+    }
+    let want_wireguard = spec.mode != Mode::Masque;
+    let want_masque = spec.mode != Mode::WireGuard && identity.masque.is_some();
+    let cache_path = spec.last_edge_path();
+    let mut last = LastEdge::load(&cache_path);
+    let mut cooldowns = Cooldowns::new(spec.cooldown);
+    let mut scan = spec.scan;
+    let now = Instant::now();
+    if spec.quick_reconnect {
+        if wireguard.is_none() && want_wireguard {
+            if let Some(edge) = last.get("wireguard") {
+                if check_wireguard(identity, spec, edge) {
+                    wireguard = Some(edge);
+                    println!("[+] selected WireGuard endpoint {edge}");
+                } else {
+                    cooldowns.hold(edge, now);
+                    scan.get_or_insert(ScanMode::Balanced);
+                    eprintln!("[-] last WireGuard edge {edge} did not answer; scanning");
+                }
+            }
+        }
+        if masque.is_none() && want_masque {
+            if let Some(edge) = last.get("masque") {
+                if check_masque(identity, spec, edge) {
+                    masque = Some(edge);
+                    println!("[+] selected MASQUE gateway {edge}");
+                } else {
+                    cooldowns.hold(edge, now);
+                    scan.get_or_insert(ScanMode::Balanced);
+                    eprintln!("[-] last MASQUE edge {edge} did not answer; scanning");
+                }
+            }
+        }
+    }
+    cooldowns.purge(now);
+    let excluded = cooldowns.excluded(now);
+    if let Some(mode) = scan {
+        eprintln!("warp: scanning edges in {} mode", mode.label());
+        let timeout = spec.stale.map_or_else(
+            || warp_scan::scan_timeout(mode),
+            |stale| stale.min(warp_scan::scan_timeout(mode)),
+        );
+        let (found_wireguard, found_masque) = std::thread::scope(|scope| {
+            let wireguard = (wireguard.is_none() && want_wireguard).then(|| {
+                let identity = identity.clone();
+                let spec = spec.clone();
+                let excluded = excluded.clone();
+                scope.spawn(move || scan_wireguard(&identity, &spec, mode, timeout, &excluded))
+            });
+            let masque = (masque.is_none() && want_masque).then(|| {
+                let identity = identity.clone();
+                let spec = spec.clone();
+                let excluded = excluded.clone();
+                scope.spawn(move || scan_masque(&identity, &spec, mode, &excluded))
+            });
+            (
+                wireguard.and_then(|handle| handle.join().ok().flatten()),
+                masque.and_then(|handle| handle.join().ok().flatten()),
+            )
+        });
+        if let Some(edge) = found_wireguard {
+            wireguard = Some(edge);
+            println!("[+] selected WireGuard endpoint {edge}");
+        }
+        if let Some(edge) = found_masque {
+            masque = Some(edge);
+            println!("[+] selected MASQUE gateway {edge}");
+        }
+        if want_wireguard && wireguard.is_none() && spec.mode == Mode::WireGuard {
+            return Err("warp: the WireGuard sweep found no edge that carries traffic".to_owned());
+        }
+        if want_masque && masque.is_none() && spec.mode == Mode::Masque {
+            return Err("warp: the MASQUE sweep found no edge that carries traffic".to_owned());
+        }
+        if want_wireguard && wireguard.is_none() {
+            eprintln!("warp: the WireGuard sweep found no edge; keeping the API endpoint");
+        }
+        if want_masque && masque.is_none() {
+            eprintln!("warp: the MASQUE sweep found no edge; keeping the API edge");
+        }
+    }
+    if let Some(edge) = wireguard {
+        identity.wireguard.endpoint = edge;
+    }
+    if let Some(edge) = masque {
+        set_masque_edge(spec, edge);
+    }
+    if (spec.scan.is_some() || spec.quick_reconnect) && (wireguard.is_some() || masque.is_some()) {
+        if let Some(edge) = wireguard {
+            last.record("wireguard", edge);
+        }
+        if let Some(edge) = masque {
+            last.record("masque", edge);
+        }
+        if let Err(error) = last.save(&cache_path) {
+            eprintln!("warp: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn set_masque_edge(spec: &mut WarpSpec, edge: SocketAddr) {
+    spec.masque_address = edge.ip().to_string();
+    spec.masque_port = edge.port();
+}
+
+fn scan_wireguard(
+    identity: &Identity,
+    spec: &WarpSpec,
+    mode: ScanMode,
+    timeout: Duration,
+    excluded: &HashSet<SocketAddr>,
+) -> Option<SocketAddr> {
+    let ironclad = mode == ScanMode::Ironclad;
+    warp_scan::hunt(warp_scan::wg_candidates(mode), mode, excluded, |edge| {
+        let local = identity
+            .wireguard
+            .addresses
+            .iter()
+            .find_map(|address| match address {
+                IpAddr::V4(address) => Some(*address),
+                IpAddr::V6(_) => None,
+            })?;
+        let rtt = crate::wg::verify_endpoint(
+            identity.wireguard.private,
+            identity.wireguard.peer,
+            identity.wireguard.reserved,
+            local,
+            edge,
+            timeout,
+        )?;
+        if ironclad && !http_check_wireguard(identity, spec, edge) {
+            eprintln!("[-] edge {edge} opened a tunnel but carried no HTTP answer");
+            return None;
+        }
+        Some(rtt)
+    })
+    .first()
+    .map(|(edge, _)| *edge)
+}
+
+fn scan_masque(
+    identity: &Identity,
+    spec: &WarpSpec,
+    mode: ScanMode,
+    excluded: &HashSet<SocketAddr>,
+) -> Option<SocketAddr> {
+    let ironclad = mode == ScanMode::Ironclad;
+    warp_scan::hunt(warp_scan::masque_candidates(mode), mode, excluded, |edge| {
+        let mut edge_spec = spec.clone();
+        set_masque_edge(&mut edge_spec, edge);
+        let out = build_masque(identity, &edge_spec).ok()?;
+        let started = Instant::now();
+        if !out.probe(PROBE_HOST, PROBE_PORT) {
+            return None;
+        }
+        if ironclad && !http_check_masque(identity, spec, edge) {
+            eprintln!("[-] gateway {edge} opened a tunnel but carried no HTTP answer");
+            return None;
+        }
+        Some(started.elapsed())
+    })
+    .first()
+    .map(|(edge, _)| *edge)
+}
+
+fn check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
+    let timeout = spec.stale.map_or_else(
+        || warp_scan::scan_timeout(ScanMode::Balanced),
+        |stale| stale.min(warp_scan::scan_timeout(ScanMode::Balanced)),
+    );
+    let Some(local) = identity
+        .wireguard
+        .addresses
+        .iter()
+        .find_map(|address| match address {
+            IpAddr::V4(address) => Some(*address),
+            IpAddr::V6(_) => None,
+        })
+    else {
+        return false;
+    };
+    let answered = crate::wg::verify_endpoint(
+        identity.wireguard.private,
+        identity.wireguard.peer,
+        identity.wireguard.reserved,
+        local,
+        edge,
+        timeout,
+    )
+    .is_some();
+    answered
+        && (spec.scan != Some(ScanMode::Ironclad) || http_check_wireguard(identity, spec, edge))
+}
+
+fn check_masque(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
+    let mut edge_spec = spec.clone();
+    set_masque_edge(&mut edge_spec, edge);
+    let answered =
+        build_masque(identity, &edge_spec).is_ok_and(|out| out.probe(PROBE_HOST, PROBE_PORT));
+    answered && (spec.scan != Some(ScanMode::Ironclad) || http_check_masque(identity, spec, edge))
+}
+
+fn http_check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
+    let mut identity = identity.clone();
+    identity.wireguard.endpoint = edge;
+    let Ok(out) = build_wireguard(&identity, spec) else {
+        return false;
+    };
+    http_check(
+        |client, asked| out.serve_tcp(client, asked, b""),
+        spec.ironclad_port,
+    )
+}
+
+fn http_check_masque(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
+    let mut edge_spec = spec.clone();
+    set_masque_edge(&mut edge_spec, edge);
+    let Ok(out) = build_masque(identity, &edge_spec) else {
+        return false;
+    };
+    http_check(
+        |client, asked| out.serve_tcp(client, asked, b""),
+        edge_spec.ironclad_port,
+    )
+}
+
+fn http_check(
+    serve: impl FnOnce(crate::conn::Connection, &crate::proxy::Destination),
+    port: u16,
+) -> bool {
+    let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+        return false;
+    };
+    let Ok(address) = listener.local_addr() else {
+        return false;
+    };
+    let Ok(mut client) = TcpStream::connect(address) else {
+        return false;
+    };
+    let Ok((tunnel, _)) = listener.accept() else {
+        return false;
+    };
+    let _ = client.set_read_timeout(Some(HTTP_PROBE_TIMEOUT));
+    let _ = client.set_write_timeout(Some(HTTP_PROBE_TIMEOUT));
+    serve(
+        crate::conn::Connection::from(tunnel),
+        &crate::proxy::Destination::Name(HTTP_PROBE_HOST.to_owned(), port),
+    );
+    let request = format!(
+        "GET {HTTP_PROBE_PATH} HTTP/1.1\r\nHost: {HTTP_PROBE_HOST}\r\nConnection: close\r\nUser-Agent: ferrox-ironclad\r\n\r\n"
+    );
+    if client.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 128];
+    loop {
+        match client.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.windows(2).any(|window| window == b"\r\n") || response.len() >= 128 {
+                    break;
+                }
+            }
+        }
+    }
+    let line = response.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    http_status_code(&String::from_utf8_lossy(line)) == Some(204)
+}
+
+fn http_status_code(status_line: &str) -> Option<u16> {
+    let mut parts = status_line.split(' ');
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.trim().parse().ok()
+}
+
 /// The `WireGuard` half as the existing `wireguard` outbound reads it.
 fn wireguard_settings(identity: &Identity, spec: &WarpSpec) -> crate::json::Json {
     let wireguard = &identity.wireguard;
@@ -1259,8 +1724,8 @@ impl WarpOut {
         let settings = outbound
             .get("settings")
             .ok_or("warp outbound has no settings")?;
-        let spec = WarpSpec::from(settings)?;
-        let identity = if test
+        let mut spec = WarpSpec::from(settings)?;
+        let mut identity = if test
             && spec.inline.is_none()
             && !spec
                 .identity_file
@@ -1279,6 +1744,9 @@ impl WarpOut {
         } else {
             spec.identity()?
         };
+        if !test {
+            resolve_edges(&mut identity, &mut spec)?;
+        }
         let wireguard = if spec.mode == Mode::Masque {
             None
         } else {
@@ -1696,6 +2164,14 @@ pub(crate) fn one_tap(
         masque_server_name: CONNECT_SNI.to_owned(),
         masque_host: CONNECT_HOST.to_owned(),
         masque_path: "/".to_owned(),
+        scan: None,
+        peer: None,
+        wg_peer: None,
+        ironclad_port: IRONCLAD_PORT,
+        quick_reconnect: false,
+        last_edge: None,
+        stale: None,
+        cooldown: Duration::from_secs(COOLDOWN_SECS),
     };
     let identity = register(&spec, true)?;
     identity.save(&path)?;
@@ -1893,6 +2369,51 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
 mod tests {
     use super::*;
 
+    fn sample_spec() -> WarpSpec {
+        WarpSpec {
+            mode: Mode::Auto,
+            register: false,
+            identity_file: None,
+            inline: None,
+            api: None,
+            api_address: None,
+            endpoint: None,
+            mtu: DEFAULT_MTU,
+            keepalive: DEFAULT_KEEPALIVE,
+            probe_host: PROBE_HOST.to_owned(),
+            probe_port: PROBE_PORT,
+            dns: Vec::new(),
+            masque_address: CONNECT_HOST.to_owned(),
+            masque_port: QUIC_PORT,
+            masque_server_name: CONNECT_SNI.to_owned(),
+            masque_host: CONNECT_HOST.to_owned(),
+            masque_path: "/".to_owned(),
+            scan: None,
+            peer: None,
+            wg_peer: None,
+            ironclad_port: IRONCLAD_PORT,
+            quick_reconnect: false,
+            last_edge: None,
+            stale: None,
+            cooldown: Duration::from_secs(COOLDOWN_SECS),
+        }
+    }
+
+    fn sample_identity() -> Identity {
+        Identity {
+            device_id: "a-device".to_owned(),
+            token: "a-token".to_owned(),
+            wireguard: WireGuardIdentity {
+                private: [7u8; 32],
+                peer: [8u8; 32],
+                endpoint: "192.0.2.1:2408".parse().expect("an endpoint"),
+                addresses: vec!["172.16.0.2".parse().expect("a v4 address")],
+                reserved: [1, 2, 3],
+            },
+            masque: None,
+        }
+    }
+
     fn sample_reply(peer_key: &str) -> Reply {
         let peer = obj_pairs(vec![
             ("public_key", string(peer_key)),
@@ -1957,6 +2478,14 @@ mod tests {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            scan: None,
+            peer: None,
+            wg_peer: None,
+            ironclad_port: IRONCLAD_PORT,
+            quick_reconnect: false,
+            last_edge: None,
+            stale: None,
+            cooldown: Duration::from_secs(COOLDOWN_SECS),
         };
         let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
         let masque_reply = sample_reply(&server);
@@ -2035,6 +2564,14 @@ mod tests {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            scan: None,
+            peer: None,
+            wg_peer: None,
+            ironclad_port: IRONCLAD_PORT,
+            quick_reconnect: false,
+            last_edge: None,
+            stale: None,
+            cooldown: Duration::from_secs(COOLDOWN_SECS),
         };
         let settings = wireguard_settings(&identity, &spec);
         let config = crate::wireguard::DeviceConfig::from_json(&settings).expect("the WG half");
@@ -2577,5 +3114,48 @@ mod tests {
         assert_eq!(mode, 0o600, "the keys are not readable by anyone else");
         assert_eq!(Identity::load(&path).expect("the saved identity"), identity);
         std::fs::remove_dir_all(&dir).expect("the scratch directory is removed");
+    }
+
+    #[test]
+    fn scan_settings_take_the_reference_names_and_off() {
+        assert_eq!(scan_mode("stealth"), Some(ScanMode::Verified));
+        assert_eq!(scan_mode("guaranteed"), Some(ScanMode::Ironclad));
+        assert_eq!(scan_mode("off"), None);
+        assert_eq!(scan_mode("typo"), Some(ScanMode::Balanced));
+    }
+
+    #[test]
+    fn an_http_status_line_is_read_not_guessed() {
+        assert_eq!(http_status_code("HTTP/1.1 204 No Content"), Some(204));
+        assert_eq!(http_status_code("HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(http_status_code("204"), None);
+        assert_eq!(http_status_code("GET / HTTP/1.1"), None);
+    }
+
+    #[test]
+    fn the_last_edge_sits_beside_the_identity_unless_named() {
+        let mut spec = sample_spec();
+        spec.identity_file = Some(PathBuf::from("/tmp/warp-identity.json"));
+        assert_eq!(
+            spec.last_edge_path(),
+            PathBuf::from("/tmp/warp-identity.lastconn.json")
+        );
+        spec.last_edge = Some(PathBuf::from("/tmp/chosen.json"));
+        assert_eq!(spec.last_edge_path(), PathBuf::from("/tmp/chosen.json"));
+    }
+
+    #[test]
+    fn a_forced_peer_skips_the_sweep_on_both_halves() {
+        let mut identity = sample_identity();
+        let mut spec = sample_spec();
+        spec.wg_peer = Some("192.0.2.8:2408".parse().expect("a WG peer"));
+        spec.peer = Some("192.0.2.9:443".parse().expect("a MASQUE peer"));
+        resolve_edges(&mut identity, &mut spec).expect("forced peers resolve");
+        assert_eq!(
+            identity.wireguard.endpoint,
+            "192.0.2.8:2408".parse().expect("the WG peer")
+        );
+        assert_eq!(spec.masque_address, "192.0.2.9");
+        assert_eq!(spec.masque_port, 443);
     }
 }

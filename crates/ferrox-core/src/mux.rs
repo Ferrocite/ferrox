@@ -383,29 +383,35 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
         return Err(Error::MetaLen(declared));
     }
     let meta_len = usize::from(declared);
-    let Some(meta) = after.get(..meta_len) else {
+    // One split leaves the payload's own bytes behind the metadata, so the chunk walk never indexes `buf` again.
+    let Some((meta, rest)) = after.split_at_checked(meta_len) else {
         return Err(Error::short(2 + meta_len, buf.len()));
     };
 
     // One bounded load of the fixed head: four indexed reads would each carry their own length check although `meta_len >= FIXED` proved the bytes are here.
-    let Some((&fixed, rest)) = meta.split_first_chunk::<FIXED>() else {
+    let Some((&fixed, meta_rest)) = meta.split_first_chunk::<FIXED>() else {
         return Err(Error::Truncated);
     };
     let id = u16::from_be_bytes([fixed[0], fixed[1]]);
-    let status = Status::from_byte(fixed[2]).ok_or(Error::Status(fixed[2]))?;
+    // The status answers itself and whether a target follows in one match, so the bulk TCP `Keep` never builds the `Option` the old two-step asked for.
+    let (status, carries) = match fixed[2] {
+        0x01 => (Status::New, true),
+        0x02 => (
+            Status::Keep,
+            matches!(meta_rest.first(), Some(&byte) if byte == Network::Udp.byte()),
+        ),
+        0x03 => (Status::End, false),
+        0x04 => (Status::KeepAlive, false),
+        byte => return Err(Error::Status(byte)),
+    };
     let options = fixed[3];
 
-    let mut at = FIXED;
+    let mut at = 0;
     let mut target = None;
-    // Only `New`, or a `Keep` whose metadata reaches past the fixed head and names UDP, carries a target; `rest` is already cut at that boundary, so the bulk TCP `Keep` sees it empty and pays neither the byte compare nor the option it used to build to ask.
-    let carries = match status {
-        Status::New => true,
-        Status::Keep => matches!(rest.first(), Some(&byte) if byte == Network::Udp.byte()),
-        Status::End | Status::KeepAlive => false,
-    };
+    // Only `New`, or a `Keep` whose metadata reaches past the fixed head and names UDP, carries a target; `meta_rest` is already cut at that boundary, so the bulk TCP `Keep` sees it empty and pays neither the byte compare nor the option it used to build to ask.
     if carries {
-        let (found, used) = Target::take(&meta[at..])?;
-        at += used;
+        let (found, used) = Target::take(meta_rest)?;
+        at = used;
         target = Some(found);
     }
 
@@ -413,15 +419,15 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
     let mut reflection = None;
     if status == Status::New {
         match tail {
-            NewTail::Reverse => reflection = read_reflection(&meta[at..])?,
+            NewTail::Reverse => reflection = read_reflection(&meta_rest[at..])?,
             NewTail::Forward => {
-                if options & DATA != 0
-                    && target.is_some_and(|t| t.network == Network::Udp)
-                    && meta.len() - at >= GLOBAL_ID
-                {
-                    let mut identity = [0u8; GLOBAL_ID];
-                    identity.copy_from_slice(&meta[at..at + GLOBAL_ID]);
-                    global_id = Some(identity);
+                if options & DATA != 0 && target.is_some_and(|t| t.network == Network::Udp) {
+                    let after_target = &meta_rest[at..];
+                    if after_target.len() >= GLOBAL_ID {
+                        let mut identity = [0u8; GLOBAL_ID];
+                        identity.copy_from_slice(&after_target[..GLOBAL_ID]);
+                        global_id = Some(identity);
+                    }
                 }
             }
         }
@@ -430,11 +436,7 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
     let mut consumed = 2 + meta_len;
     let mut data = None;
     if options & DATA != 0 {
-        debug_assert!(
-            buf.len() >= consumed,
-            "the metadata slice was proven present"
-        );
-        let (&len, payload) = buf[consumed..]
+        let (&len, payload) = rest
             .split_first_chunk::<2>()
             .ok_or_else(|| Error::short(consumed + 2, buf.len()))?;
         let len = usize::from(u16::from_be_bytes(len));
@@ -873,6 +875,40 @@ mod tests {
             sink += used + frame.data.map_or(0, <[u8]>::len) + usize::from(frame.id);
         }
         assert_eq!(sink, 4096 * (NEW_DOMAIN.len() + 4 + 1), "the loop ran");
+    }
+
+    /// `encode_into` driven over one fixed frame, again and again, so a callgrind
+    /// frame prices the metadata and payload write and nothing else.
+    #[test]
+    fn the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else() {
+        let out = Outgoing {
+            id: 1,
+            status: Status::New,
+            options: DATA,
+            target: Some(Target::of(Network::Tcp, "example.com", 80)),
+            global_id: None,
+        };
+        let mut buf = [0u8; 64];
+        let mut sink = 0usize;
+        for _ in 0..4096 {
+            sink += out.encode_into(Some(b"abcd"), &mut buf);
+        }
+        assert_eq!(sink, 4096 * NEW_DOMAIN.len(), "the loop ran");
+    }
+
+    /// `encode_header_into` driven over one fixed Keep, again and again, so a
+    /// callgrind frame prices the header write and nothing else.
+    #[test]
+    fn the_header_probe_costs_the_metadata_write_and_nothing_else() {
+        let out = Outgoing::bare(1, Status::Keep, DATA);
+        let mut header = Vec::with_capacity(8);
+        let mut sink = 0usize;
+        for _ in 0..4096 {
+            let at = out.encode_header_into(&mut header);
+            out.patch_payload_len(&mut header, at, CHUNK_MAX);
+            sink += header.len();
+        }
+        assert_eq!(sink, 4096 * 8, "the loop ran");
     }
 
     #[test]

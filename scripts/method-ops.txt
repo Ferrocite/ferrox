@@ -84,6 +84,7 @@ trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode
 vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
 vless  vless::tests::the_request_parse_probe_costs_the_read_and_nothing_else  ferrox_core::vless::decode_request
 vless  vless::tests::the_flow_decision_probe_costs_the_walk_and_nothing_else  ferrox_core::vless::flow_of
+vless  vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy  ferrox_core::vless_encryption::tests::sealed_write_probe
 xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
 xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Link
 xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  ferrox_app::vision::tests::Fake::pump
@@ -117,6 +118,8 @@ carrier-grpc  grpc::tests::the_varint_length_over_every_boundary  grpc::tests::t
 carrier-grpc  grpc::tests::the_varint_shift_loop_over_every_boundary  grpc::tests::the_varint_shift_loop_over_every_boundary
 carrier-grpc  grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else  grpc::tests::direct_write_probe
 carrier-grpc  grpc::tests::the_walk_write_costs_the_same_answer  grpc::tests::walk_write_probe
+carrier-grpc  grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk  grpc::tests::multi_payload_probe
+carrier-grpc  grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk  grpc::tests::multi_payload_walk_probe
 engine-api  accesslog::tests::the_ascii_scan_over_a_bulk_field  accesslog::tests::the_ascii_scan_over_a_bulk_field
 engine-api  accesslog::tests::the_swar_scan_over_a_bulk_field  accesslog::tests::the_swar_scan_over_a_bulk_field
 engine-api  accesslog::tests::the_codepoint_walk_over_a_bulk_field  accesslog::tests::the_codepoint_walk_over_a_bulk_field
@@ -140,9 +143,10 @@ carrier-xhttp  xhttp_h2::tests::a_credit_grants_both_windows_in_one_write  xhttp
 carrier-xhttp  xhttp_h2::tests::a_data_window_leaves_as_one_write  xhttp_h2::H2Conn::send_data
 carrier-xhttp  xhttp::tests::a_body_window_is_the_readers_own_buffer  xhttp::Reader<core::io::cursor::Cursor<alloc::vec::Vec<u8>>>
 carrier-xhttp  xhttp::tests::the_chunk_line_costs_one_walk  xhttp::tests::xhttp_line_probe
-mux-cool  mux::tests::a_new_frame_is_the_bytes_the_fields_add_up_to  ferrox_core::mux::Frame::encode
+mux-cool  mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else  ferrox_core::mux::Outgoing::encode_into
 mux-cool  proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held  ferrox_app::proxy::read_into_tail
 mux-cool  mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else  ferrox_core::mux::decode
+mux-cool  mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else  ferrox_core::mux::Outgoing::encode_header_into
 kcp  kcp::oracle::the_scripted_core_matches_the_pinned_go  ferrox_core::kcp::Segment::serialize
 kcp  kcp::connection::tests::every_read_size_delivers_the_same_stream  ferrox_core::kcp::worker::ReceivingWorker::read
 kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next  ferrox_core::kcp::Connection::input
@@ -204,6 +208,8 @@ socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_co
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::Target::encode_into
 socks  socks::tests::the_socks4_request_is_the_bytes_the_pinned_writer_writes  ferrox_core::socks::request4
 socks  socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes  ferrox_core::socks::grant4
+socks  proxy::tests::socks_udp_datagrams_split_and_reject  ferrox_app::proxy::parse_socks_udp
+socks  proxy::tests::socks_udp_datagrams_split_and_reject  ferrox_app::proxy::parse_socks_addr_rest
 dns-outbound  dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else  ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # The queue hit and the slot hit, on the same full pool and after the same fill:
 # one ops job reports both frames, and only their difference is a claim about

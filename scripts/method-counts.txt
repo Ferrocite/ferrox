@@ -115,6 +115,8 @@ vless sealed-record-buffer-moves 0 ferrox-core-vless::tests::a_record_is_opened_
 vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
 vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
 vless sealed-record-writes-per-batch 1 ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes
+vless sealed-record-copies 2 ferrox-core-vless::tests::a_record_inside_one_part_is_sealed_from_that_part
+vless sealed-record-write-instructions 50871336 scripts/count-ops.sh
 
 # --- Trojan -----------------------------------------------------------------
 trojan ops-retired-instructions 1170 scripts/count-ops.sh
@@ -154,7 +156,9 @@ xtls-vision shared-state-acquisitions-per-steady-framed-write 1 ferrox-app-visio
 xtls-vision shared-state-acquisitions-per-spent-direct-read 0 ferrox-app-vision::tests::a_spent_direct_read_takes_no_shared_state
 
 # --- Mux.Cool ---------------------------------------------------------------
-mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh
+mux-cool ops-retired-instructions 618496 scripts/count-ops.sh
+mux-cool frame-encode-ops-retired-instructions 876544 scripts/count-ops.sh
+mux-cool header-encode-ops-retired-instructions 393216 scripts/count-ops.sh
 mux-cool maximum-frame-payload-bytes 8192 ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame
 mux-cool downlink-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
 mux-cool xudp-uplink-copies-per-byte-written 0 ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer
@@ -179,6 +183,7 @@ carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read
 carrier-websocket relay-window-copies-per-byte 0 ferrox-app-ws::tests::the_relay_window_is_the_readers_own_buffer
 carrier-websocket relay-window-max-bytes 65536 ferrox-app-ws::tests::a_frame_larger_than_the_relay_window_keeps_its_remainder
 carrier-websocket read-calls-per-two-buffered-frames 1 ferrox-app-ws::tests::two_buffered_frames_leave_in_one_read
+carrier-websocket relay-window-messages-per-handoff 3 ferrox-app-ws::tests::small_frames_fill_one_window
 carrier-websocket transport-reads-after-a-ready-message 0 ferrox-app-ws::tests::a_partial_next_frame_does_not_hold_the_ready_message
 carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
 carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
@@ -246,6 +251,7 @@ carrier-httpheader pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::t
 carrier-grpc ops-retired-instructions 73251 scripts/count-ops.sh
 carrier-grpc wide-hunk-probe-ops 332283 scripts/count-ops.sh
 carrier-grpc varint-write-probe-ops 102414 scripts/count-ops.sh
+carrier-grpc multi-payload-probe-ops 147461 scripts/count-ops.sh
 carrier-grpc hunk-payload-bytes 16375 ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
 carrier-grpc writes-per-relay-read 1 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
@@ -657,7 +663,7 @@ security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::
 security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
 security-ech heap-buffers-for-a-shaped-sealer 0 ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations
 security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
-security-ech heap-buffers-for-a-real-ech-offer 15 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
+security-ech heap-buffers-for-a-real-ech-offer 14 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
 security-ech seal-plaintext-buffer-moves 0 ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay
 
 # --- TLS options (row 48) ---------------------------------------------------
@@ -672,7 +678,7 @@ security-tls-options server-curve-lists-picked-by-the-shaped-lane 1 ferrox-core-
 
 # --- ECH -------------------------------------------------------------------
 security-ech aes256-gcm-seal-retired-instructions 14957 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 15330 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15298 scripts/count-ops.sh
 security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
 security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
 security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)
@@ -759,6 +765,10 @@ finalmask getrandoms-for-two-random-widths 1 ferrox-core-finalmask::tests::a_ran
 finalmask records-past-max-split 0 ferrox-core-finalmask::tests::a_max_split_ends_the_run_on_the_whole_hello
 finalmask socket-writes-for-a-merged-hello 1 ferrox-core-finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths
 finalmask hello-records-from-the-config 9 ferrox-app-proxy::tests::a_configured_fragment_chain_cuts_the_hello_on_the_wire
+finalmask header-custom-handshake-write-calls 1 ferrox-core-finalmask::tests::a_client_writes_its_sequence_then_checks_the_answer
+finalmask header-custom-error-bytes-on-mismatch 1 ferrox-core-finalmask::tests::a_mismatch_writes_the_configured_error_and_stops
+finalmask header-custom-captured-vars-per-handshake 1 ferrox-core-finalmask::tests::a_captured_value_survives_into_the_next_connection
+finalmask header-custom-ops-retired-instructions UNBLESSED scripts/count-ops.sh
 finalmask unarmable-masks-dialled-unmasked 0 ferrox-app-proxy::tests::a_tcp_mask_this_tree_cannot_arm_is_refused
 finalmask splices-past-a-masked-writer 0 ferrox-app-proxy::tests::a_masked_destination_is_not_fed_by_splice
 finalmask pinned-fragment-interop-rows 2 scripts/run-upstream-suite.sh
@@ -880,7 +890,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions 51893190 scripts/count-ops.sh
+dns-outbound ops-retired-instructions 51893198 scripts/count-ops.sh
 dns-outbound answer-cases-replayed 21 ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes
 dns-outbound parse-refusals-replayed 8 ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses
 dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap
@@ -1047,3 +1057,21 @@ warp race-first-winner wireguard ferrox-app-warp::tests::the_first_answering_hal
 warp race-surviving-lane masque ferrox-app-warp::tests::a_failed_probe_does_not_end_the_race
 warp race-fallback-lane wireguard ferrox-app-warp::tests::two_failed_probes_fall_back_to_wireguard
 warp race-wait-bound-ms 5000 ferrox-app-warp::tests::a_silent_pair_falls_back_at_the_deadline
+warp scan-mode-spellings 14 warp_scan::tests::every_reference_alias_names_its_mode
+warp wg-sweep-seeds 5 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp wg-sweep-ports 54 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp masque-sweep-seeds 10 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp masque-sweep-ports 7 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp last-edge-cap 8 warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier_and_is_bounded
+warp ironclad-status 204 warp::tests::an_http_status_line_is_read_not_guessed
+
+# --- tagged outbound --------------------------------------------------------
+engine-tagged ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-tagged syscalls-per-tagged-datagram UNBLESSED scripts/count-ops.sh
+engine-tagged copies-per-tagged-datagram UNBLESSED scripts/count-ops.sh
+engine-tagged seconds-per-tagged-dial UNBLESSED CI conformance.yml (feature_test.go)
+engine-tagged tcp-dialer-proxy-hops 1 ferrox-app-proxy::tests::a_dialer_proxy_hop_carries_the_outbound_dial
+engine-tagged tagged-udp-hops 1 ferrox-app-proxy::tests::a_tagged_udp_dial_reaches_the_named_hop
+engine-tagged kcp-tagged-carrier-echoes 1 ferrox-app-proxy::tests::a_kcp_dial_rides_the_tagged_hop_to_its_server
+engine-tagged kcp-dial-with-stops-on-close 1 ferrox-core-kcp::listener::tests::a_dial_with_rides_the_callers_socket_and_stops_on_close
+engine-tagged pb-dialer-proxy-fields-decoded 1 ferrox-app-xray_pb::tests::a_sender_socket_dialer_proxy_names_the_tagged_outbound

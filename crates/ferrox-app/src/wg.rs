@@ -939,6 +939,111 @@ impl Drop for WireGuardOut {
     }
 }
 
+const VERIFY_ASK_GAP: Duration = Duration::from_millis(600);
+/// The longest a probe's receive parks, so the loop drains events and rechecks the deadline.
+const VERIFY_POLL: Duration = Duration::from_millis(100);
+
+/// The receive wait left before the caller's deadline, capped by the poll.
+fn poll_wait(left: Duration) -> Option<Duration> {
+    (!left.is_zero()).then(|| left.min(VERIFY_POLL))
+}
+
+/// Open one handshake against a candidate endpoint and ask a DNS question
+/// through it, without the stack, so a sweep does not spend two threads per
+/// edge.
+pub(crate) fn verify_endpoint(
+    private: [u8; 32],
+    peer: [u8; 32],
+    reserved: [u8; 3],
+    local: Ipv4Addr,
+    endpoint: SocketAddr,
+    timeout: Duration,
+) -> Option<Duration> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    let started = Instant::now();
+    let mut tunnel = Tunnel::new(private, peer, [0; 32], endpoint, 0, reserved, tai64n_now());
+    let mut events = Vec::new();
+    tunnel.initiate(0, &mut events);
+    let id = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos())
+        & 0xffff) as u16;
+    let query = build_query(id, b"one.one.one.one.", 1, None)?;
+    let source = ip_bytes(IpAddr::V4(local));
+    let destination = ip_bytes(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    let mut next_ask = Duration::ZERO;
+    let mut buf = [0u8; 4096];
+    loop {
+        let now = started.elapsed();
+        if now >= timeout {
+            return None;
+        }
+        for event in events.drain(..) {
+            if let Event::Send { endpoint, packet } = event {
+                let _ = socket.send_to(&packet, endpoint);
+            }
+        }
+        tunnel.poll(now.as_millis() as u64, &mut events);
+        if tunnel.established(now.as_millis() as u64) && now >= next_ask {
+            let mut packet = Vec::with_capacity(IPV4_HEADER + UDP_HEADER + query.len());
+            if !udp_datagram(
+                &UdpDatagram {
+                    source: &source,
+                    destination: &destination,
+                    source_port: 33333,
+                    destination_port: DNS_PORT,
+                    payload: &query,
+                },
+                &mut packet,
+            ) {
+                return None;
+            }
+            tunnel.send(now.as_millis() as u64, &packet, &mut events);
+            next_ask = now + VERIFY_ASK_GAP;
+        }
+        let wait = poll_wait(timeout.saturating_sub(started.elapsed()))?;
+        socket.set_read_timeout(Some(wait)).ok()?;
+        if let Ok((read, source)) = socket.recv_from(&mut buf) {
+            tunnel.receive(
+                now.as_millis() as u64,
+                recv_endpoint(source, false),
+                &mut buf[..read],
+                &mut events,
+            );
+            for event in events.drain(..) {
+                match event {
+                    Event::Send { endpoint, packet } => {
+                        let _ = socket.send_to(&packet, endpoint);
+                    }
+                    Event::Data(payload) => {
+                        let Some(datagram) = udp_from_packet(&payload) else {
+                            continue;
+                        };
+                        if datagram.source != destination.as_slice()
+                            || datagram.source_port != DNS_PORT
+                            || datagram.destination_port != 33333
+                        {
+                            continue;
+                        }
+                        if parse_answer(datagram.payload).is_some_and(|answer| {
+                            answer.id == id
+                                && answer.rcode == 0
+                                && answer
+                                    .records
+                                    .iter()
+                                    .any(|record| record.kind == 1 && record.rdata.len() == 4)
+                        }) {
+                            let answered = started.elapsed();
+                            return (answered < timeout).then_some(answered);
+                        }
+                    }
+                    Event::DataPrefixed(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// Open the server's UDP socket and spawn its reader and stack. Returns the
 /// port the OS bound, or a refusal the startup names.
 pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
@@ -2331,6 +2436,16 @@ mod tests {
         destination: IpAddr,
     ) -> Option<usize> {
         routes.peer_for(peers, destination)
+    }
+
+    #[test]
+    fn a_probe_waits_no_longer_than_the_deadline_or_the_poll() {
+        assert_eq!(poll_wait(Duration::ZERO), None);
+        assert_eq!(poll_wait(Duration::from_secs(30)), Some(VERIFY_POLL));
+        assert_eq!(
+            poll_wait(Duration::from_millis(40)),
+            Some(Duration::from_millis(40))
+        );
     }
 
     /// The prefix table answers every lookup the peer scan answered, including

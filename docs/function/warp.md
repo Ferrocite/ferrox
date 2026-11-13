@@ -22,6 +22,20 @@ The WireGuard endpoint reads the reply's `endpoint.v4` host with port 2408 when 
 The MASQUE half reuses the row 76 WARP dialect unchanged: the enrolled key mints the client certificate, the reply's server key is the SPKI pin, and the edge defaults to `cloudflareaccess.com` with SNI `consumer-masque.cloudflareclient.com`.
 
 Every identity the kind names is made in memory before any file is written, so a later slot's refusal leaves all old keys in use; each save writes a temp file beside the target and renames it, so a reader never sees half an identity.
+
+## Edge discovery
+
+`scan` (or `AETHER_SCAN`) is off by default; `turbo`, `balanced`, `thorough`, `verified` and `ironclad` set the sweep's pace, and the reference's older spellings are accepted (`fast`, `deep`/`pro`, `proven`/`stealth`/`quiet`, `real`/`verify`/`guaranteed`). An unknown value becomes `balanced` rather than refusing the outbound. `scan: false`, `off` or `none` turns the sweep off.
+The scan is IPv4-only: row 207 owns `-4`/`-6`/`--dual`, so every candidate here is a v4 edge.
+
+`peer`/`AETHER_PEER` forces the MASQUE edge and `wgPeer`/`AETHER_WG_PEER` forces the WireGuard endpoint; `endpoint` is treated the same way as `wgPeer`. A forced half prints `[+] using forced peer IP:PORT (probe skipped)` and is not swept.
+`quickReconnect`/`AETHER_QUICK_RECONNECT` reads `lastEdge` (default `<identity stem>.lastconn.json`, or `warp-lastconn.json` without an identity file) first: each half's most recent edge is opened and asked the same DNS question, then a failed one is cooled down and the remaining half is scanned.
+`ironcladPort`/`AETHER_IRONCLAD_PORT` moves the port the real request uses, default 80. `cooldown`/`AETHER_WG_ENDPOINT_COOLDOWN_SECS` holds a failed cached edge out of the scan, default 300 s. `stale`/`AETHER_WG_STALE_SECS` may shorten a candidate's WireGuard handshake-and-DNS wait; it is capped at the mode's own timeout and is not the running tunnel's watchdog (row 211 owns that).
+
+The WireGuard sweep starts from the five seeds in `warp_scan.rs` and samples the documented `/24`s, then waves each address across the reference's 54-port table. The MASQUE sweep starts from Cloudflare's documented seeds on 443, puts the same seeds on the reference's six alternate ports, and samples the MASQUE `/24`s on 443. `thorough` enumerates every host in a `/24`; the other modes take a stratified sample, because a full port/host cross-product is not a bounded startup.
+A candidate passes only when a tunnel is established and a DNS question sent through it answers: WireGuard uses `wg::verify_endpoint` (one handshake, inner UDP DNS queries, no stack), MASQUE uses `MasqueOut::probe`. `ironclad` then builds the proxy and sends `GET /generate_204` with `Host: www.gstatic.com` through it; only a `204` from the tunnel keeps the edge, and a tunnel that opens but carries no HTTP answer prints `[-] edge IP:PORT opened a tunnel but carried no HTTP answer` (or `gateway` for MASQUE).
+The chosen halves print `[+] selected WireGuard endpoint IP:PORT` and `[+] selected MASQUE gateway IP:PORT`, the lines PattNG reads; the cache keeps the newest edge per carrier, so one carrier failing does not discard the other's.
+
 The race asks `one.one.one.one` through each half's own tunnel DNS (`WireGuardOut::probe`, `MasqueOut::probe`) and takes the first `true`.
 A `false` answer does not end the race: the other half may still carry, and the wait runs to the 8 s deadline; two failures or a silent pair fall back to WireGuard, the half a fixed config would have chosen.
 The choice is made once per outbound under one lock, so concurrent flows wait for the first flow's answer instead of probing again.
@@ -32,7 +46,8 @@ Aether keeps one TOML identity per transport and re-registers a refused one thro
 PattNG's WARP-keys page stages a renewal and keeps the old keys until the new ones answer; here that is the in-memory plan plus the temp-and-rename save.
 What was removed: the second registration on a stale tunnel, the rejected identity saved for a later resume (a refusal now fails cleanly and re-provisions in one act), and the async runtime the references carry — the race is two probe threads and a channel.
 What was not removed: the registration is still sequential HTTPS calls (the API requires the device id from the first), the per-slot read-back is one more call per existing file, and the losing probe thread runs to its own timeout — it is detached, not cancelled.
-Certificate renewal and the last-connected edge cache are not on this page; edge discovery and cooldowns are row 190, team enrollment is row 192, and the API cut is row 197.
+In the scan, every candidate is IPv4; only `ironclad` sends HTTP, while the other modes trust a DNS answer through the tunnel; a cooldown lives for this startup, not across restarts; `stale` bounds discovery, not a running tunnel; and exit-location gating is row 196.
+Certificate renewal is not on this page; the last-connected edge cache and cooldowns are the edge-discovery section above (row 190), team enrollment is row 192, and the API cut is row 197.
 
 ## Data path
 
@@ -54,9 +69,17 @@ graph TD
     H --> K
     K --> L["temp file + rename<br/>0600, old keys until here"]
     L --> M["WarpOut::new"]
-    M --> N["WireGuard half<br/>row 74 carrier"]
-    M --> O["MASQUE half<br/>row 76 WARP dialect"]
-    N & O --> P{"mode auto?"}
+    M --> D0{"scan / quickReconnect / forced peer?"}
+    D0 -- "off" --> N["WireGuard half<br/>row 74 carrier"]
+    D0 -- "forced" --> D1["use endpoint<br/>skip sweep"]
+    D0 -- "quick" --> D2["last edge DNS check"]
+    D0 -- "scan" --> D3["hunt seeds + CIDRs<br/>handshake + DNS"]
+    D3 -- "ironclad" --> D4["GET /generate_204<br/>require 204"]
+    D1 & D2 & D4 --> N
+    D0 -- "off" --> O["MASQUE half<br/>row 76 WARP dialect"]
+    D1 & D2 & D4 --> O
+    N --> P{"mode auto?"}
+    O --> P
     P -- yes --> Q["race: DNS probe<br/>through each tunnel"]
     Q -- "first true" --> R["chosen lane (once)"]
     P -- "fixed" --> R
@@ -80,11 +103,19 @@ graph TD
 | race-surviving-lane | masque | ferrox-app-warp::tests::a_failed_probe_does_not_end_the_race |
 | race-fallback-lane | wireguard | ferrox-app-warp::tests::two_failed_probes_fall_back_to_wireguard |
 | race-wait-bound-ms | 5000 | ferrox-app-warp::tests::a_silent_pair_falls_back_at_the_deadline |
+| scan-mode-spellings | 14 | warp_scan::tests::every_reference_alias_names_its_mode |
+| wg-sweep-seeds | 5 | warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones |
+| wg-sweep-ports | 54 | warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones |
+| masque-sweep-seeds | 10 | warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones |
+| masque-sweep-ports | 7 | warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones |
+| last-edge-cap | 8 | warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier_and_is_bounded |
+| ironclad-status | 204 | warp::tests::an_http_status_line_is_read_not_guessed |
 <!-- counts:end -->
 
 ## Time
 
 No local duration is quoted: every contributor dials through a VPN, so a local race measures the tunnel.
+The scan's bounds are nominal per-mode deadlines (turbo 45 s, balanced 120 s, thorough 300 s, verified 60 s, ironclad 180 s) with a per-candidate verify timeout of 6/6/10/5/15 s (or a shorter `stale`) and a 6 s ironclad HTTP wait; a worker already in a probe can run one timeout past the deadline. These are bounds, not measured durations.
 The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP data plane is compared in the benchmark matrix's WARP rows — `warp-masque-down-8` in standard, `-down-16`, `-down-64` and `-duplex-64` in full — against Aether in the same cell. ZeroNet is skipped with a reason: its WARP client drops `ADDRESS_ASSIGN` and dials from its configured address, which a shared server's pool has already assigned to another tunnel. A host where the external leg did not build skips the WARP cell with that reason instead of reporting a one-engine comparison.
 
 ## CI scope
@@ -92,7 +123,7 @@ The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The dial-side of the row is this page's own unit races, and the throughput comparison is the matrix's WARP rows (`warp-masque-*`): ferrox's warp outbound against Aether in the same cell, which runs only in CI because everything beyond loopback is.
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/warp.rs
+- paths: crates/ferrox-app/src/warp.rs, crates/ferrox-app/src/warp_scan.rs
 - symbols: find_warp_outbound
 - scenarios: warp-masque
 - engines: xray-core, aether, zeronet

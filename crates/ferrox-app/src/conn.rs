@@ -19,7 +19,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use libc::{SO_RCVTIMEO, SO_SNDTIMEO};
@@ -77,12 +78,40 @@ pub(crate) struct Masked {
     stream: TcpStream,
     chain: std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
     read_chain: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>>,
+    header: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::HeaderRun>>>,
+}
+
+/// The clock the captured-variable store stamps and expires with; the core takes it as a value so
+/// that a library read stays deterministic.
+fn mask_clock() -> Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
 }
 
 impl Masked {
+    /// Run the configured handshake before the first byte of the session moves.
+    fn ensure_header(&self) -> io::Result<()> {
+        let Some(header) = &self.header else {
+            return Ok(());
+        };
+        let Ok(mut run) = header.lock() else {
+            return Err(io::Error::other("the header handshake is gone"));
+        };
+        if run.is_done() {
+            return Ok(());
+        }
+        let mut source = HeaderWire {
+            chain: &self.chain,
+            read_chain: self.read_chain.as_deref(),
+            stream: &self.stream,
+        };
+        run.handshake(&mut source, mask_clock())
+    }
+
     /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
     /// makes a writer, so a leg drained by reference masks exactly as one moved by value.
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.ensure_header()?;
         // A stage never panics while held, so a poisoned lock is a broken process, not a wire state.
         let Ok(mut chain) = self.chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
@@ -112,6 +141,7 @@ impl Masked {
 
     /// A read through the codec chain, or the socket itself when no stage transforms bytes.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_header()?;
         let Some(chain) = &self.read_chain else {
             return (&self.stream).read(buf);
         };
@@ -129,10 +159,18 @@ impl Masked {
         }
     }
 
-    /// One nonblocking read through the codec chain: the decode may need several wire reads to
-    /// produce one plaintext run, so the source answers `WouldBlock` exactly as the socket does.
+    /// One nonblocking read through the codec chain. The handshake is the blocking path's: a
+    /// pending header answers `WouldBlock` instead of running it, so a readiness lane never waits.
     #[cfg(unix)]
     fn recv_ready(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(header) = &self.header {
+            let Ok(run) = header.lock() else {
+                return Err(io::Error::other("the header handshake is gone"));
+            };
+            if !run.is_done() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+        }
         let Some(chain) = &self.read_chain else {
             return recv_ready(&self.stream, buf);
         };
@@ -144,6 +182,7 @@ impl Masked {
 
     /// Look ahead through the codec's pending plaintext without consuming it.
     fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_header()?;
         let Some(chain) = &self.read_chain else {
             return self.stream.peek(buf);
         };
@@ -166,6 +205,41 @@ impl Read for ReadySource<'_> {
     }
 }
 
+/// The handshake writes through the stages beneath its mask, as the reference's wrapped conn does,
+/// while a read stays the socket's own because a fragment writes and never decodes.
+struct HeaderWire<'a> {
+    chain: &'a std::sync::Mutex<ferrox_core::finalmask::Chain>,
+    read_chain: Option<&'a std::sync::Mutex<ferrox_core::finalmask::Chain>>,
+    stream: &'a TcpStream,
+}
+
+impl std::io::Write for HeaderWire<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(std::io::Error::other("the mask chain is gone"));
+        };
+        let mut source = self.stream;
+        chain.write(&mut source, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl std::io::Read for HeaderWire<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(chain) = self.read_chain else {
+            return (&*self.stream).read(buf);
+        };
+        let Ok(mut chain) = chain.lock() else {
+            return Err(std::io::Error::other("the mask chain is gone"));
+        };
+        let mut source = self.stream;
+        chain.read(&mut source, buf)
+    }
+}
+
 impl Connection {
     /// The same socket with this chain's clone beneath it, armed for a dialling client; `None`, or a
     /// chain with no stage, leaves the stream exactly as it came, which is the ordinary case.
@@ -174,7 +248,7 @@ impl Connection {
     }
 
     /// The same socket with the chain armed for the side this connection plays. A codec's directions
-    /// are asymmetric, so a server must not open a client's reader and writer.
+    /// are asymmetric and a header handshake expects the other side's sequences, so the role matters.
     pub(crate) fn with_mask_role(
         self,
         mask: Option<&ferrox_core::finalmask::Chain>,
@@ -182,6 +256,16 @@ impl Connection {
     ) -> Self {
         match (self, mask.filter(|chain| !chain.is_empty())) {
             (Connection::Tcp(stream), Some(chain)) => {
+                let local = stream.local_addr().ok();
+                let remote = stream.peer_addr().ok();
+                let header = chain.header().cloned().map(|header| {
+                    std::sync::Arc::new(std::sync::Mutex::new(header.open(
+                        role,
+                        local,
+                        remote,
+                        mask_clock(),
+                    )))
+                });
                 let opened = chain.open(role);
                 Connection::Masked(Masked {
                     stream,
@@ -189,6 +273,7 @@ impl Connection {
                     read_chain: opened
                         .read
                         .map(|read| std::sync::Arc::new(std::sync::Mutex::new(read))),
+                    header,
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -213,6 +298,21 @@ impl Connection {
         Connection::Proxied {
             inner: Box::new(self),
             peer,
+        }
+    }
+
+    /// Complete a pending header handshake on the blocking path, before a readiness lane asks.
+    /// A readiness read never runs it, so admission must finish it first.
+    pub(crate) fn complete_header(&self) -> io::Result<()> {
+        match self {
+            Connection::Masked(masked) => masked.ensure_header(),
+            Connection::Metered(metered) => metered.inner.complete_header(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.complete_header()
+            }
+            Connection::Tcp(_) => Ok(()),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => Ok(()),
         }
     }
 
@@ -765,6 +865,7 @@ impl Connection {
                     stream,
                     chain: std::sync::Arc::clone(&masked.chain),
                     read_chain: masked.read_chain.as_ref().map(std::sync::Arc::clone),
+                    header: masked.header.as_ref().map(std::sync::Arc::clone),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
