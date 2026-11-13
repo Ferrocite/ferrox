@@ -33,6 +33,9 @@ def allowed(a, b, c, d):
         # Cloudflare's WARP plane: resolvers and the edge the WARP lane dials
         # are runtime data in warp.rs, not test material.
         return True
+    if (a == 188 and b == 114) or (a, b, c) == (172, 65, 251):
+        # Cloudflare's other WARP edge ranges, also runtime scan data in warp_scan.rs.
+        return True
     if (a, b) in ((192, 0), (198, 51), (203, 0)) and (
         (c == 2 and a == 192) or (c == 100 and a == 198) or (c == 113 and a == 203)):
         return True
