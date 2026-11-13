@@ -54,6 +54,7 @@ The connection's own demux resumes the same way. `xhttp_h2::Frames` keeps the pr
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | 73251 | scripts/count-ops.sh |
+| wide-hunk-probe-ops | 332283 | scripts/count-ops.sh |
 | varint-write-probe-ops | 102414 | scripts/count-ops.sh |
 | hunk-payload-bytes | 16375 | ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it |
 | user-space-copies-per-byte-written | 0 | ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer |
@@ -103,7 +104,15 @@ The connection's own demux resumes the same way. `xhttp_h2::Frames` keeps the pr
   grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 ```
 
-`73251`, measured by the `ops.yml` run on the same base that read `86563` before this change. The two per-message math steps — a gRPC envelope assembled and a `Hunk` parsed — now take a straight path for the common one-byte varint and sub-128 envelope length instead of the loop, and the same row reads `13312` (`15.4%`) fewer instructions. The row is a probe, not a fixture test: it runs over buffers the compiler cannot fold, so the frame is the loops and the methods and the number is read as the difference between two runs of the same row, never as the cost of a method alone. The two-byte envelope path the `16375`-byte payload uses is the same straight form, but this probe's messages do not walk it.
+`73251`, measured by the `ops.yml` run on the same base that read `86563` before this change. The two per-message math steps — a gRPC envelope assembled and a `Hunk` parsed — now take a straight path for the common one-byte varint and sub-128 envelope length instead of the loop, and the same row reads `13312` (`15.4%`) fewer instructions. The row is a probe, not a fixture test: it runs over buffers the compiler cannot fold, so the frame is the loops and the methods and the number is read as the difference between two runs of the same row, never as the cost of a method alone. This probe's messages do not walk the two-byte envelope path; the wide probe below does.
+
+```bash
+./scripts/count-ops.sh report \
+  grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else \
+  grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
+```
+
+`332283` for the envelope and `Hunk` a relay read actually carries (run `43313013240`): `4096` two-byte lengths of `16375`, against `430587` for the same `4096` on run `43298148854`, so `98304` (`22.8%`) fewer instructions and `24` per message. The straight read is compiled only into the wide monomorph, picked by the envelope length; the one-byte row above keeps the walk it priced, because compiling the same read unconditionally raised that row to `91690` (run `43292127310`). A message that carries another field, or a length wider than three bytes, still takes the field walk.
 
 ```bash
 ./scripts/count-ops.sh report \

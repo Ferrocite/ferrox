@@ -639,24 +639,27 @@ impl<R: Read> GrpcReader<R> {
             if len > MSG_CAP || live.len() < 5 + len {
                 return false;
             }
-            if hunk_decode(&live[5..5 + len]).is_none() {
+            if hunk_decode::<false>(&live[5..5 + len]).is_none() {
                 return false;
             }
             at += 5 + len;
         }
     }
 
-    /// Messages are decoded where they landed: the payload stays in `msg` and `msg_at`..`pay_end` is what the caller has not taken, so nothing is copied to wait for it.
+    /// Messages are decoded where they landed: the payload stays in `msg` and `msg_at`..`pay_end` is what the caller has not taken, so nothing is copied to wait for it. The method is the call's and never changes, so the shape is chosen once here rather than re-read per message.
     fn decode(&mut self) -> Option<()> {
+        match self.method {
+            Method::Hunk => self.decode_hunk(),
+            Method::MultiHunk => self.decode_multi(),
+        }
+    }
+
+    fn decode_hunk(&mut self) -> Option<()> {
         loop {
             if self.msg_at < self.pay_end {
                 return Some(());
             }
             if self.msg_at < self.msg_end {
-                if self.method == Method::MultiHunk {
-                    self.next_element()?;
-                    continue;
-                }
                 self.msg_at = self.msg_end;
             }
             let live = &self.msg[self.msg_at..];
@@ -666,7 +669,7 @@ impl<R: Read> GrpcReader<R> {
             if live[0] != 0 {
                 return None;
             }
-            let len = u32::from_be_bytes(live[1..5].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes([live[1], live[2], live[3], live[4]]) as usize;
             if len > MSG_CAP {
                 return None;
             }
@@ -675,14 +678,44 @@ impl<R: Read> GrpcReader<R> {
             }
             let body = self.msg_at + 5;
             self.msg_end = body + len;
-            if self.method == Method::MultiHunk {
-                self.msg_at = body;
+            let hunk = &live[5..5 + len];
+            let (at, payload) = if len >= 0x80 {
+                hunk_decode::<true>(hunk)?
+            } else {
+                hunk_decode::<false>(hunk)?
+            };
+            self.msg_at = body + at;
+            self.pay_end = self.msg_at + payload.len();
+        }
+    }
+
+    fn decode_multi(&mut self) -> Option<()> {
+        loop {
+            if self.msg_at < self.pay_end {
+                return Some(());
+            }
+            if self.msg_at < self.msg_end {
                 self.next_element()?;
                 continue;
             }
-            let (at, payload) = hunk_decode(&live[5..5 + len])?;
-            self.msg_at = body + at;
-            self.pay_end = self.msg_at + payload.len();
+            let live = &self.msg[self.msg_at..];
+            if live.len() < 5 {
+                return Some(());
+            }
+            if live[0] != 0 {
+                return None;
+            }
+            let len = u32::from_be_bytes([live[1], live[2], live[3], live[4]]) as usize;
+            if len > MSG_CAP {
+                return None;
+            }
+            if live.len() < 5 + len {
+                return Some(());
+            }
+            let body = self.msg_at + 5;
+            self.msg_end = body + len;
+            self.msg_at = body;
+            self.next_element()?;
         }
     }
 
@@ -1802,9 +1835,45 @@ fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
-/// The `Data` field of a `Hunk`, and where it sits inside the message: the reader hands over the bytes where they lie, so the offset is part of the answer rather than something the caller finds again.
+/// A length on the schema this lane reads: one, two or three varint bytes, the widths a `Hunk`'s
+/// `16375`-byte payload and a `MultiHunk`'s elements use. Longer lengths fall back to the loop.
 #[inline]
-fn hunk_decode(msg: &[u8]) -> Option<(usize, &[u8])> {
+fn read_len(msg: &[u8], at: &mut usize) -> Option<usize> {
+    let first = *msg.get(*at)?;
+    if first < 0x80 {
+        *at += 1;
+        return Some(usize::from(first));
+    }
+    let second = *msg.get(*at + 1)?;
+    if second < 0x80 {
+        *at += 2;
+        return Some(usize::from(first & 0x7F) | (usize::from(second) << 7));
+    }
+    let third = *msg.get(*at + 2)?;
+    if third < 0x80 {
+        *at += 3;
+        return Some(
+            usize::from(first & 0x7F)
+                | (usize::from(second & 0x7F) << 7)
+                | (usize::from(third) << 14),
+        );
+    }
+    None
+}
+
+/// The `Data` field of a `Hunk`, and where it sits inside the message: the reader hands over the bytes where they lie, so the offset is part of the answer rather than something the caller finds again. `WIDE` is the two-byte-and-up shape the relay carries: its straight read is compiled in only there, so a small message keeps the walk it priced.
+#[inline]
+fn hunk_decode<const WIDE: bool>(msg: &[u8]) -> Option<(usize, &[u8])> {
+    if WIDE && msg.first() == Some(&0x0A) {
+        let mut at = 1;
+        if let Some(len) = read_len(msg, &mut at) {
+            if let Some(end) = at.checked_add(len) {
+                if end == msg.len() {
+                    return Some((at, &msg[at..end]));
+                }
+            }
+        }
+    }
     let mut at = 0;
     let mut data: &[u8] = &[];
     let mut off = 0usize;
@@ -3443,16 +3512,32 @@ mod tests {
         frame.extend_from_slice(b"ping");
         assert_eq!(frame, b"\0\0\0\0\x06\x0a\x04ping");
         assert_eq!(
-            hunk_decode(&[0x0A, 0x04, b'p', b'i', b'n', b'g']).expect("decodes"),
+            hunk_decode::<false>(&[0x0A, 0x04, b'p', b'i', b'n', b'g']).expect("decodes"),
             (2, b"ping".as_slice())
         );
         // A field the lane does not read still carries its payload's offset.
         assert_eq!(
-            hunk_decode(&[0x12, 0x02, 0x01, 0x02, 0x0A, 0x02, b'p', b'g']).expect("decodes"),
+            hunk_decode::<false>(&[0x12, 0x02, 0x01, 0x02, 0x0A, 0x02, b'p', b'g'])
+                .expect("decodes"),
             (6, b"pg".as_slice())
         );
-        assert!(hunk_decode(b"raw payload").is_none());
-        assert!(hunk_decode(&[0x0A, 0x80]).is_none());
+        // The two- and three-byte lengths a relay read and a wide element use.
+        let mut two = vec![0x0A, 0xF7, 0x7F];
+        two.extend_from_slice(&[b'x'; 16_375]);
+        assert_eq!(hunk_decode::<true>(&two).expect("decodes"), (3, &two[3..]));
+        let mut three = vec![0x0A, 0x80, 0x80, 0x01];
+        three.extend_from_slice(&[b'y'; 16_384]);
+        assert_eq!(
+            hunk_decode::<true>(&three).expect("decodes"),
+            (4, &three[4..])
+        );
+        // A trailing field takes the full walk and still names the `Data` where it lies.
+        assert_eq!(
+            hunk_decode::<false>(&[0x0A, 0x02, b'p', b'g', 0x12, 0x01, 0x00]).expect("decodes"),
+            (2, b"pg".as_slice())
+        );
+        assert!(hunk_decode::<false>(b"raw payload").is_none());
+        assert!(hunk_decode::<false>(&[0x0A, 0x80]).is_none());
     }
 
     /// A server that answers whole frames at its own pace, in memory: the place where a copy count is exact rather than a function of the scheduler.
@@ -5313,9 +5398,27 @@ mod tests {
         let mut acc = 0usize;
         for _ in 0..512 {
             for msg in messages {
-                let (off, data) = hunk_decode(msg).expect("decodes");
+                let (off, data) = hunk_decode::<false>(msg).expect("decodes");
                 acc += off + data.len() + frame_prefix(data.len(), &mut prefix);
             }
+        }
+        assert!(acc > 0);
+        std::hint::black_box(&prefix);
+    }
+
+    /// The wide probe the page's `wide-hunk-probe-ops` row names: the `16375`-byte envelope and `Hunk` a relay read carries, whose length and tag both use two varint bytes, over the same frame as the row above.
+    #[test]
+    fn the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else() {
+        let mut wide = vec![0u8; 3 + 16_375];
+        wide[0] = 0x0A;
+        wide[1] = 0xF7;
+        wide[2] = 0x7F;
+        let msg = std::hint::black_box(&wide[..]);
+        let mut prefix = [0u8; 16];
+        let mut acc = 0usize;
+        for _ in 0..4096 {
+            let (off, data) = hunk_decode::<true>(msg).expect("decodes");
+            acc += off + data.len() + frame_prefix(data.len(), &mut prefix);
         }
         assert!(acc > 0);
         std::hint::black_box(&prefix);
@@ -5401,7 +5504,7 @@ mod tests {
             assert!(body.len() < HUNK, "a hunk is wider than the window packs");
             let announced = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
             assert_eq!(announced + 5, body.len(), "a hunk crossed a frame boundary");
-            let (_, payload) = hunk_decode(&body[5..]).expect("the hunk decodes");
+            let (_, payload) = hunk_decode::<true>(&body[5..]).expect("the hunk decodes");
             got.extend_from_slice(payload);
             frames += 1;
             at += 9 + len;
@@ -5501,7 +5604,7 @@ mod tests {
             let mut body = vec![0u8; len];
             client.read_exact(&mut body).expect("body");
             if kind == T_DATA && !body.is_empty() {
-                let (_, payload) = hunk_decode(&body[5..]).expect("a hunk");
+                let (_, payload) = hunk_decode::<true>(&body[5..]).expect("a hunk");
                 if !payload.is_empty() {
                     got.push((id, payload.to_vec()));
                 }
