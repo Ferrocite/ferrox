@@ -40,7 +40,7 @@ const ICMPV6_PROTO: u8 = 58;
 /// An ICMP echo request is type 8 (128 over IPv6); its answer flips that to 0 (129) and carries the message back.
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const ICMP_ECHO_REPLY: u8 = 0;
 #[cfg(test)]
 const ICMPV6_ECHO_REPLY: u8 = 129;
