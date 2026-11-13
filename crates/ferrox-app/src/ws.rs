@@ -1991,15 +1991,17 @@ mod tests {
             },
             Vec::new(),
         );
-        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
-        assert_eq!(window.parts().len(), 3, "three frames, one window");
-        drop(window);
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+            assert_eq!(window.parts().len(), 3, "three frames, one window");
+        }
         assert_eq!(reader.reads(), 3, "one syscall per frame, not per span");
         let base = reader.have.as_ptr();
         let capacity = reader.have.capacity();
-        let next = crate::proxy::WindowRead::read_window(&mut reader).expect("reads the rest");
-        assert_eq!(next.parts().len(), 3, "the next burst fills one window too");
-        drop(next);
+        {
+            let next = crate::proxy::WindowRead::read_window(&mut reader).expect("reads the rest");
+            assert_eq!(next.parts().len(), 3, "the next burst fills one window too");
+        }
         assert_eq!(reader.have.as_ptr(), base, "the buffer did not move");
         assert_eq!(
             reader.have.capacity(),
@@ -2087,11 +2089,13 @@ mod tests {
                 .map(|(i, byte)| byte ^ mask[i % 4]),
         );
         let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
-        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
-        assert_eq!(window.parts(), &[(8, payload.len())]);
-        assert_eq!(&window.bytes()[8..][..payload.len()], &payload[..]);
-        let window_ptr = window.bytes().as_ptr();
-        drop(window);
+        let window_ptr;
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+            assert_eq!(window.parts(), &[(8, payload.len())]);
+            assert_eq!(&window.bytes()[8..][..payload.len()], &payload[..]);
+            window_ptr = window.bytes().as_ptr();
+        }
         assert_eq!(
             window_ptr,
             reader.have.as_ptr(),
