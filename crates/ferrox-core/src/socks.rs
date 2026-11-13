@@ -190,8 +190,7 @@ pub fn request(cmd: u8, target: &Target<'_>) -> Vec<u8> {
     out.push(cmd);
     out.push(0);
     target.write_address(&mut out.spare_capacity_mut()[..len]);
-    // SAFETY: `write_address` initialized every byte this length exposes; no reference
-    // was formed over uninitialized memory.
+    // SAFETY: `write_address` initializes every byte this length exposes, with no uninit reference.
     unsafe { out.set_len(3 + len) };
     out
 }
@@ -401,8 +400,7 @@ pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     let at = out.len();
     let len = target.wire_len();
     target.write_address(&mut out.spare_capacity_mut()[..len]);
-    // SAFETY: `write_address` initialized every byte this length exposes; no reference
-    // was formed over uninitialized memory.
+    // SAFETY: `write_address` initializes every byte this length exposes, with no uninit reference.
     unsafe { out.set_len(at + len) };
     out.extend_from_slice(payload);
 }
