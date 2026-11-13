@@ -34209,7 +34209,7 @@ fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
             ))
         }
         3 => {
-            let (&len, rest) = buf.split_first_chunk::<1>()?;
+            let (&[len], rest) = buf.split_first_chunk::<1>()?;
             let (name, rest) = rest.split_at_checked(usize::from(len))?;
             let (port, _) = rest.split_first_chunk::<2>()?;
             let host = std::str::from_utf8(name).ok()?;
