@@ -807,8 +807,8 @@ mod tests {
     #[test]
     fn a_window_above_the_ring_keeps_the_map() {
         let mut w = ReceivingWindow::new(RING_MAX + 1);
-        assert!(w.map.is_some());
-        assert!(w.slots.is_empty());
+        assert!(w.map.is_some(), "a large window must keep the map");
+        assert!(w.slots.is_empty(), "the map path must not allocate the ring");
         assert!(w.set(0, receive_segment(0)));
         assert!(w.has(0));
         assert!(!w.set(0, receive_segment(0)));
@@ -817,7 +817,10 @@ mod tests {
 
         let w = ReceivingWindow::new(u32::MAX);
         assert!(w.map.is_some(), "the largest window must not round up");
-        assert!(w.slots.is_empty());
+        assert!(
+            w.slots.is_empty(),
+            "the largest window must not allocate the ring"
+        );
     }
 
     /// The ring's set/remove path is the hot receive path: after the one-time
