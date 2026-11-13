@@ -55,6 +55,8 @@ const SCAN_CAP_SECS: u64 = 86_400;
 const RACE_DEADLINE: Duration = Duration::from_secs(8);
 /// The MTU WARP's own clients use.
 const DEFAULT_MTU: u16 = 1280;
+/// The reference caps the inner hop of gool at this MTU, so its packets fit the outer one.
+const GOOL_INNER_MTU: u16 = 1200;
 /// The keepalive WARP's own clients use.
 const DEFAULT_KEEPALIVE: u16 = 25;
 /// The tunnel's DNS servers, reachable from either half once it is up.
@@ -93,6 +95,7 @@ enum Mode {
     Auto,
     WireGuard,
     Masque,
+    Gool,
 }
 
 impl Mode {
@@ -101,8 +104,9 @@ impl Mode {
             "auto" => Ok(Self::Auto),
             "wireguard" | "wg" => Ok(Self::WireGuard),
             "masque" => Ok(Self::Masque),
+            "gool" | "wg-over-masque" => Ok(Self::Gool),
             other => Err(format!(
-                "warp mode `{other}` is not auto, wireguard or masque"
+                "warp mode `{other}` is not auto, wireguard, masque or gool"
             )),
         }
     }
@@ -112,6 +116,7 @@ impl Mode {
             Self::Auto => "auto",
             Self::WireGuard => "wireguard",
             Self::Masque => "masque",
+            Self::Gool => "gool",
         }
     }
 }
@@ -145,6 +150,7 @@ struct WarpSpec {
     last_edge: Option<PathBuf>,
     stale: Option<Duration>,
     cooldown: Duration,
+    gool: GoolSettings,
 }
 
 struct EdgeSpec {
@@ -212,6 +218,39 @@ impl EdgeSpec {
             cooldown,
         })
     }
+}
+
+/// The inner hop's explicit identity, file and edge.
+#[derive(Debug, Clone, Default)]
+struct GoolSettings {
+    identity_file: Option<PathBuf>,
+    inline: Option<Identity>,
+    peer: Option<SocketAddr>,
+}
+
+fn gool_settings(settings: &crate::json::Json) -> Result<GoolSettings, String> {
+    let identity_file = settings
+        .get("goolIdentityFile")
+        .and_then(crate::json::Json::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let inline = settings
+        .get("goolIdentity")
+        .map(Identity::from_json)
+        .transpose()?;
+    let peer = match settings.get("goolPeer") {
+        None => None,
+        Some(crate::json::Json::Str(text)) => Some(
+            parse_endpoint(text)
+                .ok_or_else(|| format!("warp gool: `goolPeer` is not an address: `{text}`"))?,
+        ),
+        Some(_) => return Err("warp gool: `goolPeer` must be a string".to_owned()),
+    };
+    Ok(GoolSettings {
+        identity_file,
+        inline,
+        peer,
+    })
 }
 
 impl WarpSpec {
@@ -285,6 +324,7 @@ impl WarpSpec {
         let (masque_address, masque_port, masque_server_name, masque_host, masque_path) =
             masque_settings(settings.get("masque"));
         let edge = EdgeSpec::from(settings)?;
+        let gool = gool_settings(settings)?;
         Ok(Self {
             mode,
             register,
@@ -311,6 +351,7 @@ impl WarpSpec {
             last_edge: edge.last_edge,
             stale: edge.stale,
             cooldown: edge.cooldown,
+            gool,
         })
     }
 
@@ -329,11 +370,42 @@ impl WarpSpec {
                 "warp: `register: true` needs an `identityFile` to save the account".into(),
             );
         };
+        self.identity_at(path, false)
+    }
+
+    /// The path the inner `WireGuard` identity is saved to.
+    fn gool_path(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.gool.identity_file {
+            return Ok(file.clone());
+        }
+        let Some(file) = &self.identity_file else {
+            return Err(
+                "warp gool needs `goolIdentityFile`, an inline `goolIdentity`, or an `identityFile`"
+                    .to_owned(),
+            );
+        };
+        Ok(derive_sibling_path(
+            &derive_sibling_path(file, "masque"),
+            "gool",
+        ))
+    }
+
+    /// The inner `WireGuard` identity, registered beside the outer one when absent.
+    fn gool_identity(&self) -> Result<Identity, String> {
+        if let Some(identity) = &self.gool.inline {
+            return Ok(identity.clone());
+        }
+        self.identity_at(&self.gool_path()?, true)
+    }
+
+    /// A saved identity's lifecycle, shared by the outer device and gool's inner one.
+    fn identity_at(&self, path: &Path, inner: bool) -> Result<Identity, String> {
+        let enroll = !inner && self.mode != Mode::WireGuard;
         if path.is_file() {
             let saved = match Identity::load(path) {
                 Ok(saved) => saved,
                 Err(error) if error.corrupt() && self.register && reprovision_enabled() => {
-                    let identity = register(self, self.mode != Mode::WireGuard)?;
+                    let identity = register(self, enroll)?;
                     quarantine(path);
                     identity.save(path)?;
                     return Ok(identity);
@@ -351,7 +423,7 @@ impl WarpSpec {
                 Err(error)
                     if should_reprovision(self.register, error.refused, reprovision_enabled()) =>
                 {
-                    let identity = register(self, saved.masque.is_some())?;
+                    let identity = register(self, !inner && saved.masque.is_some())?;
                     quarantine(path);
                     identity.save(path)?;
                     Ok(identity)
@@ -363,11 +435,12 @@ impl WarpSpec {
             };
         }
         if !self.register {
-            return Err(
-                "warp: the identity file does not exist and `register` is false".to_owned(),
-            );
+            return Err(format!(
+                "warp: the identity file `{}` does not exist and `register` is false",
+                path.display()
+            ));
         }
-        let identity = register(self, self.mode != Mode::WireGuard)?;
+        let identity = register(self, enroll)?;
         identity.save(path)?;
         Ok(identity)
     }
@@ -412,6 +485,7 @@ impl WarpSpec {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            gool: GoolSettings::default(),
         }
     }
 
@@ -1345,7 +1419,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
         set_masque_edge(spec, edge);
         println!("[+] using forced peer {edge} (probe skipped)");
     }
-    let want_wireguard = spec.mode != Mode::Masque;
+    let want_wireguard = matches!(spec.mode, Mode::Auto | Mode::WireGuard);
     let want_masque = spec.mode != Mode::WireGuard && identity.masque.is_some();
     let cache_path = spec.last_edge_path();
     let mut last = LastEdge::load(&cache_path);
@@ -1652,6 +1726,33 @@ fn wireguard_settings(identity: &Identity, spec: &WarpSpec) -> crate::json::Json
     ])
 }
 
+/// The inner hop's settings with its peer moved to the forwarder.
+fn wireguard_settings_with_endpoint(
+    identity: &Identity,
+    spec: &WarpSpec,
+    endpoint: SocketAddr,
+) -> crate::json::Json {
+    let mut settings = wireguard_settings(identity, spec);
+    let crate::json::Json::Obj(pairs) = &mut settings else {
+        return settings;
+    };
+    let Some((_, crate::json::Json::Arr(peers))) = pairs.iter_mut().find(|(key, _)| key == "peers")
+    else {
+        return settings;
+    };
+    let Some(crate::json::Json::Obj(peer)) = peers.first_mut() else {
+        return settings;
+    };
+    let Some((_, slot)) = peer.iter_mut().find(|(key, _)| key == "endpoint") else {
+        return settings;
+    };
+    *slot = string(&endpoint.to_string());
+    if let Some((_, slot)) = pairs.iter_mut().find(|(key, _)| key == "mtu") {
+        *slot = crate::json::Json::Num(f64::from(spec.mtu.min(GOOL_INNER_MTU)));
+    }
+    settings
+}
+
 /// The MASQUE half as the existing `masque` outbound reads it: the enrolled
 /// key pair, the edge's pinned key, and the WARP host and SNI.
 fn masque_outbound(identity: &Identity, spec: &WarpSpec) -> Result<crate::json::Json, String> {
@@ -1705,6 +1806,7 @@ fn reserved_json(reserved: [u8; 3]) -> crate::json::Json {
 enum Lane {
     WireGuard,
     Masque,
+    Gool,
 }
 
 /// The outbound: both built halves, the mode that bounds which may run, and
@@ -1714,12 +1816,25 @@ pub(crate) struct WarpOut {
     mode: Mode,
     wireguard: Option<Arc<crate::wg::WireGuardOut>>,
     masque: Option<Arc<crate::masque::MasqueOut>>,
+    gool: Option<Arc<GoolOut>>,
     chosen: Mutex<Option<Lane>>,
     probe_host: String,
     probe_port: u16,
 }
 
 impl WarpOut {
+    fn unbuilt(spec: &WarpSpec) -> Self {
+        Self {
+            mode: spec.mode,
+            wireguard: None,
+            masque: None,
+            gool: None,
+            chosen: Mutex::new(None),
+            probe_host: spec.probe_host.clone(),
+            probe_port: spec.probe_port,
+        }
+    }
+
     pub(crate) fn new(outbound: &crate::json::Json, test: bool) -> Result<Self, String> {
         let settings = outbound
             .get("settings")
@@ -1733,21 +1848,22 @@ impl WarpOut {
                 .is_some_and(|path| path.is_file())
         {
             // A config test names the settings; the registration stays a runtime act.
-            return Ok(Self {
-                mode: spec.mode,
-                wireguard: None,
-                masque: None,
-                chosen: Mutex::new(None),
-                probe_host: spec.probe_host,
-                probe_port: spec.probe_port,
-            });
+            return Ok(Self::unbuilt(&spec));
         } else {
             spec.identity()?
         };
+        if test
+            && spec.mode == Mode::Gool
+            && spec.gool.inline.is_none()
+            && !spec.gool_path().is_ok_and(|path| path.is_file())
+        {
+            // The inner device, like the outer, is registered at runtime, not by a config test.
+            return Ok(Self::unbuilt(&spec));
+        }
         if !test {
             resolve_edges(&mut identity, &mut spec)?;
         }
-        let wireguard = if spec.mode == Mode::Masque {
+        let wireguard = if matches!(spec.mode, Mode::Masque | Mode::Gool) {
             None
         } else {
             match build_wireguard(&identity, &spec) {
@@ -1761,7 +1877,7 @@ impl WarpOut {
                 }
             }
         };
-        let masque = if spec.mode == Mode::WireGuard {
+        let masque = if matches!(spec.mode, Mode::WireGuard | Mode::Gool) {
             None
         } else if identity.masque.is_none() {
             if spec.mode == Mode::Masque {
@@ -1780,13 +1896,19 @@ impl WarpOut {
                 }
             }
         };
-        if wireguard.is_none() && masque.is_none() {
+        let gool = if spec.mode == Mode::Gool {
+            Some(Arc::new(build_gool(&identity, &spec)?))
+        } else {
+            None
+        };
+        if wireguard.is_none() && masque.is_none() && gool.is_none() {
             return Err("warp: neither half could be built".to_owned());
         }
         Ok(Self {
             mode: spec.mode,
             wireguard,
             masque,
+            gool,
             chosen: Mutex::new(None),
             probe_host: spec.probe_host,
             probe_port: spec.probe_port,
@@ -1799,6 +1921,7 @@ impl WarpOut {
         match self.mode {
             Mode::WireGuard => return Lane::WireGuard,
             Mode::Masque => return Lane::Masque,
+            Mode::Gool => return Lane::Gool,
             Mode::Auto => {}
         }
         // The lock spans the race so a second flow waits for the answer instead of probing again.
@@ -1835,9 +1958,11 @@ impl WarpOut {
         match self.mode {
             Mode::WireGuard => self.wireguard.as_ref().and_then(|half| half.edge()),
             Mode::Masque => self.masque.as_ref().and_then(|half| half.edge()),
+            Mode::Gool => self.gool.as_ref().and_then(|gool| gool.edge()),
             Mode::Auto => match self.chosen.lock().ok().and_then(|chosen| *chosen) {
                 Some(Lane::WireGuard) => self.wireguard.as_ref().and_then(|half| half.edge()),
                 Some(Lane::Masque) => self.masque.as_ref().and_then(|half| half.edge()),
+                Some(Lane::Gool) => self.gool.as_ref().and_then(|gool| gool.edge()),
                 None => self
                     .wireguard
                     .as_ref()
@@ -1864,6 +1989,11 @@ impl WarpOut {
                     masque.serve_tcp(client, asked, prefix);
                 }
             }
+            Lane::Gool => {
+                if let Some(gool) = &self.gool {
+                    gool.inner.serve_tcp(client, asked, prefix);
+                }
+            }
         }
     }
 
@@ -1881,6 +2011,11 @@ impl WarpOut {
             Lane::Masque => {
                 if let Some(masque) = &self.masque {
                     masque.serve_udp(relay, associate);
+                }
+            }
+            Lane::Gool => {
+                if let Some(gool) = &self.gool {
+                    gool.inner.serve_udp(relay, associate);
                 }
             }
         }
@@ -1931,6 +2066,50 @@ fn build_wireguard(
 fn build_masque(identity: &Identity, spec: &WarpSpec) -> Result<crate::masque::MasqueOut, String> {
     let outbound = masque_outbound(identity, spec)?;
     crate::masque::MasqueOut::new(&outbound)
+}
+
+/// `WireGuard` carried inside a MASQUE conversation.
+#[derive(Debug)]
+pub(crate) struct GoolOut {
+    outer: Arc<crate::masque::MasqueOut>,
+    inner: Arc<crate::wg::WireGuardOut>,
+    _forwarder: crate::masque::UdpForwarder,
+}
+
+impl GoolOut {
+    fn new(
+        outer: crate::masque::MasqueOut,
+        inner_identity: &Identity,
+        spec: &WarpSpec,
+        remote: SocketAddr,
+    ) -> Result<Self, String> {
+        let outer = Arc::new(outer);
+        let forwarder = outer.udp_forwarder(remote)?;
+        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local);
+        let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
+        let inner = crate::wg::WireGuardOut::new(config)?;
+        Ok(Self {
+            outer,
+            inner: Arc::new(inner),
+            _forwarder: forwarder,
+        })
+    }
+
+    fn edge(&self) -> Option<SocketAddr> {
+        self.outer.edge()
+    }
+}
+
+fn build_gool(identity: &Identity, spec: &WarpSpec) -> Result<GoolOut, String> {
+    if identity.masque.is_none() {
+        return Err(
+            "warp gool: the outer identity has no MASQUE key to carry WireGuard".to_owned(),
+        );
+    }
+    let inner_identity = spec.gool_identity()?;
+    let remote = spec.gool.peer.unwrap_or(inner_identity.wireguard.endpoint);
+    let outer = build_masque(identity, spec)?;
+    GoolOut::new(outer, &inner_identity, spec, remote)
 }
 
 /// The `--register` kinds: one protocol, both hops of a two-hop one, or all five.
@@ -2172,8 +2351,12 @@ pub(crate) fn one_tap(
         last_edge: None,
         stale: None,
         cooldown: Duration::from_secs(COOLDOWN_SECS),
+        gool: GoolSettings::default(),
     };
     let identity = register(&spec, true)?;
+    if mode == Mode::Gool {
+        spec.gool_identity()?;
+    }
     identity.save(&path)?;
     let outbound = obj_pairs(vec![
         ("protocol", string("warp")),
@@ -2396,6 +2579,7 @@ mod tests {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            gool: GoolSettings::default(),
         }
     }
 
@@ -2486,6 +2670,7 @@ mod tests {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            gool: GoolSettings::default(),
         };
         let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
         let masque_reply = sample_reply(&server);
@@ -2572,6 +2757,7 @@ mod tests {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            gool: GoolSettings::default(),
         };
         let settings = wireguard_settings(&identity, &spec);
         let config = crate::wireguard::DeviceConfig::from_json(&settings).expect("the WG half");
@@ -3058,6 +3244,70 @@ mod tests {
     }
 
     #[test]
+    fn a_gool_mode_parses_the_inner_hop() {
+        let spec = WarpSpec::from(
+            &crate::json::parse(
+                r#"{"mode":"gool","register":true,"mtu":1500,"goolPeer":"192.0.2.9:2408","goolIdentityFile":"inner.json"}"#,
+            )
+            .expect("settings"),
+        )
+        .expect("a gool spec");
+        assert_eq!(spec.mode, Mode::Gool);
+        assert_eq!(spec.mode.label(), "gool");
+        assert_eq!(spec.mtu, 1500);
+        assert_eq!(
+            spec.gool.peer,
+            Some("192.0.2.9:2408".parse().expect("the inner peer"))
+        );
+        assert_eq!(
+            spec.gool.identity_file.as_deref(),
+            Some(Path::new("inner.json"))
+        );
+        assert_eq!(
+            Mode::parse(Some("wg-over-masque")).expect("the alias"),
+            Mode::Gool
+        );
+    }
+
+    #[test]
+    fn a_malformed_gool_peer_is_refused() {
+        let reason = WarpSpec::from(
+            &crate::json::parse(r#"{"mode":"gool","register":true,"goolPeer":"not-an-address"}"#)
+                .expect("settings"),
+        )
+        .expect_err("a malformed peer");
+        assert!(reason.contains("goolPeer"), "{reason}");
+    }
+
+    #[test]
+    fn the_gool_inner_hop_points_at_the_forwarder_and_caps_the_mtu() {
+        let identity = Identity {
+            device_id: "gool".to_owned(),
+            token: String::new(),
+            wireguard: WireGuardIdentity {
+                private: [0x11; 32],
+                peer: [0x22; 32],
+                endpoint: "192.0.2.9:2408".parse().expect("the inner endpoint"),
+                addresses: vec!["10.0.0.2".parse().expect("the inner address")],
+                reserved: [0; 3],
+            },
+            masque: None,
+        };
+        let spec = WarpSpec::for_command(Mode::Gool, None, None);
+        let settings = wireguard_settings_with_endpoint(
+            &identity,
+            &spec,
+            "127.0.0.1:5000".parse().expect("the forwarder"),
+        );
+        let config = crate::wireguard::DeviceConfig::from_json(&settings).expect("the inner hop");
+        assert_eq!(
+            config.peers[0].endpoint,
+            Some("127.0.0.1:5000".parse().expect("the forwarder"))
+        );
+        assert_eq!(config.mtu, usize::from(GOOL_INNER_MTU));
+    }
+
+    #[test]
     fn a_second_quarantine_keeps_the_first_damaged_identity() {
         let dir =
             std::env::temp_dir().join(format!("ferrox-warp-quarantine-{}", std::process::id()));
@@ -3077,6 +3327,118 @@ mod tests {
             b"second"
         );
         std::fs::remove_dir_all(&dir).expect("the scratch directory is removed");
+    }
+
+    fn freedom_outbound(redirect: Option<&str>) -> crate::proxy::Outbound {
+        let settings = match redirect {
+            Some(redirect) => format!(r#"{{"redirect":"{redirect}"}}"#),
+            None => "{}".to_owned(),
+        };
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{settings}}}]}}"#
+        ))
+        .expect("a freedom outbound");
+        crate::proxy::Outbound::Freedom(Arc::new(
+            crate::proxy::find_freedom_outbound(&root)
+                .expect("the outbound reads")
+                .expect("a freedom outbound"),
+        ))
+    }
+
+    #[test]
+    fn wireguard_rides_inside_masque() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+
+        use ferrox_core::foxy::account::hex_encode;
+        use ferrox_core::wireguard::device::public_key;
+
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("echo address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                seen += n;
+                if seen >= 9 {
+                    return;
+                }
+            }
+        });
+
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = public_key(&client_private);
+        let server_public = public_key(&server_private);
+        let server_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            hex_encode(&server_private),
+            hex_encode(&client_public)
+        );
+        let wireguard_inbound = crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#))
+            .expect("a wireguard inbound");
+        let wireguard_port =
+            crate::wg::serve_inbound(&wireguard_inbound, &freedom_outbound(None), "127.0.0.1:0")
+                .expect("the wireguard server serves");
+
+        let masque_inbound = crate::json::parse(
+            r#"{"settings":{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]},"streamSettings":{"network":"masque","security":"none"}}"#,
+        )
+        .expect("a masque inbound");
+        let redirect = format!("127.0.0.1:{wireguard_port}");
+        let masque_port = crate::masque::serve_inbound(
+            &masque_inbound,
+            &freedom_outbound(Some(&redirect)),
+            "127.0.0.1:0",
+        )
+        .expect("the masque server serves");
+
+        let outer_outbound = crate::json::parse(&format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":{masque_port}}},"streamSettings":{{"network":"masque","security":"none","masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
+        ))
+        .expect("a masque outbound");
+        let outer = crate::masque::MasqueOut::new(&outer_outbound).expect("the outer tunnel");
+
+        let inner_identity = Identity {
+            device_id: "gool".to_owned(),
+            token: String::new(),
+            wireguard: WireGuardIdentity {
+                private: client_private,
+                peer: server_public,
+                endpoint: "192.0.2.9:2408".parse().expect("the inner endpoint"),
+                addresses: vec!["10.0.0.2".parse().expect("the inner address")],
+                reserved: [0; 3],
+            },
+            masque: None,
+        };
+        let spec = WarpSpec::for_command(Mode::Gool, None, None);
+        let remote: SocketAddr = "192.0.2.9:2408".parse().expect("the inner peer");
+        let gool = GoolOut::new(outer, &inner_identity, &spec, remote).expect("gool builds");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun =
+            TcpStream::connect(listener.local_addr().expect("pair address")).expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
+        app.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        gool.inner.serve_tcp(
+            crate::conn::Connection::from(tun),
+            &crate::proxy::Destination::Address(echo_address),
+            b"head",
+        );
+        app.write_all(b"hello").expect("write");
+        let mut answer = [0u8; 9];
+        app.read_exact(&mut answer).expect("read");
+        assert_eq!(&answer, b"headhello");
     }
 
     #[cfg(unix)]
