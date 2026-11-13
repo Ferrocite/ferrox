@@ -32,12 +32,11 @@ fn start_from_env() -> Option<Arc<Bridge>> {
     if addr.trim().is_empty() {
         return None;
     }
-    match Bridge::start(addr.trim()) {
-        Some(bridge) => Some(bridge),
-        None => {
-            eprintln!("browser dialer: cannot listen on {addr}");
-            None
-        }
+    if let Some(bridge) = Bridge::start(addr.trim()) {
+        Some(bridge)
+    } else {
+        eprintln!("browser dialer: cannot listen on {addr}");
+        None
     }
 }
 
@@ -70,7 +69,7 @@ impl Bridge {
         let worker = Arc::clone(&bridge);
         std::thread::Builder::new()
             .name("browser-dialer".to_owned())
-            .spawn(move || worker.accept(listener))
+            .spawn(move || worker.accept(&listener))
             .ok()?;
         Some(bridge)
     }
@@ -80,7 +79,7 @@ impl Bridge {
         self.addr
     }
 
-    fn accept(self: Arc<Self>, listener: TcpListener) {
+    fn accept(self: Arc<Self>, listener: &TcpListener) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
                 continue;
@@ -232,9 +231,8 @@ fn read_ok(reader: &mut WsReader<Connection>) -> bool {
     let mut at = 0;
     while at < buf.len() {
         match reader.read(&mut buf[at..]) {
-            Ok(0) => return false,
+            Ok(0) | Err(_) => return false,
             Ok(n) => at += n,
-            Err(_) => return false,
         }
     }
     buf == *b"ok"
@@ -428,8 +426,6 @@ fn uuid_v4() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
-    use std::io::Write as _;
     use std::thread;
 
     fn connect_page(bridge: &Bridge, token: &str) -> (WsReader<Connection>, WsWriter) {

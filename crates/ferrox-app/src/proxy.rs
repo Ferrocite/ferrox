@@ -11511,8 +11511,12 @@ fn dial_vless_browser(
                 reader,
                 writer,
                 ladder,
-                Rung::Ws,
-                false,
+                &RungAttempt {
+                    rung: Rung::Ws,
+                    path,
+                    ed: *ed,
+                    explicit: false,
+                },
             );
             true
         }
@@ -11783,8 +11787,7 @@ fn relay_vless_ws(
     reader: crate::ws::WsReader<Connection>,
     writer: crate::ws::WsWriter,
     ladder: &'static Ladder,
-    rung: Rung,
-    explicit: bool,
+    attempt: &RungAttempt,
 ) -> bool {
     if vless.encryption.is_some() {
         let close = writer.clone();
@@ -11805,10 +11808,10 @@ fn relay_vless_ws(
                 }
             },
         ) {
-            note_success(ladder, rung, Stage::FirstByte, explicit);
+            note_success(ladder, attempt.rung, Stage::FirstByte, attempt.explicit);
             return true;
         }
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+        return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
     }
     let mut reader = reader;
     reader.set_poll(Some(RELAY_POLL));
@@ -11828,9 +11831,9 @@ fn relay_vless_ws(
         if sent {
             return true;
         }
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+        return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
     }
-    note_success(ladder, rung, Stage::FirstByte, explicit);
+    note_success(ladder, attempt.rung, Stage::FirstByte, attempt.explicit);
     reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink_ws(reader, &writer, client);
     true
@@ -11864,16 +11867,7 @@ fn dial_vless_rung(
             ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            relay_vless_ws(
-                client,
-                vless,
-                header,
-                reader,
-                writer,
-                ladder,
-                rung,
-                attempt.explicit,
-            )
+            relay_vless_ws(client, vless, header, reader, writer, ladder, attempt)
         }
         Rung::HttpUpgrade => {
             let first = if vless.encryption.is_some() {
@@ -19132,14 +19126,14 @@ fn browser_xhttp_pair(
     let url = crate::browser_dialer::http_url(&authority, tls, &parts.target);
     let mut reader = crate::browser_dialer::dial_get(url, &parts)?;
     reader.set_poll(Some(RELAY_POLL));
-    let post = BrowserPost {
+    let uplink = BrowserPost {
         authority,
         tls,
         host: host.to_owned(),
         settings: settings.clone(),
         session,
     };
-    let writer = crate::xhttp::XhttpWriter::packets_with(Box::new(post), settings);
+    let writer = crate::xhttp::XhttpWriter::packets_with(Box::new(uplink), settings);
     Some((XhttpPairRead::Browser(Box::new(reader)), writer))
 }
 
