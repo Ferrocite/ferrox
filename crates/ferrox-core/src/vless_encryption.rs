@@ -2494,7 +2494,10 @@ mod tests {
 
         assert_eq!(
             sliced.write.copied_records,
-            vec![MAX_RECORD_PLAINTEXT, joined.len() - 7 * MAX_RECORD_PLAINTEXT],
+            vec![
+                MAX_RECORD_PLAINTEXT,
+                joined.len() - 7 * MAX_RECORD_PLAINTEXT
+            ],
             "only the records that cross a part boundary are copied"
         );
         assert_eq!(sliced.write.sealed_records.len(), 6);
