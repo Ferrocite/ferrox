@@ -8802,8 +8802,14 @@ fn serve_xhttp_stream<R: Read + Send + 'static + RelayPoll, W: FrameWrite + Send
     arm: impl FnMut(&R, Option<Duration>) -> bool,
 ) {
     let Some((chained, h2)) = sniff_xhttp(read, decryption.is_some(), arm) else {
+        echo_trace("xhttp sniff none");
         return;
     };
+    echo_trace(if h2 {
+        "xhttp sniff h2"
+    } else {
+        "xhttp sniff h1"
+    });
     if h2 {
         #[cfg(test)]
         if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
