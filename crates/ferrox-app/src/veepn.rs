@@ -130,6 +130,10 @@ impl VeepnOut {
                 h2_fingerprint: None,
                 no_resumption: false,
                 insecure: false,
+                host_header: None,
+                server_name: None,
+                verify_names: Vec::new(),
+                pins: ferrox_core::foxy::pin::Pins::default(),
             });
         }
         if origins.is_empty() {
