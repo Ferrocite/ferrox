@@ -1777,7 +1777,15 @@ mod tests {
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
     fn a_real_ech_cover_matches_the_staged_bytes() {
-        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let (list, _keys) = crate::tls::ech::generate_with_suites(
+            "public.test",
+            7,
+            &[(
+                crate::tls::ech::KDF_SHA256,
+                crate::tls::ech::AEAD_AES_256_GCM,
+            )],
+        )
+        .expect("generates");
         let profile = Fingerprint::default().profile().expect("profile");
         let mut hello =
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
@@ -1790,6 +1798,14 @@ mod tests {
         let suite = (
             u16::from_be_bytes([outer[5], outer[6]]),
             u16::from_be_bytes([outer[7], outer[8]]),
+        );
+        assert_eq!(
+            suite,
+            (
+                crate::tls::ech::KDF_SHA256,
+                crate::tls::ech::AEAD_AES_256_GCM
+            ),
+            "the offer names the config's only suite"
         );
         let enc_len = usize::from(u16::from_be_bytes([outer[10], outer[11]]));
         let enc = &outer[12..12 + enc_len];
