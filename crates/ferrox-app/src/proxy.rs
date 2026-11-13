@@ -268,6 +268,16 @@ fn dokodemo_has(networks: &[&str], network: &str) -> bool {
         .any(|named| named.eq_ignore_ascii_case(network))
 }
 
+/// The reference carries `userLevel` on the inbound's user; the door applies it as the
+/// accepted stream's policy level.
+fn dokodemo_user_level(inbound: &Json) -> u32 {
+    inbound
+        .get("settings")
+        .and_then(|settings| settings.get("userLevel"))
+        .and_then(Json::as_u32)
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_lines)]
 fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
     // Sized before the first lane, so every flow from here reads the ceiling its role named.
@@ -2023,6 +2033,7 @@ enum Role {
         transparent: Option<crate::sockopt::Tproxy>,
         mask: Option<ferrox_core::finalmask::Chain>,
         listen: Option<SocketAddr>,
+        account: InboundAccount,
     },
     /// The role's first bytes are a PROXY protocol header, read before the carrier handshake.
     Proxied(Box<Role>),
@@ -2115,8 +2126,8 @@ impl Role {
             | Role::Shadowsocks { .. }
             | Role::Socks { .. }
             | Role::Http { .. }
-            | Role::Mixed { .. }
-            | Role::Dokodemo { .. } => None,
+            | Role::Mixed { .. } => None,
+            Role::Dokodemo { account, .. } => Some(account),
             Role::Proxied(inner) => inner.account(),
         }
     }
@@ -14637,14 +14648,7 @@ fn serve_dokodemo(
         .get("receiveOriginalDestination")
         .and_then(Json::as_bool)
         .unwrap_or(follow_redirect);
-    let user_level = inbound
-        .get("settings")
-        .and_then(|settings| settings.get("userLevel"))
-        .and_then(Json::as_u32)
-        .unwrap_or(0);
-    if user_level != 0 {
-        eprintln!("dokodemo-door in {label}: userLevel {user_level} is accepted but not applied");
-    }
+    let user_level = dokodemo_user_level(inbound);
     let rewrite = DokodemoRewrite::from_config(inbound);
     let networks = dokodemo_networks(inbound);
     if !dokodemo_has(&networks, "tcp") && !dokodemo_has(&networks, "udp") {
@@ -14713,6 +14717,10 @@ fn serve_dokodemo(
                     transparent,
                     mask,
                     listen,
+                    account: InboundAccount {
+                        email: String::new(),
+                        level: user_level,
+                    },
                 },
             ),
             inbound_tag(inbound),
@@ -41832,6 +41840,14 @@ mod tests {
             ["read armed", "write duplicate"],
             "the read was served by the unarmed duplicate"
         );
+    }
+
+    #[test]
+    fn dokodemo_reads_user_level_as_the_account_level() {
+        let inbound = crate::json::parse(r#"{"settings": {"userLevel": 7}}"#).expect("parses");
+        assert_eq!(dokodemo_user_level(&inbound), 7);
+        let absent = crate::json::parse(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(dokodemo_user_level(&absent), 0);
     }
 
     #[test]
@@ -77715,6 +77731,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             transparent,
             mask: _,
             listen,
+            account: door_account,
         } => {
             let local = stream.local_addr().ok();
             let asked = if follow_redirect {
@@ -77745,7 +77762,10 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 Front::Socks,
                 &[],
                 tag.as_deref(),
-                FlowFacts::default(),
+                FlowFacts {
+                    level: Some(door_account.level),
+                    ..FlowFacts::default()
+                },
             );
         }
         Role::Proxied(inner) => dispatch(stream, *inner, None),
