@@ -2062,6 +2062,7 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
             .as_deref()
         {
             Some("fragment") => chain.push(fragment(conf)?),
+            Some("sudoku") => chain.push_sudoku(sudoku(conf)?),
             Some("filter") => {
                 if let Some(stage) = source_filter(conf).ok()? {
                     chain.set_filter(stage);
@@ -2113,6 +2114,68 @@ pub(crate) fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fr
         waits,
         single_range(conf, "maxSplit")?,
     )
+}
+
+/// One `sudoku` stage. The new spellings win only when they hold a value, exactly as the reference's
+/// loader falls back to the legacy key, and an ascii mode or custom table it cannot derive is refused
+/// rather than armed.
+pub(crate) fn sudoku(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Sudoku> {
+    let password = optional_text(conf, "password").ok()?.unwrap_or("");
+    let ascii = optional_text(conf, "ascii").ok()?.unwrap_or("");
+    let custom = optional_text(conf, "customTable")
+        .ok()?
+        .filter(|table| !table.is_empty())
+        .or(optional_text(conf, "custom_table").ok()?)
+        .unwrap_or("");
+    let sets = sudoku_sets(conf)?;
+    let padding_min = sudoku_padding(conf, "paddingMin", "padding_min")?;
+    let padding_max = sudoku_padding(conf, "paddingMax", "padding_max")?;
+    ferrox_core::finalmask::Sudoku::new(password, ascii, custom, &sets, padding_min, padding_max)
+}
+
+/// A present string key, including the empty string; `Err` when the value is a different JSON type,
+/// which the reference's unmarshal refuses rather than silently reading as absent.
+fn optional_text<'a>(conf: Option<&'a Json>, key: &str) -> Result<Option<&'a str>, ()> {
+    match conf.and_then(|c| c.get(key)) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Str(text)) => Ok(Some(text)),
+        Some(_) => Err(()),
+    }
+}
+
+/// The `customTables` list, new spelling first and the legacy list only when the new one is absent or
+/// empty; a list holding a non-string is refused.
+fn sudoku_sets(conf: Option<&Json>) -> Option<Vec<String>> {
+    fn parse(node: Option<&Json>) -> Result<Option<Vec<String>>, ()> {
+        match node {
+            None | Some(Json::Null) => Ok(None),
+            Some(value) => {
+                let mut sets = Vec::with_capacity(value.as_arr().ok_or(())?.len());
+                for item in value.as_arr().ok_or(())? {
+                    sets.push(item.as_str().ok_or(())?.to_owned());
+                }
+                Ok(Some(sets))
+            }
+        }
+    }
+    let new = parse(conf.and_then(|c| c.get("customTables"))).ok()?;
+    let legacy = parse(conf.and_then(|c| c.get("custom_tables"))).ok()?;
+    if let Some(sets) = new.filter(|sets| !sets.is_empty()) {
+        return Some(sets);
+    }
+    Some(legacy.unwrap_or_default())
+}
+
+fn sudoku_padding(conf: Option<&Json>, new: &str, legacy: &str) -> Option<u32> {
+    fn parse(conf: Option<&Json>, key: &str) -> Result<Option<u32>, ()> {
+        match conf.and_then(|c| c.get(key)) {
+            None | Some(Json::Null) => Ok(None),
+            Some(value) => value.as_u32().map(Some).ok_or(()),
+        }
+    }
+    let new = parse(conf, new).ok()?;
+    let legacy = parse(conf, legacy).ok()?;
+    Some(new.filter(|value| *value != 0).or(legacy).unwrap_or(0))
 }
 
 /// A `lengths`-style list, or `None` when the key is absent or empty and the singular spelling rules.
@@ -3388,6 +3451,41 @@ mod tests {
             chain.rejects(Some("192.0.2.5".parse().expect("ip"))),
             "the second allowlist still gates a source the first admits"
         );
+    }
+
+    #[test]
+    fn a_sudoku_stage_reads_either_spelling_and_refuses_an_underivable_one() {
+        let armed = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"p","ascii":"ascii","customTable":"xpxpvvvv","paddingMin":10,"paddingMax":20}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"p","ascii":"prefer_ascii","custom_table":"xpxpvvvv","padding_min":10,"padding_max":20}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"p","customTables":["xpxpvvvv","vxpvxpvv"]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"p","custom_tables":["xpxpvvvv","vxpvxpvv"]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"p","customTables":[]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{}}]}}"#,
+        ];
+        for doc in armed {
+            let settings = crate::json::parse(doc).expect("parses");
+            let Carrier::Raw(chain) = stream_carrier(Some(&settings)) else {
+                panic!("{doc} must arm a raw tcp carrier");
+            };
+            assert!(!chain.is_empty(), "{doc} must arm the stage");
+        }
+        let refused = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"ascii":"bogus"}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"ascii":1}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":1}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"customTable":"xx"}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"customTables":["xpxpvvvv",3]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"paddingMin":"x"}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"paddingMin":-1}}]}}"#,
+        ];
+        for doc in refused {
+            let settings = crate::json::parse(doc).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Unknown { .. }),
+                "{doc} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -747,6 +747,10 @@ front-tun icmp-non-echo-messages-refused 3 ferrox-app-tun::tests::a_non_echo_icm
 front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
+finalmask sudoku-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask sudoku-encoder-capacity-growth 0 ferrox-core-finalmask-sudoku::tests::the_encoder_buffer_holds_its_capacity
+finalmask sudoku-pure-octets-per-plaintext-octet 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
+finalmask sudoku-packed-octets-per-three-octets 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
 finalmask ops-retired-instructions 323610 scripts/count-ops.sh
 finalmask pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies
 finalmask filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists

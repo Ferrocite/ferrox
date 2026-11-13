@@ -4425,7 +4425,7 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         let sniffing = sniffing.clone();
         if role.serves_polled_tls() {
             let stream = stream
-                .with_mask(role.tcp_mask())
+                .with_mask_role(role.tcp_mask(), ferrox_core::finalmask::MaskRole::Server)
                 .with_meter(crate::stats::inbound(tag))
                 .with_policy(Some(crate::policy::flow(0)));
             let stream = with_account(stream, role.account(), false);
@@ -4504,7 +4504,7 @@ fn serve_accepted(
     }
     // Armed once per accepted stream, as the reference wraps its listener's conn.
     let stream = stream
-        .with_mask(role.tcp_mask())
+        .with_mask_role(role.tcp_mask(), ferrox_core::finalmask::MaskRole::Server)
         .with_meter(crate::stats::inbound(tag))
         .with_policy(Some(crate::policy::flow(0)));
     front_dispatch(stream, role);
@@ -32184,6 +32184,10 @@ impl FrameWrite for Connection {
 
     #[cfg(unix)]
     fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        // A masked frame's encoded length is not the caller's, so there is no plaintext count: the caller keeps the blocking write.
+        if self.has_mask() {
+            return None;
+        }
         Some(Connection::write_ready(self, parts))
     }
 
@@ -59760,6 +59764,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_configured_sudoku_chain_decodes_both_directions() {
+        let doc = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"hunter2","paddingMin":0,"paddingMax":0}}]}}"#;
+        let settings = crate::json::parse(doc).expect("parses");
+        let carrier = stream_carrier(Some(&settings));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let mut client = Connection::connect(address)
+            .expect("connects")
+            .with_mask_role(carrier.tcp_mask(), ferrox_core::finalmask::MaskRole::Client);
+        let (peer, _) = listener.accept().expect("accepts");
+        let mut server =
+            peer.with_mask_role(carrier.tcp_mask(), ferrox_core::finalmask::MaskRole::Server);
+        let up: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        client.write_all(&up).expect("writes the client direction");
+        let mut got = vec![0u8; up.len()];
+        server
+            .read_exact(&mut got)
+            .expect("the server reads what the client wrote");
+        assert_eq!(got, up, "the client's pure stream decodes on the server");
+        let down: Vec<u8> = (0..=255u8).rev().cycle().take(1000).collect();
+        server
+            .write_all(&down)
+            .expect("writes the server direction");
+        let mut got = vec![0u8; down.len()];
+        client
+            .read_exact(&mut got)
+            .expect("the client reads what the server wrote");
+        assert_eq!(
+            got, down,
+            "the server's packed stream decodes on the client"
+        );
+    }
+
     /// What a peer's record walk finds: the width of each record and the message between them.
     fn hello_records(wire: &[u8]) -> (Vec<usize>, Vec<u8>) {
         let mut widths = Vec::new();
@@ -59780,7 +59818,8 @@ mod tests {
     fn a_tcp_mask_this_tree_cannot_arm_is_refused() {
         let fragment = r#"{"type":"fragment","settings":{"packets":"tlshello","lengths":[11]}}"#;
         let refused = [
-            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"customTable":"xx"}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"ascii":"bogus"}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{}}]}}"#,
             // A chain belongs to the tcp connection; a carrier riding another transport has nowhere to arm it.
@@ -59812,7 +59851,10 @@ mod tests {
             r#"{{"network":"tcp","finalmask":{{"tcp":[{fragment}]}}}}"#
         ))
         .expect("parses");
-        for (settings, want) in [(&empty, false), (&armed, true)] {
+        let sudoku =
+            crate::json::parse(r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"x"}}]}}"#)
+                .expect("parses");
+        for (settings, want) in [(&empty, false), (&armed, true), (&sudoku, true)] {
             let carrier = stream_carrier(Some(settings));
             assert!(matches!(carrier, Carrier::Raw(_)));
             assert_eq!(carrier.tcp_mask().is_some(), want);
