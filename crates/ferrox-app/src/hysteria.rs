@@ -340,8 +340,9 @@ fn rebind_if_moved(session: &Session) -> bool {
             }
             session.migrated.store(true, Ordering::Release);
         }
-        crate::quic::Rebind::Retry => {}
-        crate::quic::Rebind::Same | crate::quic::Rebind::Unsupported => {}
+        crate::quic::Rebind::Same
+        | crate::quic::Rebind::Retry
+        | crate::quic::Rebind::Unsupported => {}
         crate::quic::Rebind::Failed => {
             let _ = conn.close(false, 0, b"rebind");
             return false;

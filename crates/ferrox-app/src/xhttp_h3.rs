@@ -1008,8 +1008,9 @@ fn pump_connection(
                         moved = true;
                         generation = now;
                     }
-                    quic::Rebind::Same | quic::Rebind::Unsupported => generation = now,
-                    quic::Rebind::Retry => generation = now,
+                    quic::Rebind::Same | quic::Rebind::Retry | quic::Rebind::Unsupported => {
+                        generation = now;
+                    }
                     quic::Rebind::Failed => {
                         let _ = conn.close(false, 0, b"rebind");
                         break;
