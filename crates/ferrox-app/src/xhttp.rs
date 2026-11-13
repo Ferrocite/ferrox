@@ -3129,12 +3129,6 @@ pub(crate) fn accept_core<
         return Served::Closed;
     }
     let (sid, seq) = extract_meta(text, target, settings);
-    crate::proxy::echo_trace(&format!(
-        "accept {method} sid={} seq={} h2={}",
-        sid.is_some(),
-        seq.is_some(),
-        h2.is_some()
-    ));
 
     match (sid, seq) {
         (None, None) => {

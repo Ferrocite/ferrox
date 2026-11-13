@@ -1587,22 +1587,6 @@ pub(crate) fn echo_trace_on() -> bool {
     *ECHO_TRACE_ON.get_or_init(|| std::env::var("FERROX_ECHO_TRACE").is_ok())
 }
 
-/// A wait that outlives a lane turn names itself in the trace, so a stall points at the call that held it.
-pub(crate) struct SlowSpan(std::time::Instant, &'static str);
-
-impl Drop for SlowSpan {
-    fn drop(&mut self) {
-        let elapsed = self.0.elapsed();
-        if elapsed >= std::time::Duration::from_secs(1) {
-            echo_trace(&format!("slow {} {}ms", self.1, elapsed.as_millis()));
-        }
-    }
-}
-
-pub(crate) fn slow_span(label: &'static str) -> SlowSpan {
-    SlowSpan(std::time::Instant::now(), label)
-}
-
 static ECHO_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 pub(crate) fn echo_trace(stage: &str) {
@@ -1612,30 +1596,7 @@ pub(crate) fn echo_trace(stage: &str) {
             .elapsed()
             .as_millis();
         println!("echo-trace: t={at} {stage}");
-        if let Some(file) = echo_file() {
-            use std::io::Write as _;
-            let mut file = file
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = writeln!(file, "echo-trace: t={at} {stage}");
-        }
     }
-}
-
-/// Test output is captured per thread, so a trace that must be read after a run is written to the file the workflow names.
-fn echo_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
-    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
-        std::sync::OnceLock::new();
-    FILE.get_or_init(|| {
-        let path = std::env::var_os("FERROX_TRACE_FILE")?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()?;
-        Some(std::sync::Mutex::new(file))
-    })
-    .as_ref()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8808,33 +8769,23 @@ fn sniff_xhttp<R: Read>(
     let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
     let mut at = 0;
-    echo_trace("sniff entry");
     while at < magic.len() {
         match read.read(&mut magic[at..]) {
-            Ok(0) => {
-                echo_trace(&format!("sniff eof at={at}"));
-                break;
-            }
+            Ok(0) => break,
             Ok(n) => at += n,
             Err(error) if is_timeout(&error) => {
                 if Instant::now() >= until {
-                    echo_trace(&format!("sniff timeout at={at}"));
                     break;
                 }
             }
-            Err(error) => {
-                echo_trace(&format!("sniff err at={at} {error:?}"));
-                break;
-            }
+            Err(_) => break,
         }
     }
     let _ = arm(&read, if sealed { Some(RELAY_POLL) } else { None });
     if at < magic.len() && Instant::now() >= until {
-        echo_trace(&format!("sniff expired at={at}"));
         return None;
     }
     let h2 = at == magic.len() && magic == *crate::h2::MAGIC;
-    echo_trace(&format!("sniff at={at} h2={h2}"));
     Some((
         crate::xhttp::ChainReader::new(magic[..at].to_vec(), read),
         h2,
@@ -8851,14 +8802,8 @@ fn serve_xhttp_stream<R: Read + Send + 'static + RelayPoll, W: FrameWrite + Send
     arm: impl FnMut(&R, Option<Duration>) -> bool,
 ) {
     let Some((chained, h2)) = sniff_xhttp(read, decryption.is_some(), arm) else {
-        echo_trace("xhttp sniff none");
         return;
     };
-    echo_trace(if h2 {
-        "xhttp sniff h2"
-    } else {
-        "xhttp sniff h1"
-    });
     if h2 {
         #[cfg(test)]
         if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
@@ -19330,13 +19275,10 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             if self.pending_at == self.pending_end && !self.queued && filled == 0 {
                 // Nothing pending or queued: the transport is the only source and its wait holds no lock.
                 let read = {
-                    let slow = slow_span("tls cipher lock");
                     let mut reader = self
                         .reader
                         .lock()
                         .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-                    drop(slow);
-                    let _slow = slow_span("tls cipher read");
                     reader.read(&mut self.scratch)
                 };
                 match read {
@@ -19357,12 +19299,10 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             // The session's own plaintext comes out first, and the ciphertext it has not taken yet is fed after it.
             let pending = &self.scratch[self.pending_at..self.pending_end];
             let (plain, taken, closed) = {
-                let slow = slow_span("tls session lock");
                 let mut session = self
                     .session
                     .lock()
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-                drop(slow);
                 let (plain, taken) = session.open(pending, &mut buf[filled..])?;
                 (plain, taken, session.closed())
             };
@@ -22395,16 +22335,12 @@ fn serve_trojan_xhttp_carrier_now<
     freedom: bool,
     arm: A,
 ) {
-    echo_trace("carrier now entry");
     let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
-        echo_trace("carrier now sniff none");
         return;
     };
     if !h2 {
-        echo_trace("carrier now h1");
         return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
     }
-    echo_trace("carrier now h2");
     #[cfg(test)]
     if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
         paths.push(settings.path.clone());
@@ -22438,7 +22374,6 @@ fn serve_trojan_xhttp_accepted(
     key: &[[u8; 56]],
     freedom: bool,
 ) {
-    echo_trace("session xhttp accepted");
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
     let mut bounded = crate::proxy::HandshakeRead::new(creader, crate::budgets::handshake());
     let decoded = decode_trojan_request(&mut bounded, key);
@@ -27751,8 +27686,7 @@ fn relay_lanes(
     let mut forward = TcpCopy::new(client_read, target_write);
     forward.stall = forward_stall;
     forward.reply_idle = forward_stall;
-    lane_pool::submit_tagged(
-        "tcp-fwd",
+    lane_pool::submit(
         Box::new(move || forward.step(&first)),
         Box::new({
             let flow = Arc::clone(&flow);
@@ -27769,8 +27703,7 @@ fn relay_lanes(
     if let Some(answer) = answer {
         reply = reply.answering(answer);
     }
-    lane_pool::submit_tagged(
-        "tcp-bwd",
+    lane_pool::submit(
         Box::new(move || reply.step(&second)),
         Box::new({
             let flow = Arc::clone(&flow);
@@ -29123,35 +29056,6 @@ pub(crate) mod lane_pool {
         idle: u32,
         /// A relay lane's reads hand a timeout back to the step; a setup lane's own budget owns its wait.
         relay: bool,
-        tag: &'static str,
-    }
-
-    static ACTIVE: Mutex<
-        Option<
-            std::collections::HashMap<std::thread::ThreadId, (&'static str, std::time::Instant)>,
-        >,
-    > = Mutex::new(None);
-
-    struct ActiveTag(std::thread::ThreadId);
-
-    impl Drop for ActiveTag {
-        fn drop(&mut self) {
-            if let Ok(mut active) = ACTIVE.lock() {
-                if let Some(map) = active.as_mut() {
-                    map.remove(&self.0);
-                }
-            }
-        }
-    }
-
-    fn tag_active(tag: &'static str) -> ActiveTag {
-        let id = std::thread::current().id();
-        if let Ok(mut active) = ACTIVE.lock() {
-            active
-                .get_or_insert_with(std::collections::HashMap::new)
-                .insert(id, (tag, std::time::Instant::now()));
-        }
-        ActiveTag(id)
     }
 
     impl Lane {
@@ -29161,7 +29065,6 @@ pub(crate) mod lane_pool {
                 crate::proxy::forget_wait_finish();
                 crate::proxy::forget_wait_idle();
             }
-            let _tag = tag_active(self.tag);
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
                 (self.step)()
@@ -29540,7 +29443,6 @@ pub(crate) mod lane_pool {
             .name("ferrox-relay-lane".into())
             .spawn(move || worker_loop(&worker));
         let Ok(worker) = spawned else {
-            crate::proxy::echo_trace("lane spawn failed");
             pool.workers.fetch_sub(1, Relaxed);
             return false;
         };
@@ -30463,7 +30365,6 @@ pub(crate) mod lane_pool {
     }
 
     fn run_to_end(mut lane: Lane) {
-        crate::proxy::echo_trace("lane inline");
         loop {
             let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
             match stepped {
@@ -30509,17 +30410,12 @@ pub(crate) mod lane_pool {
     }
 
     pub(crate) fn submit(step: Step, complete: Complete) {
-        submit_to_tagged(&pool(), "relay", step, complete);
-    }
-
-    /// A relay lane whose step is named, so a stalled worker says which direction it is in.
-    pub(crate) fn submit_tagged(tag: &'static str, step: Step, complete: Complete) {
-        submit_to_tagged(&pool(), tag, step, complete);
+        submit_to(&pool(), step, complete);
     }
 
     /// The demux of a muxed carrier, kept off the relay workers it feeds.
     pub(crate) fn submit_demux(step: Step, complete: Complete) {
-        submit_to_tagged(&demux_pool(), "demux", step, complete);
+        submit_to(&demux_pool(), step, complete);
     }
 
     /// A muxed stream's handshake: queued behind the accept path's setup lanes instead of taking a
@@ -30566,32 +30462,12 @@ pub(crate) mod lane_pool {
         }
     }
 
-    #[cfg(test)]
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
         let _ = submit_to_with(pool, step, complete, true);
     }
 
-    fn submit_to_tagged(
-        pool: &std::sync::Arc<Pool>,
-        tag: &'static str,
-        step: Step,
-        complete: Complete,
-    ) {
-        let _ = submit_to_tagged_with(pool, tag, step, complete, true);
-    }
-
     fn submit_to_with(
         pool: &std::sync::Arc<Pool>,
-        step: Step,
-        complete: Complete,
-        relay: bool,
-    ) -> Result<(), Lane> {
-        submit_to_tagged_with(pool, "lane", step, complete, relay)
-    }
-
-    fn submit_to_tagged_with(
-        pool: &std::sync::Arc<Pool>,
-        tag: &'static str,
         step: Step,
         complete: Complete,
         relay: bool,
@@ -30602,7 +30478,6 @@ pub(crate) mod lane_pool {
             complete: Some(complete),
             idle: 0,
             relay,
-            tag,
         };
         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
@@ -30647,54 +30522,6 @@ pub(crate) mod lane_pool {
         drop(ready);
         pool.notify.notify_one();
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot() -> String {
-        let p = pool();
-        let d = demux_pool();
-        let len = |queue: &std::sync::Mutex<std::collections::VecDeque<Lane>>| {
-            queue.lock().unwrap_or_else(PoisonError::into_inner).len()
-        };
-        let active = ACTIVE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|map| {
-                let now = std::time::Instant::now();
-                let mut rows: Vec<_> = map
-                    .values()
-                    .map(|(tag, at)| format!("{tag}@{}ms", now.duration_since(*at).as_millis()))
-                    .collect();
-                rows.sort();
-                rows.join(",")
-            })
-            .unwrap_or_default();
-        format!(
-            "relay workers={} idle={} ready={} parked={} waiting={} parks={} timer={} ready_parks={} | demux workers={} idle={} ready={} waiting={} | active={active}",
-            p.workers.load(std::sync::atomic::Ordering::Relaxed),
-            p.idle.load(std::sync::atomic::Ordering::Relaxed),
-            len(&p.ready),
-            p.parked
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .lanes
-                .len(),
-            p.waiting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len(),
-            p.parks.load(std::sync::atomic::Ordering::Relaxed),
-            p.timer_parks.load(std::sync::atomic::Ordering::Relaxed),
-            p.ready_parks.load(std::sync::atomic::Ordering::Relaxed),
-            d.workers.load(std::sync::atomic::Ordering::Relaxed),
-            d.idle.load(std::sync::atomic::Ordering::Relaxed),
-            len(&d.ready),
-            d.waiting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len(),
-        )
     }
 
     #[cfg(test)]
@@ -31082,7 +30909,6 @@ pub(crate) mod lane_pool {
                 complete: None,
                 idle: 0,
                 relay: false,
-                tag: "test",
             });
             assert!(reactor.park(slot).is_none(), "the lane parks");
             let ready = reactor.wait(Duration::ZERO);
@@ -31150,7 +30976,6 @@ pub(crate) mod lane_pool {
                     complete: Some(Box::new(|| {})),
                     idle: 0,
                     relay: true,
-                    tag: "test",
                 });
                 slot
             };
@@ -31231,7 +31056,6 @@ pub(crate) mod lane_pool {
                 complete: Some(Box::new(|| {})),
                 idle: 0,
                 relay: true,
-                tag: "test",
             });
             let park = std::time::Instant::now();
             assert!(
@@ -31277,7 +31101,6 @@ pub(crate) mod lane_pool {
                     complete: Some(Box::new(|| {})),
                     idle: 0,
                     relay: true,
-                    tag: "test",
                 });
                 slot
             };
@@ -31550,7 +31373,6 @@ pub(crate) mod lane_pool {
                 complete: Some(Box::new(|| {})),
                 idle: 0,
                 relay: true,
-                tag: "test",
             }
         }
 
@@ -32951,8 +32773,7 @@ where
         .read_window()
         .map_or_else(RelayBuf::new, RelayBuf::with_limit);
     let mut at = Forward::new();
-    lane_pool::submit_tagged(
-        "carrier-fwd",
+    lane_pool::submit(
         Box::new(move || {
             if let Some(next) = settle_lane(&uplink, &mut at) {
                 return next;
@@ -32965,7 +32786,6 @@ where
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
-                let _slow = slow_span("carrier-fwd read");
                 peer_read.read_ready(buffer.as_mut())
             };
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
@@ -32997,10 +32817,8 @@ where
     let mut upload = Upload::new();
     // Every wait of this shape carries the named stall, armed once outside the byte loop.
     let _ = peer_write.set_write_timeout(Some(stall));
-    lane_pool::submit_tagged(
-        "carrier-bwd",
+    lane_pool::submit(
         Box::new(move || {
-            let _slow = slow_span("carrier-bwd read");
             let read = reader.read_window();
             let (next, timed_out) = match read {
                 Ok(window) if !window.is_empty() => {
@@ -54747,11 +54565,9 @@ mod tests {
                         stream.write_all(&chunk[..n]).expect("writes the bulk");
                         left -= n;
                     }
-                    echo_trace("sink wrote all");
                     let _ = stream.shutdown(std::net::Shutdown::Write);
                     let mut rest = [0u8; 1024];
                     while stream.read(&mut rest).unwrap_or(0) != 0 {}
-                    echo_trace("sink drained");
                 });
             }
         });
@@ -54791,7 +54607,6 @@ mod tests {
                             true,
                             |_, _| true,
                         );
-                        echo_trace("carrier returned");
                     });
                 });
             }
@@ -54824,19 +54639,10 @@ mod tests {
                 let mut got = 0usize;
                 let mut buf = vec![0u8; 65536];
                 while got < BULK {
-                    let n = sock.read(&mut buf).unwrap_or_else(|error| {
-                        panic!(
-                            "the download must not stall at {got}: {error}; {}",
-                            lane_pool::snapshot()
-                        )
-                    });
+                    let n = sock.read(&mut buf).expect("the download must not stall");
                     assert!(n > 0, "a flow ended early at {got} of {BULK}");
-                    if got == 0 {
-                        echo_trace("flow read first");
-                    }
                     got += n;
                 }
-                echo_trace("flow read all");
                 got
             }));
         }

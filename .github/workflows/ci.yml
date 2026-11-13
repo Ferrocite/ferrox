@@ -20,12 +20,6 @@ on:
       - ".github/workflows/**"
       - ".github/actions/**"
   workflow_dispatch:
-    inputs:
-      diag:
-        description: "run the eight-flow h2 test alone on windows"
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -163,40 +157,6 @@ jobs:
         # watch-test.sh is what cuts a hung suite at the quiet limit and points at the
         # one test that never returns; nothing else runs its selftest, so gate it here.
         run: ./scripts/watch-test.sh --selftest
-
-  diag-h2:
-    name: diag the eight-flow h2 test
-    if: inputs.diag
-    runs-on: windows-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: ci
-          cache-on-failure: true
-      - name: install the QUIC build tool
-        shell: bash
-        run: choco install nasm -y --no-progress || { choco list --local-only 2>/dev/null | grep -iq nasm; }
-      - name: run the ferrox-app suite, three times
-        shell: bash
-        env:
-          FERROX_ECHO_TRACE: "1"
-          RUST_TEST_THREADS: "1"
-        run: |
-          mkdir -p target/ci
-          for i in 1 2 3 4 5; do
-            echo "=== run $i ==="
-            FERROX_TRACE_FILE="$GITHUB_WORKSPACE/target/ci/trace-$i.log" cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
-          done
-      - name: upload the trace the run wrote
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diag-trace
-          path: target/ci/trace-*.log
-          if-no-files-found: ignore
 
   test:
     name: test (${{ matrix.name }})

@@ -1658,7 +1658,6 @@ fn fill_frame(
     yieldable: bool,
 ) -> Option<bool> {
     while *at < buf.len() {
-        let _slow = crate::proxy::slow_span("h2 frame read");
         match stream.read(&mut buf[*at..]) {
             Ok(0) => return None,
             Ok(n) => *at += n,
@@ -1689,7 +1688,6 @@ impl H2Conn {
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
     /// A lane step that cannot finish the frame yields the poll instead of sleeping in it.
     fn pump_read(&self, ready: impl FnOnce() -> bool, yieldable: bool) -> Pumped {
-        let _slow = crate::proxy::slow_span("h2 pump read");
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
@@ -1957,10 +1955,6 @@ impl H2Client {
             if write.write_all(MAGIC).is_err() {
                 return None;
             }
-        }
-        if let Some(raw) = conn.raw.as_ref() {
-            // A relay lane parses its own frames on the client: a transport read that can block would pin the worker the grants it waits for.
-            let _ = raw.set_read_timeout(Some(crate::budgets::RELAY_POLL));
         }
         let mut initial = Vec::with_capacity(12);
         initial.extend_from_slice(&S_WINDOW.to_be_bytes());
@@ -2399,14 +2393,6 @@ impl crate::xhttp_h3::H3Service for XhttpSessionService {
     }
 }
 
-/// H2 frame tracing is its own gate: the full suite runs the demux for every carrier, so the extra I/O is opt-in.
-pub(crate) fn h2_trace(message: &str) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("FERROX_ECHO_H2").is_some()) {
-        crate::proxy::echo_trace(message);
-    }
-}
-
 fn synth_head(method: &[u8], target: &[u8], lines: &[u8], end_stream: bool) -> Vec<u8> {
     // " " and " HTTP/2\r\n" and the closing "\r\n", plus the chunked line a stream still open carries.
     let framing = if end_stream { 12 } else { 40 };
@@ -2462,7 +2448,6 @@ fn open_stream(
     block: &[u8],
     end_stream: bool,
 ) -> bool {
-    crate::proxy::echo_trace(&format!("open stream {sid} end={end_stream}"));
     let (method, target, lines) = {
         let mut decoder = conn.decoder.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut method, mut target, mut lines) = (Vec::new(), Vec::new(), Vec::new());
@@ -2493,12 +2478,10 @@ fn open_stream(
         (method, target, lines)
     };
     if conn.goaway.load(Ordering::SeqCst) {
-        crate::proxy::echo_trace(&format!("open goaway {sid}"));
         conn.reset_stream(sid);
         return false;
     }
     let Some(state) = conn.attach_stream(sid, end_stream) else {
-        crate::proxy::echo_trace(&format!("open attach refused {sid}"));
         conn.reset_stream(sid);
         return false;
     };
@@ -2539,8 +2522,7 @@ fn open_stream(
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
-        crate::proxy::echo_trace(&format!("open handler {sid}"));
-        if let crate::xhttp::Served::Session(ureader, xwriter) = crate::xhttp::accept_core(
+        match crate::xhttp::accept_core(
             &head,
             Vec::new(),
             upload,
@@ -2549,11 +2531,10 @@ fn open_stream(
             Some(crate::xhttp::StreamOut::H2(h2out.clone())),
             None,
         ) {
-            crate::proxy::echo_trace(&format!("served session {sid}"));
-            serve(ureader, xwriter, decryption);
-        } else {
-            crate::proxy::echo_trace(&format!("served other {sid}"));
-            h2out.end();
+            crate::xhttp::Served::Session(ureader, xwriter) => {
+                serve(ureader, xwriter, decryption);
+            }
+            _ => h2out.end(),
         }
     });
     true
@@ -2720,7 +2701,6 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         block: bool,
         bounded: bool,
     ) -> Filled {
-        let _slow = crate::proxy::slow_span("h2 fill read");
         while *have < buf.len() {
             if Self::expired(until, opened) {
                 return Filled::End;
@@ -2796,10 +2776,8 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         match self.phase {
             Phase::Magic => {
                 if self.magic[..] != MAGIC[..] {
-                    h2_trace("h2 magic bad");
                     return self.end();
                 }
-                h2_trace("h2 magic ok");
                 let Some(write) = self.write.take() else {
                     return self.end();
                 };
@@ -2846,9 +2824,6 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 let sid =
                     u32::from_be_bytes([self.head[5], self.head[6], self.head[7], self.head[8]])
                         & 0x7FFF_FFFF;
-                h2_trace(&format!(
-                    "h2 head kind={kind} flags={flags} sid={sid} len={len}"
-                ));
                 if len > MAX_RECV_FRAME {
                     // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
                     if let Some(conn) = &self.conn {
@@ -2863,10 +2838,6 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
             }
             Phase::Body => {
                 let (kind, flags, sid) = self.frame;
-                h2_trace(&format!(
-                    "h2 body kind={kind} sid={sid} len={}",
-                    self.body.len()
-                ));
                 let Some(conn) = &self.conn else {
                     return self.end();
                 };
@@ -2891,7 +2862,6 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
     }
 
     fn end(&mut self) -> Stepped {
-        h2_trace("h2 end");
         if let Some(conn) = self.conn.take() {
             if conn.refused.load(Ordering::SeqCst) {
                 // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is held after the last write drains, so the peer has the window to read it, and spent off the lane.
@@ -2929,7 +2899,6 @@ pub(crate) fn serve_h2_service_until<
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
 ) {
-    h2_trace("h2 service entry");
     let mut frames = Frames::new(read, write, decryption, until, false);
     while !matches!(frames.step(service, true), Stepped::Done) {}
 }
