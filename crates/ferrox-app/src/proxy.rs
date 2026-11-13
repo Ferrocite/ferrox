@@ -34349,10 +34349,10 @@ fn socks_udp_forwarded<'a>(
 fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
     match atyp {
         1 => {
-            let ip: [u8; 4] = buf.get(..4)?.try_into().ok()?;
+            let ip = buf.first_chunk::<4>()?;
             let port: [u8; 2] = buf.get(4..6)?.try_into().ok()?;
             Some((
-                SocketAddr::new(std::net::IpAddr::V4(ip.into()), u16::from_be_bytes(port)),
+                SocketAddr::new(std::net::IpAddr::V4((*ip).into()), u16::from_be_bytes(port)),
                 6,
             ))
         }
@@ -34369,10 +34369,10 @@ fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
             Some((addr, 3 + len))
         }
         4 => {
-            let ip: [u8; 16] = buf.get(..16)?.try_into().ok()?;
+            let ip = buf.first_chunk::<16>()?;
             let port: [u8; 2] = buf.get(16..18)?.try_into().ok()?;
             Some((
-                SocketAddr::new(std::net::IpAddr::V6(ip.into()), u16::from_be_bytes(port)),
+                SocketAddr::new(std::net::IpAddr::V6((*ip).into()), u16::from_be_bytes(port)),
                 18,
             ))
         }
