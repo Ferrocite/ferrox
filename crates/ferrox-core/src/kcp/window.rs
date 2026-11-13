@@ -196,29 +196,32 @@ impl SendingWindow {
     }
 }
 
-/// Out-of-order receive slots, indexed by segment number modulo the window size.
+/// Out-of-order receive slots in a power-of-two ring; the power of two divides
+/// `2^32`, so a window that crosses `u32::MAX` still gives every live number a
+/// slot of its own.
 #[derive(Debug)]
 pub struct ReceivingWindow {
     slots: Vec<Option<DataSegment>>,
-    size: u32,
+    mask: u32,
 }
 
 impl ReceivingWindow {
     #[must_use]
     pub fn new(size: u32) -> Self {
+        let capacity = size.max(1).next_power_of_two();
         Self {
             slots: Vec::new(),
-            size: size.max(1),
+            mask: capacity - 1,
         }
     }
 
     fn index(&self, id: u32) -> usize {
-        (id % self.size) as usize
+        (id & self.mask) as usize
     }
 
     fn ensure_allocated(&mut self) {
         if self.slots.is_empty() {
-            self.slots.resize_with(self.size as usize, || None);
+            self.slots.resize_with(self.mask as usize + 1, || None);
         }
     }
 
@@ -745,19 +748,18 @@ mod tests {
         assert_eq!(w.slots.capacity(), capacity);
     }
 
-    /// Numbers wrap; the slot is chosen by the wrapped number's residue, so a
-    /// run across `u32::MAX` must still occupy eight distinct slots and keep
-    /// each segment under its own number.
+    /// Three does not divide `2^32`; a modulo index aliased `u32::MAX` and `0`
+    /// into one slot. The power-of-two ring must keep all three numbers apart.
     #[test]
     fn the_ring_keeps_wrapped_numbers_in_their_slot() {
-        let mut w = ReceivingWindow::new(8);
-        let start = u32::MAX - 3;
-        for offset in 0..8 {
+        let mut w = ReceivingWindow::new(3);
+        let start = u32::MAX - 1;
+        for offset in 0..3 {
             let number = start.wrapping_add(offset);
             assert!(w.set(number, receive_segment(number)));
         }
         assert!(!w.set(start, receive_segment(start)));
-        for offset in 0..8 {
+        for offset in 0..3 {
             let number = start.wrapping_add(offset);
             assert!(w.has(number));
             assert_eq!(w.remove(number).map(|seg| seg.number), Some(number));
