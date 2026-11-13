@@ -3,8 +3,8 @@
 //! reach the wire as the pieces the config asked for.
 //!
 //! [`Fragment`] cuts session writes, [`Sudoku`] replaces each plaintext octet with four hint octets
-//! in both directions, and [`HeaderCustom`] runs a configured ping-pong handshake before them; `xmc`
-//! is still refused by name at config, never dialled unmasked. A fragment mask rewrites nothing: the
+//! in both directions, and [`HeaderCustom`] runs a configured ping-pong handshake before them, and `xmc`
+//! runs a Minecraft login and CFB8 session. A fragment mask rewrites nothing: the
 //! octets a session writes are the octets the peer reads, cut at different record ends. Splitting a
 //! handshake record is legal TLS — a handshake message may span records — so the peer's own stack
 //! reassembles it, which is what the pinned interop rows assert.
@@ -18,8 +18,14 @@ mod go_rand;
 mod header_custom;
 mod sudoku;
 
+pub mod xmc;
+
 pub use header_custom::{Expr, ExprArg, HeaderCustom, HeaderRun, Item, Sequence};
 pub use sudoku::Sudoku;
+pub use xmc::cfb8::Cfb8;
+pub use xmc::derivation::{derive_rsa_key, private_key_der, public_key_der};
+pub use xmc::packet_stream::PacketStream;
+pub use xmc::profile::{find_profile, read_login_success, Profile};
 
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
@@ -480,6 +486,7 @@ pub struct Chain {
     stages: Vec<Stage>,
     filters: Vec<SourceFilter>,
     header: Option<Arc<HeaderCustom>>,
+    xmc: Option<Arc<xmc::Config>>,
 }
 
 /// One configured stage. `fragment` is write-only, `sudoku` carries a reader too.
@@ -562,7 +569,7 @@ impl Chain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stages.is_empty() && self.header.is_none()
+        self.stages.is_empty() && self.header.is_none() && self.xmc.is_none()
     }
 
     /// One `header-custom` handshake outside the byte stages; the first entry owns it.
@@ -575,6 +582,16 @@ impl Chain {
         self.header.as_deref()
     }
 
+    /// One `xmc` handshake outside the byte stages; the first entry owns it.
+    pub fn set_xmc(&mut self, config: xmc::Config) {
+        self.xmc = Some(Arc::new(config));
+    }
+
+    /// The xmc handshake the config armed, if any.
+    pub fn xmc(&self) -> Option<&xmc::Config> {
+        self.xmc.as_deref()
+    }
+
     /// The same chain without its handshake, which the byte stages own separately.
     #[must_use]
     pub fn without_header(&self) -> Self {
@@ -582,6 +599,7 @@ impl Chain {
             stages: self.stages.clone(),
             filters: self.filters.clone(),
             header: None,
+            xmc: None,
         }
     }
 
@@ -606,11 +624,13 @@ impl Chain {
             stages: self.stages.iter().map(|s| s.opened(role, true)).collect(),
             filters: Vec::new(),
             header: None,
+            xmc: None,
         };
         let read = self.stages.iter().any(Stage::is_codec).then(|| Chain {
             stages: self.stages.iter().map(|s| s.opened(role, false)).collect(),
             filters: Vec::new(),
             header: None,
+            xmc: None,
         });
         OpenChain { write, read }
     }

@@ -79,6 +79,92 @@ pub(crate) struct Masked {
     chain: std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
     read_chain: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>>,
     header: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::HeaderRun>>>,
+    xmc: Option<std::sync::Arc<XmcState>>,
+}
+
+#[derive(Debug)]
+struct XmcState {
+    config: ferrox_core::finalmask::xmc::Config,
+    role: ferrox_core::finalmask::MaskRole,
+    session: std::sync::OnceLock<Result<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>, String>>,
+}
+
+type XmcSession<R, W> = ferrox_core::finalmask::xmc::Session<R, W>;
+
+#[derive(Debug)]
+struct XmcWriter {
+    stream: TcpStream,
+    chain: std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
+}
+
+/// A handshake that outlives a peer's interest is a stalled connection, not a slow one; the
+/// reference's own bound is two minutes.
+const XMC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+impl std::io::Write for XmcWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(std::io::Error::other("the mask chain is gone"));
+        };
+        chain.write(&mut &self.stream, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.stream).flush()
+    }
+}
+
+impl XmcState {
+    fn session(
+        &self,
+        stream: &TcpStream,
+        chain: &std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
+    ) -> io::Result<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>> {
+        let result = self.session.get_or_init(|| {
+            let saved_read = stream.read_timeout().ok().flatten();
+            let saved_write = stream.write_timeout().ok().flatten();
+            let _ = stream.set_read_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
+            let result = (|| {
+                let reader = stream.try_clone()?;
+                let writer = XmcWriter {
+                    stream: stream.try_clone()?,
+                    chain: std::sync::Arc::clone(chain),
+                };
+                let session = match self.role {
+                    ferrox_core::finalmask::MaskRole::Client => {
+                        XmcSession::client(reader, writer, &self.config, stream.peer_addr().ok())?
+                    }
+                    ferrox_core::finalmask::MaskRole::Server => {
+                        XmcSession::server(reader, writer, &self.config)?
+                    }
+                };
+                Ok::<_, io::Error>(std::sync::Arc::new(session))
+            })();
+            let _ = stream.set_read_timeout(saved_read);
+            let _ = stream.set_write_timeout(saved_write);
+            result.map_err(|error| error.to_string())
+        });
+        result
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(|error| io::Error::other(error.clone()))
+    }
+}
+
+impl Masked {
+    /// Finish the xmc handshake before a relay lane can read; the blocking path owns it.
+    pub(crate) fn complete_xmc(&self) -> io::Result<()> {
+        self.xmc_session().map(|_| ())
+    }
+
+    fn xmc_session(&self) -> io::Result<Option<std::sync::Arc<XmcSession<TcpStream, XmcWriter>>>> {
+        self.ensure_header()?;
+        match &self.xmc {
+            Some(state) => state.session(&self.stream, &self.chain).map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 /// The clock the captured-variable store stamps and expires with; the core takes it as a value so
@@ -111,7 +197,9 @@ impl Masked {
     /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
     /// makes a writer, so a leg drained by reference masks exactly as one moved by value.
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.ensure_header()?;
+        if let Some(session) = self.xmc_session()? {
+            return (&*session).write(buf);
+        }
         // A stage never panics while held, so a poisoned lock is a broken process, not a wire state.
         let Ok(mut chain) = self.chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
@@ -141,6 +229,9 @@ impl Masked {
 
     /// A read through the codec chain, or the socket itself when no stage transforms bytes.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(session) = self.xmc_session()? {
+            return (&*session).read(buf);
+        }
         self.ensure_header()?;
         let Some(chain) = &self.read_chain else {
             return (&self.stream).read(buf);
@@ -163,6 +254,12 @@ impl Masked {
     /// pending header answers `WouldBlock` instead of running it, so a readiness lane never waits.
     #[cfg(unix)]
     fn recv_ready(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(state) = &self.xmc {
+            if state.session.get().is_none() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            return self.recv(buf);
+        }
         if let Some(header) = &self.header {
             let Ok(run) = header.lock() else {
                 return Err(io::Error::other("the header handshake is gone"));
@@ -182,6 +279,12 @@ impl Masked {
 
     /// Look ahead through the codec's pending plaintext without consuming it.
     fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.xmc.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an xmc stream cannot be peeked",
+            ));
+        }
         self.ensure_header()?;
         let Some(chain) = &self.read_chain else {
             return self.stream.peek(buf);
@@ -267,6 +370,13 @@ impl Connection {
                     )))
                 });
                 let opened = chain.open(role);
+                let xmc = chain.xmc().map(|config| {
+                    std::sync::Arc::new(XmcState {
+                        config: config.clone(),
+                        role,
+                        session: std::sync::OnceLock::new(),
+                    })
+                });
                 Connection::Masked(Masked {
                     stream,
                     chain: std::sync::Arc::new(std::sync::Mutex::new(opened.write)),
@@ -274,6 +384,7 @@ impl Connection {
                         .read
                         .map(|read| std::sync::Arc::new(std::sync::Mutex::new(read))),
                     header,
+                    xmc,
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -328,6 +439,20 @@ impl Connection {
             Connection::Tcp(_) => false,
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => false,
+        }
+    }
+
+    /// Finish an xmc handshake on the masking layer, whichever wrapper holds it.
+    pub(crate) fn complete_xmc(&self) -> io::Result<()> {
+        match self {
+            Connection::Masked(masked) => masked.complete_xmc(),
+            Connection::Metered(metered) => metered.inner.complete_xmc(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.complete_xmc()
+            }
+            Connection::Tcp(_) => Ok(()),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => Ok(()),
         }
     }
 
@@ -490,6 +615,11 @@ impl Connection {
     pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
         let result = match self {
             Connection::Tcp(stream) => sendmsg_ready(stream, parts),
+            Connection::Masked(masked) if masked.xmc.is_some() => parts
+                .iter()
+                .copied()
+                .find(|part| !part.is_empty())
+                .map_or(Ok(0), |first| masked.send(first)),
             Connection::Masked(masked) => masked.send_ready(parts),
             Connection::Metered(metered) => match metered.inner.write_ready(parts) {
                 Ok(n) => {
@@ -680,7 +810,11 @@ impl Write for Connection {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.flush(),
-            Connection::Masked(masked) => masked.stream.flush(),
+            Connection::Masked(masked) => match masked.xmc_session() {
+                Ok(Some(session)) => (&*session).flush(),
+                Ok(None) => masked.stream.flush(),
+                Err(error) => Err(error),
+            },
             Connection::Metered(metered) => metered.inner.flush(),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => inner.flush(),
             #[cfg(any(unix, windows))]
@@ -866,6 +1000,7 @@ impl Connection {
                     chain: std::sync::Arc::clone(&masked.chain),
                     read_chain: masked.read_chain.as_ref().map(std::sync::Arc::clone),
                     header: masked.header.as_ref().map(std::sync::Arc::clone),
+                    xmc: masked.xmc.as_ref().map(std::sync::Arc::clone),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -895,7 +1030,14 @@ impl Connection {
     pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.shutdown(how),
-            Connection::Masked(masked) => masked.stream.shutdown(how),
+            Connection::Masked(masked) => {
+                if let Some(state) = &masked.xmc {
+                    if let Some(Ok(session)) = state.session.get() {
+                        session.stop();
+                    }
+                }
+                masked.stream.shutdown(how)
+            }
             Connection::Metered(metered) => metered.inner.shutdown(how),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 inner.shutdown(how)

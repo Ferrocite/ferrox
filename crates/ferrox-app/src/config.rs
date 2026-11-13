@@ -2080,10 +2080,19 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
                 chain.push_sudoku(sudoku(conf)?);
             }
             Some("header-custom") => {
-                if !chain.without_header().is_empty() || chain.header().is_some() {
+                if !chain.without_header().is_empty()
+                    || chain.header().is_some()
+                    || chain.xmc().is_some()
+                {
                     return None;
                 }
                 chain.push_header_custom(header_custom(conf)?);
+            }
+            Some("xmc") => {
+                if !chain.is_empty() {
+                    return None;
+                }
+                chain.set_xmc(xmc_config(conf)?);
             }
             Some("filter") => {
                 if let Some(stage) = source_filter(conf).ok()? {
@@ -2094,6 +2103,78 @@ pub(crate) fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask
         }
     }
     Some(chain)
+}
+
+/// One `xmc` handshake: profiles, password and hostname, with both RSA forms derived from the
+/// password. A profile must name a Minecraft username and a dashed or plain UUID, and carry signed
+/// textures; anything less refuses the carrier rather than dialling a half-configured peer.
+fn xmc_config(conf: Option<&Json>) -> Option<ferrox_core::finalmask::xmc::Config> {
+    use ferrox_core::finalmask::xmc::{Config, Profile};
+    let conf = conf?;
+    let password = conf.get("password")?.as_str()?.to_owned();
+    if password.is_empty() {
+        return None;
+    }
+    let hostname = conf
+        .get("hostname")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let rows = conf.get("profiles")?.as_arr()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let mut profiles = Vec::with_capacity(rows.len());
+    for row in rows {
+        let username = row.get("username")?.as_str()?;
+        if !xmc_username(username) {
+            return None;
+        }
+        let uuid = xmc_uuid(row.get("uuid")?.as_str()?)?;
+        let textures_value = row.get("texturesValue")?.as_str()?.to_owned();
+        let textures_signature = row.get("texturesSignature")?.as_str()?.to_owned();
+        if textures_value.is_empty() || textures_signature.is_empty() {
+            return None;
+        }
+        profiles.push(Profile {
+            username: username.to_owned(),
+            uuid,
+            textures_value,
+            textures_signature,
+        });
+    }
+    let key = ferrox_core::finalmask::derive_rsa_key(&password).ok()?;
+    let private_key_der = ferrox_core::finalmask::private_key_der(&key).ok()?;
+    let public_key_der = ferrox_core::finalmask::public_key_der(&key).ok()?;
+    Config::new(
+        profiles,
+        password,
+        hostname,
+        private_key_der,
+        public_key_der,
+    )
+    .ok()
+}
+
+fn xmc_username(value: &str) -> bool {
+    (3..=16).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn xmc_uuid(value: &str) -> Option<[u8; 16]> {
+    let bytes = value.as_bytes();
+    let shaped = bytes.len() == 32
+        || (bytes.len() == 36
+            && [8, 13, 18, 23]
+                .into_iter()
+                .all(|index| bytes[index] == b'-'));
+    if shaped {
+        uuid_bytes(value)
+    } else {
+        None
+    }
 }
 
 /// One `header-custom` handshake. The lists are the reference's `clients`, `servers` and `errors`,
@@ -3671,6 +3752,51 @@ mod tests {
             source_filter(null.get("settings")).is_ok_and(|stage| stage.is_none()),
             "null settings filter nothing, as absent ones do"
         );
+    }
+
+    #[test]
+    fn an_xmc_stage_reads_a_profile_and_composes_with_a_later_fragment() {
+        let doc = r#"{"network":"tcp","finalmask":{"tcp":[
+            {"type":"xmc","settings":{"hostname":"mc.example","password":"hunter2","profiles":[
+                {"username":"Steve_01","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}
+            ]}},
+            {"type":"fragment","settings":{"lengths":[16],"delays":[0]}}
+        ]}}"#;
+        let settings = crate::json::parse(doc).expect("parses");
+        let Carrier::Raw(chain) = stream_carrier(Some(&settings)) else {
+            panic!("{doc} must arm a raw chain");
+        };
+        let xmc = chain.xmc().expect("the xmc handshake");
+        assert_eq!(xmc.hostname, "mc.example");
+        assert_eq!(xmc.profiles.len(), 1);
+        assert_eq!(xmc.profiles[0].username, "Steve_01");
+        assert!(!xmc.private_key_der.is_empty() && !xmc.public_key_der.is_empty());
+        assert!(chain.header().is_none());
+    }
+
+    #[test]
+    fn an_xmc_stage_accepts_a_plain_uuid_and_refuses_a_late_or_mixed_entry() {
+        let valid = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567e89b12d3a456426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#;
+        let settings = crate::json::parse(valid).expect("parses");
+        assert!(matches!(stream_carrier(Some(&settings)), Carrier::Raw(_)));
+
+        let refused = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"lengths":[1]}},{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}]}},{"type":"header-custom","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{}},{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"ab","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-42661417400","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"","texturesSignature":"signature"}]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[]}}]}}"#,
+        ];
+        for doc in refused {
+            let settings = crate::json::parse(doc).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Unknown { .. }),
+                "{doc} must be refused"
+            );
+        }
     }
 
     #[test]

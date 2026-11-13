@@ -33024,6 +33024,10 @@ where
             echo_trace(&format!("relay header handshake failed: {error:?}"));
             return None;
         }
+        if let Err(error) = peer.complete_xmc() {
+            echo_trace(&format!("relay xmc handshake failed: {error:?}"));
+            return None;
+        }
     }
     // The stall the buffered copy already arms, once per leg outside the byte loop: a peer that reads none of the download would otherwise pin this leg's read, and the join behind it, for the life of the process.
     let stall = budgets::relay_stall();
@@ -60382,6 +60386,43 @@ mod tests {
             "clients":[[{"type":"array","packet":[193]},{"rand":2,"randRange":"42-42","capture":"tx"}]],
             "servers":[[{"reuse":"tx"}]]
         }},{"type":"fragment","settings":{"packets":"1","lengths":[2],"delays":[0]}}]}}"#;
+        let settings = crate::json::parse(doc).expect("parses");
+        let carrier = stream_carrier(Some(&settings));
+        let chain = carrier.tcp_mask().expect("a chain").clone();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let server_chain = chain.clone();
+        let server = std::thread::spawn(move || {
+            let (peer, _) = listener.accept().expect("accepts");
+            let mut peer = peer.with_mask_role(
+                Some(&server_chain),
+                ferrox_core::finalmask::MaskRole::Server,
+            );
+            let mut ping = [0u8; 4];
+            peer.read_exact(&mut ping).expect("reads the session");
+            assert_eq!(&ping, b"ping");
+            peer.write_all(b"pong").expect("writes the answer");
+        });
+        let mut client = Connection::connect(address)
+            .expect("connects")
+            .with_mask_role(Some(&chain), ferrox_core::finalmask::MaskRole::Client);
+        client.write_all(b"ping").expect("writes the session");
+        let mut pong = [0u8; 4];
+        client.read_exact(&mut pong).expect("reads the answer");
+        assert_eq!(&pong, b"pong");
+        server.join().expect("server finishes");
+    }
+
+    /// A configured `xmc` chain on a real socket: both roles handshake, then a fragment after it
+    /// carries the session in both directions without seeing a plaintext xmc frame.
+    #[test]
+    fn a_configured_xmc_stage_carries_both_directions() {
+        let doc = r#"{"network":"tcp","finalmask":{"tcp":[
+            {"type":"xmc","settings":{"hostname":"mc.example","password":"hunter2","profiles":[
+                {"username":"Steve_01","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}
+            ]}},
+            {"type":"fragment","settings":{"lengths":[4096],"delays":[0]}}
+        ]}}"#;
         let settings = crate::json::parse(doc).expect("parses");
         let carrier = stream_carrier(Some(&settings));
         let chain = carrier.tcp_mask().expect("a chain").clone();
