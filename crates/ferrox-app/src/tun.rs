@@ -75,10 +75,6 @@ impl Framing {
             Self::Virtio => VIRTIO_NET_HDR_LEN,
         }
     }
-
-    const fn gso(self) -> bool {
-        matches!(self, Self::Virtio)
-    }
 }
 
 pub(crate) fn is_device(protocol: &str) -> bool {
@@ -302,8 +298,20 @@ fn ip_head(packet: &[u8]) -> Option<(IpHead, &[u8])> {
             body,
         ));
     }
-    let (ip, mut body) = ipv6_head(packet)?;
-    let mut protocol = ip.next_header;
+    let (ip, body) = ipv6_head(packet)?;
+    let (protocol, body) = walk_extensions(ip.next_header, body)?;
+    Some((
+        IpHead {
+            source: IpAddr::V6(Ipv6Addr::from(ip.source)),
+            destination: IpAddr::V6(Ipv6Addr::from(ip.destination)),
+            protocol,
+        },
+        body,
+    ))
+}
+
+/// Skip the IPv6 extension headers this handler can walk, handing back the transport protocol and its slice.
+fn walk_extensions(mut protocol: u8, mut body: &[u8]) -> Option<(u8, &[u8])> {
     loop {
         match protocol {
             0 | 43 | 60 => {
@@ -330,51 +338,36 @@ fn ip_head(packet: &[u8]) -> Option<(IpHead, &[u8])> {
             }
             // A fragment is not reassembled here, and an encrypted payload is not this handler's.
             44 | 50 | 59 => return None,
-            _ => break,
+            _ => return Some((protocol, body)),
         }
     }
-    Some((
-        IpHead {
-            source: IpAddr::V6(Ipv6Addr::from(ip.source)),
-            destination: IpAddr::V6(Ipv6Addr::from(ip.destination)),
-            protocol,
-        },
-        body,
-    ))
 }
 
 /// The flow a quoted packet names, read from the header plus the four port bytes an ICMP error carries. The quoted total length is usually larger than what arrived, so this does not ask the full-packet walk to accept it.
 fn quoted_flow(quoted: &[u8]) -> Option<FlowKey> {
     let first = *quoted.first()?;
-    let (header, protocol, destination) = if first >> 4 == 4 {
+    let (protocol, destination, transport) = if first >> 4 == 4 {
         let header = usize::from(first & 0x0f) * 4;
         if header < IPV4_HEADER || header > quoted.len() {
             return None;
         }
         let destination = *quoted.get(16..20)?.first_chunk::<4>()?;
         (
-            header,
             *quoted.get(9)?,
             IpAddr::V4(Ipv4Addr::from(destination)),
+            quoted.get(header..)?,
         )
     } else if first >> 4 == 6 {
         if quoted.len() < IPV6_HEADER {
             return None;
         }
         let destination = *quoted.get(24..40)?.first_chunk::<16>()?;
-        (
-            IPV6_HEADER,
-            *quoted.get(6)?,
-            IpAddr::V6(Ipv6Addr::from(destination)),
-        )
+        let (protocol, transport) = walk_extensions(*quoted.get(6)?, quoted.get(IPV6_HEADER..)?)?;
+        (protocol, IpAddr::V6(Ipv6Addr::from(destination)), transport)
     } else {
         return None;
     };
-    if protocol != TCP_PROTO {
-        return None;
-    }
-    let transport = quoted.get(header..)?;
-    if transport.len() < 4 {
+    if protocol != TCP_PROTO || transport.len() < 4 {
         return None;
     }
     Some(FlowKey {
@@ -410,7 +403,7 @@ struct UdpKey {
 
 /// A flow a thread has left: its entry goes at the next packet, so the packet path pays nothing for the reap.
 enum Ended {
-    Stream(FlowKey),
+    Stream(FlowKey, u64),
     Datagram(UdpKey),
 }
 
@@ -419,6 +412,8 @@ pub(crate) struct Device {
     handle: std::fs::File,
     mtu: usize,
     framing: Framing,
+    /// The builder enabled `TUN_F_TSO4|TUN_F_TSO6`; an inherited descriptor's `IFF_VNET_HDR` says nothing about that.
+    gso: bool,
 }
 
 impl Device {
@@ -429,6 +424,7 @@ impl Device {
                 handle,
                 mtu: spec.mtu,
                 framing,
+                gso: false,
             });
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -451,6 +447,10 @@ impl Device {
                 handle,
                 mtu: spec.mtu,
                 framing,
+                #[cfg(target_os = "linux")]
+                gso: offload,
+                #[cfg(target_os = "macos")]
+                gso: false,
             })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -505,6 +505,7 @@ impl Device {
         Ok(PacketWriter {
             handle: self.handle.try_clone()?,
             framing: self.framing,
+            gso: self.gso,
         })
     }
 
@@ -523,6 +524,7 @@ impl Device {
             handle,
             mtu,
             framing: Framing::Raw,
+            gso: false,
         }
     }
 }
@@ -531,6 +533,7 @@ impl Device {
 struct PacketWriter {
     handle: std::fs::File,
     framing: Framing,
+    gso: bool,
 }
 
 impl PacketWriter {
@@ -543,7 +546,7 @@ impl PacketWriter {
     }
 
     fn gso(&self) -> bool {
-        self.framing.gso()
+        self.gso
     }
 }
 
@@ -586,12 +589,23 @@ fn write_framed(
             } else {
                 UTUN_AF_INET
             };
-            handle.write_all(&[0, 0, 0, family])?;
-            write_packet_to(handle, packet)
+            write_pair(handle, &[0, 0, 0, family], packet)
         }
-        Framing::Virtio => {
-            handle.write_all(&virtio_header(packet, gso))?;
-            write_packet_to(handle, packet)
+        Framing::Virtio => write_pair(handle, &virtio_header(packet, gso), packet),
+    }
+}
+
+/// One framed packet in one writev, so the header and payload reach the device as one packet. A short write drops the packet rather than sending its tail as another.
+fn write_pair<W: Write>(writer: &mut W, header: &[u8], packet: &[u8]) -> io::Result<bool> {
+    let total = header.len() + packet.len();
+    let parts = [std::io::IoSlice::new(header), std::io::IoSlice::new(packet)];
+    loop {
+        match writer.write_vectored(&parts) {
+            Ok(written) if written == total => return Ok(true),
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if crate::tun_stack::refused(&error) => return Ok(false),
+            Err(error) => return Err(error),
         }
     }
 }
@@ -669,24 +683,25 @@ fn inherited_handle() -> Option<std::fs::File> {
 
 /// The pseudo-header checksum a GSO segment carries into the kernel: the field holds the folded sum before the segment, and the kernel folds the payload onto it.
 fn partial_tcp_checksum(source: IpAddr, destination: IpAddr, tcp_len: usize) -> u16 {
-    let mut pseudo = Vec::with_capacity(40);
-    match (source, destination) {
+    let mut pseudo = [0u8; IPV6_HEADER + 8];
+    let len = match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            pseudo.extend_from_slice(&source.octets());
-            pseudo.extend_from_slice(&destination.octets());
-            pseudo.push(0);
-            pseudo.push(TCP_PROTO);
-            pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
+            pseudo[..4].copy_from_slice(&source.octets());
+            pseudo[4..8].copy_from_slice(&destination.octets());
+            pseudo[9] = TCP_PROTO;
+            pseudo[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+            12
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
-            pseudo.extend_from_slice(&source.octets());
-            pseudo.extend_from_slice(&destination.octets());
-            pseudo.extend_from_slice(&(tcp_len as u32).to_be_bytes());
-            pseudo.extend_from_slice(&[0, 0, 0, TCP_PROTO]);
+            pseudo[..16].copy_from_slice(&source.octets());
+            pseudo[16..32].copy_from_slice(&destination.octets());
+            pseudo[32..36].copy_from_slice(&(tcp_len as u32).to_be_bytes());
+            pseudo[39] = TCP_PROTO;
+            40
         }
         _ => return 0,
-    }
-    !checksum(&pseudo)
+    };
+    !checksum(&pseudo[..len])
 }
 
 fn write_tcp_checksum(source: IpAddr, destination: IpAddr, partial: bool, out: &mut [u8]) {
@@ -865,6 +880,8 @@ fn build_ipv6_tcp_packet(
 /// `snd_nxt` advances as the response thread sends payload out, so a pure ACK
 /// carries both numbers truthfully.
 struct Flow {
+    /// The generation this entry was inserted at, so a late reaper cannot remove a replacement with the same tuple.
+    id: u64,
     write_half: TcpStream,
     rcv_nxt: Arc<AtomicU32>,
     snd_nxt: Arc<AtomicU32>,
@@ -925,6 +942,7 @@ pub(crate) struct Handler {
     association: Option<Association>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
+    next_flow_id: u64,
 }
 
 impl Handler {
@@ -942,6 +960,7 @@ impl Handler {
             association: None,
             ended_tx,
             ended_rx,
+            next_flow_id: 0,
         }
     }
 
@@ -962,8 +981,10 @@ impl Handler {
         // Threads that left their flow report here, so neither table keeps a dead entry or the socket inside it.
         while let Ok(ended) = self.ended_rx.try_recv() {
             match ended {
-                Ended::Stream(key) => {
-                    self.flows.remove(&key);
+                Ended::Stream(key, id) => {
+                    if self.flows.get(&key).is_some_and(|flow| flow.id == id) {
+                        self.flows.remove(&key);
+                    }
                 }
                 Ended::Datagram(key) => {
                     self.legs.remove(&key);
@@ -1124,9 +1145,12 @@ impl Handler {
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
         let busy = Arc::new(AtomicBool::new(false));
         let signaled = Arc::new(AtomicBool::new(false));
+        let id = self.next_flow_id;
+        self.next_flow_id = self.next_flow_id.wrapping_add(1);
         self.flows.insert(
             key,
             Flow {
+                id,
                 write_half,
                 rcv_nxt: Arc::clone(&rcv_nxt),
                 snd_nxt: Arc::clone(&snd_nxt),
@@ -1153,8 +1177,16 @@ impl Handler {
         });
 
         std::thread::spawn(move || {
-            let mut buf = vec![0u8; MAX_PACKET - IPV6_HEADER - 20];
+            let gso_capable = dev_writer.gso();
             let max = (mss as usize).max(1);
+            let mut buf = vec![
+                0u8;
+                if gso_capable {
+                    MAX_PACKET - IPV6_HEADER - 20
+                } else {
+                    max
+                }
+            ];
             let mut pkt = Vec::with_capacity(IPV6_HEADER + 20 + max);
             let end = loop {
                 match read_half.read(&mut buf) {
@@ -1173,7 +1205,7 @@ impl Handler {
                     }
                     Ok(n) => {
                         let seq = snd_nxt.load(Relaxed);
-                        let gso = dev_writer.gso() && n > max;
+                        let gso = gso_capable && n > max;
                         render_tcp_packet_ip(
                             (local_ip, local_port),
                             (remote_ip, remote_port),
@@ -1228,7 +1260,7 @@ impl Handler {
                 let _ = dev_writer.write_packet(&pkt);
             }
             // Queue the entry's removal before the shutdown that wakes the relay leg, so a caller that sees the leg end can reap the entry at its next dispatch.
-            let _ = ended_tx.send(Ended::Stream(key));
+            let _ = ended_tx.send(Ended::Stream(key, id));
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
             let _ = read_half.shutdown(Shutdown::Both);
         });
@@ -1435,8 +1467,7 @@ mod tests {
 
     #[test]
     fn a_virtio_gso_header_names_the_tcp_segment() {
-        let framing = Framing::Virtio;
-        assert!(framing.gso());
+        assert_eq!(Framing::Virtio.header_len(), VIRTIO_NET_HDR_LEN);
         assert_eq!(Framing::Utun.header_len(), UTUN_HEADER_LEN);
         let packet = build_ipv6_tcp_packet(
             ("2001:db8::2".parse().unwrap(), 1),
@@ -1454,6 +1485,49 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([header[4], header[5]]), 1400);
         assert_eq!(u16::from_ne_bytes([header[6], header[7]]), 40);
         assert_eq!(u16::from_ne_bytes([header[8], header[9]]), 16);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_descriptor_does_not_claim_gso() {
+        let (handle, _peer) = unix_socketpair().unwrap();
+        let device = Device::from_handle(handle, 1500);
+        assert!(!device.clone_writer().unwrap().gso());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_framed_packet_takes_one_write() {
+        let (mut writer, mut reader) = unix_socketpair().unwrap();
+        let packet = [0x45u8; 20];
+        for framing in [Framing::Raw, Framing::Utun, Framing::Virtio] {
+            let mut expected = match framing {
+                Framing::Raw => Vec::new(),
+                Framing::Utun => vec![0, 0, 0, UTUN_AF_INET],
+                Framing::Virtio => virtio_header(&packet, None).to_vec(),
+            };
+            expected.extend_from_slice(&packet);
+            assert!(write_framed(&mut writer, framing, None, &packet).unwrap());
+            let mut got = [0u8; 64];
+            let n = reader.read(&mut got).unwrap();
+            assert_eq!(&got[..n], expected, "{framing:?} split its frame");
+        }
+    }
+
+    #[test]
+    fn a_quoted_v6_flow_is_read_through_an_extension_header() {
+        let mut quoted = vec![0u8; IPV6_HEADER + 16];
+        quoted[0] = 0x60;
+        quoted[6] = 0;
+        quoted[7] = 64;
+        quoted[24..40].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        quoted[40] = TCP_PROTO;
+        quoted[48..50].copy_from_slice(&12345u16.to_be_bytes());
+        quoted[50..52].copy_from_slice(&443u16.to_be_bytes());
+        let flow = quoted_flow(&quoted).unwrap();
+        assert_eq!(flow.source_port, 12345);
+        assert_eq!(flow.destination_port, 443);
+        assert_eq!(flow.destination, "2001:db8::1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
