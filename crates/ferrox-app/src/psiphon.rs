@@ -2,6 +2,7 @@
 //! [`crate::psiphon_ssh`], and the loopback SOCKS edge the proxy dials.
 
 use crate::json::{self, Json};
+use crate::psiphon_broker::Value as Cbor;
 use crate::psiphon_ssh::{
     ApiEncoding, Channel, ChannelChunk, Identity, KeepAlive, Proxy, Server, Session, TlsShape,
     MAX_PADDING, MIN_PADDING,
@@ -28,6 +29,11 @@ use std::time::{Duration, Instant};
 const SPONSOR_ID: &str = "07D1ACD69B3AC7A2";
 const PROPAGATION_CHANNEL_ID: &str = "EE0B7486ACAE75AA";
 const CLIENT_VERSION: &str = "453";
+const DSL_REQUEST_NAME: &str = "psiphon-dsl";
+const DSL_MAX_PAYLOAD: usize = 65_536;
+const DSL_VERSION: u64 = 0;
+const DSL_DISCOVER: u64 = 1;
+const DSL_GET: u64 = 2;
 /// The compartment ID the public Android build embeds for its private conduits.
 const PRIVATE_COMPARTMENT_ID: &str = "/TYUL7wjyPuXCGAujuiQuxTRlOFhjMglpDX2kzVo/ks";
 /// The regions the Android client rejects when its censored-country switch is on.
@@ -960,6 +966,9 @@ struct Inner {
     last_osl_failure: Mutex<Option<Instant>>,
     upgrade_started: Arc<AtomicBool>,
     last_upgrade_attempt: Mutex<Option<Instant>>,
+    dsl_running: AtomicBool,
+    dsl_last_fetch: Mutex<Option<Instant>>,
+    self_ref: Mutex<Weak<Self>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
     affinity: Mutex<Option<(String, u16)>>,
@@ -1104,6 +1113,145 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         rest = &rest[at + current.len()..];
     }
     rest.is_empty()
+}
+
+/// The dynamic server list fetcher's window, resolved from the config and the
+/// handshake tactics in that order.
+#[derive(Clone, Debug)]
+struct Dsl {
+    enable: bool,
+    timeout: Duration,
+    retry_count: usize,
+    retry_delay: Duration,
+    retry_jitter: f64,
+    ttl: Duration,
+    discover_min: usize,
+    discover_max: usize,
+    get_min: usize,
+    get_max: usize,
+    prioritize_new: f64,
+    prioritize_existing: f64,
+}
+
+impl Default for Dsl {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            timeout: Duration::from_secs(5),
+            retry_count: 0,
+            retry_delay: Duration::from_secs(5),
+            retry_jitter: 0.3,
+            ttl: Duration::from_hours(1),
+            discover_min: 1,
+            discover_max: 2,
+            get_min: 30,
+            get_max: 60,
+            prioritize_new: 0.5,
+            prioritize_existing: 0.25,
+        }
+    }
+}
+
+struct DslTag {
+    tag: Vec<u8>,
+    version: i32,
+    prioritize: bool,
+}
+
+impl Dsl {
+    fn resolved(config: Option<&Json>, tactics: Option<&Json>) -> Self {
+        let mut dsl = Self::default();
+        dsl.apply(config);
+        dsl.apply(tactics);
+        if field(config, "DisableDSLFetcher")
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+        {
+            dsl.enable = false;
+        }
+        dsl
+    }
+
+    fn apply(&mut self, fields: Option<&Json>) {
+        if let Some(enable) = field(fields, "EnableDSLFetcher").and_then(Json::as_bool) {
+            self.enable = enable;
+        }
+        self.timeout = duration_field(fields, "DSLFetcherTunneledRequestTimeout", self.timeout)
+            .min(Duration::from_mins(2));
+        self.retry_count = number(fields, "DSLFetcherTunneledRequestRetryCount")
+            .map_or(self.retry_count, |count| count.min(5) as usize);
+        self.retry_delay = duration_field(
+            fields,
+            "DSLFetcherTunneledRequestRetryDelay",
+            self.retry_delay,
+        )
+        .min(Duration::from_mins(1));
+        self.retry_jitter = decimal(fields, "DSLFetcherTunneledRequestRetryDelayJitter")
+            .unwrap_or(self.retry_jitter)
+            .clamp(0.0, 1.0);
+        self.ttl = duration_field(fields, "DSLFetcherTunneledFetchTTL", self.ttl)
+            .min(Duration::from_hours(24));
+        self.discover_min = count_field(
+            fields,
+            "DSLFetcherTunneledDiscoverServerEntriesMinCount",
+            self.discover_min,
+        );
+        self.discover_max = count_field(
+            fields,
+            "DSLFetcherTunneledDiscoverServerEntriesMaxCount",
+            self.discover_max,
+        );
+        self.get_min = count_field(
+            fields,
+            "DSLFetcherTunneledGetServerEntriesMinCount",
+            self.get_min,
+        );
+        self.get_max = count_field(
+            fields,
+            "DSLFetcherTunneledGetServerEntriesMaxCount",
+            self.get_max,
+        );
+        self.prioritize_new = probability_field(
+            fields,
+            "DSLPrioritizeDialNewServerEntryProbability",
+            self.prioritize_new,
+        );
+        self.prioritize_existing = probability_field(
+            fields,
+            "DSLPrioritizeDialExistingServerEntryProbability",
+            self.prioritize_existing,
+        );
+        if self.discover_max < self.discover_min {
+            self.discover_max = self.discover_min;
+        }
+        if self.get_max < self.get_min {
+            self.get_max = self.get_min;
+        }
+    }
+}
+
+fn field<'a>(fields: Option<&'a Json>, key: &str) -> Option<&'a Json> {
+    fields.and_then(|fields| fields.get(key))
+}
+
+fn duration_field(fields: Option<&Json>, key: &str, default: Duration) -> Duration {
+    let Some(value) = field(fields, key) else {
+        return default;
+    };
+    if let Some(text) = value.as_str() {
+        return go_duration(text).unwrap_or(default);
+    }
+    value.as_i64().map_or(default, |nanos| {
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(0))
+    })
+}
+
+fn count_field(fields: Option<&Json>, key: &str, default: usize) -> usize {
+    number(fields, key).map_or(default, |count| count.min(256) as usize)
+}
+
+fn probability_field(fields: Option<&Json>, key: &str, default: f64) -> f64 {
+    decimal(fields, key).unwrap_or(default).clamp(0.0, 1.0)
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -1364,6 +1512,9 @@ impl PsiphonOut {
             last_osl_failure: Mutex::new(None),
             upgrade_started: Arc::new(AtomicBool::new(false)),
             last_upgrade_attempt: Mutex::new(None),
+            dsl_running: AtomicBool::new(false),
+            dsl_last_fetch: Mutex::new(None),
+            self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -1378,6 +1529,7 @@ impl PsiphonOut {
             replay,
             light,
         });
+        *lock(&inner.self_ref) = Arc::downgrade(&inner);
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
@@ -1880,6 +2032,209 @@ impl Inner {
         });
     }
 
+    /// Start the dynamic server list fetch off an established tunnel, at most one in flight.
+    fn start_dsl(self: &Arc<Self>, session: &Arc<Session>) {
+        if self.settings.disable_api {
+            return;
+        }
+        let tactics = session
+            .handshake()
+            .tactics_payload
+            .as_ref()
+            .map(crate::psiphon_tactics::Tactics::from_json);
+        let dsl = Dsl::resolved(
+            self.settings.raw.as_ref(),
+            tactics
+                .as_ref()
+                .and_then(|tactics| tactics.parameters.as_ref()),
+        );
+        if !dsl.enable {
+            return;
+        }
+        if lock(&self.dsl_last_fetch).is_some_and(|at| at.elapsed() < dsl.ttl) {
+            return;
+        }
+        if self.dsl_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let lane = Arc::clone(self);
+        let session = Arc::clone(session);
+        if let Err(error) = thread::Builder::new()
+            .name("psiphon-dsl".to_owned())
+            .spawn(move || {
+                match lane.dsl_fetch(&session) {
+                    Ok(added) => {
+                        if added > 0 {
+                            eprintln!("psiphon: DSL added {added} server entries");
+                        }
+                    }
+                    Err(why) => eprintln!("psiphon: DSL fetch: {why}"),
+                }
+                lane.dsl_running.store(false, Ordering::Release);
+            })
+        {
+            self.dsl_running.store(false, Ordering::Release);
+            eprintln!("psiphon: DSL thread: {error}");
+        }
+    }
+
+    /// Run one discover-then-get pass against the active tunnel's relay.
+    #[allow(clippy::too_many_lines)]
+    fn dsl_fetch(&self, session: &Session) -> Result<usize, String> {
+        if self.settings.disable_api {
+            return Ok(0);
+        }
+        let tactics = session
+            .handshake()
+            .tactics_payload
+            .as_ref()
+            .map(crate::psiphon_tactics::Tactics::from_json);
+        let dsl = Dsl::resolved(
+            self.settings.raw.as_ref(),
+            tactics
+                .as_ref()
+                .and_then(|tactics| tactics.parameters.as_ref()),
+        );
+        if !dsl.enable {
+            return Ok(0);
+        }
+        if lock(&self.dsl_last_fetch).is_some_and(|at| at.elapsed() < dsl.ttl) {
+            return Ok(0);
+        }
+        let parameters = dsl_base_parameters(
+            &self.settings,
+            &self.session_id,
+            tactics.as_ref().map_or("", |tactics| tactics.tag.as_str()),
+        );
+        let discover = dsl_discover(
+            session,
+            &dsl,
+            &parameters,
+            random_count(dsl.discover_min, dsl.discover_max),
+        )?;
+        let mut known = HashSet::new();
+        {
+            let entries = lock(&self.entries);
+            for entry in entries.iter() {
+                known.insert((entry.dsl_tag(), entry.configuration_version));
+            }
+        }
+        let mut get = Vec::new();
+        let mut prioritized = Vec::new();
+        for tag in discover {
+            let name = ferrox_core::b64::encode(&tag.tag);
+            if known.contains(&(name.clone(), tag.version)) {
+                if tag.prioritize && coin(dsl.prioritize_existing) {
+                    prioritized.push(name);
+                }
+                continue;
+            }
+            get.push(tag);
+        }
+        let mut added = 0usize;
+        let mut at = 0usize;
+        while at < get.len() {
+            let remaining = get.len() - at;
+            let mut count = random_count(dsl.get_min.max(1), dsl.get_max).clamp(1, remaining);
+            let mut attempt = 0usize;
+            loop {
+                match dsl_get(
+                    session,
+                    &dsl,
+                    &parameters,
+                    &get[at..at + count],
+                    &self.settings.conduit_protocols,
+                ) {
+                    Ok(entries) => {
+                        for (tag, server) in get[at..at + count].iter().zip(entries) {
+                            let Some(server) = server else {
+                                continue;
+                            };
+                            if !entry_allowed(
+                                &server,
+                                &self.settings.protocols,
+                                self.settings.fronted,
+                            ) {
+                                continue;
+                            }
+                            let name = server.dsl_tag();
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let mut entries = lock(&self.entries);
+                            let list = Arc::make_mut(&mut *entries);
+                            if let Some(existing) = list
+                                .iter()
+                                .position(|known| !name.is_empty() && known.dsl_tag() == name)
+                            {
+                                if list[existing].configuration_version
+                                    < server.configuration_version
+                                {
+                                    list[existing] = server;
+                                }
+                                if tag.prioritize && coin(dsl.prioritize_existing) {
+                                    prioritized.push(name);
+                                }
+                                continue;
+                            }
+                            list.push(server);
+                            if tag.prioritize && coin(dsl.prioritize_new) {
+                                prioritized.push(name);
+                            }
+                            added += 1;
+                        }
+                        at += count;
+                        break;
+                    }
+                    Err(why)
+                        if why.starts_with("psiphon ssh")
+                            && !why.contains("timed out")
+                            && attempt < dsl.retry_count
+                            && count > 1 =>
+                    {
+                        pause_dsl(&dsl);
+                        count = (count / 2).max(1);
+                        attempt += 1;
+                        eprintln!("psiphon: DSL get retry after {why}");
+                    }
+                    Err(why) => return Err(why),
+                }
+            }
+        }
+        for name in prioritized {
+            self.prioritize_tag(&name);
+        }
+        *lock(&self.dsl_last_fetch) = Some(Instant::now());
+        Ok(added)
+    }
+
+    /// Move one DSL-prioritized entry to the dial head, under the same cap as a live server.
+    fn prioritize_tag(&self, tag: &str) {
+        if tag.is_empty() {
+            return;
+        }
+        let max = self.settings.server_entry_max_move_to_front;
+        if max == 0 {
+            return;
+        }
+        let mut entries = lock(&self.entries);
+        let mut moved = lock(&self.moved_to_front);
+        if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
+            return;
+        }
+        let list = Arc::make_mut(&mut *entries);
+        let Some(at) = list.iter().position(|entry| entry.dsl_tag() == tag) else {
+            return;
+        };
+        if at == 0 {
+            return;
+        }
+        let entry = list.remove(at);
+        let key = format!("{}:{}", entry.host, entry.port);
+        list.insert(0, entry);
+        moved.insert(key);
+    }
+
     /// Apply the server's handshake reply: a steering IP for the fronting provider and new entries.
     fn apply_handshake(&self, session: &Session) {
         let state = session.handshake();
@@ -2154,6 +2509,9 @@ impl Inner {
         let (start, lead) = self.start();
         let session = self.connect_locked(start, lead, Some(connecting))?;
         self.remember(session.server());
+        if let Some(lane) = lock(&self.self_ref).upgrade() {
+            lane.start_dsl(&session);
+        }
         Ok(session)
     }
 
@@ -2182,6 +2540,7 @@ impl Inner {
                 let (start, lead) = self.start();
                 let session = self.connect_locked(start, lead, Some(connecting))?;
                 self.remember(session.server());
+                self.start_dsl(&session);
                 continue;
             }
             let width = missing.min(fill_workers);
@@ -2198,7 +2557,11 @@ impl Inner {
                 handles.push(
                     thread::Builder::new()
                         .name("psiphon-pool".to_owned())
-                        .spawn(move || lane.connect_locked(start, worker_lead, None))
+                        .spawn(move || {
+                            let session = lane.connect_locked(start, worker_lead, None)?;
+                            lane.start_dsl(&session);
+                            Ok(session)
+                        })
                         .map_err(|error| format!("psiphon: pool thread: {error}"))?,
                 );
             }
@@ -5376,6 +5739,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "EstablishTunnelTimeoutSeconds",
     "TunnelConnectTimeoutSeconds",
     "CompressTactics",
+    "EnableDSLFetcher",
+    "DisableDSLFetcher",
+    "DSLPrioritizeDialNewServerEntryProbability",
+    "DSLPrioritizeDialExistingServerEntryProbability",
     "ServerEntryIteratorMaxMoveToFront",
     "ServerEntryIteratorResetProbability",
     "RestrictDirectProviderIDsClientProbability",
@@ -7808,6 +8175,16 @@ fn decode_entry_with(
         return None;
     }
     let entry = json::parse(&String::from_utf8_lossy(parts[4])).ok()?;
+    server_from_entry_json(&entry, include_inproxy, conduit_protocols)
+}
+
+/// Build the lane's entry from one decoded server-entry object.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn server_from_entry_json(
+    entry: &Json,
+    include_inproxy: bool,
+    conduit_protocols: &[String],
+) -> Option<Server> {
     let host = entry.get("ipAddress").and_then(Json::as_str)?;
     let address = host.parse::<IpAddr>().ok()?;
     let host = host.to_owned();
@@ -7829,7 +8206,7 @@ fn decode_entry_with(
         meek_key: meek_obfuscated_key,
         ssh: ssh_port,
         tls: tls_port,
-    } = entry_ports(&entry);
+    } = entry_ports(entry);
     let quic_port = entry
         .get("sshObfuscatedQUICPort")
         .and_then(Json::as_port)
@@ -7861,14 +8238,14 @@ fn decode_entry_with(
             key,
             obfuscation_key: obfuscated_key.clone(),
         });
-    let protocol = meek_protocol(&entry);
-    let tactics_capable = tactics_capability(&entry);
+    let protocol = meek_protocol(entry);
+    let tactics_capable = tactics_capability(entry);
     let direct = obfuscated_port.is_some()
         || ssh_port.is_some()
         || quic_port.is_some()
         || (tls_port.is_some() && obfuscated_key.is_some());
-    let inproxy = crate::psiphon_broker::destination(&entry, &host, false, conduit_protocols);
-    let tls_inproxy = crate::psiphon_broker::destination(&entry, &host, true, conduit_protocols);
+    let inproxy = crate::psiphon_broker::destination(entry, &host, false, conduit_protocols);
+    let tls_inproxy = crate::psiphon_broker::destination(entry, &host, true, conduit_protocols);
     let inproxy_meek = inproxy.as_ref().and_then(|destination| {
         let base = destination.base_protocol();
         (base.starts_with("UNFRONTED-MEEK")
@@ -7876,7 +8253,7 @@ fn decode_entry_with(
                 base,
                 "FRONTED-MEEK-OSSH" | "FRONTED-MEEK-HTTP-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
             ))
-        .then(|| meek_entry(&entry, &host, base))
+        .then(|| meek_entry(entry, &host, base))
         .flatten()
     });
     let inproxy_port = inproxy
@@ -7946,15 +8323,30 @@ fn decode_entry_with(
         .and_then(Json::as_str)
         .filter(|provider| !provider.is_empty())
         .map(str::to_owned);
-    let mut meek = protocol.and_then(|protocol| meek_entry(&entry, &host, protocol));
+    let tag = entry
+        .get("tag")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let web_server_secret = entry
+        .get("webServerSecret")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let configuration_version = entry
+        .get("configurationVersion")
+        .and_then(Json::as_i64)
+        .and_then(|version| i32::try_from(version).ok())
+        .unwrap_or(0);
+    let mut meek = protocol.and_then(|protocol| meek_entry(entry, &host, protocol));
     let mut unfronted_meek = protocol
         .filter(|protocol| protocol.starts_with("FRONTED-MEEK"))
-        .and_then(|_| unfronted_meek_protocol(&entry))
-        .and_then(|protocol| meek_entry(&entry, &host, protocol));
+        .and_then(|_| unfronted_meek_protocol(entry))
+        .and_then(|protocol| meek_entry(entry, &host, protocol));
     if meek.is_none() {
         meek = unfronted_meek.take();
     }
-    let tactics = tactics_entry(&entry, &host);
+    let tactics = tactics_entry(entry, &host);
     if !direct
         && meek.is_none()
         && unfronted_meek.is_none()
@@ -7986,6 +8378,9 @@ fn decode_entry_with(
         region,
         provider_id,
         fronting_provider_id,
+        tag,
+        web_server_secret,
+        configuration_version,
         scan_cdn: true,
         ssh_api,
         direct,
@@ -8856,6 +9251,389 @@ fn new_entries(current: &[Server], entries: Vec<Server>) -> Vec<Server> {
         .into_iter()
         .filter(|entry| seen.insert(server_key(entry)))
         .collect()
+}
+
+fn random_count(min: usize, max: usize) -> usize {
+    let low = min.min(max);
+    let high = min.max(max);
+    let span = u64::try_from(high - low)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    low + usize::try_from(u64::from_le_bytes(random::<8>()) % span).unwrap_or(0)
+}
+
+fn pause_dsl(dsl: &Dsl) {
+    if dsl.retry_delay.is_zero() {
+        return;
+    }
+    let unit = f64::from(u16::from_be_bytes(random::<2>())) / 65_535.0;
+    let factor = (1.0 + (unit * 2.0 - 1.0) * dsl.retry_jitter).max(0.0);
+    thread::sleep(Duration::from_secs_f64(
+        dsl.retry_delay.as_secs_f64() * factor,
+    ));
+}
+
+fn dsl_hex(text: &str) -> Option<Vec<u8>> {
+    if text.len().is_multiple_of(2) {
+        hex_decode(text)
+    } else {
+        None
+    }
+}
+
+fn dsl_base_parameters(settings: &Settings, session_id: &str, tactics_tag: &str) -> Cbor {
+    let raw = settings.raw.as_ref();
+    let mut pairs = vec![
+        (
+            Cbor::UInt(6),
+            Cbor::Bytes(dsl_hex(&settings.propagation).unwrap_or_default()),
+        ),
+        (
+            Cbor::UInt(7),
+            Cbor::Bytes(dsl_hex(&settings.sponsor).unwrap_or_default()),
+        ),
+        (
+            Cbor::UInt(8),
+            Cbor::UInt(settings.client_version.parse().unwrap_or(0)),
+        ),
+        (Cbor::UInt(9), Cbor::Text(settings.platform.clone())),
+        (
+            Cbor::UInt(54),
+            Cbor::Text(text(raw, "NetworkType").unwrap_or_else(|| "unknown".to_owned())),
+        ),
+        (Cbor::UInt(127), Cbor::UInt(1)),
+    ];
+    if !settings.client_features.is_empty() {
+        pairs.push((
+            Cbor::UInt(10),
+            Cbor::Array(
+                settings
+                    .client_features
+                    .iter()
+                    .map(|feature| Cbor::Text(feature.clone()))
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(rev) = text(raw, "ClientBuildRev") {
+        pairs.push((Cbor::UInt(11), Cbor::Text(rev)));
+    }
+    if let Some(region) = settings.device_region.as_ref() {
+        pairs.push((Cbor::UInt(12), Cbor::Text(region.clone())));
+    }
+    if let Some(location) = settings.device_location.as_ref() {
+        pairs.push((Cbor::UInt(13), Cbor::Text(location.clone())));
+    }
+    if let Some(id) = dsl_hex(session_id) {
+        pairs.push((Cbor::UInt(14), Cbor::Bytes(id)));
+    }
+    if let Some(tag) = dsl_hex(tactics_tag) {
+        pairs.push((Cbor::UInt(4), Cbor::Bytes(tag)));
+    }
+    if let Some(region) = settings.region.as_ref() {
+        pairs.push((Cbor::UInt(43), Cbor::Text(region.clone())));
+    }
+    let upstream = random_count(0, 1024);
+    if upstream > 0 {
+        pairs.push((Cbor::UInt(40), Cbor::Text(" ".repeat(upstream))));
+    }
+    let downstream = random_count(0, 1024);
+    if downstream > 0 {
+        pairs.push((
+            Cbor::UInt(41),
+            Cbor::UInt(u64::try_from(downstream).unwrap_or(0)),
+        ));
+    }
+    Cbor::Map(pairs)
+}
+
+fn dsl_relayed(
+    request_type: u64,
+    parameters: &Cbor,
+    extra: Vec<(Cbor, Cbor)>,
+) -> Result<Vec<u8>, String> {
+    let mut request = vec![(Cbor::UInt(1), parameters.clone())];
+    request.extend(extra);
+    let wrapped = Cbor::Map(vec![
+        (Cbor::UInt(1), Cbor::UInt(request_type)),
+        (Cbor::UInt(2), Cbor::UInt(DSL_VERSION)),
+        (
+            Cbor::UInt(3),
+            Cbor::Bytes(crate::psiphon_broker::encode(&Cbor::Map(request))),
+        ),
+    ]);
+    let payload = crate::psiphon_broker::encode(&wrapped);
+    if payload.len() > DSL_MAX_PAYLOAD {
+        return Err(format!(
+            "psiphon DSL: request is {} bytes, over {DSL_MAX_PAYLOAD}",
+            payload.len()
+        ));
+    }
+    Ok(payload)
+}
+
+fn dsl_relayed_response(payload: &[u8]) -> Result<Cbor, String> {
+    let Some((wrapped, used)) = crate::psiphon_broker::decode(payload) else {
+        return Err("psiphon DSL: response is not CBOR".to_owned());
+    };
+    if used != payload.len() {
+        return Err("psiphon DSL: response has trailing bytes".to_owned());
+    }
+    if let Some(error) = wrapped.get(1).and_then(Cbor::uint) {
+        if error != 0 {
+            return Err(format!("psiphon DSL: backend error {error}"));
+        }
+    }
+    let compression = wrapped.get(2).and_then(Cbor::uint).unwrap_or(0);
+    let response = wrapped.get(3).and_then(Cbor::bytes).unwrap_or(&[]);
+    let plain = match compression {
+        0 => response.to_vec(),
+        1 => {
+            let mut plain = Vec::new();
+            ZlibDecoder::new(response)
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut plain)
+                .map_err(|error| format!("psiphon DSL: response inflate: {error}"))?;
+            if plain.len() > 4 * 1024 * 1024 {
+                return Err("psiphon DSL: response is over 4 MiB".to_owned());
+            }
+            plain
+        }
+        other => return Err(format!("psiphon DSL: unknown compression {other}")),
+    };
+    let Some((inner, used)) = crate::psiphon_broker::decode(&plain) else {
+        return Err("psiphon DSL: response body is not CBOR".to_owned());
+    };
+    if used != plain.len() {
+        return Err("psiphon DSL: response body has trailing bytes".to_owned());
+    }
+    Ok(inner)
+}
+
+fn dsl_discover(
+    session: &Session,
+    dsl: &Dsl,
+    parameters: &Cbor,
+    count: usize,
+) -> Result<Vec<DslTag>, String> {
+    let mut count = count;
+    let mut attempt = 0usize;
+    loop {
+        let request = dsl_relayed(
+            DSL_DISCOVER,
+            parameters,
+            vec![
+                (Cbor::UInt(2), Cbor::Array(Vec::new())),
+                (Cbor::UInt(3), Cbor::UInt(u64::try_from(count).unwrap_or(0))),
+            ],
+        )?;
+        let reply = session.api_request(DSL_REQUEST_NAME, &request, dsl.timeout);
+        let response = reply.and_then(|reply| dsl_relayed_response(&reply));
+        match response {
+            Ok(response) => {
+                let Some(tags) = response.get(1).and_then(Cbor::array) else {
+                    return Ok(Vec::new());
+                };
+                let mut out = Vec::with_capacity(tags.len());
+                for tag in tags {
+                    let Some(bytes) = tag.get(1).and_then(Cbor::bytes) else {
+                        continue;
+                    };
+                    out.push(DslTag {
+                        tag: bytes.to_vec(),
+                        version: i32::try_from(tag.get(2).and_then(Cbor::uint).unwrap_or(0))
+                            .unwrap_or(0),
+                        prioritize: tag.get(3).and_then(Cbor::bool).unwrap_or(false),
+                    });
+                }
+                return Ok(out);
+            }
+            Err(why)
+                if why.starts_with("psiphon ssh")
+                    && !why.contains("timed out")
+                    && attempt < dsl.retry_count
+                    && count > 1 =>
+            {
+                pause_dsl(dsl);
+                count = (count / 2).max(1);
+                attempt += 1;
+                eprintln!("psiphon: DSL discover retry after {why}");
+            }
+            Err(why) => return Err(why),
+        }
+    }
+}
+
+fn dsl_get(
+    session: &Session,
+    dsl: &Dsl,
+    parameters: &Cbor,
+    tags: &[DslTag],
+    conduit_protocols: &[String],
+) -> Result<Vec<Option<Server>>, String> {
+    let request = dsl_relayed(
+        DSL_GET,
+        parameters,
+        vec![(
+            Cbor::UInt(2),
+            Cbor::Array(
+                tags.iter()
+                    .map(|tag| Cbor::Bytes(tag.tag.clone()))
+                    .collect(),
+            ),
+        )],
+    )?;
+    let reply = session.api_request(DSL_REQUEST_NAME, &request, dsl.timeout)?;
+    let response = dsl_relayed_response(&reply)?;
+    let Some(entries) = response.get(1).and_then(Cbor::array) else {
+        return Err("psiphon DSL: get response has no entries".to_owned());
+    };
+    if entries.len() != tags.len() {
+        return Err(format!(
+            "psiphon DSL: get returned {} entries for {} tags",
+            entries.len(),
+            tags.len()
+        ));
+    }
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            dsl_entry_json(entry)
+                .and_then(|entry| server_from_entry_json(&entry, true, conduit_protocols))
+        })
+        .collect())
+}
+
+fn dsl_entry_json(entry: &Cbor) -> Option<Json> {
+    let fields = entry.get(1)?.map()?;
+    let mut pairs = Vec::with_capacity(fields.len() + 2);
+    for (key, value) in fields {
+        let Cbor::UInt(key) = key else {
+            continue;
+        };
+        let Some((name, field)) = dsl_field(*key) else {
+            continue;
+        };
+        if let Some(value) = dsl_field_value(value, field) {
+            pairs.push((name.to_owned(), value));
+        }
+    }
+    if let Some(unrecognized) = entry.get(2).and_then(Cbor::map) {
+        for (key, value) in unrecognized {
+            if let Some(name) = key.text() {
+                pairs.push((name.to_owned(), dsl_json(value)));
+            }
+        }
+    }
+    Some(Json::Obj(pairs))
+}
+
+#[derive(Clone, Copy)]
+enum DslField {
+    Raw,
+    Int,
+    LowerHex,
+    UpperHex,
+    Base64,
+    UnpaddedBase64,
+}
+
+fn dsl_field(key: u64) -> Option<(&'static str, DslField)> {
+    Some(match key {
+        1 => ("tag", DslField::Base64),
+        2 => ("ipAddress", DslField::Raw),
+        3 => ("webServerPort", DslField::Int),
+        4 => ("webServerSecret", DslField::LowerHex),
+        5 => ("webServerCertificate", DslField::Raw),
+        6 => ("sshPort", DslField::Int),
+        7 => ("sshUsername", DslField::Raw),
+        8 => ("sshPassword", DslField::LowerHex),
+        9 => ("sshHostKey", DslField::Base64),
+        10 => ("sshObfuscatedPort", DslField::Int),
+        11 => ("sshObfuscatedQUICPort", DslField::Int),
+        12 => ("limitQUICVersions", DslField::Raw),
+        13 => ("sshObfuscatedTapdancePort", DslField::Int),
+        14 => ("sshObfuscatedConjurePort", DslField::Int),
+        15 => ("sshObfuscatedKey", DslField::LowerHex),
+        16 => ("capabilities", DslField::Raw),
+        17 => ("region", DslField::Raw),
+        18 => ("providerID", DslField::UpperHex),
+        19 => ("frontingProviderID", DslField::UpperHex),
+        20 => ("tlsOSSHPort", DslField::Int),
+        21 => ("meekServerPort", DslField::Int),
+        22 => ("meekCookieEncryptionPublicKey", DslField::Base64),
+        23 => ("meekObfuscatedKey", DslField::LowerHex),
+        24 => ("meekFrontingHost", DslField::Raw),
+        25 => ("meekFrontingHosts", DslField::Raw),
+        26 => ("meekFrontingDomain", DslField::Raw),
+        27 => ("meekFrontingAddresses", DslField::Raw),
+        28 => ("meekFrontingAddressesRegex", DslField::Raw),
+        29 => ("meekFrontingDisableSNI", DslField::Raw),
+        30 => ("tacticsRequestPublicKey", DslField::Base64),
+        31 => ("tacticsRequestObfuscatedKey", DslField::Base64),
+        32 => ("configurationVersion", DslField::Int),
+        33 => ("signature", DslField::Base64),
+        34 => ("disableHTTPTransforms", DslField::Raw),
+        35 => ("disableObfuscatedQUICTransforms", DslField::Raw),
+        36 => ("disableOSSHTransforms", DslField::Raw),
+        37 => ("disableOSSHPrefix", DslField::Raw),
+        38 => ("inproxySessionPublicKey", DslField::UnpaddedBase64),
+        39 => (
+            "inproxySessionRootObfuscationSecret",
+            DslField::UnpaddedBase64,
+        ),
+        40 => ("inproxySSHPort", DslField::Int),
+        41 => ("inproxyOSSHPort", DslField::Int),
+        42 => ("inproxyQUICPort", DslField::Int),
+        43 => ("inproxyMeekPort", DslField::Int),
+        44 => ("inproxyTlsOSSHPort", DslField::Int),
+        45 => ("localSource", DslField::Raw),
+        46 => ("localTimestamp", DslField::Raw),
+        47 => ("isLocalDerivedTag", DslField::Raw),
+        _ => return None,
+    })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn dsl_field_value(value: &Cbor, field: DslField) -> Option<Json> {
+    match field {
+        DslField::Raw => Some(dsl_json(value)),
+        DslField::Int => match value {
+            Cbor::UInt(number) => Some(Json::Num(*number as f64)),
+            Cbor::Int(number) => Some(Json::Num(*number as f64)),
+            _ => None,
+        },
+        DslField::LowerHex => value.bytes().map(hex).map(Json::Str),
+        DslField::UpperHex => value
+            .bytes()
+            .map(hex)
+            .map(|text| Json::Str(text.to_uppercase())),
+        DslField::Base64 => value.bytes().map(ferrox_core::b64::encode).map(Json::Str),
+        DslField::UnpaddedBase64 => value
+            .bytes()
+            .map(ferrox_core::b64::encode)
+            .map(|text| Json::Str(text.trim_end_matches('=').to_owned())),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn dsl_json(value: &Cbor) -> Json {
+    match value {
+        Cbor::UInt(number) => Json::Num(*number as f64),
+        Cbor::Int(number) => Json::Num(*number as f64),
+        Cbor::Text(text) => Json::Str(text.clone()),
+        Cbor::Bytes(bytes) => Json::Str(String::from_utf8_lossy(bytes).into_owned()),
+        Cbor::Array(items) => Json::Arr(items.iter().map(dsl_json).collect()),
+        Cbor::Map(entries) => Json::Obj(
+            entries
+                .iter()
+                .filter_map(|(key, value)| key.text().map(|key| (key.to_owned(), dsl_json(value))))
+                .collect(),
+        ),
+        Cbor::Bool(value) => Json::Bool(*value),
+        Cbor::Null => Json::Null,
+        Cbor::Float(number) => Json::Num(*number),
+    }
 }
 
 /// Move a live server to the front; returns whether it moved.
@@ -11923,6 +12701,9 @@ mod tests {
             region: None,
             provider_id: None,
             fronting_provider_id: None,
+            tag: String::new(),
+            web_server_secret: String::new(),
+            configuration_version: 0,
             scan_cdn: true,
             ssh_api: true,
             direct: true,
@@ -13204,6 +13985,9 @@ mod tests {
             last_osl_failure: Mutex::new(None),
             upgrade_started: Arc::new(AtomicBool::new(false)),
             last_upgrade_attempt: Mutex::new(None),
+            dsl_running: AtomicBool::new(false),
+            dsl_last_fetch: Mutex::new(None),
+            self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -13268,6 +14052,9 @@ mod tests {
             last_osl_failure: Mutex::new(None),
             upgrade_started: Arc::new(AtomicBool::new(false)),
             last_upgrade_attempt: Mutex::new(None),
+            dsl_running: AtomicBool::new(false),
+            dsl_last_fetch: Mutex::new(None),
+            self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(None),
@@ -13351,6 +14138,9 @@ mod tests {
                 region: None,
                 provider_id: None,
                 fronting_provider_id: None,
+                tag: String::new(),
+                web_server_secret: String::new(),
+                configuration_version: 0,
                 scan_cdn: true,
                 ssh_api: true,
                 direct: true,
@@ -13409,6 +14199,9 @@ mod tests {
                 region: None,
                 provider_id: None,
                 fronting_provider_id: None,
+                tag: String::new(),
+                web_server_secret: String::new(),
+                configuration_version: 0,
                 scan_cdn: true,
                 ssh_api: true,
                 direct: true,
@@ -13794,6 +14587,9 @@ mod tests {
             last_osl_failure: Mutex::new(None),
             upgrade_started: Arc::new(AtomicBool::new(false)),
             last_upgrade_attempt: Mutex::new(None),
+            dsl_running: AtomicBool::new(false),
+            dsl_last_fetch: Mutex::new(None),
+            self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             affinity: Mutex::new(Some(affinity.clone())),
@@ -13956,5 +14752,110 @@ mod tests {
             assert!(is_bogon(bogon.into()), "{bogon}");
         }
         assert!(!is_bogon(Ipv4Addr::from([8, 8, 8, 8]).into()));
+    }
+    #[test]
+    fn a_dsl_tag_is_the_reference_hmac() {
+        let entry = json::parse(
+            r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","webServerSecret":"00"}"#,
+        )
+        .expect("entry");
+        let server = server_from_entry_json(&entry, false, &[]).expect("server");
+        assert_eq!(
+            server.dsl_tag(),
+            "9r7VcvyowhViJrVML0cBiApuHYkx1O3uyV7nrq/eeIQ="
+        );
+        let tagged = json::parse(
+            r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","tag":"explicit"}"#,
+        )
+        .expect("entry");
+        let server = server_from_entry_json(&tagged, false, &[]).expect("server");
+        assert_eq!(server.dsl_tag(), "explicit");
+    }
+
+    #[test]
+    fn a_packed_entry_reads_as_the_signed_json_shape() {
+        let packed = Cbor::Map(vec![
+            (Cbor::UInt(2), Cbor::Text("192.0.2.1".to_owned())),
+            (Cbor::UInt(4), Cbor::Bytes(vec![0x00])),
+            (Cbor::UInt(6), Cbor::UInt(22)),
+            (Cbor::UInt(7), Cbor::Text("user".to_owned())),
+            (Cbor::UInt(8), Cbor::Bytes(vec![0xaa])),
+            (Cbor::UInt(9), Cbor::Bytes(vec![1, 2, 3])),
+            (Cbor::UInt(32), Cbor::UInt(7)),
+        ]);
+        let entry = dsl_entry_json(&Cbor::Map(vec![(Cbor::UInt(1), packed)])).expect("entry");
+        assert_eq!(
+            entry.get("ipAddress").and_then(Json::as_str),
+            Some("192.0.2.1")
+        );
+        assert_eq!(entry.get("sshPassword").and_then(Json::as_str), Some("aa"));
+        assert_eq!(
+            entry.get("configurationVersion").and_then(Json::as_i64),
+            Some(7)
+        );
+        let server = server_from_entry_json(&entry, false, &[]).expect("server");
+        assert_eq!(
+            server.dsl_tag(),
+            "9r7VcvyowhViJrVML0cBiApuHYkx1O3uyV7nrq/eeIQ="
+        );
+    }
+
+    #[test]
+    fn a_dsl_request_is_one_cbor_relay_envelope() {
+        let request = dsl_relayed(
+            DSL_DISCOVER,
+            &Cbor::Map(Vec::new()),
+            vec![(Cbor::UInt(3), Cbor::UInt(2))],
+        )
+        .expect("request");
+        let (outer, used) = crate::psiphon_broker::decode(&request).expect("outer");
+        assert_eq!(used, request.len());
+        assert_eq!(outer.get(1).and_then(Cbor::uint), Some(DSL_DISCOVER));
+        assert_eq!(outer.get(2).and_then(Cbor::uint), Some(DSL_VERSION));
+        let (inner, used) =
+            crate::psiphon_broker::decode(outer.get(3).and_then(Cbor::bytes).expect("inner"))
+                .expect("inner");
+        assert_eq!(
+            used,
+            outer.get(3).and_then(Cbor::bytes).expect("inner").len()
+        );
+        assert_eq!(inner.get(3).and_then(Cbor::uint), Some(2));
+    }
+
+    #[test]
+    fn a_dsl_reply_is_decompressed_before_it_is_read() {
+        let inner = crate::psiphon_broker::encode(&Cbor::Map(vec![(
+            Cbor::UInt(1),
+            Cbor::Array(vec![Cbor::Map(vec![
+                (Cbor::UInt(1), Cbor::Bytes(vec![1, 2, 3])),
+                (Cbor::UInt(2), Cbor::UInt(4)),
+            ])]),
+        )]));
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&inner).expect("compress");
+        let compressed = encoder.finish().expect("finish");
+        let reply = crate::psiphon_broker::encode(&Cbor::Map(vec![
+            (Cbor::UInt(1), Cbor::UInt(0)),
+            (Cbor::UInt(2), Cbor::UInt(1)),
+            (Cbor::UInt(3), Cbor::Bytes(compressed)),
+        ]));
+        let response = dsl_relayed_response(&reply).expect("response");
+        let tags = response.get(1).and_then(Cbor::array).expect("tags");
+        assert_eq!(tags[0].get(2).and_then(Cbor::uint), Some(4));
+    }
+    #[test]
+    fn dsl_settings_take_tactics_last_and_disable_wins() {
+        let config = json::parse(
+            r#"{"EnableDSLFetcher":true,"DSLPrioritizeDialNewServerEntryProbability":0.9,"DisableDSLFetcher":false}"#,
+        )
+        .expect("config");
+        let tactics = json::parse(r#"{"EnableDSLFetcher":false}"#).expect("tactics");
+        let dsl = Dsl::resolved(Some(&config), Some(&tactics));
+        assert!(!dsl.enable);
+        assert!((dsl.prioritize_new - 0.9).abs() < f64::EPSILON);
+        let disabled = json::parse(r#"{"DisableDSLFetcher":true}"#).expect("config");
+        let enabled = json::parse(r#"{"EnableDSLFetcher":true}"#).expect("tactics");
+        assert!(!Dsl::resolved(Some(&disabled), Some(&enabled)).enable);
     }
 }

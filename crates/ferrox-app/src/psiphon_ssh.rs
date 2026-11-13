@@ -301,6 +301,9 @@ pub(crate) struct Server {
     pub(crate) region: Option<String>,
     pub(crate) provider_id: Option<String>,
     pub(crate) fronting_provider_id: Option<String>,
+    pub(crate) tag: String,
+    pub(crate) web_server_secret: String,
+    pub(crate) configuration_version: i32,
     /// Whether the protocol limit that selected this entry lets it take CDN
     /// scan candidates; a bare limit keeps the advertised fronting host.
     pub(crate) scan_cdn: bool,
@@ -321,6 +324,20 @@ pub(crate) struct Server {
 }
 
 impl Server {
+    /// The DSL tag: the network's explicit tag, else the reference's HMAC of
+    /// the address under the web server secret.
+    #[must_use]
+    pub(crate) fn dsl_tag(&self) -> String {
+        if !self.tag.is_empty() {
+            return self.tag.clone();
+        }
+        if self.web_server_secret.is_empty() {
+            return String::new();
+        }
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.web_server_secret.as_bytes());
+        ferrox_core::b64::encode(hmac::sign(&key, self.host.as_bytes()).as_ref())
+    }
+
     /// The obfuscated shape when the entry carries an OSSH key or a meek front, plain SSH otherwise.
     #[must_use]
     pub(crate) fn obfuscated(&self) -> bool {
@@ -1498,6 +1515,8 @@ pub(crate) struct Session {
     id: usize,
 }
 
+type ApiReply = mpsc::Sender<Result<Vec<u8>, String>>;
+
 struct Inner {
     writer: Mutex<PacketWriter>,
     channels: Mutex<HashMap<u32, Arc<ChannelState>>>,
@@ -1515,6 +1534,9 @@ struct Inner {
     burst: Mutex<crate::psiphon_burst::Burst>,
     burst_enabled: bool,
     pending_request: Mutex<Option<mpsc::Sender<bool>>>,
+    pending_api: Mutex<Option<ApiReply>>,
+    api_timed_out: AtomicBool,
+    request_lock: Mutex<()>,
     requests: Option<Arc<dyn ServerRequests>>,
     server: String,
     protocol: &'static str,
@@ -1779,6 +1801,9 @@ impl Session {
             burst_enabled: burst.is_some(),
             burst: Mutex::new(crate::psiphon_burst::Burst::new(burst, opened_at)),
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests,
             server: format!("{}:{}", server.host, server.port),
             protocol,
@@ -1841,6 +1866,47 @@ impl Session {
         put_str(&mut extra, b"127.0.0.1");
         put_u32(&mut extra, 0);
         self.open_payload(channel_type, &extra, &format!("{host}:{port}"))
+    }
+
+    /// Send a Psiphon API request through the tunnel and wait for its success payload.
+    pub(crate) fn api_request(
+        &self,
+        name: &str,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        if self.is_closed() {
+            return Err("psiphon ssh api: the session is closed".to_owned());
+        }
+        let _request = lock(&self.inner.request_lock);
+        if self.is_closed() {
+            return Err("psiphon ssh api: the session is closed".to_owned());
+        }
+        if self.inner.api_timed_out.load(Ordering::Acquire) {
+            return Err("psiphon ssh api: an earlier request timed out".to_owned());
+        }
+        let (reply, wait) = mpsc::channel();
+        *lock(&self.inner.pending_api) = Some(reply);
+        let mut request = Vec::with_capacity(64 + name.len() + payload.len());
+        request.push(MSG_GLOBAL_REQUEST);
+        put_str(&mut request, name.as_bytes());
+        request.push(1);
+        request.extend_from_slice(payload);
+        if let Err(error) = self.inner.send(&request) {
+            let _ = lock(&self.inner.pending_api).take();
+            return Err(error);
+        }
+        match wait.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                self.inner.api_timed_out.store(true, Ordering::Release);
+                let _ = lock(&self.inner.pending_api).take();
+                Err(format!("psiphon ssh api {name} timed out"))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("psiphon ssh api: the session closed".to_owned())
+            }
+        }
     }
 
     /// The reference's liveness test: a random stream the server echoes and discards.
@@ -2068,6 +2134,7 @@ fn ssh_keepalive(inner: &Weak<Inner>, config: KeepAlive) {
         if inner.idle() < config.inactive {
             continue;
         }
+        let _request = lock(&inner.request_lock);
         let padding = config.padding();
         let mut request = Vec::with_capacity(64 + padding);
         request.push(MSG_GLOBAL_REQUEST);
@@ -2211,6 +2278,9 @@ impl Inner {
         }
         let _ = self.socket.shutdown();
         let _ = lock(&self.pending_request).take();
+        if let Some(reply) = lock(&self.pending_api).take() {
+            let _ = reply.send(Err("psiphon ssh closed".to_owned()));
+        }
         let channels: Vec<Arc<ChannelState>> = lock(&self.channels)
             .drain()
             .map(|(_, state)| state)
@@ -4679,7 +4749,14 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             Dispatch::Recycle(packet.buffer)
         }
         MSG_REQUEST_SUCCESS | MSG_REQUEST_FAILURE => {
-            if let Some(reply) = lock(&inner.pending_request).take() {
+            if let Some(reply) = lock(&inner.pending_api).take() {
+                let result = if kind == MSG_REQUEST_SUCCESS {
+                    Ok(body.to_vec())
+                } else {
+                    Err("psiphon ssh api request rejected".to_owned())
+                };
+                let _ = reply.send(result);
+            } else if let Some(reply) = lock(&inner.pending_request).take() {
                 let _ = reply.send(kind == MSG_REQUEST_SUCCESS);
             }
             Dispatch::Recycle(packet.buffer)
@@ -4787,6 +4864,9 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         burst: Mutex::new(crate::psiphon_burst::Burst::default()),
         burst_enabled: false,
         pending_request: Mutex::new(None),
+        pending_api: Mutex::new(None),
+        api_timed_out: AtomicBool::new(false),
+        request_lock: Mutex::new(()),
         requests: None,
         server: "test".to_owned(),
         protocol: "SSH",
@@ -5115,6 +5195,9 @@ mod tests {
             burst: Mutex::new(crate::psiphon_burst::Burst::default()),
             burst_enabled: false,
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
@@ -5205,6 +5288,9 @@ mod tests {
             burst: Mutex::new(crate::psiphon_burst::Burst::default()),
             burst_enabled: false,
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
@@ -5281,6 +5367,9 @@ mod tests {
             burst: Mutex::new(crate::psiphon_burst::Burst::default()),
             burst_enabled: false,
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
@@ -5382,6 +5471,9 @@ mod tests {
             burst: Mutex::new(crate::psiphon_burst::Burst::default()),
             burst_enabled: false,
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
@@ -5478,6 +5570,9 @@ mod tests {
             burst: Mutex::new(crate::psiphon_burst::Burst::default()),
             burst_enabled: false,
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",
@@ -5529,6 +5624,9 @@ mod tests {
             burst: Mutex::new(crate::psiphon_burst::Burst::default()),
             burst_enabled: false,
             pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
             requests: None,
             server: "test".to_owned(),
             protocol: "SSH",

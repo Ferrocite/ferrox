@@ -38,16 +38,22 @@ pub(crate) struct Broker {
 }
 
 /// The parts of a tactics payload this lane reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Tactics {
     pub(crate) tag: String,
     pub(crate) ttl: String,
     pub(crate) brokers: Vec<Broker>,
     pub(crate) compartments: Vec<String>,
     pub(crate) stun_servers: Vec<String>,
+    pub(crate) parameters: Option<Json>,
 }
 
 impl Tactics {
+    /// Read the payload the handshake or a tactics fetch returned.
+    pub(crate) fn from_json(payload: &Json) -> Self {
+        tactics_from_json(payload)
+    }
+
     /// Fetch tactics from the first entry that advertises a tactics capability.
     pub(crate) fn fetch(
         server: &crate::psiphon_ssh::Server,
@@ -283,6 +289,7 @@ fn tactics_from_json(payload: &Json) -> Tactics {
             brokers: Vec::new(),
             compartments: Vec::new(),
             stun_servers: Vec::new(),
+            parameters: None,
         };
     };
     let ttl = tactics
@@ -329,6 +336,7 @@ fn tactics_from_json(payload: &Json) -> Tactics {
         brokers,
         compartments,
         stun_servers,
+        parameters: parameters.cloned(),
     }
 }
 

@@ -88,6 +88,20 @@ impl Value {
             _ => None,
         }
     }
+
+    pub(crate) fn array(&self) -> Option<&[Value]> {
+        match self {
+            Self::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn map(&self) -> Option<&[(Value, Value)]> {
+        match self {
+            Self::Map(entries) => Some(entries),
+            _ => None,
+        }
+    }
 }
 
 /// The JSON view of a CBOR tactics payload; non-text map keys are dropped.
