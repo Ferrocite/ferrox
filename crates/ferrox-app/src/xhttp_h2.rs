@@ -1658,6 +1658,7 @@ fn fill_frame(
     yieldable: bool,
 ) -> Option<bool> {
     while *at < buf.len() {
+        let _slow = crate::proxy::slow_span("h2 frame read");
         match stream.read(&mut buf[*at..]) {
             Ok(0) => return None,
             Ok(n) => *at += n,
@@ -1694,7 +1695,10 @@ impl H2Conn {
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
-        let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut read = {
+            let _slow = crate::proxy::slow_span("h2 read lock");
+            read.lock().unwrap_or_else(PoisonError::into_inner)
+        };
         if ready() {
             return Pumped::Alive;
         }

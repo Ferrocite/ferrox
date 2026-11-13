@@ -19330,10 +19330,13 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             if self.pending_at == self.pending_end && !self.queued && filled == 0 {
                 // Nothing pending or queued: the transport is the only source and its wait holds no lock.
                 let read = {
+                    let _slow = slow_span("tls cipher lock");
                     let mut reader = self
                         .reader
                         .lock()
                         .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+                    drop(_slow);
+                    let _slow = slow_span("tls cipher read");
                     reader.read(&mut self.scratch)
                 };
                 match read {
@@ -19354,10 +19357,12 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             // The session's own plaintext comes out first, and the ciphertext it has not taken yet is fed after it.
             let pending = &self.scratch[self.pending_at..self.pending_end];
             let (plain, taken, closed) = {
+                let _slow = slow_span("tls session lock");
                 let mut session = self
                     .session
                     .lock()
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+                drop(_slow);
                 let (plain, taken) = session.open(pending, &mut buf[filled..])?;
                 (plain, taken, session.closed())
             };
