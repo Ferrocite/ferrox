@@ -299,3 +299,16 @@ ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pi
 # sink. A record wholly inside the payload part is sealed from that part, so only
 # the two records that cross a part boundary are copied; 50871336 is 198716.2 per turn.
 ferrox_core::vless_encryption::tests::sealed_write_probe 50871336 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+# The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
+# prices the frame walk and nothing else. The probe branch built from origin/main
+# read 634880 (155 a call); splitting the frame once, fusing the status with the
+# target question, and taking the target walk from the head's own remainder reads
+# 618496 (151 a call). Every status, option and target shape is held by the
+# decoder's own sweep, so the bytes do not move.
+ferrox_core::mux::decode 618496 mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else
+# The two encode probes landed with the decode change, so these rows are the
+# code they found, not a before/after pair: the first attempt to fuse the fixed
+# head and skip `clear`/`reserve` measured 884736 and 409600, 2 and 4 Ir a call
+# dearer than these, and was reverted rather than blessed.
+ferrox_core::mux::Outgoing::encode_into 876544 mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else
+ferrox_core::mux::Outgoing::encode_header_into 393216 mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
