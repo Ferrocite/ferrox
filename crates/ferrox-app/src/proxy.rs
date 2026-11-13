@@ -2033,7 +2033,7 @@ enum Role {
         transparent: Option<crate::sockopt::Tproxy>,
         mask: Option<ferrox_core::finalmask::Chain>,
         listen: Option<SocketAddr>,
-        account: InboundAccount,
+        account: Box<InboundAccount>,
     },
     /// The role's first bytes are a PROXY protocol header, read before the carrier handshake.
     Proxied(Box<Role>),
@@ -2127,7 +2127,7 @@ impl Role {
             | Role::Socks { .. }
             | Role::Http { .. }
             | Role::Mixed { .. } => None,
-            Role::Dokodemo { account, .. } => Some(account),
+            Role::Dokodemo { account, .. } => Some(account.as_ref()),
             Role::Proxied(inner) => inner.account(),
         }
     }
@@ -14717,10 +14717,10 @@ fn serve_dokodemo(
                     transparent,
                     mask,
                     listen,
-                    account: InboundAccount {
+                    account: Box::new(InboundAccount {
                         email: String::new(),
                         level: user_level,
-                    },
+                    }),
                 },
             ),
             inbound_tag(inbound),
