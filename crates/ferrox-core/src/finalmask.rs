@@ -3,8 +3,8 @@
 //! reach the wire as the pieces the config asked for.
 //!
 //! [`Fragment`] cuts session writes, [`Sudoku`] replaces each plaintext octet with four hint octets
-//! in both directions, and [`HeaderCustom`] runs a configured ping-pong handshake before them; `xmc`
-//! is still refused by name at config, never dialled unmasked. A fragment mask rewrites nothing: the
+//! in both directions, and [`HeaderCustom`] runs a configured ping-pong handshake before them, and `xmc`
+//! runs a Minecraft login and CFB8 session. A fragment mask rewrites nothing: the
 //! octets a session writes are the octets the peer reads, cut at different record ends. Splitting a
 //! handshake record is legal TLS — a handshake message may span records — so the peer's own stack
 //! reassembles it, which is what the pinned interop rows assert.
@@ -18,8 +18,14 @@ mod go_rand;
 mod header_custom;
 mod sudoku;
 
+pub mod xmc;
+
 pub use header_custom::{Expr, ExprArg, HeaderCustom, HeaderRun, Item, Sequence};
 pub use sudoku::Sudoku;
+pub use xmc::cfb8::Cfb8;
+pub use xmc::derivation::{derive_rsa_key, private_key_der, public_key_der};
+pub use xmc::packet_stream::PacketStream;
+pub use xmc::profile::{find_profile, read_login_success, Profile};
 
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
