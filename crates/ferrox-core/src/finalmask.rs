@@ -2,27 +2,32 @@
 //! layer (`transport/internet/finalmask`, `fragment/conn.go`), so the records a handshake emits
 //! reach the wire as the pieces the config asked for.
 //!
-//! [`Fragment`] cuts session writes and [`HeaderCustom`] runs a configured ping-pong handshake
-//! before them; `sudoku` and `xmc` are refused by name at config, never dialled unmasked. A
-//! fragment mask rewrites nothing: the octets a session writes are the octets the peer reads, cut at
-//! different record ends. Splitting a handshake record is legal TLS — a handshake message may span
-//! records — so the peer's own stack reassembles it, which is what the pinned interop rows assert.
+//! [`Fragment`] cuts session writes, [`Sudoku`] replaces each plaintext octet with four hint octets
+//! in both directions, and [`HeaderCustom`] runs a configured ping-pong handshake before them; `xmc`
+//! is still refused by name at config, never dialled unmasked. A fragment mask rewrites nothing: the
+//! octets a session writes are the octets the peer reads, cut at different record ends. Splitting a
+//! handshake record is legal TLS — a handshake message may span records — so the peer's own stack
+//! reassembles it, which is what the pinned interop rows assert.
 //!
 //! Stages compose in config order on the write path: the first configured entry sees the session's
 //! whole, and what it hands on is the next stage's whole, the last stage nearest the socket. That is
-//! the reference's reverse-then-wrap order read from the other end.
+//! the reference's reverse-then-wrap order read from the other end. The read path runs the same
+//! stages from the socket end, so a codec's bytes are unwrapped before the stage above it sees them.
 
+mod go_rand;
 mod header_custom;
+mod sudoku;
 
 pub use header_custom::{Expr, ExprArg, HeaderCustom, HeaderRun, Item, Sequence};
+pub use sudoku::Sudoku;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The side a connection plays. A header handshake sends one side's sequences and expects the
-/// other's, so the same config must be armed differently on a dial and on an accept.
+/// The side a connection plays. Sudoku's directions are asymmetric and a header handshake expects
+/// the other side's sequences, so the same config must be armed differently on a dial and an accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskRole {
     Client,
@@ -472,15 +477,88 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 /// session's whole and the last of which is nearest the socket.
 #[derive(Debug, Default, Clone)]
 pub struct Chain {
-    stages: Vec<Fragment>,
+    stages: Vec<Stage>,
     filters: Vec<SourceFilter>,
     header: Option<Arc<HeaderCustom>>,
+}
+
+/// One configured stage. `fragment` is write-only, `sudoku` carries a reader too.
+#[derive(Debug, Clone)]
+enum Stage {
+    Fragment(Fragment),
+    Sudoku(Sudoku),
+}
+
+impl Stage {
+    fn is_codec(&self) -> bool {
+        matches!(self, Self::Sudoku(_))
+    }
+
+    fn opened(&self, role: MaskRole, write: bool) -> Self {
+        match self {
+            Self::Fragment(stage) => Self::Fragment(stage.clone()),
+            Self::Sudoku(stage) => Self::Sudoku(if write {
+                stage.open_write(role)
+            } else {
+                stage.open_read(role)
+            }),
+        }
+    }
+
+    fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Fragment(stage) => stage.write(raw, p),
+            Self::Sudoku(stage) => stage.write(raw, p),
+        }
+    }
+
+    fn read<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Fragment(_) => inner.read(buf),
+            Self::Sudoku(stage) => stage.read_from(inner, buf),
+        }
+    }
+
+    fn peek_from<R: Read + PeekRead>(
+        &mut self,
+        inner: &mut R,
+        buf: &mut [u8],
+    ) -> io::Result<usize> {
+        match self {
+            Self::Fragment(_) => inner.peek(buf),
+            Self::Sudoku(stage) => stage.peek_from(inner, buf),
+        }
+    }
+}
+
+/// A stream that can look ahead without consuming: a TCP socket serves this with `MSG_PEEK`, which
+/// is what a header sniff needs when a codec lies between it and the socket.
+pub trait PeekRead: Read {
+    fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+}
+
+impl PeekRead for &std::net::TcpStream {
+    fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        std::net::TcpStream::peek(self, buf)
+    }
+}
+
+/// One connection's opened chains: the writer always, the reader only when a codec stage needs one.
+#[derive(Debug)]
+pub struct OpenChain {
+    pub write: Chain,
+    pub read: Option<Chain>,
 }
 
 impl Chain {
     /// One more stage, appended in config order.
     pub fn push(&mut self, stage: Fragment) {
-        self.stages.push(stage);
+        self.stages.push(Stage::Fragment(stage));
+    }
+
+    /// One more codec stage.
+    pub fn push_sudoku(&mut self, stage: Sudoku) {
+        self.stages.push(Stage::Sudoku(stage));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -521,14 +599,42 @@ impl Chain {
         self.filters.iter().any(|filter| filter.rejects(source))
     }
 
+    /// The same chain for one connection: every codec opens a reader and writer for the side this
+    /// connection plays, while the template stays untouched so the next connection counts from zero.
+    pub fn open(&self, role: MaskRole) -> OpenChain {
+        let write = Chain {
+            stages: self.stages.iter().map(|s| s.opened(role, true)).collect(),
+            filters: Vec::new(),
+            header: None,
+        };
+        let read = self.stages.iter().any(Stage::is_codec).then(|| Chain {
+            stages: self.stages.iter().map(|s| s.opened(role, false)).collect(),
+            filters: Vec::new(),
+            header: None,
+        });
+        OpenChain { write, read }
+    }
+
     /// The write the stream was asked to make, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         drive(&mut self.stages, raw, p)
     }
+
+    /// One read through every codec stage: the last configured stage sees the socket, and each
+    /// stage above it reads that stage's output.
+    pub fn read<R: Read>(&mut self, raw: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        read_drive(&mut self.stages, raw, buf)
+    }
+
+    /// One look-ahead that leaves the plaintext for the read: a codec fills its own pending bytes
+    /// from the socket, and a stage above it peeks through that pending rather than past it.
+    pub fn peek<R: Read + PeekRead>(&mut self, raw: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        peek_drive(&mut self.stages, raw, buf)
+    }
 }
 
 // The first stage sees the whole and hands its pieces to the next; the depth is the config's stage count.
-fn drive<W: Write>(stages: &mut [Fragment], raw: &mut W, p: &[u8]) -> io::Result<usize> {
+fn drive<W: Write>(stages: &mut [Stage], raw: &mut W, p: &[u8]) -> io::Result<usize> {
     let Some((first, rest)) = stages.split_first_mut() else {
         return raw.write(p);
     };
@@ -539,8 +645,34 @@ fn drive<W: Write>(stages: &mut [Fragment], raw: &mut W, p: &[u8]) -> io::Result
     first.write(&mut pipe, p)
 }
 
+fn read_drive<R: Read>(stages: &mut [Stage], raw: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let Some((first, rest)) = stages.split_first_mut() else {
+        return raw.read(buf);
+    };
+    if rest.is_empty() {
+        return first.read(raw, buf);
+    }
+    let mut pipe = ReadPipe { stages: rest, raw };
+    first.read(&mut pipe, buf)
+}
+
+fn peek_drive<R: Read + PeekRead>(
+    stages: &mut [Stage],
+    raw: &mut R,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    let Some((first, rest)) = stages.split_first_mut() else {
+        return raw.peek(buf);
+    };
+    if rest.is_empty() {
+        return first.peek_from(raw, buf);
+    }
+    let mut pipe = ReadPipe { stages: rest, raw };
+    first.peek_from(&mut pipe, buf)
+}
+
 struct Pipe<'a, W> {
-    stages: &'a mut [Fragment],
+    stages: &'a mut [Stage],
     raw: &'a mut W,
 }
 
@@ -569,12 +701,36 @@ impl<W: Write> Write for Pipe<'_, W> {
     }
 }
 
+struct ReadPipe<'a, R> {
+    stages: &'a mut [Stage],
+    raw: &'a mut R,
+}
+
+impl<R: Read> Read for ReadPipe<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        read_drive(self.stages, &mut *self.raw, buf)
+    }
+}
+
+impl<R: Read + PeekRead> PeekRead for ReadPipe<'_, R> {
+    fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        peek_drive(self.stages, &mut *self.raw, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn range(min: i64, max: i64) -> Range {
         Range::ordered(min, max)
+    }
+
+    fn fragment_count(stage: &Stage) -> u64 {
+        match stage {
+            Stage::Fragment(fragment) => fragment.count,
+            Stage::Sudoku(_) => panic!("a fragment stage"),
+        }
     }
 
     /// A handshake record of `body` octets, every one of them distinct.
@@ -994,7 +1150,8 @@ mod tests {
         let mut wire = Wire::default();
         assert_eq!(chain.write(&mut wire, &whole).expect("writes"), whole.len());
         assert_eq!(
-            chain.stages[1].count, 1,
+            fragment_count(&chain.stages[1]),
+            1,
             "the gathered run reaches the next stage as one write, not one per slice"
         );
         let (widths, message) = records(&wire.bytes);
@@ -1258,8 +1415,46 @@ mod tests {
             vec![3, 3, 2, 2],
             "the first stage cut the whole at 8, the last cut each of its pieces at 3"
         );
-        assert_eq!(chain.stages[0].count, 1, "each stage counts its own writes");
-        assert_eq!(chain.stages[1].count, 2);
+        assert_eq!(
+            fragment_count(&chain.stages[0]),
+            1,
+            "each stage counts its own writes"
+        );
+        assert_eq!(fragment_count(&chain.stages[1]), 2);
+    }
+
+    #[test]
+    fn a_codec_chain_decodes_in_reverse_stage_order() {
+        let stage =
+            |password: &str| Sudoku::new(password, "", "", &[], 0, 0).expect("a driveable stage");
+        let mut chain = Chain::default();
+        chain.push_sudoku(stage("outer"));
+        chain.push_sudoku(stage("inner"));
+        let plain: Vec<u8> = (0..=255u8).cycle().take(777).collect();
+        let mut client = chain.open(MaskRole::Client);
+        let mut server = chain.open(MaskRole::Server);
+        let mut wire = Vec::new();
+        client
+            .write
+            .write(&mut wire, &plain)
+            .expect("encodes both stages");
+        let mut input = wire.as_slice();
+        let mut decoded = vec![0u8; plain.len()];
+        let mut got = 0usize;
+        while got < decoded.len() {
+            let n = server
+                .read
+                .as_mut()
+                .expect("a codec reader")
+                .read(&mut input, &mut decoded[got..])
+                .expect("decodes both stages");
+            assert_ne!(n, 0);
+            got += n;
+        }
+        assert_eq!(
+            decoded, plain,
+            "the stage nearest the socket decodes first, as the write order reverses"
+        );
     }
 
     #[test]

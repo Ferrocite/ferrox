@@ -32517,6 +32517,10 @@ impl FrameWrite for Connection {
 
     #[cfg(unix)]
     fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        // A masked frame's encoded length is not the caller's, so there is no plaintext count: the caller keeps the blocking write.
+        if self.has_mask() {
+            return None;
+        }
         Some(Connection::write_ready(self, parts))
     }
 
@@ -33010,6 +33014,17 @@ where
     let Ok(peer_write) = peer.try_clone() else {
         return None;
     };
+    // The header handshake is the blocking path's, finished before a readiness lane can ask for bytes.
+    if peer.masked() {
+        let saved = peer.read_timeout().unwrap_or(None);
+        let _ = peer.set_read_timeout(Some(crate::budgets::handshake()));
+        let completed = peer.complete_header();
+        let _ = peer.set_read_timeout(saved);
+        if let Err(error) = completed {
+            echo_trace(&format!("relay header handshake failed: {error:?}"));
+            return None;
+        }
+    }
     // The stall the buffered copy already arms, once per leg outside the byte loop: a peer that reads none of the download would otherwise pin this leg's read, and the join behind it, for the life of the process.
     let stall = budgets::relay_stall();
     // A parked lane read polls instead of waiting, and asks whether its sibling ended.
@@ -60325,6 +60340,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_configured_sudoku_chain_decodes_both_directions() {
+        let doc = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"hunter2","paddingMin":0,"paddingMax":0}}]}}"#;
+        let settings = crate::json::parse(doc).expect("parses");
+        let carrier = stream_carrier(Some(&settings));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let mut client = Connection::connect(address)
+            .expect("connects")
+            .with_mask_role(carrier.tcp_mask(), ferrox_core::finalmask::MaskRole::Client);
+        let (peer, _) = listener.accept().expect("accepts");
+        let mut server =
+            peer.with_mask_role(carrier.tcp_mask(), ferrox_core::finalmask::MaskRole::Server);
+        let up: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        client.write_all(&up).expect("writes the client direction");
+        let mut got = vec![0u8; up.len()];
+        server
+            .read_exact(&mut got)
+            .expect("the server reads what the client wrote");
+        assert_eq!(got, up, "the client's pure stream decodes on the server");
+        let down: Vec<u8> = (0..=255u8).rev().cycle().take(1000).collect();
+        server
+            .write_all(&down)
+            .expect("writes the server direction");
+        let mut got = vec![0u8; down.len()];
+        client
+            .read_exact(&mut got)
+            .expect("the client reads what the server wrote");
+        assert_eq!(
+            got, down,
+            "the server's packed stream decodes on the client"
+        );
+    }
+
     /// A configured `header-custom` chain on a real socket: the client writes its sequence, the
     /// server answers with the captured value, and the session follows both ways.
     #[test]
@@ -60380,7 +60429,8 @@ mod tests {
     fn a_tcp_mask_this_tree_cannot_arm_is_refused() {
         let fragment = r#"{"type":"fragment","settings":{"packets":"tlshello","lengths":[11]}}"#;
         let refused = [
-            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"customTable":"xx"}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"ascii":"bogus"}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{}}]}}"#,
             // A chain belongs to the tcp connection; a carrier riding another transport has nowhere to arm it.
             r#"{"network":"ws","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":[11]}}]}}"#,
@@ -60411,7 +60461,10 @@ mod tests {
             r#"{{"network":"tcp","finalmask":{{"tcp":[{fragment}]}}}}"#
         ))
         .expect("parses");
-        for (settings, want) in [(&empty, false), (&armed, true)] {
+        let sudoku =
+            crate::json::parse(r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"x"}}]}}"#)
+                .expect("parses");
+        for (settings, want) in [(&empty, false), (&armed, true), (&sudoku, true)] {
             let carrier = stream_carrier(Some(settings));
             assert!(matches!(carrier, Carrier::Raw(_)));
             assert_eq!(carrier.tcp_mask().is_some(), want);
