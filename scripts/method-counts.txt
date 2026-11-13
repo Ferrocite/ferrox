@@ -1044,3 +1044,10 @@ warp race-first-winner wireguard ferrox-app-warp::tests::the_first_answering_hal
 warp race-surviving-lane masque ferrox-app-warp::tests::a_failed_probe_does_not_end_the_race
 warp race-fallback-lane wireguard ferrox-app-warp::tests::two_failed_probes_fall_back_to_wireguard
 warp race-wait-bound-ms 5000 ferrox-app-warp::tests::a_silent_pair_falls_back_at_the_deadline
+warp scan-mode-spellings 14 warp_scan::tests::every_reference_alias_names_its_mode
+warp wg-sweep-seeds 5 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp wg-sweep-ports 54 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp masque-sweep-seeds 10 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp masque-sweep-ports 7 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
+warp last-edge-cap 8 warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier_and_is_bounded
+warp ironclad-status 204 warp::tests::an_http_status_line_is_read_not_guessed

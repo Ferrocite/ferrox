@@ -87,6 +87,7 @@ mod veepn;
 mod vision;
 mod vmess;
 mod warp;
+mod warp_scan;
 mod webhook;
 mod wg;
 #[cfg(target_os = "linux")]
