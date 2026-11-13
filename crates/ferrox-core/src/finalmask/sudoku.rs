@@ -806,18 +806,17 @@ fn should_pad(
     padding_min: u32,
     padding_max: u32,
 ) -> io::Result<bool> {
-    let drawn = match *chance {
-        Some(chance) => chance,
-        None => {
-            let drawn = if padding_min == padding_max {
-                padding_min
-            } else {
-                let span = (padding_max - padding_min + 1) as usize;
-                padding_min + rng.int_n(span)? as u32
-            };
-            *chance = Some(drawn);
-            drawn
-        }
+    let drawn = if let Some(drawn) = *chance {
+        drawn
+    } else {
+        let drawn = if padding_min == padding_max {
+            padding_min
+        } else {
+            let span = (padding_max - padding_min + 1) as usize;
+            padding_min + rng.int_n(span)? as u32
+        };
+        *chance = Some(drawn);
+        drawn
     };
     if drawn == 0 {
         return Ok(false);
