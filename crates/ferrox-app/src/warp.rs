@@ -1350,6 +1350,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     let cache_path = spec.last_edge_path();
     let mut last = LastEdge::load(&cache_path);
     let mut cooldowns = Cooldowns::new(spec.cooldown);
+    let mut scan = spec.scan;
     let now = Instant::now();
     if spec.quick_reconnect {
         if wireguard.is_none() && want_wireguard {
@@ -1359,6 +1360,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
                     println!("[+] selected WireGuard endpoint {edge}");
                 } else {
                     cooldowns.hold(edge, now);
+                    scan.get_or_insert(ScanMode::Balanced);
                     eprintln!("[-] last WireGuard edge {edge} did not answer; scanning");
                 }
             }
@@ -1370,6 +1372,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
                     println!("[+] selected MASQUE gateway {edge}");
                 } else {
                     cooldowns.hold(edge, now);
+                    scan.get_or_insert(ScanMode::Balanced);
                     eprintln!("[-] last MASQUE edge {edge} did not answer; scanning");
                 }
             }
@@ -1377,9 +1380,12 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     }
     cooldowns.purge(now);
     let excluded = cooldowns.excluded(now);
-    if let Some(mode) = spec.scan {
+    if let Some(mode) = scan {
         eprintln!("warp: scanning edges in {} mode", mode.label());
-        let timeout = spec.stale.unwrap_or_else(|| warp_scan::scan_timeout(mode));
+        let timeout = spec.stale.map_or_else(
+            || warp_scan::scan_timeout(mode),
+            |stale| stale.min(warp_scan::scan_timeout(mode)),
+        );
         let (found_wireguard, found_masque) = std::thread::scope(|scope| {
             let wireguard = (wireguard.is_none() && want_wireguard).then(|| {
                 let identity = identity.clone();
@@ -1505,9 +1511,10 @@ fn scan_masque(
 }
 
 fn check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
-    let timeout = spec
-        .stale
-        .unwrap_or_else(|| warp_scan::scan_timeout(ScanMode::Balanced));
+    let timeout = spec.stale.map_or_else(
+        || warp_scan::scan_timeout(ScanMode::Balanced),
+        |stale| stale.min(warp_scan::scan_timeout(ScanMode::Balanced)),
+    );
     let Some(local) = identity
         .wireguard
         .addresses

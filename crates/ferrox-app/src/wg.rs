@@ -1019,9 +1019,14 @@ pub(crate) fn verify_endpoint(
                         {
                             continue;
                         }
-                        if parse_answer(datagram.payload)
-                            .is_some_and(|answer| answer.id == id && answer.rcode == 0)
-                        {
+                        if parse_answer(datagram.payload).is_some_and(|answer| {
+                            answer.id == id
+                                && answer.rcode == 0
+                                && answer
+                                    .records
+                                    .iter()
+                                    .any(|record| record.kind == 1 && record.rdata.len() == 4)
+                        }) {
                             return Some(started.elapsed());
                         }
                     }
