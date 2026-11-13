@@ -175,7 +175,7 @@ pub(crate) fn handshake() -> Duration {
 }
 
 pub(crate) fn handshake_cap() -> Option<Duration> {
-    HANDSHAKE_CAP.with(|cell| cell.get())
+    HANDSHAKE_CAP.with(std::cell::Cell::get)
 }
 
 pub(crate) fn head_arrival() -> Duration {
