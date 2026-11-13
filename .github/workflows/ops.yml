@@ -74,6 +74,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ops-line-tables-ubuntu24-20261027
+          # The rows price thin-LTO layout, so a restored target measures a different build.
+          cache-targets: false
       - name: plan the scope, so the rows are read from the same plan
         if: steps.provision.outcome == 'success'
         shell: bash
