@@ -297,8 +297,10 @@ struct AckEntry {
 
 // Upstream bounds an ack's number list and the deferred-candidate buffer separately, and they are separate limits that happen to share a value.
 const FLUSH_CANDIDATES: usize = 128;
+const ACK_ENTRY_LIMIT: usize = 1024;
+const ACK_DUPLICATE_ALLOWANCE: usize = 128;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AckList {
     entries: Vec<AckEntry>,
     candidates: Vec<u32>,
@@ -307,6 +309,13 @@ pub struct AckList {
     /// keeps one allocation instead of a fresh `Vec<u32>` per emitted ack.
     scratch: AckSegment,
     dirty: bool,
+    limit: usize,
+}
+
+impl Default for AckList {
+    fn default() -> Self {
+        Self::with_limit(ACK_ENTRY_LIMIT)
+    }
 }
 
 impl AckList {
@@ -315,7 +324,25 @@ impl AckList {
         Self::default()
     }
 
+    #[must_use]
+    pub(crate) fn for_window(window_size: u32) -> Self {
+        Self::with_limit(window_size as usize + ACK_DUPLICATE_ALLOWANCE)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            candidates: Vec::new(),
+            scratch: AckSegment::default(),
+            dirty: false,
+            limit: limit.max(1),
+        }
+    }
+
     pub fn add(&mut self, number: u32, timestamp: u32) {
+        if self.entries.len() >= self.limit {
+            return;
+        }
         self.entries.push(AckEntry {
             number,
             timestamp,
@@ -359,6 +386,7 @@ impl AckList {
             candidates,
             scratch,
             dirty,
+            ..
         } = self;
         scratch.begin(limit);
         let timeout = (rto / 2).max(20);
@@ -664,6 +692,19 @@ mod tests {
         assert_eq!(
             wire_hex,
             "000000000000000000000000000000c8020000000700000007"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_flood_is_bounded_by_the_ack_list_limit() {
+        let mut l = AckList::for_window(1);
+        for timestamp in 0..=ACK_DUPLICATE_ALLOWANCE as u32 + 1 {
+            l.add(7, timestamp);
+        }
+        assert_eq!(l.entries.len(), 1 + ACK_DUPLICATE_ALLOWANCE);
+        assert_eq!(
+            l.entries.last().unwrap().timestamp,
+            ACK_DUPLICATE_ALLOWANCE as u32
         );
     }
 

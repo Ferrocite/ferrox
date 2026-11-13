@@ -235,7 +235,7 @@ impl ReceivingWorker {
             left_over: VecDeque::new(),
             left_over_off: 0,
             window: ReceivingWindow::new(window_size),
-            acklist: AckList::new(),
+            acklist: AckList::for_window(window_size),
             next_number: 0,
             window_size,
             ack_limit: config.ack_limit(),
