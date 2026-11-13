@@ -2,19 +2,32 @@
 //! layer (`transport/internet/finalmask`, `fragment/conn.go`), so the records a handshake emits
 //! reach the wire as the pieces the config asked for.
 //!
-//! [`Fragment`] is the only TCP entry the chain carries here; `header-custom`, `sudoku` and `xmc`
-//! are refused by name at config, never dialled unmasked. A fragment mask rewrites nothing: the
-//! octets a session writes are the octets the peer reads, cut at different record ends. Splitting a
-//! handshake record is legal TLS — a handshake message may span records — so the peer's own stack
-//! reassembles it, which is what the pinned interop rows assert.
+//! [`Fragment`] cuts session writes and [`HeaderCustom`] runs a configured ping-pong handshake
+//! before them; `sudoku` and `xmc` are refused by name at config, never dialled unmasked. A
+//! fragment mask rewrites nothing: the octets a session writes are the octets the peer reads, cut at
+//! different record ends. Splitting a handshake record is legal TLS — a handshake message may span
+//! records — so the peer's own stack reassembles it, which is what the pinned interop rows assert.
 //!
 //! Stages compose in config order on the write path: the first configured entry sees the session's
 //! whole, and what it hands on is the next stage's whole, the last stage nearest the socket. That is
 //! the reference's reverse-then-wrap order read from the other end.
 
+mod header_custom;
+
+pub use header_custom::{Expr, ExprArg, HeaderCustom, HeaderRun, Item, Sequence};
+
 use std::io::{self, Write};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// The side a connection plays. A header handshake sends one side's sequences and expects the
+/// other's, so the same config must be armed differently on a dial and on an accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskRole {
+    Client,
+    Server,
+}
 
 /// The record type a handshake rides, and the width of a TLS record header.
 const HANDSHAKE: u8 = 22;
@@ -461,6 +474,7 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 pub struct Chain {
     stages: Vec<Fragment>,
     filters: Vec<SourceFilter>,
+    header: Option<Arc<HeaderCustom>>,
 }
 
 impl Chain {
@@ -470,7 +484,27 @@ impl Chain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stages.is_empty()
+        self.stages.is_empty() && self.header.is_none()
+    }
+
+    /// One `header-custom` handshake outside the byte stages; the first entry owns it.
+    pub fn push_header_custom(&mut self, header: HeaderCustom) {
+        self.header = Some(Arc::new(header));
+    }
+
+    /// The handshake the config armed, if any.
+    pub fn header(&self) -> Option<&HeaderCustom> {
+        self.header.as_deref()
+    }
+
+    /// The same chain without its handshake, which the byte stages own separately.
+    #[must_use]
+    pub fn without_header(&self) -> Self {
+        Self {
+            stages: self.stages.clone(),
+            filters: self.filters.clone(),
+            header: None,
+        }
     }
 
     /// Attach one more source filter; every stage's verdict is a separate gate.
