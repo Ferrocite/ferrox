@@ -238,10 +238,14 @@ fn gool_settings(settings: &crate::json::Json) -> Result<GoolSettings, String> {
         .get("goolIdentity")
         .map(Identity::from_json)
         .transpose()?;
-    let peer = settings
-        .get("goolPeer")
-        .and_then(crate::json::Json::as_str)
-        .and_then(parse_endpoint);
+    let peer = match settings.get("goolPeer") {
+        None => None,
+        Some(crate::json::Json::Str(text)) => Some(
+            parse_endpoint(text)
+                .ok_or_else(|| format!("warp gool: `goolPeer` is not an address: `{text}`"))?,
+        ),
+        Some(_) => return Err("warp gool: `goolPeer` must be a string".to_owned()),
+    };
     Ok(GoolSettings {
         identity_file,
         inline,
@@ -366,11 +370,42 @@ impl WarpSpec {
                 "warp: `register: true` needs an `identityFile` to save the account".into(),
             );
         };
+        self.identity_at(path, false)
+    }
+
+    /// The path the inner `WireGuard` identity is saved to.
+    fn gool_path(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.gool.identity_file {
+            return Ok(file.clone());
+        }
+        let Some(file) = &self.identity_file else {
+            return Err(
+                "warp gool needs `goolIdentityFile`, an inline `goolIdentity`, or an `identityFile`"
+                    .to_owned(),
+            );
+        };
+        Ok(derive_sibling_path(
+            &derive_sibling_path(file, "masque"),
+            "gool",
+        ))
+    }
+
+    /// The inner `WireGuard` identity, registered beside the outer one when absent.
+    fn gool_identity(&self) -> Result<Identity, String> {
+        if let Some(identity) = &self.gool.inline {
+            return Ok(identity.clone());
+        }
+        self.identity_at(&self.gool_path()?, true)
+    }
+
+    /// A saved identity's lifecycle, shared by the outer device and gool's inner one.
+    fn identity_at(&self, path: &Path, inner: bool) -> Result<Identity, String> {
+        let enroll = !inner && self.mode != Mode::WireGuard;
         if path.is_file() {
             let saved = match Identity::load(path) {
                 Ok(saved) => saved,
                 Err(error) if error.corrupt() && self.register && reprovision_enabled() => {
-                    let identity = register(self, self.mode != Mode::WireGuard)?;
+                    let identity = register(self, enroll)?;
                     quarantine(path);
                     identity.save(path)?;
                     return Ok(identity);
@@ -388,7 +423,7 @@ impl WarpSpec {
                 Err(error)
                     if should_reprovision(self.register, error.refused, reprovision_enabled()) =>
                 {
-                    let identity = register(self, saved.masque.is_some())?;
+                    let identity = register(self, !inner && saved.masque.is_some())?;
                     quarantine(path);
                     identity.save(path)?;
                     Ok(identity)
@@ -400,42 +435,13 @@ impl WarpSpec {
             };
         }
         if !self.register {
-            return Err(
-                "warp: the identity file does not exist and `register` is false".to_owned(),
-            );
-        }
-        let identity = register(self, self.mode != Mode::WireGuard)?;
-        identity.save(path)?;
-        Ok(identity)
-    }
-
-    /// The inner `WireGuard` identity, registered beside the outer one when absent.
-    fn gool_identity(&self) -> Result<Identity, String> {
-        if let Some(identity) = &self.gool.inline {
-            return Ok(identity.clone());
-        }
-        let path = if let Some(file) = &self.gool.identity_file {
-            file.clone()
-        } else {
-            let Some(file) = &self.identity_file else {
-                return Err(
-                    "warp gool needs `goolIdentityFile`, an inline `goolIdentity`, or an `identityFile`"
-                        .to_owned(),
-                );
-            };
-            derive_sibling_path(&derive_sibling_path(file, "masque"), "gool")
-        };
-        if path.is_file() {
-            return Identity::load(&path).map_err(LoadError::into_message);
-        }
-        if !self.register {
             return Err(format!(
-                "warp gool: the identity file `{}` does not exist and `register` is false",
+                "warp: the identity file `{}` does not exist and `register` is false",
                 path.display()
             ));
         }
-        let identity = register(self, false)?;
-        identity.save(&path)?;
+        let identity = register(self, enroll)?;
+        identity.save(path)?;
         Ok(identity)
     }
 
@@ -1817,6 +1823,18 @@ pub(crate) struct WarpOut {
 }
 
 impl WarpOut {
+    fn unbuilt(spec: &WarpSpec) -> Self {
+        Self {
+            mode: spec.mode,
+            wireguard: None,
+            masque: None,
+            gool: None,
+            chosen: Mutex::new(None),
+            probe_host: spec.probe_host.clone(),
+            probe_port: spec.probe_port,
+        }
+    }
+
     pub(crate) fn new(outbound: &crate::json::Json, test: bool) -> Result<Self, String> {
         let settings = outbound
             .get("settings")
@@ -1830,18 +1848,18 @@ impl WarpOut {
                 .is_some_and(|path| path.is_file())
         {
             // A config test names the settings; the registration stays a runtime act.
-            return Ok(Self {
-                mode: spec.mode,
-                wireguard: None,
-                masque: None,
-                gool: None,
-                chosen: Mutex::new(None),
-                probe_host: spec.probe_host,
-                probe_port: spec.probe_port,
-            });
+            return Ok(Self::unbuilt(&spec));
         } else {
             spec.identity()?
         };
+        if test
+            && spec.mode == Mode::Gool
+            && spec.gool.inline.is_none()
+            && !spec.gool_path().is_ok_and(|path| path.is_file())
+        {
+            // The inner device, like the outer, is registered at runtime, not by a config test.
+            return Ok(Self::unbuilt(&spec));
+        }
         if !test {
             resolve_edges(&mut identity, &mut spec)?;
         }
@@ -2336,10 +2354,10 @@ pub(crate) fn one_tap(
         gool: GoolSettings::default(),
     };
     let identity = register(&spec, true)?;
-    identity.save(&path)?;
     if mode == Mode::Gool {
         spec.gool_identity()?;
     }
+    identity.save(&path)?;
     let outbound = obj_pairs(vec![
         ("protocol", string("warp")),
         (
@@ -3249,6 +3267,16 @@ mod tests {
             Mode::parse(Some("wg-over-masque")).expect("the alias"),
             Mode::Gool
         );
+    }
+
+    #[test]
+    fn a_malformed_gool_peer_is_refused() {
+        let reason = WarpSpec::from(
+            &crate::json::parse(r#"{"mode":"gool","register":true,"goolPeer":"not-an-address"}"#)
+                .expect("settings"),
+        )
+        .expect_err("a malformed peer");
+        assert!(reason.contains("goolPeer"), "{reason}");
     }
 
     #[test]

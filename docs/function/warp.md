@@ -2,7 +2,7 @@
 
 `protocol: warp` is Cloudflare WARP as one outbound: a device identity, the WireGuard half (row 74's carrier) and the MASQUE CONNECT-IP half (row 76's carrier), with `mode: auto` racing the two and the first real DNS answer deciding which carries the flows.
 `mode: wireguard` and `mode: masque` pin one half and never probe; an auto with only one built half takes it without a race.
-`mode: gool` carries a second WireGuard device inside the MASQUE half: the outer identity is the usual WARP one, the inner comes from `goolIdentity`/`goolIdentityFile` or `<identity>-masque-gool.json` (registered without a MASQUE enrollment when absent and `register` is true), and `goolPeer` (or that identity's endpoint) names the inner edge on port 2408. The inner hop is rewritten to a loopback forwarder that carries each datagram through the outer CONNECT-IP tunnel on one fixed inner source port, so the handshake and every transport packet reach the edge from the outer tunnel; the outer conversation is dialled on the forwarder's first datagram, so `warp` still loads while the edge is down. `mode: gool` builds neither standalone half and never races. The server side is the composition of a `masque` inbound and a `wireguard` inbound: the MASQUE server routes its inner UDP flow through a freedom redirect to the WireGuard listener, so this row adds no inbound.
+`mode: gool` carries a second WireGuard device inside the MASQUE half: the outer identity is the usual WARP one, the inner comes from `goolIdentity`/`goolIdentityFile` or `<identity>-masque-gool.json` (registered without a MASQUE enrollment when absent, read back and re-registered on a refusal, like the outer identity), and `goolPeer` (or that identity's endpoint) names the inner edge on port 2408. The inner hop is rewritten to a loopback forwarder that carries each datagram through the outer CONNECT-IP tunnel on one fixed inner source port, so the handshake and every transport packet reach the edge from the outer tunnel; the outer conversation is dialled on the forwarder's first datagram, so `warp` still loads while the edge is down. `mode: gool` builds neither standalone half and never races. The server side is the composition of a `masque` inbound and a `wireguard` inbound: the MASQUE server routes its inner UDP flow through a freedom redirect to the WireGuard listener, so this row adds no inbound.
 The identity comes from an inline `identity` block, a saved `identityFile`, or `register: true` which registers once and saves into `identityFile` — a restart reuses the file and never creates a second device.
 A saved file is read back from the API before it is used: the peer, endpoint, reserved bytes and addresses are refreshed in place, so a device whose edge moved keeps working.
 `ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all] [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR] [--mode auto|wireguard|masque|gool]` is the form.
@@ -71,11 +71,11 @@ graph TD
     H --> K
     K --> L["temp file + rename<br/>0600, old keys until here"]
     L --> M["WarpOut::new"]
-    M --> G{"mode gool?"}
-    G -- yes --> G1["GoolOut: MASQUE outer +<br/>WireGuard inner → 127.0.0.1:0"]
+    M --> GG{"mode gool?"}
+    GG -- yes --> G1["GoolOut: MASQUE outer +<br/>WireGuard inner → 127.0.0.1:0"]
     G1 --> G2["UdpForwarder: one fixed<br/>inner port, MTU ≤ 1200"]
     G2 --> S
-    G -- no --> D0{"scan / quickReconnect / forced peer?"}
+    GG -- no --> D0{"scan / quickReconnect / forced peer?"}
     D0 -- "off" --> N["WireGuard half<br/>row 74 carrier"]
     D0 -- "forced" --> D1["use endpoint<br/>skip sweep"]
     D0 -- "quick" --> D2["last edge DNS check"]
