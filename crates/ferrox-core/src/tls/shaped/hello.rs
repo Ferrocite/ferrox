@@ -299,18 +299,25 @@ impl Hello {
     pub(crate) fn enable_ech(&mut self, list: &[u8]) -> Result<(), TlsError> {
         use crate::tls::ech;
         let configs = ech::parse_config_list(list).map_err(TlsError::Other)?;
-        let picked = configs.iter().find_map(|config| {
-            if config.kem_id != ech::KEM_X25519 || config.has_unknown_mandatory_extension() {
-                return None;
+        let mut picked = None;
+        for config in configs {
+            let config = config.map_err(TlsError::Other)?;
+            if picked.is_some() {
+                continue;
             }
-            let name = std::str::from_utf8(config.public_name).ok()?;
+            if config.kem_id != ech::KEM_X25519 || config.has_unknown_mandatory_extension() {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(config.public_name) else {
+                continue;
+            };
             if name.is_empty()
                 || name.parse::<std::net::IpAddr>().is_ok()
-                || rustls::pki_types::DnsName::try_from(name.to_owned()).is_err()
+                || rustls::pki_types::DnsName::try_from(name).is_err()
             {
-                return None;
+                continue;
             }
-            config.suites().find_map(|suite| match suite {
+            picked = config.suites().find_map(|suite| match suite {
                 (ech::KDF_SHA256, ech::AEAD_AES_128_GCM) => {
                     Some((config, suite, &crate::tls::hpke::AES128_GCM))
                 }
@@ -321,22 +328,22 @@ impl Hello {
                     Some((config, suite, &crate::tls::hpke::CHACHA20_POLY1305))
                 }
                 _ => None,
-            })
-        });
+            });
+        }
         let (config, suite, hpke) =
             picked.ok_or_else(|| TlsError::Other("ech: no supported config".to_owned()))?;
         let public_name = std::str::from_utf8(config.public_name)
             .map_err(|_| TlsError::Other("ech: public name is not utf-8".to_owned()))?
             .to_owned();
-        let mut info = Vec::with_capacity(8 + config.encoded_len());
-        info.extend_from_slice(b"tls ech\0");
-        config.encode_into(&mut info);
         let public_key: [u8; 32] = config
             .public_key
             .try_into()
             .map_err(|_| TlsError::Other("ech: public key is not 32 bytes".to_owned()))?;
         let (enc, sealer) = hpke
-            .setup_sealer_owned(&info, &public_key)
+            .setup_sealer_owned_from(&public_key, |put| {
+                put(b"tls ech\0");
+                config.feed_encoded(|bytes| put(bytes));
+            })
             .map_err(|e| TlsError::Other(format!("ech: hpke: {e}")))?;
         let mut inner_random = [0u8; 32];
         getrandom::fill(&mut inner_random).map_err(entropy)?;
@@ -346,7 +353,7 @@ impl Hello {
             enc,
             sealer,
             inner_random,
-            inner_name: self.sni.clone(),
+            inner_name: self.sni.take(),
             transcript: Vec::new(),
             maximum_name_length: match config.maximum_name_length {
                 0 => 255,
@@ -1615,11 +1622,26 @@ mod tests {
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 14, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 10, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
         );
+    }
+
+    /// A list keeps validating after its first supported config, so a later malformed one still refuses.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_malformed_config_after_a_supported_one_is_refused() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let mut body = list[2..].to_vec();
+        body.extend_from_slice(&[0xfe, 0x0d, 0x00, 0x04, 9, 0x00, 0x20, 0x00]);
+        let mut bad = (body.len() as u16).to_be_bytes().to_vec();
+        bad.extend_from_slice(&body);
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
+        assert!(hello.enable_ech(&bad).is_err());
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]

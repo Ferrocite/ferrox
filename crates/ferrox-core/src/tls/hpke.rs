@@ -226,6 +226,19 @@ fn labeled_extract(salt: &[u8], label: &[u8], ikm: &[u8], suite: &[u8]) -> [u8; 
     out
 }
 
+/// The context's info hash from a caller that streams its fields into the HMAC.
+fn streamed_info_hash(info: impl FnOnce(&mut dyn FnMut(&[u8])), suite: &[u8]) -> [u8; 32] {
+    let mut extract = HkdfExtract::<Sha256>::new(None);
+    extract.input_ikm(b"HPKE-v1");
+    extract.input_ikm(suite);
+    extract.input_ikm(b"info_hash");
+    info(&mut |part| extract.input_ikm(part));
+    let (prk, _) = extract.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&prk);
+    out
+}
+
 /// The same components in the same order, expanded without building the concatenation.
 fn labeled_expand(prk: &[u8; 32], label: &[u8], info: &[u8], out: &mut [u8], suite: &[u8]) {
     let hk = Hkdf::<Sha256>::from_prk(prk).expect("a 32-byte prk");
@@ -259,11 +272,16 @@ struct Context {
 impl Context {
     fn new(shared_secret: &[u8; 32], info: &[u8], aead: Aead) -> Self {
         let suite = suite_id(KEM_ID, KDF_ID, aead.id());
-        let psk_id_hash = labeled_extract(&[], b"psk_id_hash", &[], &suite);
         let info_hash = labeled_extract(&[], b"info_hash", info, &suite);
+        Self::from_info_hash(shared_secret, &info_hash, aead)
+    }
+
+    fn from_info_hash(shared_secret: &[u8; 32], info_hash: &[u8; 32], aead: Aead) -> Self {
+        let suite = suite_id(KEM_ID, KDF_ID, aead.id());
+        let psk_id_hash = labeled_extract(&[], b"psk_id_hash", &[], &suite);
         let mut context = [0u8; 1 + 64];
         context[1..33].copy_from_slice(&psk_id_hash);
-        context[33..].copy_from_slice(&info_hash);
+        context[33..].copy_from_slice(info_hash);
         let secret = labeled_extract(shared_secret, b"secret", &[], &suite);
         let mut key = [0u8; 32];
         labeled_expand(
@@ -411,11 +429,22 @@ impl X25519Hpke {
         info: &[u8],
         public_key: &[u8; 32],
     ) -> Result<([u8; 32], Sealer), rustls::Error> {
+        self.setup_sealer_owned_from(public_key, |put| put(info))
+    }
+
+    /// The same sealer with the context info streamed from its fields, so no caller builds it.
+    pub(crate) fn setup_sealer_owned_from(
+        &self,
+        public_key: &[u8; 32],
+        info: impl FnOnce(&mut dyn FnMut(&[u8])),
+    ) -> Result<([u8; 32], Sealer), rustls::Error> {
         let (enc, secret) = encapsulate(public_key)?;
+        let suite = suite_id(KEM_ID, KDF_ID, self.aead.id());
+        let info_hash = streamed_info_hash(info, &suite);
         Ok((
             enc,
             Sealer {
-                context: Context::new(&secret, info, self.aead),
+                context: Context::from_info_hash(&secret, &info_hash, self.aead),
                 sequence: 0,
             },
         ))
