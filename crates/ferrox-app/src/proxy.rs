@@ -4583,11 +4583,18 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
                 .with_policy(Some(crate::policy::flow(0)));
             let stream = with_account(stream, role.account(), false);
             // The ClientHello peek runs on a setup lane, so a stalled hello cannot hold the accept loop.
+            let accepted_at = Instant::now();
             let mut work = Some((role, stream, sniffing));
             lane_pool::submit_setup(
                 Box::new(move || {
                     if let Some((role, stream, sniffing)) = work.take() {
-                        // The header handshake reads the peer's first bytes; the lane spends the handshake budget before the peek arms its own clock.
+                        // The header handshake reads the peer's first bytes; the lane spends what is left of the handshake budget, queue time included.
+                        let budget = budgets::handshake();
+                        let waited = accepted_at.elapsed();
+                        if waited >= budget {
+                            return lane_pool::Next::Done;
+                        }
+                        let _cap = budgets::cap_handshake(budget.saturating_sub(waited));
                         if stream.start_mask().is_ok() {
                             role.serve_polled_tls(stream, sniffing);
                         }

@@ -254,15 +254,13 @@ impl Masked {
         if run.is_done() {
             return Ok(());
         }
-        // The relay arms a one-millisecond poll clock; the handshake's own reads take the handshake budget, and the clock comes back as it was.
+        // The relay arms a one-millisecond poll clock; the handshake's reads run to one absolute deadline instead, so a dribbled byte cannot restart the budget, and the clock comes back.
         let prior = self.stream.read_timeout().ok();
-        let _ = self
-            .stream
-            .set_read_timeout(Some(crate::budgets::handshake()));
         let mut source = HeaderWire {
             chain: &self.chain,
             read_chain: self.read_chain.as_deref(),
             stream: &self.stream,
+            until: Instant::now() + crate::budgets::handshake(),
         };
         let result = run.handshake(&mut source, mask_clock());
         if let Some(prior) = prior {
@@ -391,6 +389,7 @@ struct HeaderWire<'a> {
     chain: &'a std::sync::Mutex<ferrox_core::finalmask::Chain>,
     read_chain: Option<&'a std::sync::Mutex<ferrox_core::finalmask::Chain>>,
     stream: &'a TcpStream,
+    until: Instant,
 }
 
 impl std::io::Write for HeaderWire<'_> {
@@ -409,6 +408,14 @@ impl std::io::Write for HeaderWire<'_> {
 
 impl std::io::Read for HeaderWire<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the header handshake deadline passed",
+            ));
+        }
+        self.stream.set_read_timeout(Some(left))?;
         let Some(chain) = self.read_chain else {
             return (&*self.stream).read(buf);
         };
@@ -3593,5 +3600,49 @@ mod tests {
         deadline.end();
         let after = reader.read(&mut byte).expect_err("nothing arrives");
         assert_eq!(after.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// A peer that dribbles a byte before each clock cannot hold a handshake open: the reads run to
+    /// one absolute deadline, not a budget each read restarts.
+    #[test]
+    fn a_trickled_header_ends_at_the_handshake_deadline() {
+        use ferrox_core::finalmask::{Chain, HeaderCustom, Item, MaskRole, Sequence};
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(40));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connects");
+            for byte in b"abcd" {
+                std::thread::sleep(Duration::from_millis(30));
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let (side, _) = listener.accept().expect("accepts");
+        let clients = Item {
+            packet: Some(b"abcd".to_vec()),
+            ..Item::default()
+        };
+        let header = HeaderCustom::new(
+            vec![Sequence {
+                items: vec![clients],
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("a mask the config can drive");
+        let mut chain = Chain::default();
+        chain.push_header_custom(header);
+        let connection = Connection::Tcp(side).with_mask_role(Some(&chain), MaskRole::Server);
+        let began = std::time::Instant::now();
+        connection
+            .start_mask()
+            .expect_err("the trickle runs out the deadline");
+        assert!(
+            began.elapsed() < Duration::from_millis(120),
+            "the handshake outlived its one deadline"
+        );
+        peer.join().expect("joins");
     }
 }
