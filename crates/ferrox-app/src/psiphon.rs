@@ -1489,6 +1489,17 @@ impl FrontedOverride {
     }
 }
 
+/// One `FrontingSpec`: the edge a transfer dials and the origin its `Host` header names.
+#[derive(Debug, Clone)]
+struct FrontingSpec {
+    addresses: Vec<String>,
+    disable_sni: bool,
+    skip_verify: bool,
+    verify_name: String,
+    verify_pins: Vec<String>,
+    host: String,
+}
+
 /// One `ObfuscatedServerListRootURLs` entry: a base URL and its per-URL transfer policy.
 #[derive(Debug, Clone)]
 struct TransferRoot {
@@ -1497,6 +1508,7 @@ struct TransferRoot {
     headers: Vec<(String, String)>,
     key: Option<String>,
     only_after: usize,
+    fronting: Vec<FrontingSpec>,
 }
 
 fn regex_matches_any(patterns: &[regex::Regex], values: &[&str]) -> bool {
@@ -1791,13 +1803,14 @@ impl Inner {
     }
 
     /// Record a live server: it becomes the affinity and, under the cap, the next first entry.
-    fn remember(&self, host: &str) {
+    fn remember(&self, host: &str, protocol: &str) {
         let affinity = host
             .rsplit_once(':')
             .and_then(|(name, port)| port.parse().ok().map(|port| (name, port)));
         if let Some((name, port)) = affinity {
             *lock(&self.affinity) = Some((name.to_owned(), port));
             save_affinity(&self.settings, name);
+            save_dial_parameters(&self.settings, name, protocol);
         }
         let mut guard = lock(&self.entries);
         let max = self.settings.server_entry_max_move_to_front;
@@ -2622,7 +2635,7 @@ impl Inner {
         self.replay.start_pass();
         let (start, lead) = self.start();
         let session = self.connect_locked(start, lead, Some(connecting))?;
-        self.remember(session.server());
+        self.remember(session.server(), session.protocol());
         if let Some(lane) = lock(&self.self_ref).upgrade() {
             lane.start_dsl(&session);
         }
@@ -2653,7 +2666,7 @@ impl Inner {
                 }
                 let (start, lead) = self.start();
                 let session = self.connect_locked(start, lead, Some(connecting))?;
-                self.remember(session.server());
+                self.remember(session.server(), session.protocol());
                 self.start_dsl(&session);
                 continue;
             }
@@ -2686,14 +2699,14 @@ impl Inner {
                 match handle.join() {
                     Ok(Ok(session)) => {
                         succeeded += 1;
-                        reached = Some(session.server().to_owned());
+                        reached = Some((session.server().to_owned(), session.protocol()));
                     }
                     Ok(Err(why)) => last = why,
                     Err(_) => "psiphon: a pool dial panicked".clone_into(&mut last),
                 }
             }
-            if let Some(host) = reached {
-                self.remember(&host);
+            if let Some((host, protocol)) = reached {
+                self.remember(&host, protocol);
             }
             if succeeded == 0 {
                 return Err(last);
@@ -4152,7 +4165,7 @@ impl Settings {
         let feedback_attempts = usize::try_from(
             number(settings, "FeedbackUploadMaxAttempts")
                 .unwrap_or(5)
-                .max(1),
+                .max(0),
         )
         .unwrap_or(5);
         let feedback_retry_min = Duration::from_secs(
@@ -5561,6 +5574,7 @@ fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
                     headers: global,
                     key: None,
                     only_after: 0,
+                    fronting: Vec::new(),
                 });
             }
         }
@@ -5585,6 +5599,7 @@ fn upgrade_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
                     headers: global,
                     key: None,
                     only_after: 0,
+                    fronting: Vec::new(),
                 });
             }
         }
@@ -5615,6 +5630,7 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                         headers: global.to_vec(),
                         key: None,
                         only_after: 0,
+                        fronting: Vec::new(),
                     });
                 } else {
                     eprintln!("psiphon: {label} entry names no URL");
@@ -5664,12 +5680,63 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                     headers,
                     key,
                     only_after: usize::try_from(only_after).unwrap_or(0),
+                    fronting: fronting_specs(fields, label),
                 });
             }
             _ => eprintln!("psiphon: {label} entry is not an object"),
         }
     }
     roots
+}
+
+/// The transfer-URL `FrontingSpecs`: fronted HTTPS only, as the reference's plaintext round trip.
+fn fronting_specs(fields: &[(String, Json)], label: &str) -> Vec<FrontingSpec> {
+    let item = Json::Obj(fields.to_vec());
+    let Some(Json::Arr(specs)) = field(Some(&item), "FrontingSpecs") else {
+        return Vec::new();
+    };
+    let mut parsed = Vec::new();
+    for spec in specs {
+        let Json::Obj(fields) = spec else {
+            eprintln!("psiphon: {label} FrontingSpecs entry is not an object");
+            continue;
+        };
+        let item = Json::Obj(fields.clone());
+        let provider_id = text_in(&item, "FrontingProviderID").unwrap_or_default();
+        let addresses = string_list_in(&item, "Addresses");
+        let transports = string_list_in(&item, "Transports");
+        let disable_sni = bool_in(&item, "DisableSNI");
+        let skip_verify = bool_in(&item, "SkipVerify");
+        let verify_name = text_in(&item, "VerifyServerName").unwrap_or_default();
+        let verify_pins = string_list_in(&item, "VerifyPins");
+        let host = text_in(&item, "Host").unwrap_or_default();
+        let https = transports.is_empty()
+            || transports
+                .iter()
+                .any(|transport| transport == "FRONTED-HTTPS");
+        if provider_id.is_empty()
+            || addresses.is_empty()
+            || host.is_empty()
+            || !https
+            || (skip_verify && (!verify_name.is_empty() || !verify_pins.is_empty()))
+            || (!skip_verify && verify_name.is_empty())
+            || verify_pins.iter().any(String::is_empty)
+        {
+            eprintln!(
+                "psiphon: {label} ignores a FrontingSpec that is incomplete or not fronted HTTPS"
+            );
+            continue;
+        }
+        parsed.push(FrontingSpec {
+            addresses,
+            disable_sni,
+            skip_verify,
+            verify_name,
+            verify_pins,
+            host,
+        });
+    }
+    parsed
 }
 
 /// A `TransferURL`'s URL is base64 encoded; plain HTTPS URLs are accepted for existing configs.
@@ -7096,6 +7163,7 @@ fn load_source_entries(
             );
         }
     }
+    apply_dial_parameters(settings, &mut servers);
     Ok(limit_quic_versions(servers, settings))
 }
 
@@ -8153,6 +8221,118 @@ fn prioritize_servers(servers: &mut Vec<Server>, protocols: &[String], count: us
     *servers = priority;
 }
 
+/// The server rebuilt as a stored or imported tunnel protocol, when this entry can dial it.
+fn server_with_protocol(server: &Server, protocol: &str) -> Option<Server> {
+    if server_dial_port(server).is_some_and(|(current, _)| current == protocol) {
+        return Some(server.clone());
+    }
+    match protocol {
+        "SSH" | "UNFRONTED-SSH" => {
+            if let Some(variant) = ssh_variant(server) {
+                return Some(variant);
+            }
+            let port = server.ssh_port?;
+            (!server.obfuscated()
+                && !server.quic
+                && !server.tls
+                && !server.ss
+                && server.port == port)
+                .then(|| server.clone())
+        }
+        "OSSH" | "UNFRONTED-OSSH" => {
+            if server.tls || server.quic || server.ss || server.obfuscation_key.is_none() {
+                return None;
+            }
+            let mut variant = server.clone();
+            variant.direct = true;
+            variant.tls = false;
+            variant.tls_port = None;
+            variant.ss = false;
+            variant.shadowsocks = None;
+            variant.quic = false;
+            variant.quic_port = None;
+            variant.meek = None;
+            variant.unfronted_meek = None;
+            variant.inproxy = None;
+            variant.tls_inproxy = None;
+            variant.tactics = None;
+            Some(variant)
+        }
+        "TLS-OSSH" => {
+            if server.tls {
+                return Some(server.clone());
+            }
+            tls_variant(server)
+        }
+        "QUIC-OSSH" => {
+            if server.quic {
+                return Some(server.clone());
+            }
+            server.quic_variant()
+        }
+        "SHADOWSOCKS-OSSH" => {
+            if server.ss {
+                return Some(server.clone());
+            }
+            server.shadowsocks_variant()
+        }
+        protocol if protocol.starts_with("FRONTED-MEEK") => {
+            let mut variant = server.clone();
+            let meek = variant.meek.as_mut()?;
+            if !meek.fronted || !meek_protocol_shape(protocol, meek.https, meek.quic) {
+                return None;
+            }
+            let port = meek.port;
+            meek.protocol = static_tunnel_protocol(protocol)?;
+            variant.port = port;
+            Some(variant)
+        }
+        protocol if protocol.starts_with("UNFRONTED-MEEK") => {
+            let mut variant = server.clone();
+            let meek = if variant.unfronted_meek.is_some() {
+                variant.unfronted_meek.as_mut()?
+            } else {
+                variant.meek.as_mut().filter(|meek| !meek.fronted)?
+            };
+            if !meek_protocol_shape(protocol, meek.https, meek.quic) {
+                return None;
+            }
+            let port = meek.port;
+            meek.protocol = static_tunnel_protocol(protocol)?;
+            variant.port = port;
+            Some(variant)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a protocol's HTTPS/QUIC shape matches the front this entry already carries.
+fn meek_protocol_shape(protocol: &str, https: bool, quic: bool) -> bool {
+    let want_https = !protocol.contains("-HTTP-");
+    let want_quic = protocol.contains("-QUIC-");
+    https == want_https && quic == want_quic
+}
+
+fn static_tunnel_protocol(protocol: &str) -> Option<&'static str> {
+    Some(match protocol {
+        "SSH" => "SSH",
+        "OSSH" => "OSSH",
+        "TLS-OSSH" => "TLS-OSSH",
+        "QUIC-OSSH" => "QUIC-OSSH",
+        "SHADOWSOCKS-OSSH" => "SHADOWSOCKS-OSSH",
+        "UNFRONTED-MEEK-OSSH" => "UNFRONTED-MEEK-OSSH",
+        "UNFRONTED-MEEK-HTTPS-OSSH" => "UNFRONTED-MEEK-HTTPS-OSSH",
+        "UNFRONTED-MEEK-SESSION-TICKET-OSSH" => "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+        "FRONTED-MEEK-OSSH" => "FRONTED-MEEK-OSSH",
+        "FRONTED-MEEK-CDN-OSSH" => "FRONTED-MEEK-CDN-OSSH",
+        "FRONTED-MEEK-HTTP-OSSH" => "FRONTED-MEEK-HTTP-OSSH",
+        "FRONTED-MEEK-CDN-HTTP-OSSH" => "FRONTED-MEEK-CDN-HTTP-OSSH",
+        "FRONTED-MEEK-QUIC-OSSH" => "FRONTED-MEEK-QUIC-OSSH",
+        "FRONTED-MEEK-CDN-QUIC-OSSH" => "FRONTED-MEEK-CDN-QUIC-OSSH",
+        _ => return None,
+    })
+}
+
 fn ssh_variant(server: &Server) -> Option<Server> {
     let port = server.ssh_port?;
     if !server.obfuscated() && !server.ss && !server.quic && !server.tls && server.port == port {
@@ -8934,7 +9114,7 @@ fn fetch_list(
     roots: &crate::psiphon_ssh::TlsRoots,
     insecure: bool,
 ) -> Result<String, String> {
-    let body = fetch_bytes(url, custom, roots, insecure)?;
+    let body = fetch_bytes(url, custom, roots, insecure, None)?;
     unpack(&body, public_key)
 }
 
@@ -8943,8 +9123,9 @@ fn fetch_bytes(
     custom: &[(String, String)],
     roots: &crate::psiphon_ssh::TlsRoots,
     insecure: bool,
+    fronting: Option<&FrontingSpec>,
 ) -> Result<Vec<u8>, String> {
-    let reply = fetch_reply(url, custom, roots, insecure, &[])?;
+    let reply = fetch_reply(url, custom, roots, insecure, fronting, &[])?;
     if reply.status != 200 {
         return Err(format!("psiphon: {url}: HTTP {}", reply.status));
     }
@@ -8956,9 +9137,10 @@ fn fetch_reply(
     custom: &[(String, String)],
     roots: &crate::psiphon_ssh::TlsRoots,
     insecure: bool,
+    fronting: Option<&FrontingSpec>,
     extra: &[(&str, &str)],
 ) -> Result<crate::foxy_account::Reply, String> {
-    let endpoint = transfer_endpoint(url, roots, insecure)?;
+    let endpoint = transfer_endpoint(url, roots, insecure, fronting)?;
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(custom.len() + extra.len() + 1);
     headers.push(("Accept", "*/*"));
     headers.extend(
@@ -9015,6 +9197,7 @@ fn fetch_cached(
     headers: &[(String, String)],
     roots: &crate::psiphon_ssh::TlsRoots,
     insecure: bool,
+    fronting: Option<&FrontingSpec>,
     cache: Option<CacheSlot<'_>>,
 ) -> Result<Vec<u8>, String> {
     let cached = cache.and_then(CacheSlot::body);
@@ -9026,7 +9209,7 @@ fn fetch_cached(
         .map(|etag| ("If-None-Match", etag))
         .into_iter()
         .collect::<Vec<_>>();
-    let reply = fetch_reply(url, headers, roots, insecure, &conditional)?;
+    let reply = fetch_reply(url, headers, roots, insecure, fronting, &conditional)?;
     match reply.status {
         200 => {
             if let Some(cache) = cache {
@@ -9064,6 +9247,7 @@ fn osl_body(
             &root.headers,
             &settings.tls_shape.roots,
             osl_insecure(root, settings),
+            transfer_fronting(root),
             cache,
         )?
     };
@@ -9150,6 +9334,7 @@ fn upgrade_available(job: &UpgradeJob) -> Result<String, String> {
             &root.url,
             &job.tls_roots,
             job.disable_system_roots || root.skip_verify,
+            transfer_fronting(root),
         ) {
             Ok(endpoint) => endpoint,
             Err(why) => {
@@ -9189,6 +9374,7 @@ fn fetch_upgrade(
         &root.url,
         &job.tls_roots,
         job.disable_system_roots || root.skip_verify,
+        transfer_fronting(root),
     )?;
     let reply = crate::foxy_account::ask_limited(
         &endpoint,
@@ -9228,6 +9414,9 @@ pub(crate) fn feedback(
     if diagnostics.is_empty() {
         return Err("psiphon: feedback diagnostics are empty".to_owned());
     }
+    if settings.feedback_attempts == 0 {
+        return Ok(());
+    }
     let upload_path = upload_path.trim_matches('/');
     let upload_id = hex(&random::<8>());
     let mut last = String::new();
@@ -9241,6 +9430,7 @@ pub(crate) fn feedback(
             &root.url,
             &settings.tls_shape.roots,
             settings.tls_shape.disable_system_root_cas || root.skip_verify,
+            transfer_fronting(root),
         ) {
             Ok(endpoint) => endpoint,
             Err(why) => {
@@ -9408,9 +9598,10 @@ pub(crate) fn exchange_export(settings: Option<&Json>) -> Result<String, String>
         .ok_or_else(|| "psiphon: no signed server entry is available for exchange".to_owned())?;
     remove_unsigned_fields(&mut entry);
     verify_entry_signature(&entry, &settings.signature_key)?;
+    let dial_parameters = exchanged_dial_parameters(&settings, &entry);
     let payload = Json::Obj(vec![
         ("ServerEntryFields".to_owned(), entry),
-        ("ExchangedDialParameters".to_owned(), Json::Null),
+        ("ExchangedDialParameters".to_owned(), dial_parameters),
     ]);
     let mut plaintext = String::new();
     json::write(&payload, &mut plaintext);
@@ -9458,12 +9649,43 @@ pub(crate) fn exchange_import(settings: Option<&Json>, payload: &str) -> Result<
         .get("ipAddress")
         .and_then(Json::as_str)
         .ok_or_else(|| "psiphon: exchanged entry names no ipAddress".to_owned())?;
-    if server_from_entry_json(&entry, true, &settings.conduit_protocols).is_none() {
-        return Err("psiphon: exchanged entry has no usable transport".to_owned());
-    }
+    let server = server_from_entry_json(&entry, true, &settings.conduit_protocols)
+        .ok_or_else(|| "psiphon: exchanged entry has no usable transport".to_owned())?;
+    let protocol =
+        document
+            .get("ExchangedDialParameters")
+            .and_then(|parameters| match parameters {
+                Json::Obj(fields) => fields
+                    .iter()
+                    .find(|(name, _)| name == "TunnelProtocol")
+                    .and_then(|(_, value)| value.as_str()),
+                _ => None,
+            });
     save_exchanged(&settings, &entry)?;
+    if let Some(protocol) = protocol {
+        if server_with_protocol(&server, protocol).is_some() {
+            save_dial_parameters(&settings, host, protocol);
+        }
+    }
     save_affinity(&settings, host);
     Ok(host.to_owned())
+}
+
+/// The tunnel protocol a stored dial parameter names for the affinity entry, if this client can dial it.
+fn exchanged_dial_parameters(settings: &Settings, entry: &Json) -> Json {
+    let Some(host) = entry.get("ipAddress").and_then(Json::as_str) else {
+        return Json::Null;
+    };
+    let Some(protocol) = dial_parameters(settings).remove(host) else {
+        return Json::Null;
+    };
+    if server_from_entry_json(entry, true, &settings.conduit_protocols)
+        .and_then(|server| server_with_protocol(&server, &protocol))
+        .is_none()
+    {
+        return Json::Null;
+    }
+    Json::Obj(vec![("TunnelProtocol".to_owned(), Json::Str(protocol))])
 }
 
 fn exchange_key(settings: &Settings) -> Result<[u8; 32], String> {
@@ -9573,17 +9795,85 @@ fn exchanged_path(settings: &Settings) -> PathBuf {
     settings.state.join("exchanged.jsonl")
 }
 
+fn dial_parameters_path(settings: &Settings) -> PathBuf {
+    settings.state.join("dial_parameters.json")
+}
+
+fn dial_parameters(settings: &Settings) -> HashMap<String, String> {
+    if !state_is_ours(&settings.state) {
+        return HashMap::new();
+    }
+    let Ok(text) = std::fs::read_to_string(dial_parameters_path(settings)) else {
+        return HashMap::new();
+    };
+    let Ok(Json::Obj(entries)) = json::parse(&text) else {
+        return HashMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|(host, protocol)| Some((host, protocol.as_str()?.to_owned())))
+        .collect()
+}
+
+fn save_dial_parameters(settings: &Settings, host: &str, protocol: &str) {
+    if !state_is_ours(&settings.state) {
+        return;
+    }
+    let mut entries: Vec<(String, Json)> = dial_parameters(settings)
+        .into_iter()
+        .map(|(host, protocol)| (host, Json::Str(protocol)))
+        .collect();
+    entries.retain(|(existing, _)| existing.as_str() != host);
+    entries.push((host.to_owned(), Json::Str(protocol.to_owned())));
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut text = String::new();
+    json::write(&Json::Obj(entries), &mut text);
+    let _ = std::fs::create_dir_all(&settings.state);
+    let _ = std::fs::write(dial_parameters_path(settings), text);
+}
+
+/// Apply an imported tunnel protocol to the entry's matching dial variant.
+fn apply_dial_parameters(settings: &Settings, servers: &mut [Server]) {
+    let parameters = dial_parameters(settings);
+    if parameters.is_empty() {
+        return;
+    }
+    for server in servers {
+        let Some(protocol) = parameters.get(&server.host) else {
+            continue;
+        };
+        if let Some(variant) = server_with_protocol(server, protocol) {
+            *server = variant;
+        }
+    }
+}
+
 fn save_exchanged(settings: &Settings, entry: &Json) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&settings.state);
+    let path = exchanged_path(settings);
+    let host = entry.get("ipAddress").and_then(Json::as_str).unwrap_or("");
+    let mut entries = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            if let Ok(entry) = json::parse(line) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.retain(|existing| existing.get("ipAddress").and_then(Json::as_str) != Some(host));
+    entries.push(entry.clone());
     let mut text = String::new();
-    json::write(entry, &mut text);
-    text.push('\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(exchanged_path(settings))
-        .map_err(|error| format!("psiphon: exchanged entry store: {error}"))?;
-    file.write_all(text.as_bytes())
+    for entry in entries {
+        json::write(&entry, &mut text);
+        text.push('\n');
+    }
+    let part = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
+    std::fs::write(&part, text)
+        .and_then(|()| {
+            std::fs::rename(&part, &path).or_else(|_| {
+                std::fs::remove_file(&path).and_then(|()| std::fs::rename(&part, &path))
+            })
+        })
         .map_err(|error| format!("psiphon: exchanged entry store: {error}"))
 }
 
@@ -9634,15 +9924,51 @@ fn transfer_endpoint(
     url: &str,
     roots: &crate::psiphon_ssh::TlsRoots,
     insecure: bool,
+    fronting: Option<&FrontingSpec>,
 ) -> Result<crate::foxy_account::Endpoint, String> {
+    let verified = fronting.is_some_and(|spec| !spec.verify_name.is_empty());
+    let insecure = fronting.map_or(insecure, |spec| spec.skip_verify || !verified);
     let roots = if insecure {
         Vec::new().into()
     } else {
         roots.load()?
     };
-    crate::foxy_account::Endpoint::parse(url, roots)
-        .ok_or_else(|| format!("psiphon: {url} is not https"))
-        .map(|endpoint| endpoint.with_insecure(insecure))
+    let endpoint = crate::foxy_account::Endpoint::parse(url, roots)
+        .ok_or_else(|| format!("psiphon: {url} is not https"))?
+        .with_insecure(insecure);
+    let Some(spec) = fronting else {
+        return Ok(endpoint);
+    };
+    let raw = spec
+        .addresses
+        .get(usize::from(random::<1>()[0]) % spec.addresses.len())
+        .ok_or_else(|| format!("psiphon: {url} names no fronting address"))?;
+    let dial = if raw.parse::<IpAddr>().is_ok() || raw.parse::<SocketAddr>().is_ok() {
+        raw.clone()
+    } else {
+        crate::psiphon_ssh::random_hostname(raw)
+            .ok_or_else(|| format!("psiphon: {url} fronting address {raw:?} is not a pattern"))?
+    };
+    let (dial, port) = split_fronting_address_with(&dial, 443);
+    let disable_sni = spec.disable_sni || dial.parse::<IpAddr>().is_ok();
+    let verify_name = (verified && !spec.skip_verify).then_some(spec.verify_name.as_str());
+    Ok(endpoint.with_fronting(
+        &spec.host,
+        &dial,
+        port,
+        disable_sni,
+        verify_name,
+        spec.verify_pins.clone(),
+    ))
+}
+
+/// The fronting spec a transfer root draws for one request.
+fn transfer_fronting(root: &TransferRoot) -> Option<&FrontingSpec> {
+    if root.fronting.is_empty() {
+        return None;
+    }
+    let pick = usize::from(random::<1>()[0]) % root.fronting.len();
+    root.fronting.get(pick)
 }
 
 fn transfer_headers(root: &TransferRoot) -> Vec<(&str, &str)> {
@@ -9678,6 +10004,7 @@ fn fetch_osl_entries(
             &root.headers,
             &settings.tls_shape.roots,
             osl_insecure(root, settings),
+            transfer_fronting(root),
             registry_cache,
         ) {
             Ok(body) => body,
@@ -12759,11 +13086,61 @@ mod tests {
             headers: Vec::new(),
             key: None,
             only_after: 0,
+            fronting: Vec::new(),
         };
         assert!(
             osl_insecure(&skipped, &plain),
             "a root's own SkipVerify was dropped"
         );
+    }
+
+    #[test]
+    fn a_transfer_root_carries_fronting_specs() {
+        let settings = json::parse(
+            r#"{"FeedbackUploadURLs":[{"URL":"https://upload.example","FrontingSpecs":[{"FrontingProviderID":"front","Addresses":["edge\\.example"],"VerifyServerName":"front.example","VerifyPins":["sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],"Host":"origin.example"}]}]}"#,
+        )
+        .expect("settings");
+        let roots = feedback_roots(Some(&settings));
+        let spec = &roots[0].fronting[0];
+        assert_eq!(spec.addresses, [r"edge\.example"]);
+        assert_eq!(spec.verify_name, "front.example");
+        assert_eq!(spec.host, "origin.example");
+        assert!(!spec.skip_verify);
+        let endpoint = transfer_endpoint(
+            &roots[0].url,
+            &crate::psiphon_ssh::TlsRoots::Empty,
+            false,
+            Some(spec),
+        )
+        .expect("endpoint");
+        assert_eq!(endpoint.host, "edge.example");
+        assert_eq!(endpoint.host_header(), "origin.example");
+        assert_eq!(endpoint.verify_names, ["front.example"]);
+        assert!(!endpoint.insecure);
+    }
+
+    #[test]
+    fn a_fronting_spec_without_verification_is_refused() {
+        let settings = json::parse(
+            r#"{"FeedbackUploadURLs":[{"URL":"https://upload.example","FrontingSpecs":[{"FrontingProviderID":"front","Addresses":["edge\\.example"],"VerifyServerName":"front.example","SkipVerify":true,"Host":"origin.example"}]}]}"#,
+        )
+        .expect("settings");
+        assert!(feedback_roots(Some(&settings))[0].fronting.is_empty());
+    }
+
+    #[test]
+    fn zero_feedback_attempts_returns_without_uploading() {
+        let settings = json::parse(
+            r#"{"EnableFeedbackUpload":true,"FeedbackUploadURLs":["https://f.example"],"FeedbackEncryptionPublicKey":"abc","FeedbackUploadMaxAttempts":0}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .feedback_attempts,
+            0
+        );
+        feedback(Some(&settings), b"diagnostics", "").expect("zero attempts is a no-op");
     }
 
     #[test]
@@ -12955,17 +13332,27 @@ mod tests {
             ferrox_core::b64::encode(&public)
         ))
         .expect("settings");
+        let settings = Settings::from_json(Some(&config)).expect("settings");
+        save_dial_parameters(&settings, "192.0.2.10", "SSH");
         let payload = exchange_export(Some(&config)).expect("export");
         assert!(!payload.contains("192.0.2.10"));
         assert_eq!(
             exchange_import(Some(&config), &payload).expect("import"),
             "192.0.2.10"
         );
-        let settings = Settings::from_json(Some(&config)).expect("settings");
         assert_eq!(affinity_host(&settings).as_deref(), Some("192.0.2.10"));
+        assert_eq!(
+            dial_parameters(&settings)
+                .get("192.0.2.10")
+                .map(String::as_str),
+            Some("SSH")
+        );
         assert!(raw_entries(&settings)
             .iter()
             .any(|entry| entry.get("ipAddress").and_then(Json::as_str) == Some("192.0.2.10")));
+        save_exchanged(&settings, &signed).expect("replace");
+        let stored = std::fs::read_to_string(exchanged_path(&settings)).expect("store");
+        assert_eq!(stored.lines().count(), 1, "the same entry replaces itself");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

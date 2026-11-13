@@ -520,6 +520,14 @@ pub(crate) struct Endpoint {
     pub(crate) no_resumption: bool,
     /// A dial that accepts any certificate, for the reference's `DisableSystemRootCAs`.
     pub(crate) insecure: bool,
+    /// A domain-fronted `Host` header that differs from the TLS name.
+    pub(crate) host_header: Option<String>,
+    /// The SNI a fronted dial sends, which may be empty to omit it.
+    pub(crate) server_name: Option<String>,
+    /// The names a fronted certificate is verified against, instead of the SNI.
+    pub(crate) verify_names: Vec<String>,
+    /// The leaf keys a fronted certificate must match.
+    pub(crate) pins: ferrox_core::foxy::pin::Pins,
 }
 
 impl Endpoint {
@@ -548,7 +556,32 @@ impl Endpoint {
             h2_fingerprint: None,
             no_resumption: false,
             insecure: false,
+            host_header: None,
+            server_name: None,
+            verify_names: Vec::new(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
         })
+    }
+
+    /// Separate the fronted `Host` header from the dialed name and its TLS verification.
+    #[must_use]
+    pub(crate) fn with_fronting(
+        mut self,
+        host_header: &str,
+        dial: &str,
+        port: u16,
+        disable_sni: bool,
+        verify_name: Option<&str>,
+        pins: Vec<String>,
+    ) -> Self {
+        self.host = dial.to_owned();
+        self.port = port;
+        self.address = edge_peer(dial, port);
+        self.host_header = Some(host_header.to_owned());
+        self.server_name = disable_sni.then(String::new);
+        self.verify_names = verify_name.map(str::to_owned).into_iter().collect();
+        self.pins = ferrox_core::foxy::pin::Pins::parse(pins);
+        self
     }
 
     /// The reference skips verification when system roots are disabled; an untunneled
@@ -562,6 +595,12 @@ impl Endpoint {
     #[must_use]
     pub(crate) fn origin(&self) -> String {
         self.host.clone()
+    }
+
+    /// The `Host`/`:authority` value: a fronted request names the origin, not the edge it dials.
+    #[must_use]
+    pub(crate) fn host_header(&self) -> &str {
+        self.host_header.as_deref().unwrap_or(&self.host)
     }
 
     /// Where a request goes: the origin's own prefix, then the path.
@@ -583,12 +622,15 @@ impl Endpoint {
 
     fn tls(&self) -> TlsConfig {
         TlsConfig {
-            server_name: self.host.clone(),
+            server_name: self
+                .server_name
+                .clone()
+                .unwrap_or_else(|| self.host.clone()),
             alpn: vec![b"http/1.1".to_vec()].into(),
             roots: std::sync::Arc::clone(&self.roots),
-            pins: ferrox_core::foxy::pin::Pins::default(),
+            pins: self.pins.clone(),
             cert_pins: std::sync::Arc::from(Vec::new()),
-            verify_names: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::from(self.verify_names.clone()),
             cipher_suites: std::sync::Arc::default(),
             curves: std::sync::Arc::default(),
             insecure: self.insecure,
@@ -719,7 +761,9 @@ impl H2Connection {
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
         fields.push((":scheme".to_owned(), "https".to_owned()));
-        let authority = if endpoint.port == 443 {
+        let authority = if endpoint.host_header.is_some() {
+            endpoint.host_header().to_owned()
+        } else if endpoint.port == 443 {
             endpoint.host.clone()
         } else {
             format!("{}:{}", endpoint.host, endpoint.port)
@@ -906,7 +950,7 @@ pub(crate) fn ask_limited(
     max_body: usize,
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request(method, &endpoint.origin(), url, headers, body))
+    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
@@ -920,7 +964,7 @@ pub(crate) fn ask_head(
     headers: &[(&str, &str)],
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request("HEAD", &endpoint.origin(), url, headers, &[]))
+    tls.write_all(&request("HEAD", endpoint.host_header(), url, headers, &[]))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     let mut io = BufReader::with_capacity(1024, &mut tls);
