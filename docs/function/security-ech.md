@@ -39,7 +39,7 @@ graph TD
 | heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
 | heap-buffers-for-a-shaped-sealer | 0 | ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations |
 | heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
-| heap-buffers-for-a-real-ech-offer | 10 | ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place |
+| heap-buffers-for-a-real-ech-offer | 8 | ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place |
 | seal-plaintext-buffer-moves | 0 | ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay |
 <!-- counts:end -->
 
@@ -66,6 +66,7 @@ No matrix cell isolates ECH: the bench cells time a relay after the handshake, a
 - **The real offer's staged cover.** The cover header and its zero payload are written straight into the outer hello, so the offer no longer allocates a cover buffer or copies it in.
 - **The inner hello's ciphertext buffer and the plaintext copy into it.** The inner body is reserved with room for its padding and tag, then sealed where it lies; the tag is appended and the caller copies one ciphertext into the cover instead of allocating a second buffer and copying the plaintext through it.
 - **The parse copies and staged hello frames.** The config list is walked where it lies, the HPKE info is hashed from the config's own fields, and the inner transcript and outer hello are framed where they are written.
+- **The cipher list's reallocations.** The outer hello reserves its cipher list to the table's exact length before the first suite, so a 16-entry profile no longer grows it through two reallocations.
 - **The hidden name's clone and the public name's DNS temporary.** The offer moves the hello's hidden name instead of cloning it, and validates the public name as the borrowed config slice, so neither the old copy nor a validation `String` is allocated.
 - **A config rebuild for the retry.** The rejected offer clones the parsed `TlsConfig`, replaces its `ech_config_list` `Arc`, and reuses every other field; no text is parsed again and no server name is resolved again.
 - **A second accept loop for QUIC.** The listener's BoringSSL context is built once per identity and shared with quiche; the dial sets the list on the connection it already made.
