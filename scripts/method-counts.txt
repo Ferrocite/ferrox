@@ -179,6 +179,7 @@ carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read
 carrier-websocket relay-window-copies-per-byte 0 ferrox-app-ws::tests::the_relay_window_is_the_readers_own_buffer
 carrier-websocket relay-window-max-bytes 65536 ferrox-app-ws::tests::a_frame_larger_than_the_relay_window_keeps_its_remainder
 carrier-websocket read-calls-per-two-buffered-frames 1 ferrox-app-ws::tests::two_buffered_frames_leave_in_one_read
+carrier-websocket relay-window-messages-per-handoff 3 ferrox-app-ws::tests::small_frames_fill_one_window
 carrier-websocket transport-reads-after-a-ready-message 0 ferrox-app-ws::tests::a_partial_next_frame_does_not_hold_the_ready_message
 carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
 carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
