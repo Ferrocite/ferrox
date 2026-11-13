@@ -569,6 +569,7 @@ impl<R: Read> WsReader<R> {
     ) -> std::io::Result<usize> {
         let mut len = 0;
         let mut room = WINDOW_MAX;
+        let mut empty = 0usize;
         loop {
             if self.at < self.msg_end {
                 let start = self.at;
@@ -578,6 +579,7 @@ impl<R: Read> WsReader<R> {
                 spans[len] = (start, take);
                 len += 1;
                 room -= take;
+                empty = 0;
             } else {
                 if self.eof {
                     break;
@@ -612,6 +614,16 @@ impl<R: Read> WsReader<R> {
                     spans[len] = (start, take);
                     len += 1;
                     room -= take;
+                    empty = 0;
+                } else {
+                    // An empty frame adds no span and no room, so a run of them hands the lane back instead of holding it here.
+                    empty += 1;
+                    if empty == crate::proxy::WINDOW_PARTS {
+                        if len == 0 {
+                            return Err(std::io::ErrorKind::WouldBlock.into());
+                        }
+                        break;
+                    }
                 }
             }
             if len == crate::proxy::WINDOW_PARTS || room == 0 {
@@ -2007,6 +2019,32 @@ mod tests {
             reader.have.capacity(),
             capacity,
             "the buffer did not grow across a window"
+        );
+    }
+
+    /// A peer that sends only empty data frames cannot hold the lane inside one window: the run hands
+    /// the turn back, and the bytes behind it still arrive on the next call.
+    #[test]
+    fn a_run_of_empty_frames_hands_the_lane_back() {
+        let frame = |payload: &[u8]| {
+            let mut wire = vec![0x80 | OP_DATA, payload.len() as u8];
+            wire.extend_from_slice(payload);
+            wire
+        };
+        let mut wire = Vec::new();
+        for _ in 0..crate::proxy::WINDOW_PARTS {
+            wire.extend(frame(b""));
+        }
+        wire.extend(frame(b"after"));
+        let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
+        assert!(
+            crate::proxy::WindowRead::read_window(&mut reader).is_err(),
+            "sixteen frames that carry nothing hand the lane back"
+        );
+        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads the data");
+        assert_eq!(
+            &window.bytes()[window.parts()[0].0..][..window.parts()[0].1],
+            b"after"
         );
     }
 
