@@ -40,9 +40,9 @@ const ICMPV6_PROTO: u8 = 58;
 /// An ICMP echo request is type 8 (128 over IPv6); its answer flips that to 0 (129) and carries the message back.
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 const ICMP_ECHO_REPLY: u8 = 0;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -434,9 +434,12 @@ impl Device {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::io::IntoRawFd;
-            let (device, _offload, _) = crate::tun_stack::build(spec, false, true)?;
             #[cfg(target_os = "linux")]
-            let framing = if _offload {
+            let (device, offload, _) = crate::tun_stack::build(spec, false, true)?;
+            #[cfg(target_os = "macos")]
+            let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
+            #[cfg(target_os = "linux")]
+            let framing = if offload {
                 Framing::Virtio
             } else {
                 Framing::Raw
@@ -1476,10 +1479,7 @@ mod tests {
         assert_eq!(tcp.destination_port, 443);
         assert_eq!(payload, b"v6");
         let (from, to) = octets(source, destination);
-        assert_eq!(
-            u16::from_be_bytes([body[16], body[17]]),
-            tcp_checksum(&from, &to, body)
-        );
+        assert_eq!(tcp_checksum(&from, &to, body), 0);
     }
 
     #[test]
