@@ -11430,7 +11430,7 @@ pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
 
 fn browser_host<'a>(
     host: &'a str,
-    tls: Option<&ferrox_core::tls::TlsConfig>,
+    tls: Option<&'a ferrox_core::tls::TlsConfig>,
     server: &'a SocketAddr,
 ) -> std::borrow::Cow<'a, str> {
     if !host.is_empty() {
