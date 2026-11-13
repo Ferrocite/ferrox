@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 
 use super::segment::{
     write_data_header, AckSegment, DataSegment, OutgoingHeader, SegmentOption,
@@ -196,22 +197,36 @@ impl SendingWindow {
     }
 }
 
+/// A receive window of at most this many segments is a fixed ring; a larger
+/// window keeps the map, because its ring would be a multi-megabyte allocation
+/// per connection that a sparse window never fills.
+const RING_MAX: u32 = 1 << 16;
+
 /// Out-of-order receive slots in a power-of-two ring; the power of two divides
 /// `2^32`, so a window that crosses `u32::MAX` still gives every live number a
-/// slot of its own.
+/// slot of its own. A window larger than `RING_MAX` keeps the map instead.
 #[derive(Debug)]
 pub struct ReceivingWindow {
     slots: Vec<Option<DataSegment>>,
     mask: u32,
+    map: Option<HashMap<u32, DataSegment>>,
 }
 
 impl ReceivingWindow {
     #[must_use]
     pub fn new(size: u32) -> Self {
+        if size > RING_MAX {
+            return Self {
+                slots: Vec::new(),
+                mask: 0,
+                map: Some(HashMap::new()),
+            };
+        }
         let capacity = size.max(1).next_power_of_two();
         Self {
             slots: Vec::new(),
             mask: capacity - 1,
+            map: None,
         }
     }
 
@@ -226,6 +241,15 @@ impl ReceivingWindow {
     }
 
     pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
+        if let Some(map) = &mut self.map {
+            return match map.entry(id) {
+                Entry::Occupied(_) => false,
+                Entry::Vacant(slot) => {
+                    slot.insert(value);
+                    true
+                }
+            };
+        }
         self.ensure_allocated();
         let index = self.index(id);
         let slot = &mut self.slots[index];
@@ -238,10 +262,16 @@ impl ReceivingWindow {
 
     #[must_use]
     pub fn has(&self, id: u32) -> bool {
+        if let Some(map) = &self.map {
+            return map.contains_key(&id);
+        }
         !self.slots.is_empty() && self.slots[self.index(id)].is_some()
     }
 
     pub fn remove(&mut self, id: u32) -> Option<DataSegment> {
+        if let Some(map) = &mut self.map {
+            return map.remove(&id);
+        }
         if self.slots.is_empty() {
             return None;
         }
@@ -250,7 +280,11 @@ impl ReceivingWindow {
     }
 
     pub fn release(&mut self) {
-        self.slots = Vec::new();
+        if let Some(map) = &mut self.map {
+            *map = HashMap::new();
+        } else {
+            self.slots = Vec::new();
+        }
     }
 }
 
@@ -715,10 +749,11 @@ mod tests {
         }
     }
 
-    /// The receive window is a fixed ring, not a growable map: one allocation
-    /// on the first segment, then the same base and capacity through a full
-    /// window and the next lap. A map would grow its bucket array, and a
-    /// per-segment buffer would move the base, so identity is the witness.
+    /// A receive window within the ring bound is a fixed ring, not a growable
+    /// map: one allocation on the first segment, then the same base and
+    /// capacity through a full window and the next lap. A map would grow its
+    /// bucket array, and a per-segment buffer would move the base, so identity
+    /// is the witness.
     #[test]
     fn the_receive_window_indexes_a_fixed_ring() {
         let mut w = ReceivingWindow::new(8);
@@ -765,6 +800,24 @@ mod tests {
             assert_eq!(w.remove(number).map(|seg| seg.number), Some(number));
         }
         assert!(w.slots.iter().all(Option::is_none));
+    }
+
+    /// A window above the ring bound must not preallocate its slots: it keeps
+    /// the map, and the map still refuses a duplicate and returns its segment.
+    #[test]
+    fn a_window_above_the_ring_keeps_the_map() {
+        let mut w = ReceivingWindow::new(RING_MAX + 1);
+        assert!(w.map.is_some());
+        assert!(w.slots.is_empty());
+        assert!(w.set(0, receive_segment(0)));
+        assert!(w.has(0));
+        assert!(!w.set(0, receive_segment(0)));
+        assert_eq!(w.remove(0).map(|seg| seg.number), Some(0));
+        assert!(!w.has(0));
+
+        let w = ReceivingWindow::new(u32::MAX);
+        assert!(w.map.is_some(), "the largest window must not round up");
+        assert!(w.slots.is_empty());
     }
 
     /// The ring's set/remove path is the hot receive path: after the one-time
