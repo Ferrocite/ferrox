@@ -32,6 +32,7 @@ struct ReadState<R> {
     reader: R,
     buffer: Vec<u8>,
     pending: Vec<u8>,
+    chunk: [u8; 8192],
 }
 
 impl<R: Read> ReadState<R> {
@@ -41,15 +42,14 @@ impl<R: Read> ReadState<R> {
                 self.buffer.drain(..length);
                 return Ok(packet);
             }
-            let mut chunk = [0u8; 8192];
-            match self.reader.read(&mut chunk) {
+            match self.reader.read(&mut self.chunk) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "minecraft packet stream closed",
                     ))
                 }
-                Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
+                Ok(read) => self.buffer.extend_from_slice(&self.chunk[..read]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
@@ -95,6 +95,7 @@ where
                 reader,
                 buffer: Vec::new(),
                 pending: Vec::new(),
+                chunk: [0; 8192],
             }),
             writer,
             is_client,
@@ -272,7 +273,7 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
     }
 }
 
-fn parse_custom_payload(packet: &Packet) -> io::Result<Option<Vec<u8>>> {
+fn parse_custom_payload(packet: &Packet) -> io::Result<Option<&[u8]>> {
     let mut data = packet.data.as_slice();
     let channel = read_string(&mut data).map_err(|error| {
         io::Error::other(format!("read minecraft custom payload channel: {error}"))
@@ -280,7 +281,7 @@ fn parse_custom_payload(packet: &Packet) -> io::Result<Option<Vec<u8>>> {
     if channel != CHANNEL {
         return Ok(None);
     }
-    Ok(Some(data.to_vec()))
+    Ok(Some(data))
 }
 
 fn spawn_keepalive<W: Write + Send + 'static>(
@@ -402,13 +403,14 @@ mod tests {
             let mut body_reader = body;
             let _ = read_varint_with_length(&mut body_reader).expect("id");
             let _ = prefix;
-            let payload = parse_custom_payload(&Packet {
+            let packet = Packet {
                 id: body[0] as i32,
                 data: body[1..].to_vec(),
-            })
-            .expect("payload")
-            .expect("channel");
-            recovered.extend_from_slice(&payload);
+            };
+            let payload = parse_custom_payload(&packet)
+                .expect("payload")
+                .expect("channel");
+            recovered.extend_from_slice(payload);
             frames += 1;
         }
         assert_eq!(frames, 3);
