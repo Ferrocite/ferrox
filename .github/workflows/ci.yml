@@ -188,7 +188,7 @@ jobs:
           mkdir -p target/ci
           for i in 1 2 3 4 5; do
             echo "=== run $i ==="
-            FERROX_TRACE_FILE="target/ci/trace-$i.log" cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
+            FERROX_TRACE_FILE="$GITHUB_WORKSPACE/target/ci/trace-$i.log" cargo test -p ferrox-app --locked || echo "RUN $i FAILED"
           done
       - name: upload the trace the run wrote
         if: always()

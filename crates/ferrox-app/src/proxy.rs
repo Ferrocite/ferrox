@@ -1587,6 +1587,22 @@ pub(crate) fn echo_trace_on() -> bool {
     *ECHO_TRACE_ON.get_or_init(|| std::env::var("FERROX_ECHO_TRACE").is_ok())
 }
 
+/// A wait that outlives a lane turn names itself in the trace, so a stall points at the call that held it.
+pub(crate) struct SlowSpan(std::time::Instant, &'static str);
+
+impl Drop for SlowSpan {
+    fn drop(&mut self) {
+        let elapsed = self.0.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            echo_trace(&format!("slow {} {}ms", self.1, elapsed.as_millis()));
+        }
+    }
+}
+
+pub(crate) fn slow_span(label: &'static str) -> SlowSpan {
+    SlowSpan(std::time::Instant::now(), label)
+}
+
 static ECHO_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 pub(crate) fn echo_trace(stage: &str) {
@@ -32944,6 +32960,7 @@ where
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
+                let _slow = slow_span("carrier-fwd read");
                 peer_read.read_ready(buffer.as_mut())
             };
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
@@ -32978,6 +32995,7 @@ where
     lane_pool::submit_tagged(
         "carrier-bwd",
         Box::new(move || {
+            let _slow = slow_span("carrier-bwd read");
             let read = reader.read_window();
             let (next, timed_out) = match read {
                 Ok(window) if !window.is_empty() => {

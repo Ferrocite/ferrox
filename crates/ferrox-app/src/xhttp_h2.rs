@@ -1690,6 +1690,7 @@ impl H2Conn {
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
     /// A lane step that cannot finish the frame yields the poll instead of sleeping in it.
     fn pump_read(&self, ready: impl FnOnce() -> bool, yieldable: bool) -> Pumped {
+        let _slow = crate::proxy::slow_span("h2 pump read");
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
@@ -1948,6 +1949,10 @@ impl H2Client {
             if write.write_all(MAGIC).is_err() {
                 return None;
             }
+        }
+        if let Some(raw) = conn.raw.as_ref() {
+            // A relay lane parses its own frames on the client: a transport read that can block would pin the worker the grants it waits for.
+            let _ = raw.set_read_timeout(Some(crate::budgets::RELAY_POLL));
         }
         let mut initial = Vec::with_capacity(12);
         initial.extend_from_slice(&S_WINDOW.to_be_bytes());
@@ -2707,6 +2712,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         block: bool,
         bounded: bool,
     ) -> Filled {
+        let _slow = crate::proxy::slow_span("h2 fill read");
         while *have < buf.len() {
             if Self::expired(until, opened) {
                 return Filled::End;
