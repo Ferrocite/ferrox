@@ -234,6 +234,12 @@ grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 3
 # two/three-byte read moved the one-byte probe above to 84003, so that rewrite
 # did not land. The bytes, lengths and the 73251 row are unchanged.
 grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_second_byte_and_nothing_else
+# Blessed 147461 by grpc-multi-payload-fit: the multi writer's payload fit was a
+# one-byte walk; the closed form lands on the same payload with two length
+# lookups. The walk reads 311301 on the same probe (run 43408759589), so 163840
+# (52.6%) came out; the chosen payload is equal at every cap 8..=70000 and the
+# bytes, frames and window splits are unchanged.
+grpc::tests::multi_payload_probe 147461 grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk
 # sniff::Sniffing::inspect is reported in scripts/method-ops.txt, not gated:
 # its loopback probe's frame has read 1228 and 1231 on the same source, so an
 # exact row here would be a coin flip. The probe test still asserts the domain
