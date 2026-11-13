@@ -190,6 +190,11 @@ impl H2StreamOut {
         self.conn.end_session_of(self.stream);
     }
 
+    /// The served call's `HEADERS` trailer: the status block ends the response half instead of the empty `DATA` an untyped HTTP/2 stream would send.
+    pub(crate) fn trailers(&self, block: &[u8]) -> bool {
+        self.conn.respond_trailers(self.stream, block)
+    }
+
     /// The request is refused with its body unread: an `RST_STREAM` frees the stream and the credit
     /// it would otherwise keep granting a body nobody drains.
     pub(crate) fn reset(&self) {
@@ -2282,6 +2287,47 @@ impl H2Conn {
             .get(&sid)
         {
             state.responded.store(true, Ordering::SeqCst);
+        }
+        true
+    }
+
+    /// A trailer block ends the response stream: `END_STREAM` rides the first `HEADERS` and `END_HEADERS` the last, so a block cut across continuations still closes once.
+    pub(crate) fn respond_trailers(&self, sid: u32, block: &[u8]) -> bool {
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut at = 0;
+        loop {
+            let end = (at + max).min(block.len());
+            let mut flags = if end == block.len() { F_END_HEADERS } else { 0 };
+            if at == 0 {
+                flags |= F_END;
+            }
+            let kind = if at == 0 { T_HEADERS } else { T_CONT };
+            if !self.frame(kind, flags, sid, &block[at..end]) {
+                return false;
+            }
+            at = end;
+            if at >= block.len() {
+                break;
+            }
+        }
+        let ended = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&sid)
+            .is_some_and(|state| {
+                state.responded.store(true, Ordering::SeqCst);
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                st.finished = true;
+                let ended = st.ended;
+                state.cv.notify_all();
+                ended
+            });
+        if ended {
+            self.retire(sid);
         }
         true
     }
