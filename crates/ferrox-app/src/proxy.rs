@@ -34201,30 +34201,30 @@ fn socks_udp_forwarded<'a>(
 fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
     match atyp {
         1 => {
-            let ip: [u8; 4] = buf.get(..4)?.try_into().ok()?;
-            let port: [u8; 2] = buf.get(4..6)?.try_into().ok()?;
+            let (ip, rest) = buf.split_first_chunk::<4>()?;
+            let (port, _) = rest.split_first_chunk::<2>()?;
             Some((
-                SocketAddr::new(std::net::IpAddr::V4(ip.into()), u16::from_be_bytes(port)),
+                SocketAddr::new(std::net::IpAddr::V4((*ip).into()), u16::from_be_bytes(*port)),
                 6,
             ))
         }
         3 => {
-            let len = usize::from(*buf.first()?);
-            let name = buf.get(1..1 + len)?;
-            let port: [u8; 2] = buf.get(1 + len..3 + len)?.try_into().ok()?;
+            let (&len, rest) = buf.split_first_chunk::<1>()?;
+            let (name, rest) = rest.split_at_checked(usize::from(len))?;
+            let (port, _) = rest.split_first_chunk::<2>()?;
             let host = std::str::from_utf8(name).ok()?;
             // The name and the port go to the resolver as they are: the authority the datagram named is never spelled out.
-            let addr = (host, u16::from_be_bytes(port))
+            let addr = (host, u16::from_be_bytes(*port))
                 .to_socket_addrs()
                 .ok()?
                 .next()?;
-            Some((addr, 3 + len))
+            Some((addr, 3 + usize::from(len)))
         }
         4 => {
-            let ip: [u8; 16] = buf.get(..16)?.try_into().ok()?;
-            let port: [u8; 2] = buf.get(16..18)?.try_into().ok()?;
+            let (ip, rest) = buf.split_first_chunk::<16>()?;
+            let (port, _) = rest.split_first_chunk::<2>()?;
             Some((
-                SocketAddr::new(std::net::IpAddr::V6(ip.into()), u16::from_be_bytes(port)),
+                SocketAddr::new(std::net::IpAddr::V6((*ip).into()), u16::from_be_bytes(*port)),
                 18,
             ))
         }
@@ -34233,11 +34233,12 @@ fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
 }
 
 pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
-    if packet.len() < 4 || packet[2] != 0 {
+    let (&[_, _, frag, atyp], body) = packet.split_first_chunk::<4>()?;
+    if frag != 0 {
         return None;
     }
-    let (addr, used) = parse_socks_addr_rest(&packet[4..], packet[3])?;
-    Some((addr, &packet[4 + used..]))
+    let (addr, used) = parse_socks_addr_rest(body, atyp)?;
+    Some((addr, &body[used..]))
 }
 
 /// The same frame with the name kept: a routing rule may name a domain, and resolving here would
