@@ -214,15 +214,13 @@ impl Outgoing<'_> {
     /// Writes `[meta length][metadata]` and returns the offset the payload
     /// length goes at. `out` must already be at least `2 + meta` long.
     fn write_meta(&self, out: &mut [u8], meta: usize) -> usize {
-        // The session id, status and options are one big-endian word, so the fixed head is one store and one bounds check instead of three of each.
-        let head = u32::from_be_bytes([
-            (self.id >> 8) as u8,
-            self.id as u8,
-            self.status.byte(),
-            self.options,
-        ]);
-        out[2..6].copy_from_slice(&head.to_be_bytes());
-        let mut o = 6;
+        let mut o = 2;
+        out[o..o + 2].copy_from_slice(&self.id.to_be_bytes());
+        o += 2;
+        out[o] = self.status.byte();
+        o += 1;
+        out[o] = self.options;
+        o += 1;
         if let Some(target) = self.target {
             o += target.encode_into(&mut out[o..]);
         }
@@ -252,10 +250,8 @@ impl Outgoing<'_> {
     pub fn encode_header_into(&self, out: &mut Vec<u8>) -> usize {
         let meta = self.check_meta();
         let len = 2 + meta + usize::from(self.has_data()) * 2;
-        // The header overwrites the whole length it asks for, so the only growth that matters is capacity; a warm buffer keeps its base and pays neither `clear` nor a reserve check.
-        if out.capacity() < len {
-            out.reserve_exact(len - out.len());
-        }
+        out.clear();
+        out.reserve_exact(len);
         // SAFETY: `write_meta` fills `[0 .. 2 + meta]` in full and the two payload-length bytes are written below, so no grown byte is read uninitialized; the `resize` this replaces zero-filled the metadata region only for `write_meta` to overwrite every byte of it.
         unsafe { out.set_len(len) };
         let at = self.write_meta(out, meta);
