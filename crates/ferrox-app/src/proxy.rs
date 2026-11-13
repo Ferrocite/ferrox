@@ -12367,11 +12367,7 @@ fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16
 
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
     let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
-        freedom
-            && cmd == 1
-            && users
-                .iter()
-                .any(|user| same_vless_user(&user.id, id) && vless_flow_ok(user, flow, cmd, false))
+        vless_user_allows(users, id, flow, cmd, freedom, false)
     };
     let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
         &mut io,
@@ -12394,6 +12390,19 @@ fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], free
         return;
     }
     io = io.with_meter(crate::stats::user(&user.email, user.level));
+    if cmd == 3 {
+        if io.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let read = io.clone();
+        let closer = io.clone();
+        return serve_mux_tunnel(
+            Box::new(read),
+            Box::new(io),
+            Arc::new(move || closer.close()),
+            &[],
+        );
+    }
     let Some(uplink) = dial_or_report(&target) else {
         io.close();
         return;
@@ -13305,9 +13314,6 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
         return;
     };
     // A mux or reverse header names no destination, so the gate above never saw it.
-    if cmd == 3 {
-        return;
-    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
@@ -13319,6 +13325,14 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
         return;
     };
     session = session.with_meter(crate::stats::user(&user.email, user.level));
+    if cmd == 3 {
+        if session.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let read = session.clone();
+        let close = xdrive_close(&session);
+        return serve_mux_tunnel(Box::new(read), Box::new(session), close, &[]);
+    }
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -16723,6 +16737,8 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     match &vless.carrier {
         Carrier::Quic => return open_vless_mux_quic(vless),
         Carrier::Kcp(_) => return vless_mux_kcp(vless),
+        Carrier::Hysteria(_) => return open_vless_mux_hysteria(vless),
+        Carrier::Xdrive { .. } => return open_vless_mux_xdrive(vless),
         Carrier::Raw(_)
         | Carrier::Ws { .. }
         | Carrier::HttpUpgrade { .. }
@@ -17069,6 +17085,35 @@ where
     })
 }
 
+fn open_vless_mux_hysteria(vless: &VlessOut) -> Option<MuxUplink> {
+    let dial = hysteria_dial_session(vless)?;
+    let header = vless_mux_header(&vless.id);
+    let flow = crate::hysteria::open(&dial, &header, 2)?;
+    let read = crate::hysteria::FlowRead::new(flow.clone());
+    let closer = flow.clone();
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(flow),
+        close: Arc::new(move || closer.close()),
+    })
+}
+
+fn open_vless_mux_xdrive(vless: &VlessOut) -> Option<MuxUplink> {
+    let mut session = xdrive_dial_session(&vless.carrier, &vless.address, vless.port)?;
+    if session.write_all(&vless_mux_header(&vless.id)).is_err() {
+        return None;
+    }
+    read_vless_response(&mut session)?;
+    let read = session.clone();
+    let write = session.clone();
+    let close = xdrive_close(&session);
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(write),
+        close,
+    })
+}
+
 fn vless_mux_unserved() -> Option<MuxUplink> {
     static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if SAID.set(()).is_ok() {
@@ -17081,6 +17126,11 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     // The 2022 rung answers its own reply handshake before a frame, and its mux reader is not wired yet: the caller dials directly.
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
         return None;
+    }
+    match &ss.carrier {
+        Carrier::Hysteria(_) => return open_ss_mux_hysteria(ss),
+        Carrier::Xdrive { .. } => return open_ss_mux_xdrive(ss),
+        _ => {}
     }
     let server = resolve_outbound(&ss.address, ss.port)?;
     let target = Destination::Name(
@@ -17119,15 +17169,53 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     })
 }
 
+fn open_ss_mux_hysteria(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let dial = ss_hysteria_dial(ss)?;
+    let target = Destination::Name(
+        crate::shadowsocks::MUX_HOST.to_owned(),
+        crate::shadowsocks::MUX_PORT,
+    );
+    let mut head = Vec::with_capacity(128);
+    let (send, recv) =
+        crate::shadowsocks::client_send_handshake(&mut head, &ss.password, &ss.method, &target)
+            .ok()?;
+    let flow = crate::hysteria::open(&dial, &head, 0)?;
+    let read = flow.clone();
+    let closer = flow.clone();
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks::SsMuxWriter::new(flow, send)),
+        close: Arc::new(move || closer.close()),
+    })
+}
+
+fn open_ss_mux_xdrive(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let mut session = xdrive_dial_session(&ss.carrier, &ss.address, ss.port)?;
+    let target = Destination::Name(
+        crate::shadowsocks::MUX_HOST.to_owned(),
+        crate::shadowsocks::MUX_PORT,
+    );
+    let (send, recv) =
+        crate::shadowsocks::client_send_handshake(&mut session, &ss.password, &ss.method, &target)
+            .ok()?;
+    let read = session.clone();
+    let close = xdrive_close(&session);
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks::SsMuxWriter::new(session, send)),
+        close,
+    })
+}
+
 /// The `VMess` carrier as a mux underlayer: the dial names the mux command, so the existing dial
-/// ladder carries the frames and no second session type exists; a loopback pair hands them over.
+/// ladder carries the frames; a loopback pair hands over every carrier but xdrive, whose store
+/// session is wrapped directly.
 fn open_vmess_mux(vmess: &VmessOut) -> Option<MuxUplink> {
     match &vmess.carrier {
-        Carrier::Kcp(_)
-        | Carrier::Xdrive { .. }
-        | Carrier::Masque
-        | Carrier::Http
-        | Carrier::Unknown { .. } => return vmess_mux_unserved(),
+        Carrier::Xdrive { .. } => return open_vmess_mux_xdrive(vmess),
+        Carrier::Kcp(_) | Carrier::Masque | Carrier::Http | Carrier::Unknown { .. } => {
+            return vmess_mux_unserved();
+        }
         _ => {}
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
@@ -17158,6 +17246,32 @@ fn open_vmess_mux(vmess: &VmessOut) -> Option<MuxUplink> {
     })
 }
 
+fn open_vmess_mux_xdrive(vmess: &VmessOut) -> Option<MuxUplink> {
+    let mut session = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
+    let (request, send, recv, response_key, response_iv, auth) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        &vmess_mux_target(),
+        1,
+    )?;
+    if session.write_all(&request).is_err() {
+        return None;
+    }
+    if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
+        return None;
+    }
+    let read = session.clone();
+    let write = session.clone();
+    let close = xdrive_close(&session);
+    Some(MuxUplink {
+        read: Box::new(crate::vmess::CarriedReader::new(read, recv)),
+        write: Box::new(crate::vmess::CarriedWriter::new(write, send)?),
+        close,
+    })
+}
+
 fn vmess_mux_unserved() -> Option<MuxUplink> {
     static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if SAID.set(()).is_ok() {
@@ -17174,6 +17288,12 @@ fn vmess_mux_target() -> Destination {
 fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
     if matches!(trojan.carrier, Carrier::Kcp(_)) {
         return trojan_mux_kcp(trojan);
+    }
+    if matches!(trojan.carrier, Carrier::Hysteria(_)) {
+        return open_trojan_mux_hysteria(trojan);
+    }
+    if matches!(trojan.carrier, Carrier::Xdrive { .. }) {
+        return open_trojan_mux_xdrive(trojan);
     }
     if !matches!(
         trojan.carrier,
@@ -17416,6 +17536,35 @@ fn trojan_mux_kcp(trojan: &TrojanOut) -> Option<MuxUplink> {
     })
 }
 
+fn open_trojan_mux_hysteria(trojan: &TrojanOut) -> Option<MuxUplink> {
+    let dial = trojan_hysteria_dial(trojan)?;
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    let flow = crate::hysteria::open(&dial, &header, 0)?;
+    let read = flow.clone();
+    let closer = flow.clone();
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(flow),
+        close: Arc::new(move || closer.close()),
+    })
+}
+
+fn open_trojan_mux_xdrive(trojan: &TrojanOut) -> Option<MuxUplink> {
+    let mut session = xdrive_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    if session.write_all(&header).is_err() {
+        return None;
+    }
+    let read = session.clone();
+    let write = session.clone();
+    let close = xdrive_close(&session);
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(write),
+        close,
+    })
+}
+
 fn trojan_mux_unserved() -> Option<MuxUplink> {
     static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if SAID.set(()).is_ok() {
@@ -17486,10 +17635,11 @@ fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
     Some(MuxUplink { read, write, close })
 }
 
-fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) {
-    if let Some(pool) = vless.tcp_pool() {
-        dial_pooled_mux(client, &pool, target);
-    }
+fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) -> bool {
+    let Some(pool) = vless.tcp_pool() else {
+        return false;
+    };
+    dial_pooled_mux(client, &pool, target)
 }
 
 fn dial_vmess_mux(client: &Connection, vmess: &VmessOut, target: &Destination) -> bool {
@@ -17738,6 +17888,10 @@ fn dial_vmess(
     }
     if matches!(vmess.carrier, Carrier::Quic) {
         dial_vmess_quic(client, vmess, target);
+        return;
+    }
+    if matches!(vmess.carrier, Carrier::Xdrive { .. }) {
+        dial_vmess_xdrive(client, vmess, target);
         return;
     }
     if matches!(vmess.carrier, Carrier::Hysteria(_)) {
@@ -23519,9 +23673,10 @@ fn serve_connect_at(
     };
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
-            if vless.mux.tcp.is_some() {
-                dial_vless_mux(&client, vless, asked);
-            } else if vless.encryption.is_some() {
+            if vless.mux.tcp.is_some() && dial_vless_mux(&client, vless, asked) {
+                return;
+            }
+            if vless.encryption.is_some() {
                 dial_vless_quic_sealed(&client, vless, asked);
             } else {
                 crate::quic::dial_pooled(&client, &vless_quic_dial(vless), asked);
@@ -23534,14 +23689,17 @@ fn serve_connect_at(
             }
             return;
         }
-        if matches!(vless.carrier, Carrier::Hysteria(_)) && vless.mux.tcp.is_none() {
+        if matches!(vless.carrier, Carrier::Hysteria(_)) {
+            if vless.mux.tcp.is_some() && dial_vless_mux(&client, vless, asked) {
+                return;
+            }
             if let Some(dial) = hysteria_dial_session(vless) {
                 crate::hysteria::dial_vless(&client, &dial, &vless.id, asked);
             }
             return;
         }
         if let Carrier::Xdrive { .. } = &vless.carrier {
-            if vless.mux.tcp.is_none() {
+            if vless.mux.tcp.is_none() || !dial_vless_mux(&client, vless, asked) {
                 dial_vless_xdrive(&client, vless, asked);
             }
             return;
@@ -23555,7 +23713,9 @@ fn serve_connect_at(
             return;
         }
         if let Carrier::Xdrive { .. } = &vmess.carrier {
-            dial_vmess_xdrive(&client, vmess, asked);
+            if vmess.mux.tcp.is_none() || !dial_vmess_mux(&client, vmess, asked) {
+                dial_vmess_xdrive(&client, vmess, asked);
+            }
             return;
         }
     }
@@ -23566,6 +23726,9 @@ fn serve_connect_at(
             return;
         }
         if matches!(trojan.carrier, Carrier::Hysteria(_)) {
+            if trojan.mux.tcp.is_some() && dial_trojan_mux(&client, trojan, asked) {
+                return;
+            }
             let header = trojan_header(&trojan.key, 1, asked);
             if let Some(dial) = trojan_hysteria_dial(trojan) {
                 crate::hysteria::dial_header(&client, &dial, &header, 0);
@@ -23579,7 +23742,9 @@ fn serve_connect_at(
             return;
         }
         if let Carrier::Xdrive { .. } = &trojan.carrier {
-            dial_trojan_xdrive(&client, trojan, asked);
+            if trojan.mux.tcp.is_none() || !dial_trojan_mux(&client, trojan, asked) {
+                dial_trojan_xdrive(&client, trojan, asked);
+            }
             return;
         }
     }
@@ -23591,13 +23756,17 @@ fn serve_connect_at(
             return;
         }
         if matches!(ss.carrier, Carrier::Hysteria(_)) {
-            if let Some(dial) = ss_hysteria_dial(ss) {
-                dial_ss_hysteria(&client, &dial, ss, asked);
+            if ss.mux.tcp.is_none() || !dial_ss_mux(&client, ss, asked) {
+                if let Some(dial) = ss_hysteria_dial(ss) {
+                    dial_ss_hysteria(&client, &dial, ss, asked);
+                }
             }
             return;
         }
         if let Carrier::Xdrive { .. } = &ss.carrier {
-            dial_ss_xdrive(&client, ss, asked);
+            if ss.mux.tcp.is_none() || !dial_ss_mux(&client, ss, asked) {
+                dial_ss_xdrive(&client, ss, asked);
+            }
             return;
         }
     }
@@ -23614,9 +23783,7 @@ fn dial_socks_outbound(
     let ladder = Ladder::global();
     match out {
         Outbound::Vless(vless) => {
-            if vless.mux.tcp.is_some() {
-                dial_vless_mux(client, vless, target);
-            } else {
+            if vless.mux.tcp.is_none() || !dial_vless_mux(client, vless, target) {
                 dial_vless(client, server, vless, Some(target), ladder);
             }
         }
@@ -25293,6 +25460,7 @@ pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Optio
     serve_udp_lane_with(relay, out, associate, source, sockopts.as_ref());
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_udp_lane_with(
     relay: &UdpSocket,
     out: &Outbound,
@@ -25323,22 +25491,51 @@ fn serve_udp_lane_with(
             serve_socks_udp_vless(relay, vless);
         }
         Outbound::Vless(vless)
-            if matches!(vless.carrier, Carrier::Hysteria(_)) && vless.mux.tcp.is_none() =>
+            if matches!(vless.carrier, Carrier::Hysteria(_))
+                && vless.mux.udp_manager().is_some() =>
         {
+            serve_socks_udp_vless(relay, vless);
+        }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) => {
             // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
             if let Some(dial) = hysteria_dial_session(vless) {
                 crate::hysteria::serve_udp(relay, &dial);
             }
+        }
+        Outbound::Vless(vless)
+            if matches!(vless.carrier, Carrier::Xdrive { .. })
+                && vless.mux.udp_manager().is_some() =>
+        {
+            serve_socks_udp_vless(relay, vless);
+        }
+        Outbound::Trojan(trojan)
+            if matches!(trojan.carrier, Carrier::Hysteria(_))
+                && trojan.mux.udp_manager().is_some() =>
+        {
+            serve_socks_udp_trojan(relay, trojan);
         }
         Outbound::Trojan(trojan) if matches!(trojan.carrier, Carrier::Hysteria(_)) => {
             if let Some(dial) = trojan_hysteria_dial(trojan) {
                 crate::hysteria::serve_udp(relay, &dial);
             }
         }
+        Outbound::Trojan(trojan)
+            if matches!(trojan.carrier, Carrier::Xdrive { .. })
+                && trojan.mux.udp_manager().is_some() =>
+        {
+            serve_socks_udp_trojan(relay, trojan);
+        }
         Outbound::Trojan(trojan) if trojan_udp_carried(&trojan.carrier) => {
             serve_socks_udp_trojan(relay, trojan);
         }
         Outbound::Vmess(vmess) => serve_socks_udp_vmess(relay, vmess),
+        Outbound::Shadowsocks(ss)
+            if matches!(ss.carrier, Carrier::Hysteria(_) | Carrier::Xdrive { .. })
+                && ss.mux.udp_manager().is_some()
+                && ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_none() =>
+        {
+            serve_socks_udp_shadowsocks(relay, ss);
+        }
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
             serve_socks_udp_shadowsocks(relay, ss);
         }
@@ -38422,6 +38619,8 @@ fn vless_mux_pairs(carrier: &Carrier) -> bool {
             | Carrier::HttpHeader { .. }
             | Carrier::Quic
             | Carrier::Kcp(_)
+            | Carrier::Hysteria(_)
+            | Carrier::Xdrive { .. }
     )
 }
 
@@ -38526,10 +38725,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             encryption,
         });
     }
-    if !vless_security_supported(security)
-        && !transport_tls
-        && (mux.tcp.is_some() || stored.is_none())
-    {
+    if !vless_security_supported(security) && !transport_tls && stored.is_none() {
         return None;
     }
     let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
@@ -52925,6 +53121,400 @@ mod tests {
         let _ = pump.join();
     }
 
+    fn xdrive_mux_settings(tag: &str) -> (std::path::PathBuf, String) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        (dir, settings)
+    }
+
+    fn xdrive_dispatch_mux_echo(tag: &str, out: &Outbound) {
+        let echo_port = echo_loop();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            out,
+            Destination::from(target),
+            Duration::from_secs(30),
+            Front::Socks,
+            tag,
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping", "{tag} echoes");
+    }
+
+    fn xdrive_dispatch_xudp(tag: &str, out: Outbound) {
+        let echo_port = udp_echo_loop();
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"xudp-ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, target, "{tag}");
+        assert_eq!(payload, b"xudp-ping", "{tag}");
+    }
+
+    #[test]
+    fn an_xdrive_vless_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vless-mux");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vless(mut vless) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        vless.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-vless-mux", &Outbound::Vless(vless));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_vless_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vless-xudp");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vless(mut vless) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        vless.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+        };
+        let echo_port = udp_echo_loop();
+        let out = Outbound::Vless(vless);
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"xudp-ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, target);
+        assert_eq!(payload, b"xudp-ping");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_trojan_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("trojan-mux");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_trojan_inbound("127.0.0.1:9", &inbound, true));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Trojan(mut trojan) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        trojan.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-trojan-mux", &Outbound::Trojan(trojan));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_shadowsocks_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("ss-mux");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks",
+                "settings": {{"password": "ss-mux-pass", "method": "aes-256-gcm"}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_shadowsocks_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            &std::collections::HashSet::new()
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "shadowsocks",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "method": "aes-256-gcm", "password": "ss-mux-pass"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Shadowsocks(mut ss) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a shadowsocks outbound")
+        else {
+            panic!("the outbound dials shadowsocks");
+        };
+        ss.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-ss-mux", &Outbound::Shadowsocks(ss));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vmess_xdrive_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vmess-direct");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:9", &inbound, true, None);
+        assert!(served);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(mut vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        vmess.mux = Mux::default();
+        xdrive_dispatch_mux_echo("xdrive-vmess-direct", &Outbound::Vmess(vmess));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_vmess_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vmess-mux");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:9", &inbound, true, None);
+        assert!(served);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(mut vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        vmess.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-vmess-mux", &Outbound::Vmess(vmess));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_trojan_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("trojan-xudp");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_trojan_inbound("127.0.0.1:9", &inbound, true));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Trojan(mut trojan) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        trojan.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+        };
+        xdrive_dispatch_xudp("xdrive-trojan-xudp", Outbound::Trojan(trojan));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_shadowsocks_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("ss-xudp");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks",
+                "settings": {{"password": "ss-mux-pass", "method": "aes-256-gcm"}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_shadowsocks_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            &std::collections::HashSet::new()
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "shadowsocks",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "method": "aes-256-gcm", "password": "ss-mux-pass"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Shadowsocks(mut ss) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a shadowsocks outbound")
+        else {
+            panic!("the outbound dials shadowsocks");
+        };
+        ss.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+        };
+        xdrive_dispatch_xudp("xdrive-ss-xudp", Outbound::Shadowsocks(ss));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_vmess_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vmess-xudp");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:9", &inbound, true, None);
+        assert!(served);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(mut vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        vmess.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+        };
+        xdrive_dispatch_xudp("xdrive-vmess-xudp", Outbound::Vmess(vmess));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The store is the transport, so an xdrive row that declares tls parses and dials: both roles read the folder the config names.
     #[test]
     fn a_trojan_xdrive_dial_under_tls_reaches_the_store() {
@@ -65933,6 +66523,394 @@ mod tests {
     fn hysteria_carries_vless_echo_over_loopback() {
         let _serial = quic_serial();
         hysteria_echo_once();
+    }
+
+    #[test]
+    fn hysteria_carries_a_vless_mux_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let auth = "mux-auth";
+        let (port, roots) = hysteria_loop_with(auth, id, "");
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux {
+                enabled: true,
+                tcp: Some(1),
+                xudp: Xudp::Off,
+                udp443: Udp443::Reject,
+            },
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &out,
+            Destination::from(target),
+            QUIC_TEST_TIMEOUT,
+            Front::Socks,
+            "hysteria-mux",
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+    }
+
+    #[test]
+    fn a_failed_hysteria_mux_dial_falls_back_to_the_direct_flow() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let auth = "mux-fallback-auth";
+        let (port, roots) = hysteria_loop_with(auth, id, "");
+        let pool = Pools::default();
+        let _ = pool.tcp(1, || -> Option<crate::muxpool::Uplink> { None });
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux {
+                enabled: true,
+                tcp: Some(1),
+                xudp: Xudp::Off,
+                udp443: Udp443::Reject,
+            },
+            pool,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &out,
+            Destination::from(target),
+            QUIC_TEST_TIMEOUT,
+            Front::Socks,
+            "hysteria-mux-fallback",
+        )
+        .expect("direct fallback");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+    }
+
+    #[test]
+    fn hysteria_carries_a_trojan_mux_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let key = trojan_key("mux-secret");
+        let (port, roots) = hysteria_trojan_loop("trojan-mux-auth", key, "");
+        let out = Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "trojan-mux-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            tls: None,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+            mux: Mux::on(),
+            pool: Pools::default(),
+            reality: None,
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &out,
+            Destination::from(target),
+            QUIC_TEST_TIMEOUT,
+            Front::Socks,
+            "hysteria-trojan-mux",
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+    }
+
+    #[test]
+    fn hysteria_carries_a_shadowsocks_mux_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let accounts = crate::shadowsocks::SsAccounts {
+            users: crate::shadowsocks::account("ss-mux-pass", "aes-256-gcm"),
+            password: "ss-mux-pass".to_owned(),
+            method: "aes-256-gcm".to_owned(),
+            is_2022: false,
+            identities: Vec::new(),
+        };
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_ss_hysteria(flow, &accounts, true);
+        });
+        let (port, roots) = hysteria_loop_serve(
+            "ss-mux-auth",
+            "",
+            ferrox_core::hysteria::Masquerade::NotFound,
+            serve,
+        );
+        let out = Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: "aes-256-gcm".to_owned(),
+            password: "ss-mux-pass".to_owned(),
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "ss-mux-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux::on(),
+            pool: Pools::default(),
+            tls: None,
+            reality: None,
+            hysteria_roots: Some(roots.into()),
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &out,
+            Destination::from(target),
+            QUIC_TEST_TIMEOUT,
+            Front::Socks,
+            "hysteria-ss-mux",
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+    }
+
+    #[test]
+    fn hysteria_carries_a_vmess_mux_echo_over_loopback() {
+        let _serial = quic_serial();
+        hysteria_vmess_mux_once();
+    }
+
+    #[test]
+    fn hysteria_carries_a_trojan_xudp_association_over_loopback() {
+        let _serial = quic_serial();
+        let key = trojan_key("xudp-secret");
+        let (port, roots) = hysteria_trojan_loop("trojan-xudp-auth", key, "");
+        let out = Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "trojan-xudp-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            tls: None,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Own(8),
+                udp443: Udp443::Reject,
+            },
+            pool: Pools::default(),
+            reality: None,
+        });
+        xudp_association_once(out, "hysteria-trojan-xudp");
+    }
+
+    #[test]
+    fn hysteria_carries_a_shadowsocks_xudp_association_over_loopback() {
+        let _serial = quic_serial();
+        let accounts = crate::shadowsocks::SsAccounts {
+            users: crate::shadowsocks::account("ss-xudp-pass", "aes-256-gcm"),
+            password: "ss-xudp-pass".to_owned(),
+            method: "aes-256-gcm".to_owned(),
+            is_2022: false,
+            identities: Vec::new(),
+        };
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_ss_hysteria(flow, &accounts, true);
+        });
+        let (port, roots) = hysteria_loop_serve(
+            "ss-xudp-auth",
+            "",
+            ferrox_core::hysteria::Masquerade::NotFound,
+            serve,
+        );
+        let out = Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: "aes-256-gcm".to_owned(),
+            password: "ss-xudp-pass".to_owned(),
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "ss-xudp-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Own(8),
+                udp443: Udp443::Reject,
+            },
+            pool: Pools::default(),
+            tls: None,
+            reality: None,
+            hysteria_roots: Some(roots.into()),
+        });
+        xudp_association_once(out, "hysteria-ss-xudp");
+    }
+
+    #[test]
+    fn hysteria_carries_a_vmess_xudp_association_over_loopback() {
+        let _serial = quic_serial();
+        let id = [0x61u8; 16];
+        let (port, roots) = hysteria_vmess_loop("vmess-xudp-auth", id, "");
+        let mut out = hysteria_vmess_out(port, id, "vmess-xudp-auth", roots);
+        out.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+        };
+        xudp_association_once(Outbound::Vmess(out), "hysteria-vmess-xudp");
+    }
+
+    fn hysteria_vmess_mux_once() {
+        let echo_port = echo_loop();
+        let id = [0x61u8; 16];
+        let (port, roots) = hysteria_vmess_loop("vmess-mux-auth", id, "");
+        let mut out = hysteria_vmess_out(port, id, "vmess-mux-auth", roots);
+        out.mux = Mux::on();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &Outbound::Vmess(out),
+            Destination::from(target),
+            QUIC_TEST_TIMEOUT,
+            Front::Socks,
+            "hysteria-vmess-mux",
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+    }
+
+    fn xudp_association_once(out: Outbound, tag: &str) {
+        let echo_port = udp_echo_loop();
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        let out = out;
+        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"xudp-ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, target, "{tag}");
+        assert_eq!(payload, b"xudp-ping", "{tag}");
+    }
+
+    #[test]
+    fn hysteria_carries_a_vless_xudp_association_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = udp_echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let auth = "xudp-auth";
+        let (port, roots) = hysteria_loop_with(auth, id, "");
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Own(8),
+                udp443: Udp443::Reject,
+            },
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"xudp-ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, target);
+        assert_eq!(payload, b"xudp-ping");
     }
 
     fn hysteria_echo_once() {
