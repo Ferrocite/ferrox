@@ -34798,7 +34798,8 @@ fn no_termination(client: &Json) -> bool {
     account_experiments(client).is_some_and(|text| text.contains("NoTerminationSignal"))
 }
 
-/// The reference parses `security: "none"` as `auto`; only the authenticated length keeps that spelling out of the plain flow.
+/// The reference parses `security: "none"` as `auto` (`infra/conf/vmess.go`, `VMessAccount.Build`), so the
+/// outbound sends the negotiated cipher's code rather than the plain code 5 its inbound refuses.
 fn vmess_cipher(account: &Json) -> crate::vmess::Cipher {
     let cipher = crate::vmess::Cipher::parse(
         account
@@ -34806,7 +34807,7 @@ fn vmess_cipher(account: &Json) -> crate::vmess::Cipher {
             .and_then(Json::as_str)
             .unwrap_or("auto"),
     );
-    if cipher == crate::vmess::Cipher::None && authenticated_length(account) {
+    if cipher == crate::vmess::Cipher::None {
         crate::vmess::Cipher::Auto
     } else {
         cipher
@@ -49158,7 +49159,21 @@ mod tests {
         assert_eq!(
             out.cipher,
             crate::vmess::Cipher::Auto,
-            "security none is the reference's auto when the length is authenticated"
+            "security none is the reference's auto"
+        );
+        let plain_none = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "security": "none"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&plain_none).expect("finds plain none");
+        assert_eq!(
+            out.cipher,
+            crate::vmess::Cipher::Auto,
+            "security none without an experiment is still the reference's auto"
         );
         let _ = std::fs::remove_file(&ca);
     }
