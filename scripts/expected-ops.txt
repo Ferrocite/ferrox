@@ -282,6 +282,8 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
-# through `spare_capacity_mut` and `MaybeUninit::write` so no reference is formed
-# over uninitialized memory. The oracle test replays the pinned Go writer's bytes.
-ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+# through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
+# reference is formed over uninitialized memory and no byte loop runs. The copy
+# moved from the method's own frame into `memcpy`; the oracle test replays the
+# pinned Go writer's bytes.
+ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
