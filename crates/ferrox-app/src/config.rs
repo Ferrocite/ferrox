@@ -2165,13 +2165,19 @@ fn xmc_username(value: &str) -> bool {
 
 fn xmc_uuid(value: &str) -> Option<[u8; 16]> {
     let bytes = value.as_bytes();
-    let shaped = bytes.len() == 32
-        || (bytes.len() == 36
-            && [8, 13, 18, 23]
-                .into_iter()
-                .all(|index| bytes[index] == b'-'));
-    if shaped {
-        uuid_bytes(value)
+    let text = if bytes.len() == 45 && bytes[..9].eq_ignore_ascii_case(b"urn:uuid:") {
+        &bytes[9..]
+    } else if bytes.len() == 38 && bytes[0] == b'{' && bytes[37] == b'}' {
+        &bytes[1..37]
+    } else {
+        bytes
+    };
+    let canonical = text.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| text[index] == b'-');
+    if text.len() == 32 || canonical {
+        uuid_bytes(std::str::from_utf8(text).ok()?)
     } else {
         None
     }
@@ -3776,9 +3782,22 @@ mod tests {
 
     #[test]
     fn an_xmc_stage_accepts_a_plain_uuid_and_refuses_a_late_or_mixed_entry() {
-        let valid = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567e89b12d3a456426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#;
-        let settings = crate::json::parse(valid).expect("parses");
-        assert!(matches!(stream_carrier(Some(&settings)), Carrier::Raw(_)));
+        for uuid in [
+            "123e4567e89b12d3a456426614174000",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+            "URN:UUID:123E4567-E89B-12D3-A456-426614174000",
+            "{123e4567-e89b-12d3-a456-426614174000}",
+        ] {
+            let valid = format!(
+                r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"xmc","settings":{{"password":"pw","profiles":[{{"username":"Steve","uuid":"{uuid}","texturesValue":"value","texturesSignature":"signature"}}]}}}}]}}}}"#
+            );
+            let settings = crate::json::parse(&valid).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Raw(_)),
+                "{uuid} is a UUID the reference parses"
+            );
+        }
 
         let refused = [
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"lengths":[1]}},{"type":"xmc","settings":{"password":"pw","profiles":[{"username":"Steve","uuid":"123e4567-e89b-12d3-a456-426614174000","texturesValue":"value","texturesSignature":"signature"}]}}]}}"#,
