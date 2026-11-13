@@ -47,21 +47,27 @@ impl<'a> Config<'a> {
     }
 
     /// Appends the config, header included, to `out`.
+    #[cfg(test)]
     pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        self.feed_encoded(|bytes| out.extend_from_slice(bytes));
+    }
+
+    /// Feeds the config, header included, to a sink a field at a time.
+    pub(crate) fn feed_encoded(&self, mut put: impl FnMut(&[u8])) {
         let contents = self.encoded_len() - 4;
-        out.extend_from_slice(&VERSION.to_be_bytes());
-        out.extend_from_slice(&(contents as u16).to_be_bytes());
-        out.push(self.id);
-        out.extend_from_slice(&self.kem_id.to_be_bytes());
-        out.extend_from_slice(&(self.public_key.len() as u16).to_be_bytes());
-        out.extend_from_slice(self.public_key);
-        out.extend_from_slice(&(self.cipher_suites.len() as u16).to_be_bytes());
-        out.extend_from_slice(self.cipher_suites);
-        out.push(self.maximum_name_length);
-        out.push(self.public_name.len() as u8);
-        out.extend_from_slice(self.public_name);
-        out.extend_from_slice(&(self.extensions.len() as u16).to_be_bytes());
-        out.extend_from_slice(self.extensions);
+        put(&VERSION.to_be_bytes());
+        put(&(contents as u16).to_be_bytes());
+        put(&[self.id]);
+        put(&self.kem_id.to_be_bytes());
+        put(&(self.public_key.len() as u16).to_be_bytes());
+        put(self.public_key);
+        put(&(self.cipher_suites.len() as u16).to_be_bytes());
+        put(self.cipher_suites);
+        put(&[self.maximum_name_length]);
+        put(&[self.public_name.len() as u8]);
+        put(self.public_name);
+        put(&(self.extensions.len() as u16).to_be_bytes());
+        put(self.extensions);
     }
 
     /// The four-byte cipher suite entries as `(kdf, aead)` pairs.
@@ -149,7 +155,62 @@ impl<'a> Config<'a> {
     }
 }
 
-pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Vec<Config<'_>>, String> {
+/// The configs a list carries, walked where they lie so a dial allocates no list.
+pub(crate) struct Configs<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    end: usize,
+    seen: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for Configs<'a> {
+    type Item = Result<Config<'a>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if self.at >= self.end {
+                self.done = true;
+                return (self.seen == 0)
+                    .then(|| Err("ech: no supported config in the list".to_owned()));
+            }
+            if self.end - self.at < 4 {
+                self.done = true;
+                return Some(Err("ech: short config header".to_owned()));
+            }
+            let version = u16::from_be_bytes([self.bytes[self.at], self.bytes[self.at + 1]]);
+            let length = usize::from(u16::from_be_bytes([
+                self.bytes[self.at + 2],
+                self.bytes[self.at + 3],
+            ]));
+            let Some(config_end) = self
+                .at
+                .checked_add(4 + length)
+                .filter(|config_end| *config_end <= self.end)
+            else {
+                self.done = true;
+                return Some(Err("ech: config length past the end".to_owned()));
+            };
+            if version != VERSION {
+                self.at = config_end;
+                continue;
+            }
+            let mut at = self.at + 4;
+            self.at = config_end;
+            self.seen += 1;
+            let config = Config::decode_contents(self.bytes, &mut at, config_end);
+            if config.is_err() {
+                self.done = true;
+            }
+            return Some(config);
+        }
+    }
+}
+
+pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Configs<'_>, String> {
     let mut at = 0;
     let length = usize::from(take_u16(bytes, &mut at, bytes.len())?);
     let end = at
@@ -159,31 +220,13 @@ pub(crate) fn parse_config_list(bytes: &[u8]) -> Result<Vec<Config<'_>>, String>
     if end != bytes.len() {
         return Err("ech: trailing bytes after the config list".to_owned());
     }
-    let mut configs = Vec::new();
-    while at < end {
-        if end - at < 4 {
-            return Err("ech: short config header".to_owned());
-        }
-        let version = u16::from_be_bytes([bytes[at], bytes[at + 1]]);
-        let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
-        let config_end = at
-            .checked_add(4 + length)
-            .filter(|config_end| *config_end <= end)
-            .ok_or("ech: config length past the end")?;
-        if version == VERSION {
-            at += 4;
-            configs.push(Config::decode_contents(bytes, &mut at, config_end)?);
-        } else {
-            at = config_end;
-        }
-    }
-    if at != end {
-        return Err("ech: trailing bytes in config list".to_owned());
-    }
-    if configs.is_empty() {
-        return Err("ech: no supported config in the list".to_owned());
-    }
-    Ok(configs)
+    Ok(Configs {
+        bytes,
+        at,
+        end,
+        seen: 0,
+        done: false,
+    })
 }
 
 #[cfg(test)]
@@ -198,7 +241,9 @@ pub(crate) fn encode_config_list(configs: &[Config]) -> Vec<u8> {
 }
 
 pub(crate) fn normalize_config_list(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    if parse_config_list(&bytes).is_ok() {
+    if parse_config_list(&bytes)
+        .is_ok_and(|configs| configs.into_iter().all(|config| config.is_ok()))
+    {
         return Ok(bytes);
     }
     if Config::single(&bytes).is_ok() {
@@ -350,11 +395,18 @@ fn take_len16<'a>(bytes: &'a [u8], at: &mut usize, end: usize) -> Result<&'a [u8
 mod tests {
     use super::*;
 
+    fn parsed(bytes: &[u8]) -> Vec<Config<'_>> {
+        parse_config_list(bytes)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
     fn a_generated_pair_round_trips() {
         let (list, keys) = generate("cloudflare-ech.com", 7).unwrap();
-        let configs = parse_config_list(&list).unwrap();
+        let configs = parsed(&list);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].id, 7);
         assert_eq!(configs[0].kem_id, KEM_X25519);
@@ -374,7 +426,7 @@ mod tests {
     #[test]
     fn an_encoded_config_is_one_buffer() {
         let (list, _) = generate("example.com", 0).unwrap();
-        let config = parse_config_list(&list).unwrap().remove(0);
+        let config = parsed(&list).remove(0);
         let (bytes, counts) = crate::alloc_count::measure(|| config.encode());
         assert_eq!(counts.allocs, 1, "one reservation holds the whole config");
         assert_eq!(bytes, config.encode(), "the bytes are unchanged");
@@ -384,7 +436,7 @@ mod tests {
     #[test]
     fn a_bare_config_is_wrapped() {
         let (list, _) = generate("example.com", 0).unwrap();
-        let config = parse_config_list(&list).unwrap()[0].encode();
+        let config = parsed(&list)[0].encode();
         assert_eq!(normalize_config_list(config.clone()).unwrap(), list);
         assert_eq!(normalize_config_list(list.clone()).unwrap(), list);
     }
@@ -417,9 +469,26 @@ mod tests {
         body.extend_from_slice(&list[2..]);
         let mut bytes = (body.len() as u16).to_be_bytes().to_vec();
         bytes.extend_from_slice(&body);
-        let configs = parse_config_list(&bytes).unwrap();
+        let configs = parsed(&bytes);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].public_name, b"example.com");
+    }
+
+    #[test]
+    fn a_long_run_of_unsupported_versions_is_walked_without_recursion() {
+        let count = 16_000u16;
+        let mut body = Vec::with_capacity(usize::from(count) * 4);
+        for _ in 0..count {
+            body.extend_from_slice(&[0xfe, 0x0e, 0x00, 0x00]);
+        }
+        let mut bytes = (body.len() as u16).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        let mut configs = parse_config_list(&bytes).unwrap();
+        match configs.next() {
+            Some(Err(err)) => assert_eq!(err, "ech: no supported config in the list"),
+            _ => panic!("a list of unknown versions has no supported config"),
+        }
+        assert!(configs.next().is_none());
     }
 
     #[test]
