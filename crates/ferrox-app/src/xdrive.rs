@@ -3041,7 +3041,7 @@ struct Found {
     description: Option<Vec<u8>>,
 }
 
-/// S3 as an object store: every name is a key under the configured folder, signed with SigV4 and listed a page at a time.
+/// S3 as an object store: every name is a key under the configured folder, signed with `SigV4` and listed a page at a time.
 pub(crate) struct S3 {
     http: Arc<Http>,
     scheme: &'static str,
@@ -3279,10 +3279,8 @@ impl S3 {
                     ));
                 }
             }
-            if page.truncated {
-                if page.next.is_empty() || !seen.insert(page.next.clone()) {
-                    return Err(carrier_error("S3 list pagination did not advance"));
-                }
+            if page.truncated && (page.next.is_empty() || !seen.insert(page.next.clone())) {
+                return Err(carrier_error("S3 list pagination did not advance"));
             }
             visit(&page)?;
             if !page.truncated {
@@ -5834,7 +5832,7 @@ mod tests {
         let request = fake.text(0);
         assert!(
             request.starts_with(
-                "GET /bucket/root/streams/a/?delimiter=%2F&list-type=2&max-keys=1000&prefix=root%2Fstreams%2Fa%2F HTTP/1.1"
+                "GET /bucket/?delimiter=%2F&list-type=2&max-keys=1000&prefix=root%2Fstreams%2Fa%2F HTTP/1.1"
             ),
             "{request}"
         );
@@ -5936,8 +5934,7 @@ mod tests {
         store.put("abc", b"x").expect("puts through the href");
         assert_eq!(fake.asks(), 2);
         assert!(
-            fake.text(0)
-                .starts_with(&format!("PUT /start/abc HTTP/1.1")),
+            fake.text(0).starts_with("PUT /start/abc HTTP/1.1"),
             "{}",
             fake.text(0)
         );
