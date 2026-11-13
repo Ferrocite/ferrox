@@ -729,6 +729,11 @@ impl crate::proxy::WindowRead for H2StreamReader {
     }
 }
 
+impl crate::proxy::RelayPoll for H2StreamReader {
+    /// The body wait hands the lane back at the poll grain of its own accord, so the carrier arms nothing second.
+    fn arm_relay_poll(&mut self) {}
+}
+
 pub(crate) struct H2StreamWriter {
     conn: Arc<H2Conn>,
     stream: u32,

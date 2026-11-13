@@ -26,7 +26,6 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
-socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
 shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks write-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
@@ -245,6 +244,7 @@ carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests:
 carrier-httpheader pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_an_httpheader_vmess_request
 
 carrier-grpc ops-retired-instructions 73251 scripts/count-ops.sh
+carrier-grpc wide-hunk-probe-ops 332283 scripts/count-ops.sh
 carrier-grpc varint-write-probe-ops 102414 scripts/count-ops.sh
 carrier-grpc hunk-payload-bytes 16375 ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
@@ -283,7 +283,7 @@ carrier-grpc decoder-buffer-writes-per-borrowed-field 0 ferrox-app-h2::tests::a_
 carrier-grpc header-field-allocations-per-inserted-field 2 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
 carrier-grpc header-block-allocations-per-frame 1 ferrox-app-h2::tests::a_header_block_is_opened_once
 
-carrier-xhttp ops-retired-instructions 68114 scripts/count-ops.sh
+carrier-xhttp ops-retired-instructions 33046 scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
 carrier-xhttp framing-read-syscalls-per-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp read-syscalls-per-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
@@ -657,11 +657,22 @@ security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::
 security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
 security-ech heap-buffers-for-a-shaped-sealer 0 ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations
 security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
-security-ech heap-buffers-for-a-real-ech-offer 17 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
+security-ech heap-buffers-for-a-real-ech-offer 15 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
+security-ech seal-plaintext-buffer-moves 0 ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay
+
+# --- TLS options (row 48) ---------------------------------------------------
+security-tls-options ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-tls-options syscalls-per-tls-handshake UNBLESSED scripts/count-ops.sh
+security-tls-options user-space-copies-per-tls-handshake UNBLESSED no copy checker yet
+security-tls-options seconds-per-tls-handshake UNBLESSED CI bench.yml (no cell yet)
+security-tls-options client-version-ceilings-narrowing-the-shaped-hello 1 ferrox-core-tls::shaped::hello::tests::a_client_version_ceiling_narrows_the_shaped_hello
+security-tls-options client-version-ceilings-refused-by-the-stock-lane 1 ferrox-core-tls::rustls_backend::tests::a_client_version_ceiling_refuses_a_newer_listener
+security-tls-options server-curve-lists-ordered-by-the-stock-lane 1 ferrox-core-tls::rustls_backend::tests::a_configured_server_curve_orders_the_listener_provider
+security-tls-options server-curve-lists-picked-by-the-shaped-lane 1 ferrox-core-tls::shaped::server::tests::a_configured_server_curve_is_the_one_the_listener_picks
 
 # --- ECH -------------------------------------------------------------------
-security-ech aes256-gcm-seal-retired-instructions 15414 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 15332 scripts/count-ops.sh
+security-ech aes256-gcm-seal-retired-instructions 14957 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15330 scripts/count-ops.sh
 security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
 security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
 security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)
@@ -736,12 +747,11 @@ front-tun icmp-non-echo-messages-refused 3 ferrox-app-tun::tests::a_non_echo_icm
 front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
-finalmask ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask ops-retired-instructions 323610 scripts/count-ops.sh
 finalmask pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies
 finalmask filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
+finalmask merged-pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_merged_run_gathers_the_callers_body_without_restaging_it
 finalmask getrandoms-for-two-random-widths 1 ferrox-core-finalmask::tests::a_random_merged_hello_draws_only_the_random_widths_from_the_supply
-finalmask merged-buffer-regrowths-per-hello 0 ferrox-core-finalmask::tests::the_merged_run_is_the_only_buffer_the_mask_owns
-finalmask first-merged-hello-growth 0 ferrox-core-finalmask::tests::a_merged_first_hello_lands_in_room_it_drew_ahead_of
 finalmask records-past-max-split 0 ferrox-core-finalmask::tests::a_max_split_ends_the_run_on_the_whole_hello
 finalmask socket-writes-for-a-merged-hello 1 ferrox-core-finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths
 finalmask hello-records-from-the-config 9 ferrox-app-proxy::tests::a_configured_fragment_chain_cuts_the_hello_on_the_wire
@@ -777,8 +787,9 @@ engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests:
 engine-router gunzip-write-chunk-bytes 65536 ferrox-app-geodata::tests::a_gzipped_asset_is_written_while_it_is_decompressed
 
 # --- SOCKS5, both roles ------------------------------------------------------
-socks ops-retired-instructions UNBLESSED scripts/count-ops.sh
-socks seconds-per-socks-dial UNBLESSED CI bench.yml (no socks cell yet)
+socks ops-retired-instructions 758 scripts/count-ops.sh
+socks socks-raw-down-8-client-mib-per-second 2658 CI benchmark-matrix.yml run 43292720499
+socks socks-raw-down-8-server-mib-per-second 2808 CI benchmark-matrix.yml run 43292720499
 socks oracle-lines-matching-the-pinned-go 8 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
 socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
@@ -817,6 +828,7 @@ socks socks5-credentialed-connect-read-calls 4 ferrox-app-socks::tests::a_creden
 socks socks5-credentialed-connect-allocations 0 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
 socks socks5-long-connect-allocations 0 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
 socks socks5-long-connect-read-calls 4 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
+socks socks5-association-bound-name-allocations 0 ferrox-app-socks::tests::an_association_bound_name_is_read_without_a_heap_buffer
 socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
 socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 socks http-fallback-requests-served 1 ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account
@@ -864,7 +876,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions 51893352 scripts/count-ops.sh
+dns-outbound ops-retired-instructions 51893190 scripts/count-ops.sh
 dns-outbound answer-cases-replayed 21 ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes
 dns-outbound parse-refusals-replayed 8 ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses
 dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap
@@ -1005,7 +1017,7 @@ carrier-psiphon move-to-front-allocations 0 ferrox-app-psiphon::tests::a_live_se
 carrier-psiphon capability-name-allocations 0 ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed
 carrier-psiphon preresolved-pick-allocations 0 ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap
 carrier-psiphon ss-direct-write-probe-ops 47483770 scripts/count-ops.sh
-carrier-psiphon ss-flatten-write-probe-ops 47621526 scripts/count-ops.sh
+carrier-psiphon ss-flatten-write-probe-ops 47621538 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
 carrier-psiphon rc4-passes-per-byte 1 ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length

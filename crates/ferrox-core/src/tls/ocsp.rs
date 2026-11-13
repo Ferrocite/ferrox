@@ -773,6 +773,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             certs: vec![crate::tls::CertEntry {
                 cert_chain: vec![leaf, issuer],
                 key_der: key.private_key_to_der_pkcs8().expect("pkcs8"),

@@ -200,14 +200,10 @@ impl Aead {
         }
         let split = sealed.len() - TAG_LEN;
         let (body, tag) = sealed.split_at_mut(split);
-        let mut tag_bytes = [0u8; TAG_LEN];
-        tag_bytes.copy_from_slice(tag);
+        let tag: &[u8; TAG_LEN] = (&*tag).try_into().expect("the tail is one tag");
         match &self.cipher {
             Cipher::Aes(cipher) => {
-                if cipher
-                    .open_in_place(&nonce, aad, body, &tag_bytes)
-                    .is_none()
-                {
+                if cipher.open_in_place(&nonce, aad, body, tag).is_none() {
                     return Err(invalid("VLESS encryption record failed authentication"));
                 }
             }
@@ -216,7 +212,7 @@ impl Aead {
                     &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
                     aad,
                     (&mut body[..]).into(),
-                    &chacha20poly1305::Tag::try_from(&tag_bytes[..]).expect("length"),
+                    &chacha20poly1305::Tag::try_from(&tag[..]).expect("length"),
                 )
                 .map_err(|_| invalid("VLESS encryption record failed authentication"))?,
         }
@@ -1160,6 +1156,14 @@ impl HeaderMask {
             bytes = &mut std::mem::take(&mut bytes)[take..];
         }
     }
+
+    /// Unmask one inbound record header. The record path reads the length from the unmasked bytes,
+    /// so it never leaves a skip for the body to consume.
+    fn unmask_header(&mut self, header: &mut [u8; HEADER_LEN]) {
+        if let Some(ctr) = self.ctr.as_mut() {
+            ctr.apply_keystream(header);
+        }
+    }
 }
 
 enum ReadStage {
@@ -1314,16 +1318,18 @@ impl ReadSide {
                 self.fill_input(inner)
             }
             ReadStage::Records => {
-                let header = if let Some(header) = self.header {
-                    header
+                let (header, len) = if let Some(header) = self.header {
+                    let len = decode_header(&header)
+                        .ok_or_else(|| invalid("invalid VLESS encryption record header"))?;
+                    (header, len)
                 } else {
                     let at = self.take_wire(inner, HEADER_LEN)?;
                     let mut header: [u8; HEADER_LEN] = self.wire[at..at + HEADER_LEN]
                         .try_into()
                         .map_err(|_| invalid("VLESS encryption record header is short"))?;
                     self.wire_pos = at + HEADER_LEN;
-                    self.in_mask.apply(&mut header, false);
-                    if decode_header(&header).is_none() {
+                    self.in_mask.unmask_header(&mut header);
+                    let Some(len) = decode_header(&header) else {
                         if let Some((owner, pfs_key)) = self.zero_rtt.take() {
                             owner.expire_ticket(&pfs_key);
                             return Err(io::Error::new(
@@ -1332,17 +1338,14 @@ impl ReadSide {
                             ));
                         }
                         return Err(invalid("invalid VLESS encryption record header"));
-                    }
+                    };
                     self.zero_rtt = None;
                     self.header = Some(header);
-                    header
+                    (header, len)
                 };
-                let len = decode_header(&header)
-                    .ok_or_else(|| invalid("invalid VLESS encryption record header"))?;
                 let at = self.take_wire(inner, len)?;
                 self.header = None;
                 self.wire_pos = at + len;
-                self.in_mask.apply(&mut self.wire[at..at + len], false);
                 let peer = self
                     .peer_aead
                     .as_mut()
@@ -1705,6 +1708,12 @@ impl<W> EncryptedWriter<W> {
 
     pub fn enter_direct_mode(&mut self) {
         self.side.direct = true;
+    }
+}
+
+impl<W: Write> EncryptedWriter<W> {
+    pub fn write_all_slices(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        self.side.write_all_slices(&mut self.inner, parts)
     }
 }
 

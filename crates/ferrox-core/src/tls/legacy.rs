@@ -77,6 +77,27 @@ pub(crate) fn version(value: u16) -> Result<SslVersion, TlsError> {
     }
 }
 
+/// The protocol bounds a dial's config names, clamped onto the pair this backend carries.
+fn client_versions(cfg: &TlsConfig) -> Result<(SslVersion, SslVersion), TlsError> {
+    let floor = cfg.min_version.unwrap_or(0x0303).max(0x0303);
+    let ceiling = cfg
+        .max_version
+        .unwrap_or_else(|| {
+            if crate::tls::cipher_suites::offers_tls13(&cfg.cipher_suites) {
+                0x0304
+            } else {
+                0x0303
+            }
+        })
+        .min(0x0304);
+    if floor > ceiling {
+        return Err(TlsError::Other(
+            "tls client version bounds name no supported protocol".to_owned(),
+        ));
+    }
+    Ok((version(floor)?, version(ceiling)?))
+}
+
 /// The protocol bounds a listener's config names, clamped onto the pair this backend carries.
 fn server_versions(cfg: &TlsServerConfig) -> Result<(SslVersion, SslVersion), TlsError> {
     let floor = cfg.min_version.unwrap_or(0x0303).max(0x0303);
@@ -91,7 +112,7 @@ fn server_versions(cfg: &TlsServerConfig) -> Result<(SslVersion, SslVersion), Tl
 
 /// The curves a config names, as `BoringSSL`'s own names. A group this backend cannot carry is
 /// skipped, and a list it carries none of leaves the stock order.
-fn curve_list(ids: &[u16]) -> String {
+pub(crate) fn curve_list(ids: &[u16]) -> String {
     let mut list = String::with_capacity(ids.len() * 7);
     for name in ids.iter().filter_map(|&id| match id {
         0x0017 => Some("P-256"),
@@ -269,15 +290,13 @@ fn build_context(cfg: &TlsConfig) -> Result<SslContext, TlsError> {
             .set_alpn_protos(&alpn_wire(&cfg.alpn)?)
             .map_err(|e| error_stack(&e))?;
     }
+    let (floor, ceiling) = client_versions(cfg)?;
     builder
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .set_min_proto_version(Some(floor))
         .map_err(|e| error_stack(&e))?;
-    // No TLS 1.3 id means the reference's max is below 1.3; the cap drops BoringSSL's fixed trio.
-    if !crate::tls::cipher_suites::offers_tls13(&cfg.cipher_suites) {
-        builder
-            .set_max_proto_version(Some(SslVersion::TLS1_2))
-            .map_err(|e| error_stack(&e))?;
-    }
+    builder
+        .set_max_proto_version(Some(ceiling))
+        .map_err(|e| error_stack(&e))?;
     let curves = curve_list(&cfg.curves);
     if !curves.is_empty() {
         builder

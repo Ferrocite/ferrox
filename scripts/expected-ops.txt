@@ -167,9 +167,19 @@ append_pem 562
 # The 51893400 is not reproduced on main 675c21a3d: the same tree measures
 # 51893352 twice, and 48 is not a multiple of the 4096-turn walk, so the five
 # decisions are unchanged and the move is in the frame's setup.
+# Re-blessed 51893190 by p2-ech: the in-place HPKE seal and its witness test in
+# ferrox-core shift this probe's thin-LTO frame back; dns.rs is untouched and
+# the five decisions still walk 4096 times.
+# Re-blessed 51893352 by the grpc re-base: the tls version bounds (#1555) shift
+# this probe's thin-LTO frame back to the pre-ech 51893352; dns.rs is untouched
+# and the five decisions still walk 4096 times. ops.yml run 43329638157.
+# Re-blessed 51893238 on p2-socks: the SOCKS address and datagram writes move this
+# probe back under the grpc re-base; dns.rs is untouched and the five decisions
+# still walk 4096 times. ops.yml run 43344587778.
 # Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893352 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 51893400 on main 96d147c9: the carried vless-encryption layout moved it; dns.rs is untouched. ops.yml run 43373102520.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893400 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -200,11 +210,18 @@ proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_read
 
 # Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
 # envelope lengths now take a straight path instead of the loop; the same row
-# read 86563 on the same base, so the loops took 13312 (15.4%) out. The
-# two-byte envelope path the 16375-byte payload uses is the same straight form,
-# but this probe's messages do not walk it. The messages, offsets, prefixes and
-# bytes are unchanged.
+# read 86563 on the same base, so the loops took 13312 (15.4%) out. This probe's
+# messages do not walk the two-byte envelope path; the wide probe below does.
+# The messages, offsets, prefixes and bytes are unchanged.
 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+# The wide probe reads the 16375-byte envelope and Hunk a relay read carries,
+# where both lengths take two bytes. Blessed 332283 by grpc-read-straight
+# (ops.yml run 43313013240): 4096 two-byte Hunk lengths of 16375 take the
+# straight read, against 430587
+# for the field walk in run 43298148854, so 98304 (22.8%) came out. The fast
+# read is compiled only into the wide monomorph, so the one-byte row above
+# keeps its 73251 walk.
+grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332283 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
 # Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
 # 16375 now take the direct write, against 118798 for the byte loop on the same
 # run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
@@ -244,8 +261,31 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shad
 # Re-blessed 47621526 by p2-socks: the SOCKS front's borrowed account and the
 # client datagram's two-part send change the same ferrox-app bin's layout;
 # psiphon_shadowsocks.rs is untouched.
+# Re-blessed 47621538 by p2-ech: the in-place HPKE seal and its witness test
+# change the same ferrox-app bin's layout; psiphon_shadowsocks.rs is untouched.
+# Re-blessed 47621526 by the grpc wide read: the straight read changes the same
+# ferrox-app bin's layout; psiphon_shadowsocks.rs is untouched. ops.yml run
+# 43329638157.
+# Re-blessed 47621538 on p2-socks: the SOCKS address and datagram writes move this
+# probe forward under the grpc wide read; psiphon_shadowsocks.rs is untouched.
+# ops.yml run 43344587778.
+# Re-blessed 47621526 on main 96d147c9: the carried vless-encryption layout moved it; psiphon_shadowsocks.rs is untouched. ops.yml run 43373102520.
 ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
-# changed each turn so the call is not hoisted. The CRLF scan and the hex parse
-# share a pass and the line is never copied. Nothing on the wire moves.
-ferrox_app::xhttp::tests::xhttp_line_probe 68114 xhttp::tests::the_chunk_line_costs_one_walk
+# changed each turn so the call is not hoisted. The hex run is parsed in place
+# and only a non-closing terminator pays a second, CRLF-only pass; the line is
+# never copied. Nothing on the wire moves. Re-blessed 33046 by that rewrite.
+ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_costs_one_walk
+# The merged hello: 256 fixed 300-octet hellos cut at widths 11 and 37 through
+# one stage with a single zero delay, over a sink that takes a whole gathered
+# write and keeps nothing. 323610 is 1264.1 per turn; the two widths and the
+# zero delay never draw, so the probe prices the cuts and the 32-record gather.
+# The record bytes are the same as the merge-copy path this replaced.
+ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# The client request built by `request`: one address type byte, the address and
+# the port, written in one match with the vector's room reserved exactly once,
+# through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
+# reference is formed over uninitialized memory and no byte loop runs. The copy
+# stays one pass, a block per field; the oracle test replays the pinned Go
+# writer's bytes.
+ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes

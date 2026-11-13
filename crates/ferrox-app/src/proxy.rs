@@ -6189,8 +6189,13 @@ fn serve_sealed_split_with<R, W, C>(
             }
             let close = close_with_uplink(&closer, &uplink);
             if flow == Flow::Vision {
-                eprintln!("vless: vision over a carried encrypted session is not served yet");
-                close();
+                reader.arm_relay_poll();
+                let link = crate::vision::Link::switchable(
+                    JoinedHalves { reader, writer },
+                    &got,
+                    JoinedHalves::enter_direct_mode,
+                );
+                relay_link(&uplink, link, &close, None);
                 return;
             }
             relay_split(reader, writer, &uplink, &close);
@@ -6403,9 +6408,44 @@ fn relay_sealed<S: Read + Write + Send + 'static>(
     );
 }
 
-fn relay_link<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
+/// One Vision link over both sealed halves: reads take the plaintext the reader opens, writes seal through the writer.
+struct JoinedHalves<R, W> {
+    reader: ferrox_core::vless_encryption::EncryptedReader<R>,
+    writer: ferrox_core::vless_encryption::EncryptedWriter<W>,
+}
+
+impl<R, W> JoinedHalves<R, W> {
+    fn enter_direct_mode(&mut self) {
+        self.reader.enter_direct_mode();
+        self.writer.enter_direct_mode();
+    }
+}
+
+impl<R: Read, W> Read for JoinedHalves<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl<R, W: Write> Write for JoinedHalves<R, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<R: Read, W: Write> ferrox_core::tls::RecordAlignment for JoinedHalves<R, W> {
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.writer.write_all_slices(parts)
+    }
+}
+
+fn relay_link<T: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
     plain: &Connection,
-    link: crate::vision::Link<crate::vision::Sealed<S>>,
+    link: crate::vision::Link<T>,
     close: &Arc<dyn Fn() + Send + Sync>,
     timeout: Option<Connection>,
 ) {
@@ -11330,7 +11370,7 @@ fn dial_sealed_carried<R, W>(
     close: &Arc<dyn Fn() + Send + Sync>,
 ) -> bool
 where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
 {
     dial_sealed_carried_armed(client, vless, header, reader, writer, close, |_, _| {})
@@ -11346,7 +11386,7 @@ fn dial_sealed_carried_armed<R, W, A>(
     armed: A,
 ) -> bool
 where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
     A: Fn(&mut R, bool),
 {
@@ -11372,14 +11412,19 @@ where
         close();
         return false;
     }
-    let Some((reader, writer)) = sealed.into_split() else {
+    let Some((mut reader, writer)) = sealed.into_split() else {
         close();
         return false;
     };
-    if vless.flow == ferrox_core::vless::VISION_FLOW {
-        eprintln!("vless: vision over a carried encrypted session is not served yet");
-        close();
-        return false;
+    if vless.is_vision() {
+        reader.arm_relay_poll();
+        let link = crate::vision::Link::switchable(
+            JoinedHalves { reader, writer },
+            &vless.id,
+            JoinedHalves::enter_direct_mode,
+        );
+        relay_link(client, link, close, None);
+        return true;
     }
     relay_split(reader, writer, client, close);
     true
@@ -19503,7 +19548,7 @@ where
 #[allow(clippy::too_many_lines)]
 /// What a VLESS xHTTP session does once its stream exists, whether the stream was just dialled or
 /// taken from the `xmux` pool.
-fn relay_vless_xhttp_session<R: WindowRead + Send + 'static>(
+fn relay_vless_xhttp_session<R: WindowRead + Send + RelayPoll + 'static>(
     server: &SocketAddr,
     client: &Connection,
     vless: &VlessOut,
@@ -24999,8 +25044,6 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         return;
     };
     let lane_address = lane.address;
-    let mut lanes = HashMap::new();
-    lanes.insert(None, lane);
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
@@ -25049,7 +25092,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         };
         let _ = relay.send_to(frame, lane_address);
     }
-    retire_udp_lanes(relay, lanes);
+    retire_udp_lanes(relay, HashMap::new(), Some(lane));
 }
 
 /// One lane for the whole association: every datagram reaches the same outbound.
@@ -25266,8 +25309,9 @@ fn serve_socks_udp_split(
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
             addr.ip()
         });
-    let mut lanes: HashMap<Option<String>, UdpLane> = HashMap::new();
-    let mut replies: HashMap<SocketAddr, Option<String>> = HashMap::new();
+    let mut lanes: HashMap<String, UdpLane> = HashMap::new();
+    let mut default_lane: Option<UdpLane> = None;
+    let mut replies: HashSet<SocketAddr> = HashSet::new();
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
@@ -25285,7 +25329,7 @@ fn serve_socks_udp_split(
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
                 quiet = Instant::now();
-                if replies.contains_key(&src) {
+                if replies.contains(&src) {
                     if let Some(client) = client_addr {
                         let _ = relay.send_to(&buf[..n], client);
                     }
@@ -25294,7 +25338,7 @@ fn serve_socks_udp_split(
                 let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
                     continue;
                 };
-                let mut route = dest.clone();
+                let mut overridden = None;
                 let mut dial = None;
                 let mut protocol = None;
                 let mut route_only = None;
@@ -25304,22 +25348,25 @@ fn serve_socks_udp_split(
                     if let Some(found) = sniffing.inspect_udp(&dest, payload) {
                         protocol = Some(found.protocol);
                         if found.override_destination {
-                            route = Destination::Name(found.domain.clone(), dest.port());
-                            if sniffing.should_dial_override(&found) {
+                            let dial_override = sniffing.should_dial_override(&found);
+                            overridden = Some(Destination::Name(found.domain, dest.port()));
+                            let route = overridden.as_ref().expect("just set");
+                            if dial_override {
                                 dial = route.socket();
                             } else {
-                                route_only = Some(&route);
+                                route_only = Some(route);
                             }
                         }
                     }
                 }
+                let route = overridden.as_ref().unwrap_or(&dest);
                 client_addr = Some(src);
                 if process_src != Some(src) {
                     process = plan.process_owner_from(crate::router::Network::Udp, src);
                     process_src = Some(src);
                 }
                 let (out, key) = plan.lane_with_protocol(
-                    &route,
+                    route,
                     crate::router::Network::Udp,
                     Some(&client),
                     FlowFacts {
@@ -25334,25 +25381,27 @@ fn serve_socks_udp_split(
                         route: route_only,
                     },
                 );
-                let key = key.map(std::borrow::Cow::into_owned);
                 if matches!(&*out, Outbound::Block(_)) {
                     continue;
                 }
-                let lane_address = match retire_finished_lane(&mut lanes, &mut replies, &key) {
-                    Some(address) => Some(address),
-                    None => match lanes.entry(key) {
-                        std::collections::hash_map::Entry::Occupied(entry) => {
-                            Some(entry.get().address)
-                        }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
-                                replies.insert(lane.address, entry.key().clone());
-                                let address = lane.address;
-                                entry.insert(lane);
-                                address
-                            })
-                        }
-                    },
+                let lane_address = if let Some(tag) = key.as_deref() {
+                    match retire_finished_lane(&mut lanes, &mut replies, tag) {
+                        Some(address) => Some(address),
+                        None => spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
+                            replies.insert(lane.address);
+                            let address = lane.address;
+                            lanes.insert(tag.to_owned(), lane);
+                            address
+                        }),
+                    }
+                } else {
+                    default_udp_lane(
+                        &mut default_lane,
+                        &mut replies,
+                        &out,
+                        local,
+                        client.try_clone().ok(),
+                    )
                 };
                 if let Some(lane_address) = lane_address {
                     let frame = match dial {
@@ -25369,7 +25418,7 @@ fn serve_socks_udp_split(
             }
         }
     }
-    retire_udp_lanes(relay, lanes);
+    retire_udp_lanes(relay, lanes, default_lane);
 }
 
 /// The upstream socket's family follows the relay's: an IPv4 relay gets an unspecified IPv4 bind, an IPv6 relay an unspecified IPv6 bind.
@@ -25384,13 +25433,12 @@ fn udp_bind_for(relay: SocketAddr) -> SocketAddr {
     }
 }
 
-/// A lane's loop ends on its own idle or a refused upstream; the key must not keep writing to the
-/// socket nobody reads, so a later datagram for that tag opens a fresh lane.
-#[allow(clippy::ref_option)] // the map is keyed by the optional tag itself
+/// A lane's loop ends on its own idle or a refused upstream; the tag must not keep writing to the
+/// socket nobody reads, so a later datagram for it opens a fresh lane.
 fn retire_finished_lane(
-    lanes: &mut HashMap<Option<String>, UdpLane>,
-    replies: &mut HashMap<SocketAddr, Option<String>>,
-    key: &Option<String>,
+    lanes: &mut HashMap<String, UdpLane>,
+    replies: &mut HashSet<SocketAddr>,
+    key: &str,
 ) -> Option<SocketAddr> {
     let lane = lanes.get(key)?;
     if !lane.handle.is_finished() {
@@ -25400,6 +25448,28 @@ fn retire_finished_lane(
         replies.remove(&lane.address);
     }
     None
+}
+
+/// The untagged lane is not a map key: an outbound tag may be any string, so the default lives
+/// beside the tag map and only a real tag can own a named lane.
+fn default_udp_lane(
+    lane: &mut Option<UdpLane>,
+    replies: &mut HashSet<SocketAddr>,
+    out: &Outbound,
+    local: std::net::IpAddr,
+    associate: Option<Connection>,
+) -> Option<SocketAddr> {
+    if let Some(running) = lane.as_ref().filter(|lane| !lane.handle.is_finished()) {
+        return Some(running.address);
+    }
+    if let Some(finished) = lane.take() {
+        replies.remove(&finished.address);
+    }
+    let spawned = spawn_udp_lane(out, local, associate)?;
+    replies.insert(spawned.address);
+    let address = spawned.address;
+    *lane = Some(spawned);
+    Some(address)
 }
 
 fn arm_control(associate: Option<&Connection>) {
@@ -25437,16 +25507,20 @@ fn spawn_udp_lane(
 /// An association that owns its lanes: when it ends, each lane is woken with a datagram that names
 /// no destination and its read timeout is shortened, while the relay stays bound until every lane
 /// has joined so a late answer cannot reach a later association on the reused port.
-fn retire_udp_lanes(relay: UdpSocket, lanes: HashMap<Option<String>, UdpLane>) {
-    if lanes.is_empty() {
+fn retire_udp_lanes(
+    relay: UdpSocket,
+    lanes: HashMap<String, UdpLane>,
+    default_lane: Option<UdpLane>,
+) {
+    if lanes.is_empty() && default_lane.is_none() {
         return;
     }
     thread::spawn(move || {
-        for lane in lanes.values() {
+        for lane in lanes.values().chain(default_lane.iter()) {
             let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
             let _ = relay.send_to(&[0u8], lane.address);
         }
-        for lane in lanes.into_values() {
+        for lane in lanes.into_values().chain(default_lane) {
             let _ = lane.handle.join();
         }
     });
@@ -34242,12 +34316,13 @@ fn socks_request<'a>(
     )
     .ok()?;
     // The one method this front wants: the credential exchange when the front has accounts, no authentication when it has none — a front that asks for the credential exchange refuses a client that does not offer it, the way the pinned Go server does (`authNoMatchingMethod`), and the no-authentication front answers whatever the client offered, as it always has.
-    let wanted = if accounts.wants_credential() {
+    let wants = accounts.wants_credential();
+    let wanted = if wants {
         ferrox_core::socks::METHOD_USER
     } else {
         ferrox_core::socks::METHOD_NONE
     };
-    if accounts.wants_credential() && !methods[..usize::from(head[1])].contains(&wanted) {
+    if wants && !methods[..usize::from(head[1])].contains(&wanted) {
         client.write_all(&[5, 0xff]).ok()?;
         return None;
     }
@@ -40388,6 +40463,189 @@ mod tests {
                 path: "/sealed".to_owned(),
             },
             "header.test",
+        );
+    }
+
+    /// Vision rides the sealed session above a carrier: the framing command, the padding and the
+    /// echo all cross the engine's records, which are themselves framed by the carrier.
+    #[cfg(unix)]
+    fn encrypted_vless_carried_vision_echo(carrier: Carrier, host: &str, flow: &str) {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x46u8; 16];
+        let server_carrier = carrier.clone();
+        thread::spawn(move || {
+            let user = VlessUser {
+                id,
+                flow: Flow::Vision,
+                email: String::new(),
+                level: 0,
+                reverse: None,
+            };
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                std::slice::from_ref(&user),
+                &server_carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier,
+            host: host.to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: flow.to_owned(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+                Ladder::global(),
+            );
+        });
+        let payload = vec![0x5Au8; 48 * 1024];
+        peer.write_all(&payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(got, payload);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_grpc_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Grpc(crate::config::GrpcSettings::path("/sealed")),
+            "127.0.0.1",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpupgrade_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::HttpUpgrade {
+                path: "/sealed".to_owned(),
+                host: "upgrade.test".to_owned(),
+            },
+            "upgrade.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_vision_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        encrypted_vless_carried_vision_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_h2_vision_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        settings.h2c = true;
+        encrypted_vless_carried_vision_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpheader_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::HttpHeader {
+                path: "/sealed".to_owned(),
+            },
+            "header.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_vision_udp443_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+            ferrox_core::vless::VISION_UDP443_FLOW,
         );
     }
 
@@ -46652,6 +46910,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
@@ -63390,6 +63649,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
+            curves: Vec::new(),
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
@@ -71096,24 +71356,24 @@ end
     #[test]
     fn a_finished_udp_lane_is_retired_before_its_key_is_reused() {
         let address: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let key = Some("lane".to_owned());
+        let key = "lane";
         let handle = thread::spawn(|| {});
         while !handle.is_finished() {
             thread::yield_now();
         }
         let waker = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let mut lanes = HashMap::from([(
-            key.clone(),
+            key.to_owned(),
             UdpLane {
                 address,
                 handle,
                 waker,
             },
         )]);
-        let mut replies = HashMap::from([(address, key.clone())]);
-        let _ = retire_finished_lane(&mut lanes, &mut replies, &key);
-        assert!(!lanes.contains_key(&key));
-        assert!(!replies.contains_key(&address));
+        let mut replies = HashSet::from([address]);
+        let _ = retire_finished_lane(&mut lanes, &mut replies, key);
+        assert!(!lanes.contains_key(key));
+        assert!(!replies.contains(&address));
     }
 
     /// A balancer picks a lane per flow: the round robin walks the selected tags in config order,

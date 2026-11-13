@@ -685,6 +685,7 @@ pub(crate) fn tls_identity_from_settings(
         min_version: None,
         max_version: None,
         cipher_suites: Vec::new(),
+        curves: Vec::new(),
         send_tickets: true,
         reject_unknown_sni: false,
         server_config_cache: std::sync::Arc::default(),
@@ -696,6 +697,13 @@ pub(crate) fn tls_identity_from_settings(
     identity.min_version = tls_version(tls, "minVersion");
     identity.max_version = tls_version(tls, "maxVersion");
     identity.cipher_suites = tls_cipher_suites(tls);
+    identity.curves = match tls_curves(tls, false) {
+        Ok(curves) => curves.to_vec(),
+        Err(why) => {
+            eprintln!("curvePreferences: {why}; the listener keeps the backend's order");
+            Vec::new()
+        }
+    };
     identity.reject_unknown_sni = tls
         .and_then(|tls| tls.get("rejectUnknownSni"))
         .and_then(Json::as_bool)
@@ -1284,6 +1292,8 @@ pub(crate) fn outbound_tls(
         None => ferrox_core::tls::Fingerprint::default(),
     };
     let curves = tls_curves(tls, fingerprint.is_shaped())?;
+    let min_version = tls_version(tls, "minVersion");
+    let max_version = tls_version(tls, "maxVersion");
     // xray leaves Go's session cache empty unless the config names one, so an unnamed store keeps no ticket.
     let resumption = matches!(
         tls.and_then(|s| s.get("enableSessionResumption")),
@@ -1303,6 +1313,8 @@ pub(crate) fn outbound_tls(
         verify_names: tls_verify_names(tls),
         cipher_suites: tls_cipher_suites(tls).into(),
         curves,
+        min_version,
+        max_version,
         insecure,
         resumption,
         fingerprint: Some(fingerprint),
@@ -1496,10 +1508,21 @@ impl GrpcSettings {
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(0)
         };
+        let tls_authority = settings
+            .filter(|s| s.get("security").and_then(Json::as_str) == Some("tls"))
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|s| s.get("serverName"))
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        let authority = text("authority");
         Self {
             path,
             multi_path,
-            authority: text("authority"),
+            authority: if authority.is_empty() {
+                tls_authority.to_owned()
+            } else {
+                authority
+            },
             user_agent: text("userAgent"),
             multi_mode: node
                 .and_then(|s| s.get("multiMode"))
@@ -4874,14 +4897,30 @@ mod tests {
     #[test]
     fn inbound_tls_identity_reads_the_version_bounds_and_suites() {
         let (identity, _) = inbound_tls_identity_with(
-            r#""minVersion": "1.2", "maxVersion": "1.2", "cipherSuites": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256""#,
+            r#""minVersion": "1.2", "maxVersion": "1.2", "cipherSuites": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "curvePreferences": ["curvep256", "x25519"]"#,
         );
         assert_eq!(identity.min_version, Some(0x0303));
         assert_eq!(identity.max_version, Some(0x0303));
+        assert_eq!(
+            identity.curves,
+            vec![0x0017, 0x001d],
+            "the configured curves reach the listener in the named order"
+        );
         assert!(
             identity.cipher_suites.contains(&0xc02b),
             "the configured TLS 1.2 suite reaches the identity"
         );
+    }
+
+    #[test]
+    fn outbound_tls_reads_the_client_version_bounds() {
+        let outbound = crate::json::parse(
+            r#"{"streamSettings": {"security": "tls", "tlsSettings": {"serverName": "tls.test", "allowInsecure": true, "minVersion": "1.2", "maxVersion": "1.3"}}}"#,
+        )
+        .expect("parses");
+        let config = outbound_tls(&outbound, "tls.test").expect("the outbound is read");
+        assert_eq!(config.min_version, Some(0x0303));
+        assert_eq!(config.max_version, Some(0x0304));
     }
 
     #[test]
@@ -5416,5 +5455,47 @@ mod tests {
 
         let bare = crate::json::parse(r#"{"streamSettings":{"network":"ws"}}"#).expect("bare");
         assert_eq!(outbound_carrier(&bare, "192.0.2.4").1, "192.0.2.4");
+    }
+
+    #[test]
+    fn grpc_authority_falls_back_to_the_tls_server_name() {
+        let tls = crate::json::parse(
+            r#"{"network":"grpc","security":"tls","tlsSettings":{"serverName":"edge.example"},"grpcSettings":{"serviceName":"svc"}}"#,
+        )
+        .expect("tls");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&tls)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.authority, "edge.example");
+
+        let explicit = crate::json::parse(
+            r#"{"network":"grpc","security":"tls","tlsSettings":{"serverName":"edge.example"},"grpcSettings":{"serviceName":"svc","authority":"head.example"}}"#,
+        )
+        .expect("explicit");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&explicit)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.authority, "head.example");
+
+        let plain = crate::json::parse(
+            r#"{"network":"grpc","security":"none","tlsSettings":{"serverName":"edge.example"},"grpcSettings":{"serviceName":"svc"}}"#,
+        )
+        .expect("plain");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&plain)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.authority, "");
+    }
+
+    #[test]
+    fn a_custom_grpc_service_without_a_split_names_one_path_for_both_streams() {
+        let custom =
+            crate::json::parse(r#"{"network":"grpc","grpcSettings":{"serviceName":"/svc/tun"}}"#)
+                .expect("custom");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&custom)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.path, "/svc/tun");
+        assert_eq!(settings.multi_path, "/svc/tun");
     }
 }

@@ -57,6 +57,12 @@ pub struct TlsConfig {
     /// names them, behind one allocation like the suite list. Empty keeps the build's own order:
     /// the shaped hello's profile shares, or ring's three curves.
     pub curves: std::sync::Arc<[u16]>,
+    /// The lowest protocol version a dial may negotiate, as xray's `tlsSettings.minVersion`
+    /// spells it. `None` keeps the backend's default floor.
+    pub min_version: Option<u16>,
+    /// The highest protocol version a dial may negotiate, as xray's `tlsSettings.maxVersion`
+    /// spells it. `None` keeps the backend's default ceiling.
+    pub max_version: Option<u16>,
     /// Accept the peer chain as presented, keeping only the handshake signature that binds
     /// it to the key exchange: xray's `allowInsecure`, read by a masquerade cover's
     /// `masq_url_insecure` origin and by an outbound that names it. `false` is the default
@@ -461,6 +467,9 @@ pub struct TlsServerConfig {
     /// xray's `tlsSettings.cipherSuites`. Empty keeps the backend's stock set;
     /// a non-empty list admits only the suites it names.
     pub cipher_suites: Vec<u16>,
+    /// The key-exchange groups the listener may negotiate, in the order xray's
+    /// `tlsSettings.curvePreferences` names them. Empty keeps the backend's stock order.
+    pub curves: Vec<u16>,
     /// Whether to send TLS 1.3 session tickets. REALITY declines them, as both
     /// references do, so an authenticated handshake is followed by no records.
     pub send_tickets: bool,
@@ -615,6 +624,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
         min_version: None,
         max_version: None,
         cipher_suites: Vec::new(),
+        curves: Vec::new(),
         certs: vec![parse_pem_entry(cert_pem, key_pem)?],
         send_tickets: true,
         reject_unknown_sni: false,

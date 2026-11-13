@@ -4,7 +4,6 @@ use super::ticket::Ticket;
 use super::{Body, Ext, Profile, GREASE};
 use crate::tls::hpke::Sealer;
 use crate::tls::TlsError;
-use rustls::crypto::hpke::HpkeSealer as _;
 
 /// The version this hello's legacy field names, which a static-RSA premaster repeats.
 pub(super) const TLS12: u16 = 0x0303;
@@ -30,6 +29,8 @@ pub(crate) struct Hello {
     /// The groups a config's `curvePreferences` names, in its order: `None` keeps the profile's
     /// own list and shares, the hello a browser would send.
     groups: Option<Vec<u16>>,
+    /// The versions a config's `minVersion`/`maxVersion` leave: `None` keeps the profile's list.
+    versions: Option<Vec<u16>>,
     grease: [u16; 7],
     alpn: Option<&'static [&'static [u8]]>,
     /// A stock hello's config-named ALPN list, which Go puts where the preset's table would.
@@ -110,6 +111,7 @@ impl Hello {
             profile,
             ciphers: None,
             groups: (!curves.is_empty()).then(|| curves.to_vec()),
+            versions: None,
             grease,
             alpn: alpn_override(alpn, websocket),
             stock_alpn: None,
@@ -140,9 +142,107 @@ impl Hello {
         self.msg = self.encode(None);
     }
 
+    /// Narrows the hello to a config's `minVersion`/`maxVersion`: the version list, the suites and
+    /// the key shares a browser would not send outside the window. `None` on both keeps the profile.
+    pub(crate) fn set_version_bounds(
+        &mut self,
+        min: Option<u16>,
+        max: Option<u16>,
+    ) -> Result<(), TlsError> {
+        if min.is_none() && max.is_none() {
+            return Ok(());
+        }
+        let floor = min.unwrap_or(0x0303).max(0x0303);
+        let ceiling = max.unwrap_or(0x0304).min(0x0304);
+        if floor > ceiling {
+            return Err(TlsError::Other(
+                "tls client version bounds name no supported protocol".to_owned(),
+            ));
+        }
+        let profile_versions = self.profile_versions();
+        if !profile_versions.is_empty() {
+            let versions: Vec<u16> = profile_versions
+                .iter()
+                .copied()
+                .filter(|&version| version == GREASE || (floor..=ceiling).contains(&version))
+                .collect();
+            if !versions.iter().any(|&version| version != GREASE) {
+                return Err(TlsError::Other(
+                    "tls client version bounds name no supported protocol".to_owned(),
+                ));
+            }
+            self.versions = Some(versions);
+        }
+        let tls13 = ceiling >= 0x0304;
+        let ciphers: Vec<u16> = self
+            .cipher_table()
+            .iter()
+            .copied()
+            .filter(|&id| {
+                id == GREASE
+                    || if tls13_suite(id) {
+                        ceiling >= 0x0304
+                    } else {
+                        floor <= 0x0303 && ceiling >= 0x0303
+                    }
+            })
+            .collect();
+        if !ciphers.iter().any(|&id| id != GREASE) {
+            return Err(TlsError::Other(
+                "tls client version bounds leave no cipher suite".to_owned(),
+            ));
+        }
+        self.ciphers = Some(ciphers);
+        if !tls13 {
+            let profile_groups = self
+                .profile
+                .exts
+                .iter()
+                .find_map(|ext| match &ext.body {
+                    Body::Groups(groups) => Some(*groups),
+                    _ => None,
+                })
+                .unwrap_or(&[]);
+            let groups = self.groups.as_deref().unwrap_or(profile_groups);
+            if groups.iter().any(|&group| hybrid_group(group)) {
+                let carried: Vec<u16> = groups
+                    .iter()
+                    .copied()
+                    .filter(|&group| !hybrid_group(group))
+                    .collect();
+                if !carried.is_empty() {
+                    self.groups = Some(carried);
+                }
+            }
+            self.shares.retain(|share| !hybrid_group(share.group));
+        }
+        self.msg = self.encode(None);
+        Ok(())
+    }
+
     /// The list this hello puts on the wire: the config's, else the profile's.
     fn cipher_table(&self) -> &[u16] {
         self.ciphers.as_deref().unwrap_or(self.profile.ciphers)
+    }
+
+    /// The versions the profile itself lists, before a config narrows them.
+    fn profile_versions(&self) -> &[u16] {
+        self.profile
+            .exts
+            .iter()
+            .find_map(|ext| match &ext.body {
+                Body::Versions(values) => Some(*values),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+
+    /// Whether the effective version list reaches TLS 1.3, so a key share rides the hello.
+    fn offers_tls13(&self) -> bool {
+        self.versions
+            .as_deref()
+            .unwrap_or_else(|| self.profile_versions())
+            .contains(&0x0304)
     }
 
     /// Whether this hello offered `id`, so a server may select it.
@@ -258,7 +358,7 @@ impl Hello {
         );
         let ciphertext = offer
             .sealer
-            .seal(&outer[4..], &encoded)
+            .seal_owned(&outer[4..], encoded)
             .map_err(|e| TlsError::Other(format!("ech: seal: {e}")))?;
         let at = outer
             .len()
@@ -317,14 +417,16 @@ impl Hello {
             },
             &entries,
             true,
+            0,
         );
-        let mut encoded = self.encode_prepared(head, &entries, false);
         let name_pad = match offer.inner_name.as_deref() {
             Some(name) => offer.maximum_name_length.saturating_sub(name.len()),
             None => offer.maximum_name_length + 9,
         };
+        let padded = head.message_len - 4 + name_pad;
+        let pad = 31 - ((padded - 1) % 32);
+        let mut encoded = self.encode_prepared(head, &entries, false, name_pad + pad + 16);
         encoded.extend(std::iter::repeat_n(0, name_pad));
-        let pad = 31 - ((encoded.len() - 1) % 32);
         encoded.extend(std::iter::repeat_n(0, pad));
         (encoded, transcript)
     }
@@ -365,6 +467,7 @@ impl Hello {
             profile: self.profile,
             ciphers: self.ciphers.clone(),
             groups: self.groups.clone(),
+            versions: self.versions.clone(),
             grease: self.grease,
             alpn: self.alpn,
             stock_alpn: self.stock_alpn.clone(),
@@ -506,11 +609,7 @@ impl Hello {
                 "obfuscated session tickets and ECH cannot share a hello".to_owned(),
             ));
         }
-        let tls13 = self
-            .profile
-            .exts
-            .iter()
-            .any(|ext| matches!(&ext.body, Body::Versions(values) if values.contains(&0x0304)));
+        let tls13 = self.offers_tls13();
         let ems = self.profile.exts.iter().any(|ext| ext.kind == 0x0017);
         if tls13 {
             if !self.profile.offers_psk() {
@@ -647,18 +746,26 @@ impl Hello {
             message_len,
             shares,
         };
-        self.encode_prepared(head, &entries, true)
+        self.encode_prepared(head, &entries, true, 0)
     }
 
     /// The hello body, or the framed handshake message when `frame` is set: the header is reserved
     /// before the first body byte, so the caller's message is never copied behind a new one.
-    fn encode_prepared(&self, head: Prepared<'_>, entries: &[Entry], frame: bool) -> Vec<u8> {
+    fn encode_prepared(
+        &self,
+        head: Prepared<'_>,
+        entries: &[Entry],
+        frame: bool,
+        extra: usize,
+    ) -> Vec<u8> {
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
-        let mut body = Vec::with_capacity(if frame {
-            head.message_len
-        } else {
-            head.message_len - 4
-        });
+        let mut body = Vec::with_capacity(
+            if frame {
+                head.message_len
+            } else {
+                head.message_len - 4
+            } + extra,
+        );
         if frame {
             body.resize(4, 0);
         }
@@ -805,8 +912,12 @@ impl Hello {
                 };
                 (ALPN, false, source)
             }
-            Body::Versions(values) => (0x002b, false, Source::Versions(values)),
-            Body::KeyShare { .. } if shares.is_empty() => return None,
+            Body::Versions(values) => (
+                0x002b,
+                false,
+                Source::Versions(self.versions.as_deref().unwrap_or(values)),
+            ),
+            Body::KeyShare { .. } if shares.is_empty() || !self.offers_tls13() => return None,
             Body::KeyShare { .. } => (0x0033, false, Source::Shares),
             Body::Ech { .. } => (0xfe0d, false, Source::Fixed(ech?)),
             Body::Raw(_)
@@ -924,6 +1035,7 @@ impl Hello {
             profile,
             ciphers: None,
             groups: None,
+            versions: None,
             grease: distinct_grease([0; 7]),
             alpn: None,
             stock_alpn: None,
@@ -1008,6 +1120,14 @@ impl Sink for Width {
     fn zeros(&mut self, count: usize) {
         self.0 += count;
     }
+}
+
+fn tls13_suite(id: u16) -> bool {
+    (0x1301..=0x1305).contains(&id)
+}
+
+fn hybrid_group(group: u16) -> bool {
+    matches!(group, keys::X25519_MLKEM768 | keys::X25519_MLKEM768_DRAFT)
 }
 
 fn share_spec(profile: &Profile) -> (&'static [u16], bool) {
@@ -1423,7 +1543,7 @@ mod tests {
     }
 
     /// A real `enable_ech` offer parses the list in place, builds the HPKE info and both hello
-    /// frames where they are written, and stages only the cover's payload and the sealed bytes.
+    /// frames where they are written, and seals the inner body where it lies.
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
     fn an_enable_ech_offer_parses_in_place() {
@@ -1433,7 +1553,7 @@ mod tests {
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 17, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 15, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
@@ -1828,6 +1948,92 @@ mod tests {
         assert_eq!(&versions[4..], &[0x02, 0x03, 0x03], "1.2 only");
     }
 
+    /// A config's `maxVersion` narrows a preset hello: the version list, the TLS 1.3 suites, the
+    /// hybrid group and the key share all leave, while the TLS 1.2 cipher list stays.
+    #[test]
+    fn a_client_version_ceiling_narrows_the_shaped_hello() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello =
+            Hello::build(profile, "example.com", &[], false, &[], None).expect("a shaped hello");
+        hello
+            .set_version_bounds(Some(0x0303), Some(0x0303))
+            .expect("the ceiling is supported");
+        let exts = extensions(&hello.msg[4..]);
+        let versions = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x002b)
+            .expect("the hello names its versions");
+        let body = &versions[4..];
+        assert_eq!(&body[body.len() - 2..], &[0x03, 0x03], "1.2 only");
+        assert!(
+            !body.windows(2).any(|pair| pair == [0x03, 0x04]),
+            "the 1.3 offer is gone"
+        );
+        assert!(
+            exts.iter().all(|ext| kind(ext) != 0x0033),
+            "no key share below 1.3"
+        );
+        let groups = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x000a)
+            .expect("the hello names its groups");
+        assert!(
+            !groups.windows(2).any(|pair| pair == [0x11, 0xec]),
+            "the hybrid group stays off a TLS 1.2 hello"
+        );
+        assert!(
+            !hello.cipher_table().iter().any(|&id| tls13_suite(id)),
+            "no TLS 1.3 suite under a 1.2 ceiling"
+        );
+        assert!(
+            hello.cipher_table().iter().any(|&id| !tls13_suite(id)),
+            "the TLS 1.2 suites stay"
+        );
+        assert!(
+            hello.cipher_table().contains(&GREASE),
+            "the GREASE cipher sentinel stays"
+        );
+    }
+
+    /// A config naming only a hybrid group under a 1.2 ceiling keeps a non-empty
+    /// `supported_groups`, since an empty one is a malformed hello.
+    #[test]
+    fn an_all_hybrid_group_list_stays_valid_under_a_tls12_ceiling() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(
+            profile,
+            "example.com",
+            &[],
+            false,
+            &[keys::X25519_MLKEM768],
+            None,
+        )
+        .expect("a shaped hello");
+        hello
+            .set_version_bounds(Some(0x0303), Some(0x0303))
+            .expect("the ceiling is supported");
+        let exts = extensions(&hello.msg[4..]);
+        let groups = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x000a)
+            .expect("the hello names its groups");
+        assert!(groups.len() > 4, "the group extension keeps its list");
+        assert!(
+            groups.windows(2).any(|pair| pair == [0x11, 0xec]),
+            "the named hybrid group stays offered"
+        );
+        assert!(
+            exts.iter().all(|ext| kind(ext) != 0x0033),
+            "no key share below 1.3"
+        );
+    }
+
     /// REALITY refuses a fingerprint with no TLS 1.3 share, so the REALITY dial swaps android for
     /// a variant carrying the suites and the hybrid share its uTLS preset omits.
     #[test]
@@ -2020,6 +2226,27 @@ mod tests {
             .find(|entry| kind(entry) == SESSION_TICKET)
             .expect("the session_ticket extension");
         assert_eq!(&session[4..], ticket.bytes.as_slice());
+    }
+
+    #[test]
+    fn a_tls12_ceiling_makes_a_tls13_profile_mint_a_tls12_ticket() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
+        hello
+            .set_version_bounds(Some(0x0303), Some(0x0303))
+            .expect("the ceiling is supported");
+        hello
+            .set_obfuscated_ticket(&[0x77; 32], 0)
+            .expect("the ticket follows the effective window");
+        let ticket = hello.ticket().expect("a ticket");
+        assert!(!ticket.tls13, "a 1.2 ceiling mints a TLS 1.2 ticket");
+        assert!(extensions(&hello.msg[4..])
+            .iter()
+            .any(|entry| kind(entry) == SESSION_TICKET));
     }
 
     #[test]

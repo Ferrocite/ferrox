@@ -65,6 +65,10 @@ impl Entropy {
     }
 }
 
+/// Records one gathered write carries: two slices each, a list narrow enough for every platform's
+/// vectored write. A merged run past this width pays another call rather than a body copy.
+const GATHERED_RECORDS: usize = 32;
+
 /// One `Int32Range` from the config, its ends already ordered by [`Range::ordered`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
@@ -108,7 +112,6 @@ pub struct Fragment {
     pub lengths: Vec<Range>,
     pub delays: Vec<Range>,
     pub max_split: Range,
-    merged: Vec<u8>,
     ent: Entropy,
     count: u64,
 }
@@ -137,7 +140,6 @@ impl Fragment {
             lengths,
             delays,
             max_split,
-            merged: Vec::new(),
             ent: Entropy::new(),
             count: 0,
         })
@@ -159,9 +161,9 @@ impl Fragment {
 
     /// The segment's width, or the body's last octet once `max_split` has taken its bound: the run
     /// always ends on the whole, so a bounded hello is a short hello, never a lost one.
-    fn cut(&mut self, segment: usize, from: usize, end: usize, bound: i64) -> Option<usize> {
+    fn cut(&mut self, segment: usize, from: usize, end: usize, bound: usize) -> Option<usize> {
         let width = self.lengths[segment.min(self.lengths.len() - 1)].pick_from(&mut self.ent)?;
-        let last = bound > 0 && i64::try_from(segment).ok()? + 1 >= bound;
+        let last = bound != 0 && segment + 1 >= bound;
         let to = from.saturating_add(width as usize);
         Some(if last || to > end { end } else { to })
     }
@@ -198,50 +200,82 @@ impl Fragment {
             // No entropy for the bound: the hello goes out as the one record it was.
             return raw.write_all(p).map(|()| p.len());
         };
+        // A drawn bound above zero caps the run; every other value is the reference's "no bound".
+        let bound = if bound > 0 {
+            usize::try_from(bound).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
         let merged = self.delays.len() == 1 && self.delays[0].high == 0;
-        self.merged.clear();
         if merged {
-            // The bound is the only thing that can cut the run short, so the merge starts at its exact room.
-            let extra = (bound.unsigned_abs().saturating_sub(1) as usize)
-                .saturating_mul(HEADER)
-                .min(p.len());
-            self.merged.reserve(record_len + extra);
-        }
-        let mut from = HEADER;
-        let mut segment = 0usize;
-        while from < record_len {
-            let Some(to) = self.cut(segment, from, record_len, bound) else {
-                // No entropy for a width: the hello goes out as the one record it was.
-                self.merged.clear();
-                return raw.write_all(p).map(|()| p.len());
-            };
-            let head = [
-                p[0],
-                p[1],
-                p[2],
-                ((to - from) >> 8) as u8,
-                (to - from) as u8,
-            ];
-            if merged {
-                self.merged.extend_from_slice(&head);
-                self.merged.extend_from_slice(&p[from..to]);
-            } else {
-                write_record(raw, &head, &p[from..to])?;
+            self.write_gathered(raw, p, record_len, bound)?;
+        } else {
+            let mut from = HEADER;
+            let mut segment = 0usize;
+            while from < record_len {
+                let Some(to) = self.cut(segment, from, record_len, bound) else {
+                    // No entropy for a width: the rest goes out as the one record it is.
+                    write_record(raw, &head_of(p, record_len - from), &p[from..record_len])?;
+                    break;
+                };
+                write_record(raw, &head_of(p, to - from), &p[from..to])?;
                 let delay = self.delay_at(segment);
                 self.park(delay);
+                from = to;
+                segment += 1;
             }
-            from = to;
-            segment += 1;
-        }
-        if merged && !self.merged.is_empty() {
-            raw.write_all(&self.merged)?;
-            self.merged.clear();
         }
         if p.len() == record_len {
             return Ok(p.len());
         }
         // A record that rode in behind the hello keeps its own write, whole or partial.
         Ok(record_len + raw.write(&p[record_len..])?)
+    }
+
+    /// The merged hello: every record's header goes into a bounded stack scratch and each body is
+    /// the caller's own slice, so one `writev` puts the burst out without copying the hello.
+    fn write_gathered<W: Write>(
+        &mut self,
+        raw: &mut W,
+        p: &[u8],
+        record_len: usize,
+        bound: usize,
+    ) -> io::Result<()> {
+        let mut from = HEADER;
+        let mut segment = 0usize;
+        loop {
+            let origin = from;
+            let mut heads = [0u8; GATHERED_RECORDS * HEADER];
+            let mut count = 0usize;
+            while count < GATHERED_RECORDS && from < record_len {
+                // No entropy for a width: the run ends on the whole, never on a lost octet.
+                let to = self
+                    .cut(segment, from, record_len, bound)
+                    .unwrap_or(record_len);
+                let head = head_of(p, to - from);
+                heads[count * HEADER..][..HEADER].copy_from_slice(&head);
+                from = to;
+                segment += 1;
+                count += 1;
+            }
+            let mut parts = [io::IoSlice::new(&[]); GATHERED_RECORDS * 2];
+            let mut at = origin;
+            for (index, head) in heads[..count * HEADER]
+                .as_chunks::<HEADER>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                let width = usize::from(u16::from_be_bytes([head[3], head[4]]));
+                parts[index * 2] = io::IoSlice::new(head);
+                parts[index * 2 + 1] = io::IoSlice::new(&p[at..at + width]);
+                at += width;
+            }
+            write_iovecs(raw, &mut parts[..count * 2])?;
+            if from >= record_len {
+                return Ok(());
+            }
+        }
     }
 
     fn delay_at(&self, segment: usize) -> Range {
@@ -256,6 +290,11 @@ impl Fragment {
         }
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             return write_progress(raw, p);
+        };
+        let bound = if bound > 0 {
+            usize::try_from(bound).unwrap_or(usize::MAX)
+        } else {
+            0
         };
         let mut from = 0usize;
         let mut segment = 0usize;
@@ -321,31 +360,26 @@ fn write_progress<W: Write>(raw: &mut W, mut p: &[u8]) -> io::Result<usize> {
     Ok(written)
 }
 
+/// A record's header, re-headed from the hello's type, version and this piece's width.
+fn head_of(p: &[u8], width: usize) -> [u8; HEADER] {
+    [p[0], p[1], p[2], (width >> 8) as u8, width as u8]
+}
+
 /// A record's header and its body go out as one gathered write, so the body never lands in a buffer
-/// of its own the way the reference's scratch does. The list is rebuilt from what still has to go,
-/// which is how a partial completion resumes without a copy.
+/// of its own the way the reference's scratch does.
 fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<()> {
-    let mut parts = [head, body];
-    let mut at = 0usize;
-    while at < parts.len() {
-        let iovecs = [io::IoSlice::new(parts[0]), io::IoSlice::new(parts[1])];
-        let taken = match raw.write_vectored(&iovecs[at..]) {
-            Ok(taken) => taken,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+    write_iovecs(raw, &mut [io::IoSlice::new(head), io::IoSlice::new(body)])
+}
+
+/// Hand the list to the sink in as few vectored calls as it takes, advancing the list on a short
+/// call so every part stays where the caller put it.
+fn write_iovecs<W: Write>(raw: &mut W, mut parts: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+    while !parts.is_empty() {
+        match raw.write_vectored(parts) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(taken) => io::IoSlice::advance_slices(&mut parts, taken),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
-        };
-        if taken == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-        let mut left = taken;
-        while left > 0 && at < parts.len() {
-            let run = left.min(parts[at].len());
-            parts[at] = &parts[at][run..];
-            left -= run;
-            if !parts[at].is_empty() {
-                break;
-            }
-            at += 1;
         }
     }
     Ok(())
@@ -479,6 +513,21 @@ struct Pipe<'a, W> {
 impl<W: Write> Write for Pipe<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         drive(self.stages, &mut *self.raw, buf)
+    }
+
+    // A stage reads one `&[u8]`, so a gathered write reaches it as one run or its count lands on the header and body separately.
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match bufs {
+            [] => Ok(0),
+            [one] => self.write(one),
+            _ => {
+                let mut whole = Vec::with_capacity(bufs.iter().map(|part| part.len()).sum());
+                for part in bufs {
+                    whole.extend_from_slice(part);
+                }
+                self.write(&whole)
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -829,32 +878,98 @@ mod tests {
     }
 
     #[test]
-    fn a_merged_first_hello_lands_in_room_it_drew_ahead_of() {
-        let mut mask = Fragment::new(0, 1, vec![range(100, 100)], vec![range(0, 0)], range(5, 5))
-            .expect("valid");
+    fn a_merged_run_gathers_the_callers_body_without_restaging_it() {
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid");
         let whole = hello(400);
         let mut wire = Wire::default();
-        mask.write(&mut wire, &whole).expect("first");
-        assert_eq!(
-            mask.merged.capacity(),
-            whole.len() + 4 * HEADER,
-            "the reserve covered the run the bound allows in full, so nothing regrew mid-hello"
-        );
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(wire.calls, 1, "the run leaves in one gathered write");
+        let (widths, message) = records(&wire.bytes);
+        let mut at = HEADER;
+        for (index, width) in widths.iter().enumerate() {
+            let (pointer, took) = wire.segments[index * 2 + 1];
+            assert_eq!(
+                pointer,
+                whole[at..at + width].as_ptr() as usize,
+                "piece {index}'s body is the caller's own octets, not a copy"
+            );
+            assert_eq!(took, *width);
+            at += width;
+        }
+        assert_eq!(message, whole[HEADER..], "and the hello arrives whole");
         assert_eq!(
             mask.ent.refills, 0,
             "a fixed config answers its low ends and never draws at all"
         );
-        wire.bytes.clear();
-        mask.count = 0;
-        mask.write(&mut wire, &whole).expect("second");
+    }
+
+    #[test]
+    fn a_merged_run_survives_a_socket_that_takes_a_little_at_a_time() {
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid");
+        let whole = hello(400);
+        let mut wire = Wire {
+            takes: 7,
+            ..Wire::default()
+        };
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert!(wire.calls > 1, "a short-take socket is handed the rest");
+        let (_, message) = records(&wire.bytes);
+        assert_eq!(message, whole[HEADER..], "no octet is lost or replayed");
+    }
+
+    #[test]
+    fn a_merged_run_past_the_gather_width_keeps_every_octet() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(1, 1)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let whole = hello(96);
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
         assert_eq!(
-            mask.merged.capacity(),
-            whole.len() + 4 * HEADER,
-            "and the second hello neither grew nor shrank it"
+            wire.calls, 3,
+            "ninety-six one-octet records take three batches of thirty-two"
         );
         let (widths, message) = records(&wire.bytes);
-        assert_eq!(widths, vec![100, 100, 100, 100]);
-        assert_eq!(message, whole[HEADER..], "the run is the mask's own bytes");
+        assert_eq!(widths, vec![1; 96]);
+        assert_eq!(message, whole[HEADER..], "the batching loses no octet");
+    }
+
+    #[test]
+    fn a_second_tlshello_stage_sees_the_merged_records_whole() {
+        let outer = Fragment::new(0, 1, vec![range(11, 11)], vec![range(0, 0)], range(0, 0))
+            .expect("valid");
+        let inner =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut chain = Chain::default();
+        chain.push(outer);
+        chain.push(inner);
+        let whole = hello(30);
+        let mut wire = Wire::default();
+        assert_eq!(chain.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(
+            chain.stages[1].count, 1,
+            "the gathered run reaches the next stage as one write, not one per slice"
+        );
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(
+            widths,
+            vec![3, 3, 3, 2, 11, 8],
+            "the second stage cut the first outer body to its width and passed the rest through"
+        );
+        assert_eq!(message, whole[HEADER..], "the two stages lose no octet");
     }
 
     #[test]
@@ -1123,8 +1238,40 @@ mod tests {
         assert_eq!(wire.widths, vec![12]);
     }
 
+    /// A sink that takes a whole gathered write in one call and keeps nothing, so a count here is
+    /// the mask's own work rather than a buffer copy the harness would make.
+    struct Discard;
+
+    impl Write for Discard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            Ok(bufs.iter().map(|part| part.len()).sum())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 256 fixed hellos through the merged path: the frame `scripts/count-ops.sh` prices.
+    #[inline(never)]
+    fn merged_hello_probe(mask: &mut Fragment, raw: &mut Discard, whole: &[u8]) -> usize {
+        let mut total = 0usize;
+        for _ in 0..256 {
+            mask.count = 0;
+            total += std::hint::black_box(
+                mask.write(raw, std::hint::black_box(whole))
+                    .expect("the sink always takes the whole"),
+            );
+        }
+        total
+    }
+
     #[test]
-    fn the_merged_run_is_the_only_buffer_the_mask_owns() {
+    fn the_merged_hello_costs_the_cuts_and_the_gather() {
         let mut mask = Fragment::new(
             0,
             1,
@@ -1133,27 +1280,12 @@ mod tests {
             range(24, 24),
         )
         .expect("valid");
-        let mut wire = Wire::default();
-        mask.write(&mut wire, &hello(400)).expect("first");
-        let capacity = mask.merged.capacity();
-        let pointer = mask.merged.as_ptr() as usize;
-        assert!(capacity >= 400, "the run grew to what one hello needs");
-        wire.bytes.clear();
-        mask.count = 0;
-        mask.write(&mut wire, &hello(400)).expect("second");
-        assert_eq!(mask.merged.capacity(), capacity, "a second hello reuses it");
+        let whole = hello(300);
+        let mut sink = Discard;
         assert_eq!(
-            mask.merged.as_ptr() as usize,
-            pointer,
-            "and never changes owner"
-        );
-        wire.bytes.clear();
-        mask.count = 0;
-        mask.write(&mut wire, &hello(120)).expect("smaller");
-        assert_eq!(
-            mask.merged.capacity(),
-            capacity,
-            "a smaller hello never shrinks it"
+            merged_hello_probe(&mut mask, &mut sink, &whole),
+            256 * whole.len(),
+            "every turn answers the hello it was handed"
         );
     }
 
