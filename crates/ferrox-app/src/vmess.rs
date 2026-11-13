@@ -959,11 +959,11 @@ fn write_frame_into(
 
 fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut PadSource) -> bool {
     let at = staging.len();
-    let (padding, mask_raw, masked) = match send.shake.as_mut() {
-        None => (0, 0, false),
+    let (padding, mask_raw) = match send.shake.as_mut() {
+        None => (0, 0),
         Some(s) => {
             let (pad_raw, mask_raw) = if s.masked { s.draws() } else { (s.draw(), 0) };
-            (usize::from(pad_raw % 64), mask_raw, true)
+            (usize::from(pad_raw % 64), mask_raw)
         }
     };
     let tag = if send.cipher == Cipher::None {
@@ -982,12 +982,8 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
         seal.seal_len(total as u16, &mut field);
         staging.extend_from_slice(&field);
     } else {
-        let wire = if masked {
-            mask_raw ^ total as u16
-        } else {
-            total as u16
-        };
-        staging.extend_from_slice(&wire.to_be_bytes());
+        // An unmasked parser draws no mask and keeps `mask_raw` at zero, so one xor covers both sets.
+        staging.extend_from_slice(&(mask_raw ^ total as u16).to_be_bytes());
     }
     send.seal_onto(plain, staging);
     if padding > 0 {
