@@ -64,19 +64,23 @@ pub const NAME4_MAX: usize = 255;
 /// The room an address is written into: initialized bytes or a vector's spare capacity.
 trait AddressSink {
     /// Write `bytes` at `at`.
-    fn put(&mut self, at: usize, bytes: &[u8]);
+    ///
+    /// # Safety
+    ///
+    /// `at + bytes.len()` must lie inside the sink.
+    unsafe fn put(&mut self, at: usize, bytes: &[u8]);
 }
 
 impl AddressSink for [u8] {
-    fn put(&mut self, at: usize, bytes: &[u8]) {
+    unsafe fn put(&mut self, at: usize, bytes: &[u8]) {
         self[at..at + bytes.len()].copy_from_slice(bytes);
     }
 }
 
 impl AddressSink for [core::mem::MaybeUninit<u8>] {
-    fn put(&mut self, at: usize, bytes: &[u8]) {
+    unsafe fn put(&mut self, at: usize, bytes: &[u8]) {
         debug_assert!(at + bytes.len() <= self.len(), "address write out of room");
-        // SAFETY: the caller passes spare capacity with `at + bytes.len()` inside it, and each byte initializes its slot.
+        // SAFETY: the caller's contract keeps `at + bytes.len()` inside this slice, and each byte initializes its slot.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -126,26 +130,35 @@ impl Target<'_> {
             out.len() >= self.wire_len(),
             "socks5 address buffer too short"
         );
-        self.write_address(out);
+        // SAFETY: the assert proves the sink holds `wire_len()` octets.
+        unsafe { self.write_address(out) };
     }
 
-    fn write_address<S: AddressSink + ?Sized>(&self, out: &mut S) {
-        match self {
-            Self::V4(octets, port) => {
-                out.put(0, &[ATYP_IPV4]);
-                out.put(1, octets);
-                out.put(5, &port.to_be_bytes());
-            }
-            Self::V6(octets, port) => {
-                out.put(0, &[ATYP_IPV6]);
-                out.put(1, octets);
-                out.put(17, &port.to_be_bytes());
-            }
-            Self::Name(name, port) => {
-                out.put(0, &[ATYP_DOMAIN]);
-                out.put(1, &[name.len() as u8]);
-                out.put(2, name);
-                out.put(2 + name.len(), &port.to_be_bytes());
+    /// Write this address into a sink that holds `wire_len()` octets.
+    ///
+    /// # Safety
+    ///
+    /// `out` must hold `wire_len()` octets.
+    unsafe fn write_address<S: AddressSink + ?Sized>(&self, out: &mut S) {
+        // SAFETY: every `put` below writes at a constant offset whose end is inside `wire_len()`.
+        unsafe {
+            match self {
+                Self::V4(octets, port) => {
+                    out.put(0, &[ATYP_IPV4]);
+                    out.put(1, octets);
+                    out.put(5, &port.to_be_bytes());
+                }
+                Self::V6(octets, port) => {
+                    out.put(0, &[ATYP_IPV6]);
+                    out.put(1, octets);
+                    out.put(17, &port.to_be_bytes());
+                }
+                Self::Name(name, port) => {
+                    out.put(0, &[ATYP_DOMAIN]);
+                    out.put(1, &[name.len() as u8]);
+                    out.put(2, name);
+                    out.put(2 + name.len(), &port.to_be_bytes());
+                }
             }
         }
     }
@@ -195,7 +208,8 @@ pub fn request(cmd: u8, target: &Target<'_>) -> Vec<u8> {
     out.push(VERSION);
     out.push(cmd);
     out.push(0);
-    target.write_address(&mut out.spare_capacity_mut()[..len]);
+    // SAFETY: the capacity reserves exactly `len` octets, and `spare_capacity_mut()[..len]` is that room.
+    unsafe { target.write_address(&mut out.spare_capacity_mut()[..len]) };
     // SAFETY: `write_address` initializes every byte this length exposes, with no uninit reference.
     unsafe { out.set_len(3 + len) };
     out
@@ -405,7 +419,8 @@ pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&[0, 0, 0]);
     let at = out.len();
     let len = target.wire_len();
-    target.write_address(&mut out.spare_capacity_mut()[..len]);
+    // SAFETY: the reserve holds exactly `len` octets of spare room.
+    unsafe { target.write_address(&mut out.spare_capacity_mut()[..len]) };
     // SAFETY: `write_address` initializes every byte this length exposes, with no uninit reference.
     unsafe { out.set_len(at + len) };
     out.extend_from_slice(payload);

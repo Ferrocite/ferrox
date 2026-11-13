@@ -28036,7 +28036,8 @@ fn poll_handoff(
 /// The direct Windows relay moves a pooled window batch through one `WSARecv` and one `WSASend`.
 /// It keeps eight small windows until half a megabyte has crossed, then grows to sixteen full
 /// windows, so a bulk download pays one syscall pair per megabyte and a small flow keeps its
-/// footprint.
+/// footprint. A read's wait is the response grace and a write's is the flow's idle budget, so a
+/// half-closed flow still hands its threads back.
 #[cfg(windows)]
 fn relay_vectored_direct(
     client_read: Connection,
@@ -28044,19 +28045,29 @@ fn relay_vectored_direct(
     target_read: Connection,
     client_write: Connection,
 ) {
-    for connection in [&client_read, &target_read, &target_write, &client_write] {
-        let _ = connection.set_read_timeout(None);
-        let _ = connection.set_write_timeout(None);
-    }
+    let forward_stall = client_read
+        .policy()
+        .or_else(|| target_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let reply_stall = target_read
+        .policy()
+        .or_else(|| client_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let _ = client_read.set_read_timeout(Some(crate::budgets::RELAY_RESPONSE_IDLE));
+    let _ = target_read.set_read_timeout(Some(crate::budgets::RELAY_RESPONSE_IDLE));
+    let _ = target_write.set_write_timeout(Some(forward_stall));
+    let _ = client_write.set_write_timeout(Some(reply_stall));
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let flow = RelayFinish::new(false, close, None);
     let first = Arc::clone(&flow);
     let done = RelayPool::global().run(move || {
-        vectored_copy(client_read, target_write);
+        vectored_copy(client_read, target_write, &first);
         first.mark_ended();
         first.lane_done();
     });
-    vectored_copy(target_read, client_write);
+    vectored_copy(target_read, client_write, &flow);
     flow.mark_ended();
     flow.lane_done();
     join(&done);
@@ -28065,7 +28076,7 @@ fn relay_vectored_direct(
 /// Copy one direction with eight pooled windows: the kernel fills them in order and drains them in
 /// order, so a partial send resumes at the first byte it did not take.
 #[cfg(windows)]
-fn vectored_copy(mut src: Connection, mut dst: Connection) {
+fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
     const SMALL_WINDOWS: usize = 8;
     const LARGE_WINDOWS: usize = 16;
     const GROW_AFTER: usize = 512 * 1000;
@@ -28094,6 +28105,14 @@ fn vectored_copy(mut src: Connection, mut dst: Connection) {
                 break;
             }
             Ok(n) => n,
+            // An idle read waits while the sibling lives, and the response grace decides once it ends.
+            Err(error) if is_timeout(&error) => {
+                if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    let _ = dst.shutdown(Shutdown::Write);
+                    break;
+                }
+                continue;
+            }
             Err(_) => {
                 let _ = dst.shutdown(Shutdown::Write);
                 break;
@@ -73810,6 +73829,48 @@ mod relay_tests {
         assert_eq!(
             held, pushed,
             "the trickling flow carried {held} bytes of the {pushed} its client wrote"
+        );
+    }
+
+    /// A half-closed direct flow whose peer stays open and silent hands its threads back on the
+    /// response grace: the reply leg reads with a bound and checks the sibling's end, so a peer
+    /// that never closes cannot park a thread for the life of the process.
+    #[cfg(windows)]
+    #[test]
+    fn a_half_closed_direct_flow_hands_its_threads_back() {
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("dials the front");
+        let (client_local, _) = front.accept().expect("accepts the client");
+        let _peer = Connection::connect(("127.0.0.1", back_port)).expect("dials the back");
+        let (target_local, _) = back.accept().expect("accepts the peer");
+        client
+            .set_read_timeout(Some(PATIENCE))
+            .expect("client timeout");
+
+        let client_read = client_local.try_clone().expect("clones");
+        let client_write = client_local.try_clone().expect("clones");
+        let target_write = target_local.try_clone().expect("clones");
+        client.shutdown(Shutdown::Write).expect("half-closes");
+        let (handed, parked) = mpsc::channel();
+        let relay = thread::spawn(move || {
+            relay_vectored_direct(client_read, target_write, target_local, client_write);
+            let _ = handed.send(());
+        });
+        parked.recv_timeout(Duration::from_secs(10)).expect(
+            "a peer that stayed open and silent parked the direct relay past its response grace",
+        );
+        relay.join().expect("joins");
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client
+                .read(&mut byte)
+                .expect("a silent peer must not outlive the grace"),
+            0,
+            "the half-closed flow stayed open past its response grace"
         );
     }
 
