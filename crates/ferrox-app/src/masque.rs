@@ -312,6 +312,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     }
     let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
         .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
+    let net = quic::network_generation();
     let sock = Datagram::plain(sock);
     let mut lane = establish(spec, &sock, peer, local)?;
     let addresses = lane.addresses.clone();
@@ -326,7 +327,17 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
         initial,
         alive,
         move |from_tunnel, to_stack, routes| {
-            io(lane, &sock, local, keepalive, from_tunnel, to_stack, routes);
+            io(
+                lane,
+                &sock,
+                local,
+                peer,
+                net,
+                keepalive,
+                from_tunnel,
+                to_stack,
+                routes,
+            );
         },
     ))
 }
@@ -1742,15 +1753,21 @@ impl Stream {
 /// Writes inner packets to the tunnel and hands the ones it answers back: a TCP
 /// packet to the stack, a UDP packet to the loopback lane waiting on its port.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 fn io(
     lane: Lane,
     sock: &Datagram,
     local: SocketAddr,
+    peer: SocketAddr,
+    net: u64,
     keepalive: Option<Duration>,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: UdpRoutes,
 ) {
+    let mut local = local;
+    let mut generation = net;
+    let mut moved = false;
     let Lane {
         mut conn,
         stream,
@@ -1764,6 +1781,23 @@ fn io(
     let mut unsent: Option<Vec<u8>> = None;
     let mut keepalive_at = keepalive.map(|period| Instant::now() + period);
     loop {
+        let now = quic::network_generation();
+        if now != generation {
+            match quic::rebind_path(&mut conn, sock, peer) {
+                quic::Rebind::Moved(at) => {
+                    local = at;
+                    moved = true;
+                    generation = now;
+                }
+                quic::Rebind::Same | quic::Rebind::Retry | quic::Rebind::Unsupported => {
+                    generation = now;
+                }
+                quic::Rebind::Failed => {
+                    let _ = conn.close(false, 0, b"rebind");
+                    break;
+                }
+            }
+        }
         let sent_before = conn.stats().sent;
         let recv_before = conn.stats().recv;
         while let Some(packet) = unsent.take().or_else(|| from_tunnel.try_recv().ok()) {
@@ -1783,6 +1817,10 @@ fn io(
             }
         }
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
+            break;
+        }
+        if moved && quic::path_failed(&mut conn, local) {
+            let _ = conn.close(false, 0, b"rebind");
             break;
         }
         if let Err(reason) = control.read_stream(&mut conn) {

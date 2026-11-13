@@ -871,7 +871,9 @@ impl H3Client {
             UdpSocket::bind("0.0.0.0:0").ok()?
         };
         let local = sock.local_addr().ok()?;
+        let net = quic::network_generation();
         let sock = Arc::new(Datagram::plain(sock));
+        sock.remember_source(peer)?;
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);
@@ -897,7 +899,7 @@ impl H3Client {
         let pump_dead = Arc::clone(&dead);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
-            .spawn(move || pump_connection(&pump, &pump_sock, local, &pump_dead))
+            .spawn(move || pump_connection(&pump, &pump_sock, local, peer, net, &pump_dead))
             .ok()?;
         Some(Arc::new(Self {
             conn,
@@ -988,10 +990,34 @@ fn pump_connection(
     conn: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<Datagram>,
     local: SocketAddr,
+    peer: SocketAddr,
+    generation: u64,
     dead: &Arc<AtomicBool>,
 ) {
+    let mut local = local;
+    let mut generation = generation;
+    let mut moved = false;
     let mut buf = vec![0u8; 65535];
     loop {
+        let now = quic::network_generation();
+        if now != generation {
+            if let Ok(mut conn) = conn.lock() {
+                match quic::rebind_path(&mut conn, sock, peer) {
+                    quic::Rebind::Moved(at) => {
+                        local = at;
+                        moved = true;
+                        generation = now;
+                    }
+                    quic::Rebind::Same | quic::Rebind::Retry | quic::Rebind::Unsupported => {
+                        generation = now;
+                    }
+                    quic::Rebind::Failed => {
+                        let _ = conn.close(false, 0, b"rebind");
+                        break;
+                    }
+                }
+            }
+        }
         let wait = conn
             .lock()
             .ok()
@@ -1019,6 +1045,10 @@ fn pump_connection(
         }
         conn.on_timeout();
         quic::flush_egress(&mut conn, sock);
+        if moved && quic::path_failed(&mut conn, local) {
+            let _ = conn.close(false, 0, b"rebind");
+            break;
+        }
     }
     dead.store(true, Ordering::Relaxed);
 }

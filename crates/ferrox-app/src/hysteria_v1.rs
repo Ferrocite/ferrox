@@ -111,6 +111,7 @@ fn connect(dial: &Dial) -> Option<Session> {
             None => crate::quic::Datagram::plain(sock),
         },
     };
+    let net = crate::quic::network_generation();
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let keep_alive = dial
         .config
@@ -123,6 +124,10 @@ fn connect(dial: &Dial) -> Option<Session> {
         shared: Arc::new(Mutex::new(conn)),
         sock: Arc::new(sock),
         local,
+        local_now: Arc::new(Mutex::new(local)),
+        peer: Some(peer),
+        net: Arc::new(std::sync::atomic::AtomicU64::new(net)),
+        migrated: Arc::default(),
         udp_supported: true,
         driver: None,
         send_wake: None,
@@ -456,15 +461,18 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<Flow> {
     if !response.ok {
         return None;
     }
-    Some(Flow::from_parts(
-        Arc::clone(&session.shared),
-        Arc::clone(&session.sock),
-        session.local,
-        FIRST_FLOW_STREAM,
-        Vec::new(),
-        true,
-        false,
-    ))
+    Some(
+        Flow::from_parts(
+            Arc::clone(&session.shared),
+            Arc::clone(&session.sock),
+            session.local,
+            FIRST_FLOW_STREAM,
+            Vec::new(),
+            true,
+            false,
+        )
+        .with_session(session),
+    )
 }
 
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
