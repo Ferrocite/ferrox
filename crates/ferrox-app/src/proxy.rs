@@ -693,10 +693,6 @@ fn serve_inbounds_counted(
                         };
                         // `-test` proves the device spec without opening an interface the reference also leaves closed.
                         if test {
-                            if spec.address().is_ipv6() && tun_stack(inbound) == "loopback" {
-                                eprintln!("tun inbound: the loopback handler supports IPv4 only");
-                                continue;
-                            }
                             #[cfg(not(target_os = "linux"))]
                             if tun_stack(inbound) == "system" {
                                 eprintln!("tun inbound: the system tun stack is Linux-only");
@@ -15224,10 +15220,6 @@ fn serve_tun_inbound(
                 false
             }
         };
-    }
-    if spec.address().is_ipv6() {
-        eprintln!("tun inbound: the native handler supports IPv4 only");
-        return false;
     }
     let Ok(device) = crate::tun::Device::open(spec) else {
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
