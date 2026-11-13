@@ -174,6 +174,10 @@ pub(crate) fn handshake() -> Duration {
     HANDSHAKE_CAP.with(|cell| cell.get().map_or(configured, |cap| configured.min(cap)))
 }
 
+pub(crate) fn handshake_cap() -> Option<Duration> {
+    HANDSHAKE_CAP.with(|cell| cell.get())
+}
+
 pub(crate) fn head_arrival() -> Duration {
     wait(Named::HeadArrival)
 }
