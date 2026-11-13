@@ -160,6 +160,8 @@ enum Method {
     Hunk,
     /// `rpc TunMulti`: one `MultiHunk` per message, a batch of elements in each.
     MultiHunk,
+    /// One custom path for both names: a batch arrives as a `MultiHunk` and every reply stays one element per message, so neither peer truncates the other.
+    Both,
 }
 
 /// What a header block answers, read while it decodes: each name the gates use is judged at its first field, so a head costs no allocation and no buffer outlives the block.
@@ -169,7 +171,7 @@ struct Gate {
     status: Option<bool>,
     /// The first `:path` names one of the two served methods.
     served: Option<bool>,
-    /// and which of them, so the reply is read as a `MultiHunk` rather than silently truncated to the last element of every message.
+    /// and which of them, so the reply is read as a `MultiHunk` rather than silently truncated to the last element of every message; `None` is one custom path naming both.
     multi: Option<bool>,
     /// The first `:method` was `POST`.
     posted: Option<bool>,
@@ -184,7 +186,7 @@ impl Gate {
             5 if name.eq_ignore_ascii_case(b":path") => {
                 if self.served.is_none() {
                     let multi = multi_path != path && value == multi_path.as_bytes();
-                    self.multi = Some(multi);
+                    self.multi = (multi_path != path).then_some(multi);
                     self.served = Some(multi || value == path.as_bytes());
                 }
             }
@@ -203,6 +205,14 @@ impl Gate {
             }
             _ => {}
         }
+    }
+}
+
+fn served_method(gate: &Gate) -> Method {
+    match gate.multi {
+        Some(true) => Method::MultiHunk,
+        Some(false) => Method::Hunk,
+        None => Method::Both,
     }
 }
 
@@ -438,11 +448,7 @@ impl<R: Read> GrpcReader<R> {
             self.refuse(id);
             return None;
         }
-        self.method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        self.method = served_method(gate);
         let block = block_encode(&[
             (":status", "200"),
             ("content-type", "application/grpc"),
@@ -650,7 +656,7 @@ impl<R: Read> GrpcReader<R> {
     fn decode(&mut self) -> Option<()> {
         match self.method {
             Method::Hunk => self.decode_hunk(),
-            Method::MultiHunk => self.decode_multi(),
+            Method::MultiHunk | Method::Both => self.decode_multi(),
         }
     }
 
@@ -2254,11 +2260,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -2381,11 +2383,7 @@ impl crate::xhttp_h2::H2Service for VmGrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -2494,11 +2492,7 @@ impl crate::xhttp_h2::H2Service for TrGrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -2606,11 +2600,7 @@ impl crate::xhttp_h2::H2Service for SsGrpcService {
             conn.reset(sid);
             return false;
         }
-        let method = if gate.multi == Some(true) {
-            Method::MultiHunk
-        } else {
-            Method::Hunk
-        };
+        let method = served_method(&gate);
         let Some((body, _head, out)) = conn.open(sid, end_stream) else {
             return false;
         };
@@ -3710,6 +3700,14 @@ mod tests {
         path: &str,
         frames: &[(u8, Vec<u8>)],
     ) -> Option<GrpcReader<std::io::Cursor<Vec<u8>>>> {
+        served_with(&GrpcSettings::path("/TunnelService/Tun"), path, frames)
+    }
+
+    fn served_with(
+        settings: &GrpcSettings,
+        path: &str,
+        frames: &[(u8, Vec<u8>)],
+    ) -> Option<GrpcReader<std::io::Cursor<Vec<u8>>>> {
         let mut wire = MAGIC.to_vec();
         wire.extend_from_slice(&frame(
             T_HEADERS,
@@ -3724,11 +3722,8 @@ mod tests {
         for (flags, body) in frames {
             wire.extend_from_slice(&frame(T_DATA, *flags, 1, body));
         }
-        let (reader, writer) = accept_split(
-            std::io::Cursor::new(wire),
-            Sink::default(),
-            "/TunnelService/Tun",
-        )?;
+        let (reader, writer) =
+            accept_split_with(std::io::Cursor::new(wire), Sink::default(), settings)?;
         drop(writer);
         Some(reader)
     }
@@ -3821,6 +3816,21 @@ mod tests {
             let mut reader = served(path, &frames).expect("serves");
             assert_eq!(drain_all(&mut reader).0, want, "{path}");
         }
+        let custom = GrpcSettings {
+            path: "/svc/tun".to_owned(),
+            multi_path: "/svc/tun".to_owned(),
+            ..GrpcSettings::default()
+        };
+        let mut single =
+            served_with(&custom, "/svc/tun", &[(F_END, message(b"ping"))]).expect("serves");
+        assert_eq!(drain_all(&mut single).0, b"ping".to_vec());
+        let mut multi = served_with(
+            &custom,
+            "/svc/tun",
+            &[(F_END, multi_message(&[b"pi", b"n"]))],
+        )
+        .expect("serves");
+        assert_eq!(drain_all(&mut multi).0, b"pin".to_vec());
         assert!(served("/TunnelService/TunExtra", &[]).is_none());
     }
 

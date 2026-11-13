@@ -1508,10 +1508,21 @@ impl GrpcSettings {
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(0)
         };
+        let tls_authority = settings
+            .filter(|s| s.get("security").and_then(Json::as_str) == Some("tls"))
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|s| s.get("serverName"))
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        let authority = text("authority");
         Self {
             path,
             multi_path,
-            authority: text("authority"),
+            authority: if authority.is_empty() {
+                tls_authority.to_owned()
+            } else {
+                authority
+            },
             user_agent: text("userAgent"),
             multi_mode: node
                 .and_then(|s| s.get("multiMode"))
@@ -5444,5 +5455,47 @@ mod tests {
 
         let bare = crate::json::parse(r#"{"streamSettings":{"network":"ws"}}"#).expect("bare");
         assert_eq!(outbound_carrier(&bare, "192.0.2.4").1, "192.0.2.4");
+    }
+
+    #[test]
+    fn grpc_authority_falls_back_to_the_tls_server_name() {
+        let tls = crate::json::parse(
+            r#"{"network":"grpc","security":"tls","tlsSettings":{"serverName":"edge.example"},"grpcSettings":{"serviceName":"svc"}}"#,
+        )
+        .expect("tls");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&tls)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.authority, "edge.example");
+
+        let explicit = crate::json::parse(
+            r#"{"network":"grpc","security":"tls","tlsSettings":{"serverName":"edge.example"},"grpcSettings":{"serviceName":"svc","authority":"head.example"}}"#,
+        )
+        .expect("explicit");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&explicit)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.authority, "head.example");
+
+        let plain = crate::json::parse(
+            r#"{"network":"grpc","security":"none","tlsSettings":{"serverName":"edge.example"},"grpcSettings":{"serviceName":"svc"}}"#,
+        )
+        .expect("plain");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&plain)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.authority, "");
+    }
+
+    #[test]
+    fn a_custom_grpc_service_without_a_split_names_one_path_for_both_streams() {
+        let custom =
+            crate::json::parse(r#"{"network":"grpc","grpcSettings":{"serviceName":"/svc/tun"}}"#)
+                .expect("custom");
+        let Carrier::Grpc(settings) = stream_carrier(Some(&custom)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.path, "/svc/tun");
+        assert_eq!(settings.multi_path, "/svc/tun");
     }
 }
