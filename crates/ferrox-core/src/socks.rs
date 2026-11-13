@@ -61,6 +61,26 @@ pub const REPLY4_REJECTED: u8 = 91;
 /// refused request, not a longer one.
 pub const NAME4_MAX: usize = 255;
 
+/// The room an address is written into: initialized bytes or a vector's spare capacity.
+trait AddressSink {
+    /// Write `bytes` at `at`.
+    fn put(&mut self, at: usize, bytes: &[u8]);
+}
+
+impl AddressSink for [u8] {
+    fn put(&mut self, at: usize, bytes: &[u8]) {
+        self[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
+impl AddressSink for [core::mem::MaybeUninit<u8>] {
+    fn put(&mut self, at: usize, bytes: &[u8]) {
+        for (slot, &byte) in self[at..at + bytes.len()].iter_mut().zip(bytes) {
+            slot.write(byte);
+        }
+    }
+}
+
 /// The address a request names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target<'a> {
@@ -96,26 +116,30 @@ impl Target<'_> {
 
     /// Write this target into `out`, which must hold `wire_len()` octets.
     pub fn encode_into(&self, out: &mut [u8]) {
+        assert!(
+            out.len() >= self.wire_len(),
+            "socks5 address buffer too short"
+        );
+        self.write_address(out);
+    }
+
+    fn write_address<S: AddressSink + ?Sized>(&self, out: &mut S) {
         match self {
             Self::V4(octets, port) => {
-                assert!(out.len() >= 7, "socks5 address buffer too short");
-                out[0] = ATYP_IPV4;
-                out[1..5].copy_from_slice(octets);
-                out[5..7].copy_from_slice(&port.to_be_bytes());
+                out.put(0, &[ATYP_IPV4]);
+                out.put(1, octets);
+                out.put(5, &port.to_be_bytes());
             }
             Self::V6(octets, port) => {
-                assert!(out.len() >= 19, "socks5 address buffer too short");
-                out[0] = ATYP_IPV6;
-                out[1..17].copy_from_slice(octets);
-                out[17..19].copy_from_slice(&port.to_be_bytes());
+                out.put(0, &[ATYP_IPV6]);
+                out.put(1, octets);
+                out.put(17, &port.to_be_bytes());
             }
             Self::Name(name, port) => {
-                let len = 4 + name.len();
-                assert!(out.len() >= len, "socks5 address buffer too short");
-                out[0] = ATYP_DOMAIN;
-                out[1] = name.len() as u8;
-                out[2..2 + name.len()].copy_from_slice(name);
-                out[2 + name.len()..len].copy_from_slice(&port.to_be_bytes());
+                out.put(0, &[ATYP_DOMAIN]);
+                out.put(1, &[name.len() as u8]);
+                out.put(2, name);
+                out.put(2 + name.len(), &port.to_be_bytes());
             }
         }
     }
@@ -156,7 +180,7 @@ pub fn user_pass(user: &[u8], pass: &[u8]) -> Vec<u8> {
 /// byte, and the destination.
 #[allow(
     clippy::uninit_vec,
-    reason = "the address is written into the room below before the vector is read"
+    reason = "the address is written through the spare capacity before the length is raised"
 )]
 #[must_use]
 pub fn request(cmd: u8, target: &Target<'_>) -> Vec<u8> {
@@ -165,9 +189,10 @@ pub fn request(cmd: u8, target: &Target<'_>) -> Vec<u8> {
     out.push(VERSION);
     out.push(cmd);
     out.push(0);
-    // SAFETY: the address is written into the room below before the vector is read, and `encode_into` fills every byte of it.
+    target.write_address(&mut out.spare_capacity_mut()[..len]);
+    // SAFETY: `write_address` initialized every byte this length exposes; no reference
+    // was formed over uninitialized memory.
     unsafe { out.set_len(3 + len) };
-    target.encode_into(&mut out[3..]);
     out
 }
 
@@ -375,9 +400,10 @@ pub fn datagram(target: &Target<'_>, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&[0, 0, 0]);
     let at = out.len();
     let len = target.wire_len();
-    // SAFETY: the address is written into the room below before the vector is read, and `encode_into` fills every byte of it.
+    target.write_address(&mut out.spare_capacity_mut()[..len]);
+    // SAFETY: `write_address` initialized every byte this length exposes; no reference
+    // was formed over uninitialized memory.
     unsafe { out.set_len(at + len) };
-    target.encode_into(&mut out[at..]);
     out.extend_from_slice(payload);
 }
 
