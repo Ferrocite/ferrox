@@ -7419,17 +7419,6 @@ fn send_mux_end(wire: &MuxWire, staging: &mut Vec<u8>, id: u16) {
     let _ = wire.write_frame(staging, end, None);
 }
 
-fn write_mux_keep(wire: &MuxWire, staging: &mut Vec<u8>, id: u16, payload: &[u8]) -> bool {
-    let keep = ferrox_core::mux::Outgoing {
-        id,
-        status: ferrox_core::mux::Status::Keep,
-        options: ferrox_core::mux::DATA,
-        target: None,
-        global_id: None,
-    };
-    wire.write_frame(staging, keep, Some(payload))
-}
-
 /// Frames one flow may have waiting before its origin is treated as stalled: a slow reader costs its own flow, and the session keeps reading for every other.
 const MUX_PENDING: usize = 16;
 
@@ -7593,6 +7582,27 @@ impl MuxWire {
                     staging.truncate(written);
                     stream.write_all(staging)
                 };
+                if written.is_err() {
+                    close();
+                }
+                written.is_ok()
+            }
+        }
+    }
+
+    /// An already encoded header and the payload behind it: the same two-part write as
+    /// `write_frame`, without rebuilding metadata a flow already holds.
+    fn write_parts(&self, first: &[u8], second: &[u8]) -> bool {
+        match self {
+            Self::Conn(conn) => write_mux_two(conn, first, second),
+            Self::Tunnel(tunnel) => tunnel.write_frame_parts(first, second),
+            Self::Stream { stream, close } => {
+                let Ok(mut stream) = stream.lock() else {
+                    return false;
+                };
+                let written = stream
+                    .write_all(first)
+                    .and_then(|()| stream.write_all(second));
                 if written.is_err() {
                     close();
                 }
@@ -8119,12 +8129,24 @@ impl MuxTcpFlow {
             let _ = uplink.shutdown(Shutdown::Write);
         };
         let writer = RelayPool::global().run(writer);
+        // The metadata of every Keep this flow sends is the same; only the two-byte payload length moves, so the header is encoded once into the scratch the End will later reuse and patched in place.
+        let keep = ferrox_core::mux::Outgoing::bare(
+            self.id,
+            ferrox_core::mux::Status::Keep,
+            ferrox_core::mux::DATA,
+        );
+        let at = keep.encode_header_into(&mut scratch);
         let mut chunk = [0u8; 8192];
         loop {
             match read_half.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if !write_mux_keep(&self.wire, &mut scratch, self.id, &chunk[..n]) {
+                    assert!(
+                        n <= ferrox_core::mux::CHUNK_MAX,
+                        "mux chunk longer than a length field"
+                    );
+                    keep.patch_payload_len(&mut scratch, at, n);
+                    if !self.wire.write_parts(&scratch, &chunk[..n]) {
                         break;
                     }
                 }
