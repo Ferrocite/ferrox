@@ -1445,9 +1445,50 @@ fn dial_through_proxy(
     Ok(client)
 }
 
+/// The outbounds `serve_udp_lane_with` gives a datagram lane; a tagged dial refuses a hop
+/// without one instead of handing its caller a socket no reply can reach.
+fn udp_lane_supported(out: &Outbound) -> bool {
+    match out {
+        Outbound::Loopback(loopback) => loopback.dial.as_ref().is_some_and(udp_lane_supported),
+        Outbound::Vless(vless) => match &vless.carrier {
+            Carrier::Quic => true,
+            Carrier::Raw(_) => vless.tls.is_none(),
+            Carrier::Kcp(_) => vless.mux.tcp.is_some(),
+            Carrier::Hysteria(_) => {
+                vless.mux.tcp.is_none() && hysteria_dial_session(vless).is_some()
+            }
+            _ => false,
+        },
+        Outbound::Trojan(trojan) => {
+            (matches!(trojan.carrier, Carrier::Hysteria(_))
+                && trojan_hysteria_dial(trojan).is_some())
+                || trojan_udp_carried(&trojan.carrier)
+        }
+        Outbound::Vmess(_)
+        | Outbound::Hysteria(_)
+        | Outbound::Foxy(_)
+        | Outbound::WireGuard(_)
+        | Outbound::Masque(_)
+        | Outbound::Warp(_)
+        | Outbound::Freedom(_)
+        | Outbound::Psiphon(_)
+        | Outbound::Dns(_)
+        | Outbound::ReversePortal(_) => true,
+        Outbound::Shadowsocks(ss) => matches!(ss.carrier, Carrier::Raw(_)),
+        Outbound::Socks(socks) => socks.version != crate::socks::Version::V4,
+        Outbound::Http(_)
+        | Outbound::Veepn(_)
+        | Outbound::Route(_)
+        | Outbound::Block(_)
+        | Outbound::Metrics { .. }
+        | Outbound::Api(_) => false,
+    }
+}
+
 /// Hand a datagram destination to the outbound a `dialerProxy` names. The caller gets a socket
 /// connected to a shim that frames each datagram into the hop's own UDP lane, so the hop owns the
 /// carrier and its source, options and strategy, and the pipe owns none.
+#[allow(clippy::too_many_lines)]
 fn dial_udp_through_proxy(
     target: SocketAddr,
     tag: &str,
@@ -1458,6 +1499,9 @@ fn dial_udp_through_proxy(
         return None;
     }
     let out = shared.outbound_ref(tag)?.clone();
+    if !udp_lane_supported(&out) {
+        return None;
+    }
     let (source, sockopts, strategy) = if shared.default_tag.as_deref() == Some(tag) {
         (
             shared.default_source,
@@ -1556,8 +1600,6 @@ fn dial_udp_through_proxy(
 
 fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
     // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
-    let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
-        .map_err(|_| Failure::new(Stage::SocketConnected, Kind::Local))?;
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
     if let Some(options) = sockopts.as_deref() {
         if let Some(tag) = options.dialer_proxy() {
@@ -1575,6 +1617,8 @@ fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
             });
         }
     }
+    let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
+        .map_err(|_| Failure::new(Stage::SocketConnected, Kind::Local))?;
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
@@ -25863,7 +25907,7 @@ fn serve_udp_answer(
 /// names, and the options the outbound took, all before the first packet.
 fn datagram_uplink(
     dest: SocketAddr,
-    source: Option<IpAddr>,
+    send_through: Option<SendThrough>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
 ) -> Option<(UdpSocket, Option<Arc<AtomicBool>>)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -25873,6 +25917,7 @@ fn datagram_uplink(
                 .map(|(socket, stop)| (socket, Some(stop)));
         }
     }
+    let source = resolve_source(send_through).ok()?;
     let domain = if dest.is_ipv4() {
         Domain::IPV4
     } else {
@@ -25966,10 +26011,7 @@ fn serve_socks_udp_freedom(
             }
             continue;
         }
-        let Ok(local) = resolve_source(send_through) else {
-            continue;
-        };
-        let Some((up, tagged_stop)) = datagram_uplink(dest, local, sockopts) else {
+        let Some((up, tagged_stop)) = datagram_uplink(dest, send_through, sockopts) else {
             continue;
         };
         let (Ok(writer), Ok(relay_write), Ok(noise_socket)) =
@@ -70102,6 +70144,78 @@ mod tests {
         let (n, _) = client.recv_from(&mut back).expect("echoes");
         let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
         assert_eq!(payload, b"ping");
+    }
+
+    /// A hop with no datagram lane is refused before the caller gets a socket that never answers.
+    #[test]
+    fn a_tagged_udp_lane_refuses_a_hop_without_datagrams() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let options = crate::sockopt::parse_outbound(Some(
+            &crate::json::parse(r#"{"dialerProxy":"hop"}"#).expect("parses"),
+        ))
+        .expect("parses")
+        .expect("options");
+        options.install_route(&shared);
+        assert!(
+            dial_udp_through_proxy(SocketAddr::from(([127, 0, 0, 1], 53)), "hop", &options)
+                .is_none(),
+            "an HTTP hop carries no datagrams"
+        );
+    }
+
+    /// A tagged dial does not draw the original source: the hop supplies its own.
+    #[test]
+    fn a_tagged_dial_skips_the_original_source_draw() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_tagged_dial_skips_the_original_source_draw",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","sendThrough":"198.18.0.0/15","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"freedom"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let target = SocketAddr::from(([127, 0, 0, 1], echo_port));
+        {
+            let asked = Destination::from(target);
+            let (lane, tag) = plan.lane_with_protocol(
+                &asked,
+                crate::router::Network::Tcp,
+                None,
+                FlowFacts::default(),
+            );
+            assert!(matches!(&*lane, Outbound::Freedom(_)));
+            assert_eq!(tag.as_deref(), Some("proxy"));
+        }
+        FAIL_ENTROPY.with(|flag| flag.set(true));
+        let dialed = dial(&target);
+        FAIL_ENTROPY.with(|flag| flag.set(false));
+        let mut stream = dialed.expect("the tagged dial skips the original source");
+        stream.write_all(b"ping").expect("writes");
+        let mut said = [0u8; 4];
+        stream.read_exact(&mut said).expect("echoes");
+        assert_eq!(&said, b"ping");
     }
 
     /// A KCP carrier rides the tagged socket: the shim frames each segment into the hop's UDP

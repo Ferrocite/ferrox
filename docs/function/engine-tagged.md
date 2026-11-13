@@ -37,8 +37,10 @@ same hop for that shape:
 `kcp_dial_session` takes this path when the KCP outbound names a tag, and passes the resulting
 socket to `ferrox_core::kcp::dial_with`, which rides the caller's socket instead of binding its
 own. A freedom UDP lane takes the same path per destination in `datagram_uplink`, so a routed
-datagram whose outbound names a hop does not fall back to the machine's route. The socket is not
-cached: each tagged destination or carrier owns its relay and its three threads, and the KCP
+datagram whose outbound names a hop does not fall back to the machine's route. A hop with no
+datagram lane, such as an HTTP outbound, is refused before the shim opens: the datagram fails
+instead of stalling on a socket no reply can reach. The socket is not cached: each tagged
+destination or carrier owns its relay and its three threads, and the KCP
 closer or the freedom lane's retirement sets the stop flag the threads read. A protobuf sender or receiver
 socket config decodes field 9 (`dialer_proxy`) into the same `dialerProxy` key as the JSON dialect,
 alongside `tproxy`.
