@@ -2172,10 +2172,8 @@ fn xmc_uuid(value: &str) -> Option<[u8; 16]> {
     } else {
         bytes
     };
-    let canonical = text.len() == 36
-        && [8, 13, 18, 23]
-            .into_iter()
-            .all(|index| text[index] == b'-');
+    let canonical =
+        text.len() == 36 && [8, 13, 18, 23].into_iter().all(|index| text[index] == b'-');
     if text.len() == 32 || canonical {
         uuid_bytes(std::str::from_utf8(text).ok()?)
     } else {
