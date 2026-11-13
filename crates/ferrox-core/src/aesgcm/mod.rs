@@ -908,6 +908,7 @@ impl Aes128Gcm {
         }
     }
 
+    #[cfg_attr(target_arch = "aarch64", inline)]
     #[must_use]
     pub fn open_in_place(
         &self,

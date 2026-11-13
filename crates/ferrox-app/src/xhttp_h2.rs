@@ -1204,7 +1204,7 @@ impl H2Conn {
                                 .unwrap_or_else(PoisonError::into_inner);
                             *conn > 0 && *window > 0
                         },
-                        false,
+                        crate::proxy::relay_step_owns_poll(),
                     ),
                     Pumped::Alive
                 ) {
@@ -1673,9 +1673,7 @@ fn fill_frame(
                 if yieldable {
                     return Some(false);
                 }
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    std::thread::sleep(crate::budgets::RELAY_POLL);
-                }
+                std::thread::sleep(crate::budgets::RELAY_POLL);
             }
             Err(_) => return None,
         }
@@ -1698,7 +1696,16 @@ impl H2Conn {
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
-        let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut read = if yieldable {
+            match read.try_lock() {
+                Ok(read) => read,
+                // A lane that cannot take the pump yields the poll: the reader that holds it is the one making progress.
+                Err(std::sync::TryLockError::WouldBlock) => return Pumped::Yield,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            }
+        } else {
+            read.lock().unwrap_or_else(PoisonError::into_inner)
+        };
         if ready() {
             return Pumped::Alive;
         }

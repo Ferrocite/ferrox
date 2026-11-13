@@ -1,5 +1,7 @@
 use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
+use std::io::IoSliceMut;
 use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -27696,14 +27698,7 @@ fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<A
         && !client_read.metered()
         && !target_read.metered()
     {
-        relay_owned_with(
-            client_read,
-            target_write,
-            target_read,
-            client_write,
-            None,
-            false,
-        );
+        relay_vectored_direct(client_read, target_write, target_read, client_write);
         return;
     }
     // A descriptor fast path cannot cross the mask, and only the Linux pump strips the answer the raw VLESS dial has not seen; every other host and a metered leg keep the lane pool.
@@ -28014,6 +28009,110 @@ fn poll_handoff(
     client_write: Connection,
 ) -> (RelayEnd, RelayEnd) {
     poll_copy::handoff(client_read, target_write, target_read, client_write)
+}
+
+/// The direct Windows relay moves a pooled window batch through one `WSARecv` and one `WSASend`.
+/// It keeps eight small windows until half a megabyte has crossed, then grows to sixteen full
+/// windows, so a bulk download pays one syscall pair per megabyte and a small flow keeps its
+/// footprint.
+#[cfg(windows)]
+fn relay_vectored_direct(
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
+) {
+    for connection in [&client_read, &target_read, &target_write, &client_write] {
+        let _ = connection.set_read_timeout(None);
+        let _ = connection.set_write_timeout(None);
+    }
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let flow = RelayFinish::new(false, close, None);
+    let first = Arc::clone(&flow);
+    let done = RelayPool::global().run(move || {
+        vectored_copy(client_read, target_write);
+        first.mark_ended();
+        first.lane_done();
+    });
+    vectored_copy(target_read, client_write);
+    flow.mark_ended();
+    flow.lane_done();
+    join(&done);
+}
+
+/// Copy one direction with eight pooled windows: the kernel fills them in order and drains them in
+/// order, so a partial send resumes at the first byte it did not take.
+#[cfg(windows)]
+fn vectored_copy(mut src: Connection, mut dst: Connection) {
+    const SMALL_WINDOWS: usize = 8;
+    const LARGE_WINDOWS: usize = 16;
+    const GROW_AFTER: usize = 512 * 1000;
+    let mut windows: Vec<Vec<u8>> = (0..SMALL_WINDOWS)
+        .map(|_| {
+            take_relay_window(RELAY_SMALL_BUFFER).unwrap_or_else(|| vec![0; RELAY_SMALL_BUFFER])
+        })
+        .collect();
+    let mut moved = 0;
+    'copy: loop {
+        if moved >= GROW_AFTER && windows[0].len() < RELAY_BUFFER {
+            for window in windows.drain(..) {
+                give_relay_window(window);
+            }
+            windows = (0..LARGE_WINDOWS)
+                .map(|_| take_relay_window(RELAY_BUFFER).unwrap_or_else(|| vec![0; RELAY_BUFFER]))
+                .collect();
+        }
+        let mut slices: Vec<IoSliceMut<'_>> = windows
+            .iter_mut()
+            .map(|window| IoSliceMut::new(window))
+            .collect();
+        let n = match src.read_vectored(&mut slices) {
+            Ok(0) => {
+                let _ = dst.shutdown(Shutdown::Write);
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                let _ = dst.shutdown(Shutdown::Write);
+                break;
+            }
+        };
+        moved += n;
+        let mut off = 0;
+        while off < n {
+            let mut slices = Vec::with_capacity(windows.len());
+            let mut skip = off;
+            let mut left = n - off;
+            for window in &windows {
+                if left == 0 {
+                    break;
+                }
+                if skip >= window.len() {
+                    skip -= window.len();
+                    continue;
+                }
+                let start = skip;
+                skip = 0;
+                let take = left.min(window.len() - start);
+                slices.push(IoSlice::new(&window[start..start + take]));
+                left -= take;
+            }
+            match dst.write_vectored(&slices) {
+                Ok(0) => {
+                    let _ = dst.shutdown(Shutdown::Write);
+                    break 'copy;
+                }
+                Ok(written) => off += written,
+                Err(_) => {
+                    let _ = dst.shutdown(Shutdown::Write);
+                    break 'copy;
+                }
+            }
+        }
+    }
+    for window in windows {
+        give_relay_window(window);
+    }
 }
 
 fn relay_owned(
