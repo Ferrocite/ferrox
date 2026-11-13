@@ -1409,6 +1409,10 @@ struct WriteSide {
     direct: bool,
     #[cfg(test)]
     last_slices: Vec<(*const u8, usize)>,
+    #[cfg(test)]
+    sealed_records: Vec<(*const u8, usize)>,
+    #[cfg(test)]
+    copied_records: Vec<usize>,
 }
 
 fn copy_from_parts(parts: &[&[u8]], mut at: usize, mut len: usize, out: &mut Vec<u8>) {
@@ -1425,6 +1429,20 @@ fn copy_from_parts(parts: &[&[u8]], mut at: usize, mut len: usize, out: &mut Vec
             break;
         }
     }
+}
+
+/// The record `[at, at + len)` when one caller part holds all of it, so the seal can read that
+/// part instead of copying it into the staging buffer first.
+fn part_slice<'a>(parts: &[&'a [u8]], at: usize, len: usize) -> Option<&'a [u8]> {
+    let mut base = 0;
+    for part in parts {
+        let end = base + part.len();
+        if at >= base && at + len <= end {
+            return Some(&part[at - base..at - base + len]);
+        }
+        base = end;
+    }
+    None
 }
 
 impl WriteSide {
@@ -1469,6 +1487,8 @@ impl WriteSide {
             self.last_slices.clear();
             self.last_slices
                 .extend(parts.iter().map(|part| (part.as_ptr(), part.len())));
+            self.sealed_records.clear();
+            self.copied_records.clear();
         }
         let total = parts.iter().map(|part| part.len()).sum::<usize>();
         let mut at = 0;
@@ -1491,14 +1511,22 @@ impl WriteSide {
                 let len = n + TAG_LEN;
                 let header = [23, 3, 3, (len >> 8) as u8, len as u8];
                 self.out.extend_from_slice(&header);
-                let start = self.out.len();
-                copy_from_parts(parts, at + done, n, &mut self.out);
-                debug_assert_eq!(self.out.len() - start, n);
                 let rekey = self.aead.nonce == MAX_NONCE;
-                let tag = self
-                    .aead
-                    .seal_in_place(None, &mut self.out[start..], &header);
-                self.out.extend_from_slice(&tag);
+                if let Some(src) = part_slice(parts, at + done, n) {
+                    self.aead.seal_into(None, src, &header, &mut self.out);
+                    #[cfg(test)]
+                    self.sealed_records.push((src.as_ptr(), src.len()));
+                } else {
+                    let start = self.out.len();
+                    copy_from_parts(parts, at + done, n, &mut self.out);
+                    debug_assert_eq!(self.out.len() - start, n);
+                    let tag = self
+                        .aead
+                        .seal_in_place(None, &mut self.out[start..], &header);
+                    self.out.extend_from_slice(&tag);
+                    #[cfg(test)]
+                    self.copied_records.push(n);
+                }
                 if rekey {
                     self.aead = self
                         .aead
@@ -1563,6 +1591,10 @@ impl<S> EncryptedStream<S> {
                 direct: false,
                 #[cfg(test)]
                 last_slices: Vec::new(),
+                #[cfg(test)]
+                sealed_records: Vec::new(),
+                #[cfg(test)]
+                copied_records: Vec::new(),
             },
         }
     }
@@ -2424,6 +2456,98 @@ mod tests {
             direct_sliced.get_ref().calls,
             direct_control.get_ref().calls
         );
+    }
+
+    /// A record wholly inside one caller part reaches the seal from that part, so the record
+    /// layer's copy into the staging buffer is gone; only the two records that cross a part
+    /// boundary are copied.
+    #[test]
+    fn a_record_inside_one_part_is_sealed_from_that_part() {
+        use std::io::Write as _;
+
+        let key = vec![7u8; 32];
+        let uuid = [0x11u8; 16];
+        let head = [0u8; HEADER_LEN];
+        let payload = vec![0x33u8; 7 * MAX_RECORD_PLAINTEXT];
+        let trailer = [0u8; 16];
+        let parts: [&[u8]; 4] = [&uuid, &head, &payload, &trailer];
+        let joined: Vec<u8> = parts.concat();
+
+        let mut sliced = EncryptedStream::new(
+            Vec::new(),
+            key.clone(),
+            Aead::with_cipher(b"single part", &key, true),
+            None,
+            ReadStage::Records,
+        );
+        sliced.write_all_slices(&parts).unwrap();
+
+        let mut control = EncryptedStream::new(
+            Vec::new(),
+            key.clone(),
+            Aead::with_cipher(b"single part", &key, true),
+            None,
+            ReadStage::Records,
+        );
+        control.write_all(&joined).unwrap();
+        assert_eq!(sliced.get_ref(), control.get_ref());
+
+        assert_eq!(
+            sliced.write.copied_records,
+            vec![
+                MAX_RECORD_PLAINTEXT,
+                joined.len() - 7 * MAX_RECORD_PLAINTEXT
+            ],
+            "only the records that cross a part boundary are copied"
+        );
+        assert_eq!(sliced.write.sealed_records.len(), 6);
+        for (record, (base, len)) in sliced.write.sealed_records.iter().enumerate() {
+            let start = (record + 1) * MAX_RECORD_PLAINTEXT - head.len() - uuid.len();
+            assert_eq!(*len, MAX_RECORD_PLAINTEXT);
+            assert_eq!(
+                *base,
+                payload.as_ptr().wrapping_add(start),
+                "the seal reads the caller's payload part, not a staged copy"
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn sealed_write_probe() -> usize {
+        struct Discard(usize);
+        impl Write for Discard {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = vec![7u8; 32];
+        let uuid = [0x11u8; 16];
+        let head = [0u8; HEADER_LEN];
+        let payload = vec![0x33u8; 7 * MAX_RECORD_PLAINTEXT];
+        let trailer = [0u8; 16];
+        let parts: [&[u8]; 4] = [&uuid, &head, &payload, &trailer];
+        let mut stream = EncryptedStream::new(
+            Discard(0),
+            key.clone(),
+            Aead::with_cipher(b"single part", &key, true),
+            None,
+            ReadStage::Records,
+        );
+        for _ in 0..256 {
+            stream.write_all_slices(&parts).expect("writes");
+        }
+        stream.get_ref().0
+    }
+
+    #[test]
+    fn the_sealed_write_costs_the_seal_and_the_copy() {
+        assert!(sealed_write_probe() > 0);
     }
 
     #[test]

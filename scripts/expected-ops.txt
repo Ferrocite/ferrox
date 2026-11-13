@@ -182,7 +182,7 @@ append_pem 562
 # Re-blessed 51893238 by the cover re-base: the in-place cover shifts this
 # probe's frame back; dns.rs is untouched and the five decisions still walk
 # 4096 times. ops.yml run 43378506875.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893238 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893198 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -294,3 +294,8 @@ ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_m
 # stays one pass, a block per field; the oracle test replays the pinned Go
 # writer's bytes.
 ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+# The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
+# head, seven 8 KiB payload records, trailer) through an AES engine and a discard
+# sink. A record wholly inside the payload part is sealed from that part, so only
+# the two records that cross a part boundary are copied; 50871336 is 198716.2 per turn.
+ferrox_core::vless_encryption::tests::sealed_write_probe 50871336 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
