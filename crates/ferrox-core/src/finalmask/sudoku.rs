@@ -806,26 +806,26 @@ fn should_pad(
     padding_min: u32,
     padding_max: u32,
 ) -> io::Result<bool> {
-    let chance = match *chance {
+    let drawn = match *chance {
         Some(chance) => chance,
         None => {
-            let chance = if padding_min == padding_max {
+            let drawn = if padding_min == padding_max {
                 padding_min
             } else {
                 let span = (padding_max - padding_min + 1) as usize;
                 padding_min + rng.int_n(span)? as u32
             };
-            *chance = Some(chance);
-            chance
+            *chance = Some(drawn);
+            drawn
         }
     };
-    if chance == 0 {
+    if drawn == 0 {
         return Ok(false);
     }
-    if chance >= 100 {
+    if drawn >= 100 {
         return Ok(true);
     }
-    Ok((rng.int_n(100)? as u32) < chance)
+    Ok((rng.int_n(100)? as u32) < drawn)
 }
 
 fn push_pure_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
