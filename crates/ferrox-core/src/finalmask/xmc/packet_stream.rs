@@ -466,6 +466,39 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_payload_channel_keeps_the_string_rules() {
+        let invalid_utf8 = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![1, 0xff],
+        };
+        let error = parse_custom_payload(&invalid_utf8).expect_err("invalid utf-8");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let too_long = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![0x81, 0x20],
+        };
+        let error = parse_custom_payload(&too_long).expect_err("length over the string cap");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let truncated = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![8, b'x'],
+        };
+        let error = parse_custom_payload(&truncated).expect_err("short channel");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let overlong = Packet {
+            id: CLIENTBOUND_CUSTOM_PAYLOAD,
+            data: vec![0x88, 0x00],
+        };
+        assert!(
+            parse_custom_payload(&overlong).is_err(),
+            "a non-canonical length is still refused"
+        );
+    }
+
+    #[test]
     fn a_client_echoes_keepalives_and_skips_other_payloads() {
         let out = Pipe::new();
         let input = Pipe::new();
