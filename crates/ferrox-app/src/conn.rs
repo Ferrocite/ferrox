@@ -98,6 +98,7 @@ impl Masked {
     }
 
     /// Encode a whole frame and put it on the wire in one call, the shape a blocking relay write has.
+    #[cfg(unix)]
     fn send_ready(&self, parts: &[&[u8]]) -> io::Result<usize> {
         let Ok(mut chain) = self.chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
@@ -739,6 +740,7 @@ impl Connection {
     /// Whether a codec lies between this connection and the socket. A masked frame cannot report a
     /// partial plaintext take — its encoded length is not the caller's — so the relay keeps the blocking
     /// `write_slices` for it instead of the nonblocking shortcut.
+    #[cfg(unix)]
     pub(crate) fn has_mask(&self) -> bool {
         match self {
             Connection::Masked(_) => true,
