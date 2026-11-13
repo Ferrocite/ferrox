@@ -284,6 +284,6 @@ ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_m
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
 # reference is formed over uninitialized memory and no byte loop runs. The copy
-# moved from the method's own frame into `memcpy`; the oracle test replays the
-# pinned Go writer's bytes.
+# stays one pass, a block per field; the oracle test replays the pinned Go
+# writer's bytes.
 ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
