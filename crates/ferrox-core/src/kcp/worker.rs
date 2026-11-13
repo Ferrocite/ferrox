@@ -234,7 +234,7 @@ impl ReceivingWorker {
             spare: Vec::new(),
             left_over: VecDeque::new(),
             left_over_off: 0,
-            window: ReceivingWindow::new(),
+            window: ReceivingWindow::new(window_size),
             acklist: AckList::new(),
             next_number: 0,
             window_size,
@@ -346,6 +346,6 @@ impl ReceivingWorker {
         self.left_over.clear();
         self.left_over_off = 0;
         self.spare.clear();
-        self.window = ReceivingWindow::new();
+        self.window.release();
     }
 }

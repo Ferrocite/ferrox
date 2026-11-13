@@ -33,8 +33,9 @@ impl Default for Config {
 impl Config {
     #[must_use]
     pub fn sending_in_flight_size(&self) -> u32 {
-        let size =
-            self.uplink_capacity * 1024 * 1024 / self.mtu.max(1) / (1000 / self.tti.max(1)).max(1);
+        let size = self.uplink_capacity.wrapping_mul(1024 * 1024)
+            / self.mtu.max(1)
+            / (1000 / self.tti.max(1)).max(1);
         size.max(8)
     }
 
@@ -45,7 +46,7 @@ impl Config {
 
     #[must_use]
     pub fn receiving_in_flight_size(&self) -> u32 {
-        let size = self.downlink_capacity * 1024 * 1024
+        let size = self.downlink_capacity.wrapping_mul(1024 * 1024)
             / self.mtu.max(1)
             / (1000 / self.tti.max(1)).max(1);
         size.max(8)
@@ -102,6 +103,25 @@ mod tests {
                 let _ = c.ack_limit();
             }
         }
+    }
+
+    #[test]
+    fn capacities_at_and_above_the_wrapping_point_match_the_reference() {
+        let c = Config {
+            uplink_capacity: 4096,
+            downlink_capacity: 4096,
+            ..Config::default()
+        };
+        assert_eq!(c.sending_in_flight_size(), 8);
+        assert_eq!(c.receiving_in_flight_size(), 8);
+
+        let c = Config {
+            uplink_capacity: 4097,
+            downlink_capacity: 4097,
+            ..Config::default()
+        };
+        assert_eq!(c.sending_in_flight_size(), 38);
+        assert_eq!(c.receiving_in_flight_size(), 38);
     }
 
     #[test]
