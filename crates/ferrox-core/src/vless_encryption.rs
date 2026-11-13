@@ -1711,6 +1711,12 @@ impl<W> EncryptedWriter<W> {
     }
 }
 
+impl<W: Write> EncryptedWriter<W> {
+    pub fn write_all_slices(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        self.side.write_all_slices(&mut self.inner, parts)
+    }
+}
+
 impl<W: Write> Write for EncryptedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.side.write(&mut self.inner, buf)

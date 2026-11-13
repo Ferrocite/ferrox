@@ -336,6 +336,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
+    /// A session whose direct switch lives on the session itself, so a split carrier peels its record layer the way the sealed raw path does.
+    pub(crate) fn switchable(session: S, uuid: &[u8; 16], direct: fn(&mut S)) -> Self {
+        let mut link = Self::new(session, None, uuid);
+        link.direct = Some(direct);
+        link
+    }
+
     /// Hands the link a parked read's framed prefix as the walk's window, before the session.
     pub(crate) fn preload(&mut self, prefix: Vec<u8>) {
         debug_assert!(self.have.is_empty() && self.dot == 0);
