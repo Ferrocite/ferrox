@@ -1035,7 +1035,8 @@ pub(crate) fn verify_endpoint(
                                     .iter()
                                     .any(|record| record.kind == 1 && record.rdata.len() == 4)
                         }) {
-                            return Some(started.elapsed());
+                            let answered = started.elapsed();
+                            return (answered < timeout).then_some(answered);
                         }
                     }
                     Event::DataPrefixed(_) => {}
