@@ -129,6 +129,19 @@ struct Inner {
     stable: Arc<AtomicBool>,
 }
 
+/// A local socket that carries a nested tunnel's datagrams through this conversation.
+#[derive(Debug)]
+pub(crate) struct UdpForwarder {
+    pub(crate) local: SocketAddr,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for UdpForwarder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The lane names its spec; the spec redacts the headers that carry a token and
 /// the key WARP signs with.
 impl std::fmt::Debug for MasqueOut {
@@ -273,6 +286,65 @@ impl MasqueOut {
             }
             Err(reason) => eprintln!("masque: {reason}"),
         }
+    }
+
+    /// A fixed-target datagram lane through this tunnel, dialled on its first datagram.
+    pub(crate) fn udp_forwarder(
+        self: &Arc<Self>,
+        target: SocketAddr,
+    ) -> Result<UdpForwarder, String> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("masque forwarder: cannot bind: {error}"))?;
+        let local = socket
+            .local_addr()
+            .map_err(|error| format!("masque forwarder: no local address: {error}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let tunnel = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut probe = vec![0u8; 65_535];
+            let _ = socket.set_read_timeout(Some(TICK));
+            let mut reported = false;
+            while !thread_stop.load(Ordering::Relaxed) {
+                match socket.peek_from(&mut probe) {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+                let inner = match tunnel.ensure() {
+                    Ok(inner) => {
+                        reported = false;
+                        inner
+                    }
+                    Err(reason) => {
+                        if !reported {
+                            eprintln!("masque: {reason}");
+                            reported = true;
+                        }
+                        std::thread::sleep(TICK);
+                        continue;
+                    }
+                };
+                wg_stack::client_udp_forward(
+                    &socket,
+                    &inner.config,
+                    &inner.to_tunnel,
+                    &inner.routes,
+                    target,
+                    0,
+                    &thread_stop,
+                );
+                std::thread::sleep(TICK);
+            }
+        });
+        Ok(UdpForwarder { local, stop })
     }
 
     /// A name resolves inside the tunnel the reference names, then falls back to

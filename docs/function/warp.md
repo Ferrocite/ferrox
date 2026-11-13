@@ -2,10 +2,11 @@
 
 `protocol: warp` is Cloudflare WARP as one outbound: a device identity, the WireGuard half (row 74's carrier) and the MASQUE CONNECT-IP half (row 76's carrier), with `mode: auto` racing the two and the first real DNS answer deciding which carries the flows.
 `mode: wireguard` and `mode: masque` pin one half and never probe; an auto with only one built half takes it without a race.
+`mode: gool` carries a second WireGuard device inside the MASQUE half: the outer identity is the usual WARP one, the inner comes from `goolIdentity`/`goolIdentityFile` or `<identity>-masque-gool.json` (registered without a MASQUE enrollment when absent and `register` is true), and `goolPeer` (or that identity's endpoint) names the inner edge on port 2408. The inner hop is rewritten to a loopback forwarder that carries each datagram through the outer CONNECT-IP tunnel on one fixed inner source port, so the handshake and every transport packet reach the edge from the outer tunnel; the outer conversation is dialled on the forwarder's first datagram, so `warp` still loads while the edge is down. `mode: gool` builds neither standalone half and never races. The server side is the composition of a `masque` inbound and a `wireguard` inbound: the MASQUE server routes its inner UDP flow through a freedom redirect to the WireGuard listener, so this row adds no inbound.
 The identity comes from an inline `identity` block, a saved `identityFile`, or `register: true` which registers once and saves into `identityFile` — a restart reuses the file and never creates a second device.
 A saved file is read back from the API before it is used: the peer, endpoint, reserved bytes and addresses are refreshed in place, so a device whose edge moved keeps working.
-`ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all] [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR] [--mode auto|wireguard|masque]` is the form.
-Without `--register` it registers one combined device (both halves), saves the identity owner-only (0600 on Unix; on Windows it inherits the directory ACL), and prints the outbound config that references it.
+`ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all] [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR] [--mode auto|wireguard|masque|gool]` is the form.
+Without `--register` it registers one combined device (both halves), saves the identity owner-only (0600 on Unix; on Windows it inherits the directory ACL), and prints the outbound config that references it; `--mode gool` also registers the inner WireGuard identity beside it.
 With `--register` it makes the identities the kind names and prints one readiness line per file: `wg` is the WireGuard file, `masque` the MASQUE file beside it, `gool` is MASQUE plus the WireGuard identity it carries (`<masque>-gool`), `gool-classic` is WireGuard plus its second hop (`<config>-secondary`), `mim` is MASQUE plus its second hop, and `all` is all five in that order.
 `-o`/`--config` names the base identity file (default `warp-identity.json`); `--wg-config` and `--masque-config` move the WireGuard and MASQUE files, and every second hop is derived beside its own first: `<config>-secondary`, `<masque>-secondary`, `<masque>-gool`.
 An identity file already there is kept and refreshed, never replaced while it works; a corrupt file is moved to `<name>.corrupt`, and a refused one is registered afresh unless `AETHER_REPROVISION` is `0`, `off` or `false`.
@@ -39,14 +40,15 @@ The chosen halves print `[+] selected WireGuard endpoint IP:PORT` and `[+] selec
 The race asks `one.one.one.one` through each half's own tunnel DNS (`WireGuardOut::probe`, `MasqueOut::probe`) and takes the first `true`.
 A `false` answer does not end the race: the other half may still carry, and the wait runs to the 8 s deadline; two failures or a silent pair fall back to WireGuard, the half a fixed config would have chosen.
 The choice is made once per outbound under one lock, so concurrent flows wait for the first flow's answer instead of probing again.
-`endpoint`, `mtu` (1280), `keepAlive` (25), `probe`, `probePort`, `dns`, `apiAddress`, and a `masque` block (`address`, `port`, `serverName`, `host`, `path`) override the WARP defaults; every one has the default WARP's own clients use, so the identity file is the whole config.
+`endpoint`, `mtu` (1280), `keepAlive` (25), `probe`, `probePort`, `dns`, `apiAddress`, and a `masque` block (`address`, `port`, `serverName`, `host`, `path`) override the WARP defaults; every one has the default WARP's own clients use, so the identity file is the whole config. In gool the inner hop's endpoint is the forwarder's loopback socket and its MTU is `min(mtu, 1200)`, the reference's rate for a WireGuard packet inside a MASQUE one.
 
 Against the references: ZeroNet's `warp.rs` races whole tunnels with a registry of keep-alive stacks and re-races on staleness; this races once per process and keeps the winner, because the carriers themselves already reconnect.
 Aether keeps one TOML identity per transport and re-registers a refused one through `api.rs`; the layout here is the same (base, `-masque`, `-secondary`, `-gool`) in JSON, because `ferrox-app` has no TOML reader, and the read-back is the same `GET /reg/{id}`.
 PattNG's WARP-keys page stages a renewal and keeps the old keys until the new ones answer; here that is the in-memory plan plus the temp-and-rename save.
-What was removed: the second registration on a stale tunnel, the rejected identity saved for a later resume (a refusal now fails cleanly and re-provisions in one act), and the async runtime the references carry — the race is two probe threads and a channel.
+What was removed: the second registration on a stale tunnel, the rejected identity saved for a later resume (a refusal now fails cleanly and re-provisions in one act), and the async runtime the references carry — the race is two probe threads and a channel, and gool's forwarder is one thread per tunnel.
 What was not removed: the registration is still sequential HTTPS calls (the API requires the device id from the first), the per-slot read-back is one more call per existing file, and the losing probe thread runs to its own timeout — it is detached, not cancelled.
 In the scan, every candidate is IPv4; only `ironclad` sends HTTP, while the other modes trust a DNS answer through the tunnel; a cooldown lives for this startup, not across restarts; `stale` bounds discovery, not a running tunnel; and exit-location gating is row 196.
+Gool is Aether's second device and second WARP endpoint, not a key exchange of its own: this registers the inner identity the same way (two calls, no MASQUE enrollment), rebuilds the inner peer's endpoint to the forwarder, and caps the inner MTU at 1200, but it takes `goolPeer` or the identity's one endpoint instead of scanning candidates and remembering the one that answered (row 190).
 Certificate renewal is not on this page; the last-connected edge cache and cooldowns are the edge-discovery section above (row 190), team enrollment is row 192, and the API cut is row 197.
 
 ## Data path
@@ -69,7 +71,11 @@ graph TD
     H --> K
     K --> L["temp file + rename<br/>0600, old keys until here"]
     L --> M["WarpOut::new"]
-    M --> D0{"scan / quickReconnect / forced peer?"}
+    M --> G{"mode gool?"}
+    G -- yes --> G1["GoolOut: MASQUE outer +<br/>WireGuard inner → 127.0.0.1:0"]
+    G1 --> G2["UdpForwarder: one fixed<br/>inner port, MTU ≤ 1200"]
+    G2 --> S
+    G -- no --> D0{"scan / quickReconnect / forced peer?"}
     D0 -- "off" --> N["WireGuard half<br/>row 74 carrier"]
     D0 -- "forced" --> D1["use endpoint<br/>skip sweep"]
     D0 -- "quick" --> D2["last edge DNS check"]
@@ -116,7 +122,7 @@ graph TD
 
 No local duration is quoted: every contributor dials through a VPN, so a local race measures the tunnel.
 The scan's bounds are nominal per-mode deadlines (turbo 45 s, balanced 120 s, thorough 300 s, verified 60 s, ironclad 180 s) with a per-candidate verify timeout of 6/6/10/5/15 s (or a shorter `stale`) and a 6 s ironclad HTTP wait; a worker already in a probe can run one timeout past the deadline. These are bounds, not measured durations.
-The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP data plane is compared in the benchmark matrix's WARP rows — `warp-masque-down-8` in standard, `-down-16`, `-down-64` and `-duplex-64` in full — against Aether in the same cell. ZeroNet is skipped with a reason: its WARP client drops `ADDRESS_ASSIGN` and dials from its configured address, which a shared server's pool has already assigned to another tunnel. A host where the external leg did not build skips the WARP cell with that reason instead of reporting a one-engine comparison.
+The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP data plane is compared in the benchmark matrix's WARP rows — `warp-masque-down-8` in standard, `-down-16`, `-down-64` and `-duplex-64` in full — against Aether in the same cell. ZeroNet is skipped with a reason: its WARP client drops `ADDRESS_ASSIGN` and dials from its configured address, which a shared server's pool has already assigned to another tunnel. A host where the external leg did not build skips the WARP cell with that reason instead of reporting a one-engine comparison. Gool has no CI cell of its own: `wireguard_rides_inside_masque` proves the bytes cross the composed client, and a gool duration against Aether would need Aether's own gool scan and a second WARP device, which the matrix does not provision.
 
 ## CI scope
 

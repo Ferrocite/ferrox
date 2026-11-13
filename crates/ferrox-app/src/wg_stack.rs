@@ -2762,6 +2762,61 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     }
 }
 
+/// A fixed-target client lane that carries another tunnel's datagrams verbatim.
+pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
+    relay: &UdpSocket,
+    config: &DeviceConfig,
+    to_tunnel: &T,
+    routes: &UdpRoutes,
+    target: SocketAddr,
+    headroom: usize,
+    stop: &Arc<AtomicBool>,
+) {
+    let to_tunnel: ToTunnel = to_tunnel.clone().into();
+    let Ok(local) = relay.local_addr() else {
+        return;
+    };
+    let port = local.port();
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if let Ok(mut table) = routes.lock() {
+        table.insert(port, reply_tx);
+    }
+    let _ = relay.set_read_timeout(Some(LANE_TICK));
+    let mut buf = crate::proxy::udp_buffer();
+    let mut app: Option<SocketAddr> = None;
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(inner) = reply_rx.try_recv() {
+            let Some(datagram) = udp_from_packet(&inner) else {
+                continue;
+            };
+            if datagram.destination_port != port {
+                continue;
+            }
+            let Some(app) = app else {
+                continue;
+            };
+            let _ = relay.send_to(datagram.payload, app);
+        }
+        match relay.recv_from(&mut buf) {
+            Ok((n, sender)) => {
+                app = Some(sender);
+                if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    if let Ok(mut table) = routes.lock() {
+        table.remove(&port);
+    }
+}
+
 /// A server datagram lane: the inner flow is one client source and one target,
 /// so its loopback relay carries only that pair. The tree's own UDP dispatcher
 /// dials the outbound, and a reader wraps every answer as the packet the client
@@ -4997,6 +5052,81 @@ mod client_tests {
         let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
         assert_eq!(remote, target);
         assert_eq!(payload, b"answer");
+    }
+
+    #[test]
+    fn a_fixed_datagram_lane_forwards_payloads_verbatim_both_ways() {
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_address = relay.local_addr().expect("address");
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app");
+        app.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let routes: UdpRoutes = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_relay = relay.try_clone().expect("clone");
+        let thread_config = config();
+        let thread_routes = Arc::clone(&routes);
+        let thread_stop = Arc::clone(&stop);
+        let target: SocketAddr = "192.0.2.9:2408".parse().unwrap();
+        std::thread::spawn(move || {
+            client_udp_forward(
+                &thread_relay,
+                &thread_config,
+                &to_tunnel,
+                &thread_routes,
+                target,
+                0,
+                &thread_stop,
+            );
+        });
+        let port = relay_address.port();
+        for _ in 0..100 {
+            if routes.lock().expect("routes").contains_key(&port) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(routes.lock().expect("routes").contains_key(&port));
+
+        app.send_to(b"handshake", relay_address).expect("send");
+        let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
+        let datagram = udp_from_packet(&inner).expect("packet");
+        assert_eq!(datagram.source, ip_bytes("10.0.0.2".parse().unwrap()));
+        assert_eq!(datagram.source_port, port);
+        assert_eq!(datagram.destination_port, 2408);
+        assert_eq!(datagram.payload, b"handshake");
+
+        let source = ip_bytes(target.ip());
+        let destination = ip_bytes("10.0.0.2".parse().unwrap());
+        let mut reply = Vec::new();
+        let answer = UdpDatagram {
+            source: &source,
+            destination: &destination,
+            source_port: 2408,
+            destination_port: port,
+            payload: b"response",
+        };
+        assert!(udp_datagram(&answer, &mut reply));
+        routes
+            .lock()
+            .expect("routes")
+            .get(&port)
+            .expect("lane")
+            .send(reply)
+            .expect("reply");
+        let mut received = [0u8; 2048];
+        let (n, _) = app.recv_from(&mut received).expect("reply");
+        assert_eq!(&received[..n], b"response");
+
+        stop.store(true, Ordering::Relaxed);
+        for _ in 0..100 {
+            if !routes.lock().expect("routes").contains_key(&port) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the stopped lane left its port behind");
     }
 
     /// A client datagram name races every answer it was given.
