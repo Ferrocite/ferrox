@@ -663,7 +663,7 @@ security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::
 security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
 security-ech heap-buffers-for-a-shaped-sealer 0 ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations
 security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
-security-ech heap-buffers-for-a-real-ech-offer 10 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
+security-ech heap-buffers-for-a-real-ech-offer 8 ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place
 security-ech seal-plaintext-buffer-moves 0 ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay
 
 # --- TLS options (row 48) ---------------------------------------------------
@@ -678,7 +678,7 @@ security-tls-options server-curve-lists-picked-by-the-shaped-lane 1 ferrox-core-
 
 # --- ECH -------------------------------------------------------------------
 security-ech aes256-gcm-seal-retired-instructions 14957 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 15301 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 15329 scripts/count-ops.sh
 security-ech syscalls-per-ech-handshake UNBLESSED scripts/count-ops.sh
 security-ech user-space-copies-per-ech-handshake UNBLESSED no copy checker yet
 security-ech seconds-per-ech-handshake UNBLESSED CI bench.yml (no cell yet)

@@ -765,11 +765,21 @@ impl Hello {
     }
 
     fn cipher_values(&self, tls13_only: bool) -> Vec<u16> {
-        self.cipher_table()
-            .iter()
-            .filter(|&&c| !tls13_only || matches!(c, 0x1301..=0x1303))
-            .map(|&c| grease_or(c, &self.grease, 0))
-            .collect()
+        let table = self.cipher_table();
+        let mut values = Vec::with_capacity(if tls13_only {
+            table
+                .iter()
+                .filter(|&&c| matches!(c, 0x1301..=0x1303))
+                .count()
+        } else {
+            table.len()
+        });
+        for &c in table {
+            if !tls13_only || matches!(c, 0x1301..=0x1303) {
+                values.push(grease_or(c, &self.grease, 0));
+            }
+        }
+        values
     }
 
     fn encode_body(
@@ -1622,7 +1632,7 @@ mod tests {
             Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         let (enabled, counts) = crate::alloc_count::measure(|| hello.enable_ech(&list));
         enabled.expect("ech");
-        assert_eq!(counts.allocs, 10, "the full offer cost: {counts:?}");
+        assert_eq!(counts.allocs, 8, "the full offer cost: {counts:?}");
         assert_eq!(
             counts.zeroed, 0,
             "the payload is filled in place: {counts:?}"
