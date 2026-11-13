@@ -2519,7 +2519,7 @@ fn open_stream(
     let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
         crate::proxy::echo_trace(&format!("open handler {sid}"));
-        match crate::xhttp::accept_core(
+        if let crate::xhttp::Served::Session(ureader, xwriter) = crate::xhttp::accept_core(
             &head,
             Vec::new(),
             upload,
@@ -2528,14 +2528,11 @@ fn open_stream(
             Some(crate::xhttp::StreamOut::H2(h2out.clone())),
             None,
         ) {
-            crate::xhttp::Served::Session(ureader, xwriter) => {
-                crate::proxy::echo_trace(&format!("served session {sid}"));
-                serve(ureader, xwriter, decryption);
-            }
-            _ => {
-                crate::proxy::echo_trace(&format!("served other {sid}"));
-                h2out.end();
-            }
+            crate::proxy::echo_trace(&format!("served session {sid}"));
+            serve(ureader, xwriter, decryption);
+        } else {
+            crate::proxy::echo_trace(&format!("served other {sid}"));
+            h2out.end();
         }
     });
     true
