@@ -92,8 +92,6 @@ struct XmcState {
 }
 
 type XmcSession<R, W> = ferrox_core::finalmask::xmc::Session<R, W>;
-type DeadlineReader<R> = ferrox_core::finalmask::xmc::DeadlineReader<R>;
-type HandshakeDeadline = ferrox_core::finalmask::xmc::HandshakeDeadline;
 
 #[derive(Debug)]
 struct XmcWriter {
@@ -104,6 +102,70 @@ struct XmcWriter {
 /// A handshake that outlives a peer's interest is a stalled connection, not a slow one; the
 /// reference's own bound is two minutes.
 const XMC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A read source whose clock can be re-armed for one read, so a handshake can hold a single
+/// deadline across every read it makes instead of restarting a per-read timeout.
+trait ReadClock: std::io::Read {
+    fn arm(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl ReadClock for TcpStream {
+    fn arm(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+/// One absolute deadline shared by the reader a handshake reads through.
+#[derive(Debug, Clone, Default)]
+struct HandshakeDeadline(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
+
+impl HandshakeDeadline {
+    fn begin(budget: Duration) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            std::time::Instant::now() + budget,
+        ))))
+    }
+
+    fn gate(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn end(&self) {
+        *self.gate() = None;
+    }
+}
+
+/// Reads never wait past the shared deadline: each read is clocked to the time that is left,
+/// and a deadline that has passed fails the read instead of arming another clock.
+#[derive(Debug)]
+struct DeadlineReader<R> {
+    reader: R,
+    deadline: HandshakeDeadline,
+}
+
+impl<R: ReadClock> DeadlineReader<R> {
+    fn new(reader: R, deadline: HandshakeDeadline) -> Self {
+        Self { reader, deadline }
+    }
+}
+
+impl<R: ReadClock> std::io::Read for DeadlineReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if let Some(at) = *self.deadline.gate() {
+            let left = at.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "xmc: handshake deadline passed",
+                ));
+            }
+            self.reader.arm(Some(left))?;
+        }
+        self.reader.read(output)
+    }
+}
 
 impl std::io::Write for XmcWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -130,9 +192,8 @@ impl XmcState {
             let _ = stream.set_read_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
-                let reader = stream.try_clone()?;
                 let deadline = HandshakeDeadline::begin(XMC_HANDSHAKE_TIMEOUT);
-                let reader = DeadlineReader::new(reader, deadline.clone());
+                let reader = DeadlineReader::new(stream.try_clone()?, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
                     chain: std::sync::Arc::clone(chain),
@@ -3486,5 +3547,53 @@ mod tests {
             "a second connect reports an error, and the socket it already had is the answer",
         );
         accept.join().expect("joins");
+    }
+
+    struct StalledReader {
+        armed: std::sync::Arc<std::sync::Mutex<Option<Duration>>>,
+    }
+
+    impl std::io::Read for StalledReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
+
+    impl ReadClock for StalledReader {
+        fn arm(&self, timeout: Option<Duration>) -> io::Result<()> {
+            *self.armed.lock().expect("the clock") = timeout;
+            Ok(())
+        }
+    }
+
+    /// A peer cannot hold a worker by dribbling a byte per clock: every handshake read is clocked
+    /// to what is left of one deadline, and a read past it fails instead of arming another.
+    #[test]
+    fn a_read_past_the_handshake_deadline_never_arms_another_clock() {
+        let armed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let deadline = HandshakeDeadline::begin(Duration::from_millis(30));
+        let mut reader = DeadlineReader::new(
+            StalledReader {
+                armed: std::sync::Arc::clone(&armed),
+            },
+            deadline.clone(),
+        );
+        let mut byte = [0u8; 1];
+        let first = reader.read(&mut byte).expect_err("nothing arrives");
+        assert_eq!(first.kind(), io::ErrorKind::WouldBlock);
+        let clock = armed.lock().expect("the clock").expect("a clock is armed");
+        assert!(!clock.is_zero() && clock <= Duration::from_millis(30));
+
+        std::thread::sleep(Duration::from_millis(40));
+        let past = reader.read(&mut byte).expect_err("the deadline passed");
+        assert_eq!(past.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            armed.lock().expect("the clock").is_some(),
+            "the clock is left alone once the deadline has passed"
+        );
+
+        deadline.end();
+        let after = reader.read(&mut byte).expect_err("nothing arrives");
+        assert_eq!(after.kind(), io::ErrorKind::WouldBlock);
     }
 }
