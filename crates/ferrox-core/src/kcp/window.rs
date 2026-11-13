@@ -661,7 +661,10 @@ mod tests {
         for byte in &wire {
             write!(wire_hex, "{byte:02x}").unwrap();
         }
-        assert_eq!(wire_hex, "000000000000000000000000000000c8020000000700000007");
+        assert_eq!(
+            wire_hex,
+            "000000000000000000000000000000c8020000000700000007"
+        );
     }
 
     #[test]
