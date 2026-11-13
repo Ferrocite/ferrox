@@ -6406,7 +6406,7 @@ fn relay_sealed<S: Read + Write + Send + 'static>(
     );
 }
 
-/// The two sealed halves behind one Vision link: framing reads the plaintext one half opens and writes seal through the other.
+/// One Vision link over both sealed halves: reads take the plaintext the reader opens, writes seal through the writer.
 struct JoinedHalves<R, W> {
     reader: ferrox_core::vless_encryption::EncryptedReader<R>,
     writer: ferrox_core::vless_encryption::EncryptedWriter<W>,
@@ -11414,7 +11414,7 @@ where
         close();
         return false;
     };
-    if vless.flow == ferrox_core::vless::VISION_FLOW {
+    if vless.is_vision() {
         reader.arm_relay_poll();
         let link = crate::vision::Link::switchable(
             JoinedHalves { reader, writer },
@@ -40370,7 +40370,7 @@ mod tests {
     /// Vision rides the sealed session above a carrier: the framing command, the padding and the
     /// echo all cross the engine's records, which are themselves framed by the carrier.
     #[cfg(unix)]
-    fn encrypted_vless_carried_vision_echo(carrier: Carrier, host: &str) {
+    fn encrypted_vless_carried_vision_echo(carrier: Carrier, host: &str, flow: &str) {
         use std::os::unix::net::UnixStream;
 
         let (client_string, server_string) =
@@ -40434,7 +40434,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             tls: None,
-            flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+            flow: flow.to_owned(),
             reality: None,
             headers: crate::config::carrier_headers(None).0,
             heartbeat: crate::config::carrier_headers(None).1,
@@ -40469,6 +40469,7 @@ mod tests {
                 ed: 0,
             },
             "ws.test",
+            ferrox_core::vless::VISION_FLOW,
         );
     }
 
@@ -40478,6 +40479,7 @@ mod tests {
         encrypted_vless_carried_vision_echo(
             Carrier::Grpc(crate::config::GrpcSettings::path("/sealed")),
             "127.0.0.1",
+            ferrox_core::vless::VISION_FLOW,
         );
     }
 
@@ -40490,6 +40492,7 @@ mod tests {
                 host: "upgrade.test".to_owned(),
             },
             "upgrade.test",
+            ferrox_core::vless::VISION_FLOW,
         );
     }
 
@@ -40503,6 +40506,7 @@ mod tests {
                 settings: Box::new(settings),
             },
             "xhttp.test",
+            ferrox_core::vless::VISION_FLOW,
         );
     }
 
@@ -40517,6 +40521,7 @@ mod tests {
                 settings: Box::new(settings),
             },
             "xhttp.test",
+            ferrox_core::vless::VISION_FLOW,
         );
     }
 
@@ -40528,6 +40533,20 @@ mod tests {
                 path: "/sealed".to_owned(),
             },
             "header.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_vision_udp443_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+            ferrox_core::vless::VISION_UDP443_FLOW,
         );
     }
 
