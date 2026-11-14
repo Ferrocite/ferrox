@@ -12,7 +12,7 @@ On Linux, `stack: "system"` hands TCP to the kernel instead. It binds a listener
 graph TD
     A["inbound config: protocol tun, stack smoltcp"] --> B["tun_stack::open<br/>DeviceBuilder offload + multi_queue"]
     B --> C["one queue thread set per device queue"]
-    C --> R["recv_loop: recv_multiple with a virtio header<br/>packet_bytes into a reused Vec"]
+    C --> R["recv_loop: recv_multiple with a virtio header<br/>Linux: take_slot hands the device slot to the stack<br/>else: packet_bytes into a reused Vec"]
     R --> S["serve_tun_device<br/>QueueDevice receive"]
     S --> T["smoltcp Interface::poll<br/>TcpSocket per flow"]
     T --> U["QueueDevice transmit<br/>one segment per TxToken"]
@@ -58,7 +58,7 @@ graph TD
 | writes-after-a-refused-packet | 2 | ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out |
 <!-- counts:end -->
 
-`scripts/count-ops.sh` measures `Nat::rewrite` over the payload lengths in `a_rewrite_keeps_the_checksum_of_every_payload_length`; no pointer-identity or copy-count checker yet covers this path, so the syscall and copy rows stay open. The writer copies each smoltcp segment into an aggregate buffer; the reader hands each device slot to the stack without a copy, and `a_received_slot_keeps_its_allocation` holds its base pointer and capacity fixed. The `time-*` rows measure the userspace stack; no `system` or `hybrid` row has been measured, so this page makes no speed claim for either.
+`scripts/count-ops.sh` measures `Nat::rewrite` over the payload lengths in `a_rewrite_keeps_the_checksum_of_every_payload_length`; no copy-count checker yet covers this path, so the syscall and copy rows stay open; `a_received_slot_keeps_its_allocation` is the pointer-identity gate for the Linux device read. The writer copies each smoltcp segment into an aggregate buffer; on Linux the reader hands each device slot to the stack without a copy, and `a_received_slot_keeps_its_allocation` holds its base pointer and capacity fixed. The `time-*` rows measure the userspace stack; no `system` or `hybrid` row has been measured, so this page makes no speed claim for either.
 
 ## Time
 
@@ -74,7 +74,7 @@ Against the pinned references, xray-core and sing-box open the platform device a
 
 ## What was not removed
 
-- **The userspace stack itself.** `smoltcp` per-socket receive and send buffers still copy every byte: `smoltcp` copies from the device slot into the socket ring, the pump copies to the local stream, and the writer copies into the aggregate. The device read no longer copies the slot. The reference's custom stack does less of that; this is the measured CPU gap, not a device limitation. `system` and `hybrid` still keep that stack alive for UDP and ICMP, so they do not remove it.
+- **The userspace stack itself.** `smoltcp` per-socket receive and send buffers still copy every byte: `smoltcp` copies from the device slot into the socket ring, the pump copies to the local stream, and the writer copies into the aggregate. On Linux the device read no longer copies the slot; elsewhere it still copies into a stack slot. The reference's custom stack does less of that; this is the measured CPU gap, not a device limitation. `system` and `hybrid` still keep that stack alive for UDP and ICMP, so they do not remove it.
 - **The system path's copies.** A handled TCP packet is parsed, rewritten in place and written back to the device, and the payload is still copied there; the accepted flow then copies through the relay pair like every other front. The checksum pass over the segment is gone, but no pointer-identity or copy-count checker covers the remaining copies yet, so it stays out of the Measured table.
 - **System-mode offload and multi-queue.** The kernel path opens one queue and leaves virtio GSO/GRO off; `queues > 1` warns once and runs one queue. No benchmark says the single-queue kernel path is faster or slower than the userspace multi-queue path.
 - **The native handler.** It remains the path for `stack: "loopback"` with an IPv4 or IPv6 address; a failed userspace open returns its error instead of falling back. Its page stays the description of that path.
