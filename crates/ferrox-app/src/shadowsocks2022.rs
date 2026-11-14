@@ -394,7 +394,9 @@ fn serve_accepted<R, W>(
         AcceptedBody::Mux(carried) => {
             let reader = MuxReader::new(reader, recv);
             let writer = MuxWriter::server(writer, response);
-            crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
+            crate::proxy::spawn_carried(move || {
+                crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
+            });
         }
     }
 }
@@ -563,13 +565,15 @@ pub(crate) fn serve_session<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some(accepted) = accept_on(
-        &mut reader as &mut dyn Read,
-        password,
-        method,
-        identities,
-        freedom,
-    ) else {
+    let accepted = {
+        let budget = crate::budgets::handshake();
+        let mut bounded = crate::proxy::HandshakeDeadline {
+            inner: &mut reader,
+            until: std::time::Instant::now() + budget,
+        };
+        accept_on(&mut bounded, password, method, identities, freedom)
+    };
+    let Some(accepted) = accepted else {
         close();
         return;
     };
@@ -588,13 +592,15 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some(accepted) = accept_on(
-        &mut reader as &mut dyn Read,
-        password,
-        method,
-        identities,
-        freedom,
-    ) else {
+    let accepted = {
+        let budget = crate::budgets::handshake();
+        let mut bounded = crate::proxy::HandshakeDeadline {
+            inner: &mut reader,
+            until: std::time::Instant::now() + budget,
+        };
+        accept_on(&mut bounded, password, method, identities, freedom)
+    };
+    let Some(accepted) = accepted else {
         close();
         return;
     };

@@ -17293,25 +17293,31 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     }
     let server = resolve_outbound(&ss.address, ss.port)?;
     let target = ss_mux_target();
-    let (read, write, close): MuxHalves = match (&ss.carrier, ss.tls.as_deref()) {
-        (Carrier::Raw(_), None) => {
-            let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
-            let read = stream.try_clone().ok()?;
-            let write = stream.try_clone().ok()?;
-            (Box::new(read), Box::new(write), connection_closer(&stream))
-        }
-        (Carrier::Raw(_), Some(cfg)) => {
-            let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
-            let (read, write, raw) = session.into_halves()?;
-            let close = connection_closer(&raw);
-            (Box::new(read), Box::new(write), close)
-        }
-        _ => {
-            static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            if SAID.set(()).is_ok() {
-                eprintln!("shadowsocks: this carrier does not pair with mux; dialing directly");
+    let (read, write, close): MuxHalves = if let Some(cfg) = ss.reality.as_deref() {
+        let session = dial_reality_session(&server, cfg, ss.carrier.tcp_mask())?;
+        let (read, write, raw) = session.into_halves()?;
+        (Box::new(read), Box::new(write), connection_closer(&raw))
+    } else {
+        match (&ss.carrier, ss.tls.as_deref()) {
+            (Carrier::Raw(_), None) => {
+                let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
+                let read = stream.try_clone().ok()?;
+                let write = stream.try_clone().ok()?;
+                (Box::new(read), Box::new(write), connection_closer(&stream))
             }
-            return None;
+            (Carrier::Raw(_), Some(cfg)) => {
+                let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
+                let (read, write, raw) = session.into_halves()?;
+                let close = connection_closer(&raw);
+                (Box::new(read), Box::new(write), close)
+            }
+            _ => {
+                static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if SAID.set(()).is_ok() {
+                    eprintln!("shadowsocks: this carrier does not pair with mux; dialing directly");
+                }
+                return None;
+            }
         }
     };
     let mut write = write;
@@ -17336,6 +17342,11 @@ fn open_ss_mux_2022(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     match &ss.carrier {
         Carrier::Raw(_) => {
             let server = resolve_outbound(&ss.address, ss.port)?;
+            if let Some(cfg) = ss.reality.as_deref() {
+                let session = dial_reality_session(&server, cfg, ss.carrier.tcp_mask())?;
+                let (read, write, raw) = session.into_halves()?;
+                return ss2022_mux_up(read, write, connection_closer(&raw), ss);
+            }
             match ss.tls.as_deref() {
                 None => {
                     let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
@@ -17501,6 +17512,7 @@ fn open_ss_mux_carried(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
     let address = listener.local_addr().ok()?;
     let spec = ss.carrier_spec();
+    let client = crate::conn::connect(&crate::conn::Target::Ip(address), budgets::dial()).ok()?;
     thread::spawn(move || {
         let Ok((server, _)) = listener.accept() else {
             return;
@@ -17512,7 +17524,6 @@ fn open_ss_mux_carried(ss: &ShadowsocksOut) -> Option<MuxUplink> {
         let server = Connection::from(server);
         dial_shadowsocks(&server, &edge, &spec, &ss_mux_target(), Ladder::global());
     });
-    let client = crate::conn::connect(&crate::conn::Target::Ip(address), budgets::dial()).ok()?;
     let read = client.try_clone().ok()?;
     let write = client.try_clone().ok()?;
     let closer = client.try_clone().ok()?;
@@ -17682,10 +17693,7 @@ fn open_vmess_mux_xdrive(vmess: &VmessOut) -> Option<MuxUplink> {
     if session.write_all(&request).is_err() {
         return None;
     }
-    if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
-        return None;
-    }
-    let read = session.clone();
+    let read = crate::vmess::ResponseReader::new(session.clone(), response_key, response_iv, auth);
     let write = session.clone();
     let close = xdrive_close(&session);
     Some(MuxUplink {
@@ -17713,9 +17721,7 @@ fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
             conn.close();
             return None;
         };
-        if session.write_all(&request).is_err()
-            || !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth)
-        {
+        if session.write_all(&request).is_err() {
             conn.close();
             return None;
         }
@@ -17725,6 +17731,7 @@ fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
             conn.close();
             return None;
         };
+        let read = crate::vmess::ResponseReader::new(read, response_key, response_iv, auth);
         return Some(MuxUplink {
             read: Box::new(crate::vmess::CarriedReader::new(read, recv)),
             write: Box::new(write),
@@ -17735,11 +17742,12 @@ fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
         conn.close();
         return None;
     }
-    let mut reader = KcpIo::new(Arc::clone(&conn));
-    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        conn.close();
-        return None;
-    }
+    let reader = crate::vmess::ResponseReader::new(
+        KcpIo::new(Arc::clone(&conn)),
+        response_key,
+        response_iv,
+        auth,
+    );
     let (_, writer, close) = kcp_parts(&conn);
     let Some(write) = crate::vmess::CarriedWriter::new(writer, send) else {
         conn.close();
@@ -28208,10 +28216,166 @@ impl SsUdpLane {
     }
 }
 
+struct Ss2022UdpSource {
+    uplink: UdpSocket,
+    datagrams: crate::shadowsocks2022::Datagrams,
+    last: Instant,
+    done: Arc<AtomicBool>,
+    reader: RelayEnd,
+}
+
+struct Ss2022UdpLane {
+    psks: Vec<Vec<u8>>,
+    psk: Vec<u8>,
+    method: ferrox_core::shadowsocks2022::Method,
+    server: SocketAddr,
+    sources: Mutex<HashMap<SocketAddr, Ss2022UdpSource>>,
+}
+
+impl Ss2022UdpLane {
+    fn open(ss: &ShadowsocksOut, method: ferrox_core::shadowsocks2022::Method) -> Option<Self> {
+        let psks = ferrox_core::shadowsocks2022::parse_psk_list(&ss.password, method.key_len())?;
+        let psk = psks.last()?.clone();
+        let server = resolve_outbound(&ss.address, ss.port)?;
+        Some(Self {
+            psks,
+            psk,
+            method,
+            server,
+            sources: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn send(&self, relay: &UdpSocket, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        let Ok(mut guard) = self.sources.lock() else {
+            return false;
+        };
+        if !guard.contains_key(&src) {
+            if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                let now = Instant::now();
+                let idle = budgets::udp_idle();
+                guard.retain(|_, source| {
+                    let live = now.duration_since(source.last) < idle;
+                    if !live {
+                        source.done.store(true, Ordering::Relaxed);
+                    }
+                    live
+                });
+                if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                    return true;
+                }
+            }
+            let bound = if self.server.is_ipv6() {
+                UdpSocket::bind("[::]:0")
+            } else {
+                UdpSocket::bind("0.0.0.0:0")
+            };
+            let Ok(uplink) = bound else {
+                return true;
+            };
+            if uplink.connect(self.server).is_err() {
+                return true;
+            }
+            let datagrams = crate::shadowsocks2022::Datagrams::new();
+            let source = Arc::new(Mutex::new(Some(src)));
+            let done = Arc::new(AtomicBool::new(false));
+            let Some(reader) = spawn_ss_udp_reader2022(
+                &uplink,
+                relay,
+                &self.psk,
+                self.method,
+                datagrams.client_session(),
+                source,
+                Arc::clone(&done),
+            ) else {
+                return true;
+            };
+            guard.insert(
+                src,
+                Ss2022UdpSource {
+                    uplink,
+                    datagrams,
+                    last: Instant::now(),
+                    done,
+                    reader,
+                },
+            );
+        }
+        let Some(source) = guard.get_mut(&src) else {
+            return true;
+        };
+        source.last = Instant::now();
+        let packet = if self.psks.len() > 1 && !self.method.is_chacha() {
+            source
+                .datagrams
+                .seal_list(self.method, &self.psks, &dest, payload)
+        } else {
+            source
+                .datagrams
+                .seal(&self.psk, self.method, &dest, payload)
+        };
+        if let Some(packet) = packet {
+            let _ = source.uplink.send(packet);
+        }
+        true
+    }
+
+    fn close(self) {
+        let sources: Vec<_> = self
+            .sources
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .into_values()
+            .collect();
+        for source in &sources {
+            source.done.store(true, Ordering::Relaxed);
+        }
+        for source in sources {
+            join(&source.reader);
+        }
+    }
+}
+
+enum SsSkipLane {
+    Legacy(SsUdpLane),
+    V2022(Ss2022UdpLane),
+}
+
+impl SsSkipLane {
+    fn send(
+        &self,
+        socket: &UdpSocket,
+        src: SocketAddr,
+        dest: SocketAddr,
+        buf: &mut [u8],
+        at: usize,
+        len: usize,
+    ) -> bool {
+        match self {
+            Self::Legacy(lane) => lane.send(src, dest, buf, at, len),
+            Self::V2022(lane) => lane.send(socket, src, dest, &buf[at..at + len]),
+        }
+    }
+
+    fn close(self) {
+        match self {
+            Self::Legacy(lane) => lane.close(),
+            Self::V2022(lane) => lane.close(),
+        }
+    }
+}
+
+fn ss_skip_lane(ss: &ShadowsocksOut, socket: &UdpSocket) -> Option<SsSkipLane> {
+    match ferrox_core::shadowsocks2022::Method::parse(&ss.method) {
+        Some(method) => Ss2022UdpLane::open(ss, method).map(SsSkipLane::V2022),
+        None => SsUdpLane::open(socket, ss).map(SsSkipLane::Legacy),
+    }
+}
+
 fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     if ss.mux.udp_manager().is_some() {
         if let Some(pool) = ss.udp_pool() {
-            let mut lane: Option<SsUdpLane> = None;
+            let mut lane: Option<SsSkipLane> = None;
             let mut said = false;
             serve_socks_udp_pool(
                 relay,
@@ -28222,7 +28386,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
                 |_| true,
                 |socket, src, dest, buf, at, len| {
                     if lane.is_none() {
-                        let Some(open) = SsUdpLane::open(socket, ss) else {
+                        let Some(open) = ss_skip_lane(ss, socket) else {
                             if !said {
                                 said = true;
                                 eprintln!("shadowsocks: udp/443 skip lane unavailable; dropped");
@@ -28232,7 +28396,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
                         lane = Some(open);
                     }
                     lane.as_ref()
-                        .is_some_and(|lane| lane.send(src, dest, buf, at, len))
+                        .is_some_and(|lane| lane.send(socket, src, dest, buf, at, len))
                 },
             );
             if let Some(lane) = lane {
@@ -28679,6 +28843,9 @@ fn serve_socks_udp_pool<F, G>(
                 continue;
             }
             Udp443::Allow => {}
+        }
+        if len > ferrox_core::mux::CHUNK_MAX {
+            continue;
         }
         if published != Some(src) {
             if let Ok(mut slot) = source.lock() {
@@ -59530,6 +59697,37 @@ mod tests {
         assert_udp_echo_association("ss2022 udp", &udp, move |socket| {
             serve_socks_udp_shadowsocks(socket, &ss);
         });
+    }
+
+    /// The udp/443 skip lane speaks the 2022 datagram format, not the legacy one.
+    #[test]
+    fn a_shadowsocks2022_skip_lane_seals_a_udp_datagram() {
+        let password = ferrox_core::b64::encode(&[0x43u8; 32]);
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        echo.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let echo_addr = echo.local_addr().expect("addr");
+        let ss = ss2022_mux_out(echo_addr.port(), Carrier::Raw(Chain::default()), &password);
+        let method = ferrox_core::shadowsocks2022::Method::parse(&ss.method).expect("2022 method");
+        let lane = Ss2022UdpLane::open(&ss, method).expect("opens");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let src = relay.local_addr().expect("addr");
+        let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        assert!(lane.send(&relay, src, dest, b"ping"));
+        let mut packet = [0u8; 1500];
+        let n = echo.recv(&mut packet).expect("receives");
+        assert_ne!(&packet[..n], b"ping");
+        let psk = ferrox_core::shadowsocks2022::parse_psk_list(&password, method.key_len())
+            .expect("psks")
+            .pop()
+            .expect("psk");
+        let mut server = crate::shadowsocks2022::Datagrams::new();
+        let (target, payload) = server
+            .open_server(&psk, method, &mut packet[..n])
+            .expect("opens");
+        assert_eq!(target, dest);
+        assert_eq!(payload, b"ping");
+        lane.close();
     }
 
     /// KCP has no loopback shim: the opener writes the protocol handshake on its own session, for both codecs.

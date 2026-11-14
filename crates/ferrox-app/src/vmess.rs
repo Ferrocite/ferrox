@@ -1512,6 +1512,47 @@ pub(crate) fn read_response(
     ok
 }
 
+/// Defers the response seal to the first read, so a lazy server may answer after the first mux frame.
+pub(crate) struct ResponseReader<R> {
+    inner: R,
+    response_key: [u8; 16],
+    response_iv: [u8; 16],
+    auth: u8,
+    ready: bool,
+}
+
+impl<R: Read> ResponseReader<R> {
+    pub(crate) fn new(inner: R, response_key: [u8; 16], response_iv: [u8; 16], auth: u8) -> Self {
+        Self {
+            inner,
+            response_key,
+            response_iv,
+            auth,
+            ready: false,
+        }
+    }
+}
+
+impl<R: Read> Read for ResponseReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.ready {
+            if !read_response(
+                &mut self.inner,
+                &self.response_key,
+                &self.response_iv,
+                self.auth,
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "vmess response",
+                ));
+            }
+            self.ready = true;
+        }
+        self.inner.read(buf)
+    }
+}
+
 fn read_response_header(
     stream: &mut dyn Read,
     response_key: &[u8; 16],
@@ -4087,6 +4128,23 @@ mod tests {
         });
         assert!(opened, "the sealed header opens");
         assert_eq!(counts.allocs, 0, "the response header is read on the stack");
+    }
+
+    #[test]
+    fn the_mux_response_reader_defers_its_first_read() {
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Read for Counting {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(0)
+            }
+        }
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader = super::ResponseReader::new(Counting(reads.clone()), [0; 16], [0; 16], 0);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let mut one = [0u8; 1];
+        let _ = reader.read(&mut one);
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     #[test]
