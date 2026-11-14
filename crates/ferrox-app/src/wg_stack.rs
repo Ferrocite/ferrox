@@ -532,6 +532,26 @@ impl From<SyncSender<Vec<u8>>> for ToTunnel {
         Self::Bounded(sender)
     }
 }
+
+/// A local socket that carries a nested tunnel's datagrams through this one.
+#[derive(Debug)]
+pub(crate) struct UdpForwarder {
+    pub(crate) local: SocketAddr,
+    stop: Arc<AtomicBool>,
+}
+
+impl UdpForwarder {
+    pub(crate) fn new(local: SocketAddr, stop: Arc<AtomicBool>) -> Self {
+        Self { local, stop }
+    }
+}
+
+impl Drop for UdpForwarder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum FragmentKey {
     V4 {

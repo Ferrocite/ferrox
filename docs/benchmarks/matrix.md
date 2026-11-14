@@ -101,7 +101,7 @@ cells keep it.
 
 ## Every standard configuration
 
-The standard tier measures these 172 configurations: one row per scenario and server. The standalone Hysteria v1 and VLESS-over-QUIC rows run the ferrox and sing-box servers; the WireGuard rows run all three. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, the v1 up and duplex lanes, and the userspace and kernel WireGuard up and duplex lanes, the 64-flow lanes, and every protocol by carrier in the full grid: 248 scenarios and 502 configurations. The full tier is dispatched manually on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 248 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times. The matrix never runs on a pull request.
+The standard tier measures these 174 configurations: one row per scenario and server. The standalone Hysteria v1 and VLESS-over-QUIC rows run the ferrox and sing-box servers; the WireGuard rows run all three, and the WARP rows run the ferrox server only because no pinned reference serves a WARP inbound. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, the v1 up and duplex lanes, and the userspace and kernel WireGuard up and duplex lanes, the 64-flow lanes, and every protocol by carrier in the full grid: 260 scenarios and 514 configurations. The full tier is dispatched manually on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 260 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times. The matrix never runs on a pull request.
 
 | scenario | server | measured |
 | --- | --- | --- |
@@ -271,6 +271,8 @@ The standard tier measures these 172 configurations: one row per scenario and se
 | `vmess-tls-xhttp-h2-down-8` | xray-core | yes |
 | `vmess-xhttp-down-8` | ferrox | yes |
 | `vmess-xhttp-down-8` | xray-core | yes |
+| `warp-gool-classic-down-8` | ferrox | yes |
+| `warp-gool-down-8` | ferrox | yes |
 | `wireguard-kernel-raw-down-8` | ferrox | yes |
 | `wireguard-kernel-raw-down-8` | xray-core | yes |
 | `wireguard-kernel-raw-down-8` | sing-box | yes |

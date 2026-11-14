@@ -512,7 +512,15 @@ while read -r id traffic connections iterations payload duration_ms; do
   else
     unset MATRIX_REALITY_DEST
   fi
-  config="$(scenario_config "$id" "$srvport" "$coverport")" || {
+  innerport=""
+  if matrix_nested_carrier "$id"; then
+    innerport="$(matrix_udp_srvport)" || {
+      cells_failed+=("$id (could not allocate an inner WireGuard port)")
+      status=1
+      continue
+    }
+  fi
+  config="$(scenario_config "$id" "$srvport" "$coverport" "$innerport")" || {
     cells_failed+=("$id (unknown scenario)")
     status=1
     continue

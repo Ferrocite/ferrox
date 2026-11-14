@@ -24,7 +24,7 @@ use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
 use crate::quic::{self, Datagram};
-use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
+use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpForwarder, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
@@ -131,19 +131,6 @@ struct Inner {
     routes: UdpRoutes,
     alive: Arc<AtomicBool>,
     stable: Arc<AtomicBool>,
-}
-
-/// A local socket that carries a nested tunnel's datagrams through this conversation.
-#[derive(Debug)]
-pub(crate) struct UdpForwarder {
-    pub(crate) local: SocketAddr,
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for UdpForwarder {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
 }
 
 /// The lane names its spec; the spec redacts the headers that carry a token and
@@ -348,7 +335,7 @@ impl MasqueOut {
                 std::thread::sleep(TICK);
             }
         });
-        Ok(UdpForwarder { local, stop })
+        Ok(UdpForwarder::new(local, stop))
     }
 
     /// A name resolves inside the tunnel the reference names, then falls back to
