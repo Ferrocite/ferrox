@@ -54,31 +54,22 @@ fn padding_for(payload_len: usize) -> usize {
     }
 }
 
-pub(crate) fn serve(
-    mut stream: Connection,
-    password: &str,
-    method: &str,
-    identities: &[(String, u32)],
-    freedom: bool,
-) {
-    let Some(method) = Method::parse(method) else {
-        return;
-    };
-    if !freedom {
-        return;
-    }
-    let Some(list) = psks(password, method) else {
-        return;
-    };
-    if list.len() == 1 {
-        serve_single(&mut stream, method, &list[0], freedom);
-    } else if !method.is_chacha() {
-        serve_multi(stream, method, &list, identities, freedom);
+/// Read and open the fixed+variable header of an already-salted request, returning the target and any early data; the request path says whether it names a mux session and the tests keep the direct reading.
+#[cfg(test)]
+fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
+    match read_request(stream, recv)? {
+        (Request::Target(target), early) => Some((target, early)),
+        (Request::Mux, _) => None,
     }
 }
 
-/// Read and open the fixed+variable header of an already-salted request, returning the target and any early data; the single- and multi-psk handshakes share this so the framing lives in one place.
-fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
+#[derive(Clone, Copy)]
+enum Request {
+    Mux,
+    Target(SocketAddr),
+}
+
+fn read_request(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Request, Vec<u8>)> {
     let mut fixed = [0u8; 11 + TAG_LEN];
     if read_exact(stream, &mut fixed).is_err() {
         return None;
@@ -101,144 +92,76 @@ fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Sock
     }
     recv.open_in_place(&mut variable)?;
     variable.truncate(var_len);
-    let (target, used) = parse_addr_header(&variable)?;
+    let (target, used, mux) = if let Some(used) = mux_header_len(&variable) {
+        (Request::Mux, used, true)
+    } else {
+        let (target, used) = parse_addr_header(&variable)?;
+        (Request::Target(target), used, false)
+    };
     if variable.len() < used + 2 {
         return None;
     }
     let pad = usize::from(u16::from_be_bytes([variable[used], variable[used + 1]]));
     let at = used + 2 + pad;
-    if at > variable.len() || (pad == 0 && at == variable.len()) {
+    if at > variable.len() || (!mux && pad == 0 && at == variable.len()) {
         return None;
     }
     variable.drain(..at);
     Some((target, variable))
 }
 
-fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bool) {
-    if !freedom {
-        return;
+/// The reference compares the mux domain alone, so the port a client chose never gates the session.
+fn mux_header_len(buf: &[u8]) -> Option<usize> {
+    if buf.first() != Some(&3) {
+        return None;
     }
-    let key_len = method.key_len();
-    // Bound the salt/fixed/variable request reads to a wall-clock budget, then restore the relay's blocking reads.
-    let budget = crate::budgets::handshake();
-    let _ = stream.set_read_timeout(Some(budget));
-    let opened = {
-        let mut bounded = crate::proxy::HandshakeDeadline {
-            inner: stream,
-            until: std::time::Instant::now() + budget,
-        };
-        'req: {
-            let mut salt = vec![0u8; key_len];
-            if read_exact(&mut bounded, &mut salt).is_err() {
-                break 'req None;
-            }
-            if salt_seen(&salt) {
-                break 'req None;
-            }
-            let Some(mut recv) = Cipher::from_psk(method, psk, &salt) else {
-                break 'req None;
-            };
-            let Some((target, early)) = read_request_header(&mut bounded, &mut recv) else {
-                break 'req None;
-            };
-            Some((recv, salt, target, early))
-        }
+    let (crate::proxy::AddrBody::Domain(host), at) =
+        crate::proxy::parse_addr_body(buf, crate::proxy::AddrKind::Domain)?
+    else {
+        return None;
     };
-    let _ = stream.set_read_timeout(None);
-    let Some((recv, salt, target, early)) = opened else {
-        return;
-    };
-    crate::accesslog::record_current(&target);
-    let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    if !early.is_empty() && uplink.write_all(&early).is_err() {
-        return;
+    let used = at + 2;
+    if host != crate::shadowsocks::MUX_HOST || buf.len() < used + 2 {
+        return None;
     }
-    let Some(server_salt) = fresh_salt(key_len) else {
-        return;
-    };
-    let Some(send) = Cipher::from_psk(method, psk, &server_salt) else {
-        return;
-    };
-    let response = Response::new(send, server_salt, salt);
-    pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
+    Some(used)
 }
 
-fn serve_multi(
-    mut stream: Connection,
-    method: Method,
-    list: &[Vec<u8>],
+// The raw session accepts under the handshake budget, then hands the halves to a direct target or the mux tunnel.
+pub(crate) fn serve(
+    stream: Connection,
+    password: &str,
+    method: &str,
     identities: &[(String, u32)],
     freedom: bool,
 ) {
-    if !freedom || list.len() < 2 {
+    if !freedom {
         return;
     }
-    let key_len = method.key_len();
-    let master = &list[0];
-    // Bound the salt/eih/fixed/variable request reads to a wall-clock budget, then restore the relay's blocking reads.
+    let Ok(mut reader) = stream.try_clone() else {
+        return;
+    };
     let budget = crate::budgets::handshake();
-    let _ = stream.set_read_timeout(Some(budget));
-    let opened = {
+    let _ = reader.set_read_timeout(Some(budget));
+    let accepted = {
         let mut bounded = crate::proxy::HandshakeDeadline {
-            inner: &mut stream,
+            inner: &mut reader,
             until: std::time::Instant::now() + budget,
         };
-        'req: {
-            let mut salt = vec![0u8; key_len];
-            if read_exact(&mut bounded, &mut salt).is_err() {
-                break 'req None;
-            }
-            if salt_seen(&salt) {
-                break 'req None;
-            }
-            let mut eih = [0u8; BLOCK_LEN];
-            if read_exact(&mut bounded, &mut eih).is_err() {
-                break 'req None;
-            }
-            let Some(hash) = shadowsocks2022::decrypt_eih(method, master, &salt, &eih) else {
-                break 'req None;
-            };
-            let Some(idx) = list[1..]
-                .iter()
-                .position(|p| shadowsocks2022::user_hash(p) == hash)
-            else {
-                break 'req None;
-            };
-            let psk = list[1 + idx].clone();
-            let Some(mut recv) = Cipher::from_psk(method, &psk, &salt) else {
-                break 'req None;
-            };
-            let Some((target, early)) = read_request_header(&mut bounded, &mut recv) else {
-                break 'req None;
-            };
-            Some((recv, psk, salt, target, early, idx))
-        }
+        accept_on(&mut bounded, password, method, identities, freedom)
     };
-    let _ = stream.set_read_timeout(None);
-    let Some((recv, psk, salt, target, early, idx)) = opened else {
+    let _ = reader.set_read_timeout(None);
+    let Some(accepted) = accepted else {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         return;
     };
-    // The identity header names one account, so the flow line and the byte counters read that user, not the inbound's default.
-    if let Some((email, level)) = identities.get(idx) {
-        stream = stream.with_meter(authenticate(email, *level));
-    }
-    crate::accesslog::record_current(&target);
-    let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
+    let Ok(writer) = stream.try_clone() else {
         return;
     };
-    if !early.is_empty() && uplink.write_all(&early).is_err() {
-        return;
-    }
-    let Some(server_salt) = fresh_salt(key_len) else {
-        return;
-    };
-    let Some(send) = Cipher::from_psk(method, &psk, &server_salt) else {
-        return;
-    };
-    let response = Response::new(send, server_salt, salt);
-    pump_relay_with_response(&uplink, &stream, response, Recv::Ready(recv));
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    });
+    serve_accepted(accepted, reader, writer, close);
 }
 
 /// The account whose identity header opened the request: from here its email and level are the flow's, and the counters ride the stream.
@@ -341,73 +264,139 @@ fn relay_raw(a: &mut Connection, b: &mut Connection) {
     let _ = t.join();
 }
 
+struct Accepted {
+    body: AcceptedBody,
+    response: Response,
+    recv: Recv,
+    meter: crate::stats::Meter,
+}
+
+enum AcceptedBody {
+    Direct(Connection),
+    Mux(Vec<u8>),
+}
+
 fn accept_on(
     reader: &mut dyn Read,
     password: &str,
     method: &str,
     identities: &[(String, u32)],
     freedom: bool,
-) -> Option<(Connection, Response, Recv, crate::stats::Meter)> {
+) -> Option<Accepted> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
     }
     let list = psks(password, method)?;
-    let (psk, eih_len) = if list.len() == 1 {
-        (list[0].clone(), 0)
-    } else {
-        if method.is_chacha() {
+    if list.len() == 1 {
+        let key_len = method.key_len();
+        let mut salt = vec![0u8; key_len];
+        read_exact(reader, &mut salt).ok()?;
+        if salt_seen(&salt) {
             return None;
         }
-        let mut salt_probe = vec![0u8; method.key_len()];
-        read_exact(reader, &mut salt_probe).ok()?;
-        if salt_seen(&salt_probe) {
-            return None;
-        }
-        let mut eih = [0u8; BLOCK_LEN];
-        read_exact(reader, &mut eih).ok()?;
-        let hash = shadowsocks2022::decrypt_eih(method, &list[0], &salt_probe, &eih)?;
-        let idx = list[1..]
-            .iter()
-            .position(|p| shadowsocks2022::user_hash(p) == hash)?;
-        let user = list[1 + idx].clone();
-        // The identity header names one account: the flow line reads that user and the counters ride both legs.
-        let meter = identities
-            .get(idx)
-            .map(|(email, level)| authenticate(email, *level))
-            .unwrap_or_default();
-        let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
-        let target = read_request_header(reader, &mut recv)?;
-        crate::accesslog::record_current(&target.0);
-        let mut uplink = crate::conn::dial_tcp(&target.0, Duration::from_secs(8)).ok()?;
-        uplink.write_all(&target.1).ok()?;
-        let server_salt = fresh_salt(method.key_len())?;
-        let send = Cipher::from_psk(method, &user, &server_salt)?;
-        let response = Response::new(send, server_salt, salt_probe);
-        return Some((uplink, response, Recv::Ready(recv), meter));
-    };
-    let _ = eih_len;
-    let key_len = method.key_len();
-    let mut salt = vec![0u8; key_len];
-    read_exact(reader, &mut salt).ok()?;
-    if salt_seen(&salt) {
+        let mut recv = Cipher::from_psk(method, &list[0], &salt)?;
+        let (target, early) = read_request(reader, &mut recv)?;
+        let server_salt = fresh_salt(key_len)?;
+        let send = Cipher::from_psk(method, &list[0], &server_salt)?;
+        let response = Response::new(send, server_salt, salt);
+        // A single-PSK inbound names no user, so the flow keeps the inbound's default attribution and no per-user counters ride.
+        return accept_request(
+            target,
+            early,
+            response,
+            Recv::Ready(recv),
+            crate::stats::Meter::default(),
+        );
+    }
+    if method.is_chacha() {
         return None;
     }
-    let mut recv = Cipher::from_psk(method, &psk, &salt)?;
-    let (target, early) = read_request_header(reader, &mut recv)?;
-    crate::accesslog::record_current(&target);
-    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
-    uplink.write_all(&early).ok()?;
-    let server_salt = fresh_salt(key_len)?;
-    let send = Cipher::from_psk(method, &psk, &server_salt)?;
-    let response = Response::new(send, server_salt, salt);
-    // A single-PSK inbound names no user, so the flow keeps the inbound's default attribution and no per-user counters ride.
-    Some((
-        uplink,
+    let mut salt_probe = vec![0u8; method.key_len()];
+    read_exact(reader, &mut salt_probe).ok()?;
+    if salt_seen(&salt_probe) {
+        return None;
+    }
+    let mut eih = [0u8; BLOCK_LEN];
+    read_exact(reader, &mut eih).ok()?;
+    let hash = shadowsocks2022::decrypt_eih(method, &list[0], &salt_probe, &eih)?;
+    let idx = list[1..]
+        .iter()
+        .position(|p| shadowsocks2022::user_hash(p) == hash)?;
+    let user = list[1 + idx].clone();
+    // The identity header names one account: the flow line reads that user and the counters ride both legs.
+    let meter = identities
+        .get(idx)
+        .map(|(email, level)| authenticate(email, *level))
+        .unwrap_or_default();
+    let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
+    let (target, early) = read_request(reader, &mut recv)?;
+    let server_salt = fresh_salt(method.key_len())?;
+    let send = Cipher::from_psk(method, &user, &server_salt)?;
+    let response = Response::new(send, server_salt, salt_probe);
+    accept_request(target, early, response, Recv::Ready(recv), meter)
+}
+
+fn accept_request(
+    target: Request,
+    early: Vec<u8>,
+    response: Response,
+    recv: Recv,
+    meter: crate::stats::Meter,
+) -> Option<Accepted> {
+    let body = match target {
+        Request::Mux => {
+            crate::accesslog::record_current(&format_args!(
+                "{}:{}",
+                crate::shadowsocks::MUX_HOST,
+                crate::shadowsocks::MUX_PORT
+            ));
+            AcceptedBody::Mux(early)
+        }
+        Request::Target(target) => {
+            crate::accesslog::record_current(&target);
+            let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
+            if !early.is_empty() && uplink.write_all(&early).is_err() {
+                return None;
+            }
+            AcceptedBody::Direct(uplink)
+        }
+    };
+    Some(Accepted {
+        body,
         response,
-        Recv::Ready(recv),
-        crate::stats::Meter::default(),
-    ))
+        recv,
+        meter,
+    })
+}
+
+fn serve_accepted<R, W>(
+    accepted: Accepted,
+    reader: R,
+    writer: W,
+    close: std::sync::Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    let Accepted {
+        body,
+        response,
+        recv,
+        meter,
+    } = accepted;
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
+    match body {
+        AcceptedBody::Direct(uplink) => {
+            pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
+        }
+        AcceptedBody::Mux(carried) => {
+            let reader = MuxReader::new(reader, recv);
+            let writer = MuxWriter::server(writer, response);
+            crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
+        }
+    }
 }
 
 pub(crate) fn serve_ws(
@@ -421,16 +410,12 @@ pub(crate) fn serve_ws(
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv, meter)) =
-        accept_on(&mut reader, password, method, identities, freedom)
-    else {
+    let Some(accepted) = accept_on(&mut reader, password, method, identities, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_httpupgrade(
@@ -445,9 +430,7 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, response, recv, meter)) =
-        accept_on(&mut reader, password, method, identities, freedom)
-    else {
+    let Some(accepted) = accept_on(&mut reader, password, method, identities, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -456,9 +439,7 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 #[cfg(test)]
@@ -491,16 +472,14 @@ pub(crate) fn serve_grpc_with(
     let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let Some((uplink, response, recv, meter)) = under_handshake(&mut reader, |read| {
+    let Some(accepted) = under_handshake(&mut reader, |read| {
         accept_on(read, password, method, identities, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_xhttp(
@@ -538,9 +517,7 @@ pub(crate) fn serve_xhttp_accepted(
 ) {
     // The handshake clock: a carrier that answers its head and then goes silent ends the slot at its budget instead of holding it.
     let mut reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
-    let Some((uplink, response, recv, meter)) =
-        accept_on(&mut reader, password, method, identities, freedom)
-    else {
+    let Some(accepted) = accept_on(&mut reader, password, method, identities, freedom) else {
         writer.abort();
         return;
     };
@@ -548,9 +525,7 @@ pub(crate) fn serve_xhttp_accepted(
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_httpheader(
@@ -564,9 +539,7 @@ pub(crate) fn serve_httpheader(
     let Some((mut reader, writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv, meter)) =
-        accept_on(&mut reader, password, method, identities, freedom)
-    else {
+    let Some(accepted) = accept_on(&mut reader, password, method, identities, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -575,9 +548,7 @@ pub(crate) fn serve_httpheader(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_session<R, W>(
@@ -592,7 +563,7 @@ pub(crate) fn serve_session<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, response, recv, meter)) = accept_on(
+    let Some(accepted) = accept_on(
         &mut reader as &mut dyn Read,
         password,
         method,
@@ -602,9 +573,7 @@ pub(crate) fn serve_session<R, W>(
         close();
         return;
     };
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
+    serve_accepted(accepted, reader, writer, std::sync::Arc::clone(close));
 }
 
 pub(crate) fn serve_kcp<R, W>(
@@ -619,7 +588,7 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, response, recv, meter)) = accept_on(
+    let Some(accepted) = accept_on(
         &mut reader as &mut dyn Read,
         password,
         method,
@@ -629,9 +598,7 @@ pub(crate) fn serve_kcp<R, W>(
         close();
         return;
     };
-    let reader = crate::proxy::metered(reader, meter.clone());
-    let writer = crate::proxy::metered(writer, meter);
-    pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
+    serve_accepted(accepted, reader, writer, std::sync::Arc::clone(close));
 }
 
 pub(crate) fn client_send_handshake(
@@ -686,7 +653,7 @@ pub(crate) enum Recv {
     Waiting(Method, Vec<u8>, Vec<u8>),
 }
 
-struct Response {
+pub(crate) struct Response {
     send: Cipher,
     server_salt: Vec<u8>,
     request_salt: Vec<u8>,
@@ -736,22 +703,152 @@ impl Response {
     }
 }
 
-enum Outbound {
+pub(crate) enum Outbound {
     Client(Cipher),
     Server(Response),
 }
 
-pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, recv: Recv) {
-    pump_relay_outbound(plain, sealed, Outbound::Client(send), recv);
+pub(crate) struct MuxReader<R> {
+    downlink: Downlink<R>,
+    pending: Vec<u8>,
+    at: usize,
+    done: bool,
 }
 
-fn pump_relay_with_response(
-    plain: &Connection,
-    sealed: &Connection,
-    response: Response,
-    recv: Recv,
-) {
-    pump_relay_outbound(plain, sealed, Outbound::Server(response), recv);
+impl<R: Read> MuxReader<R> {
+    pub(crate) fn new(reader: R, recv: Recv) -> Self {
+        Self {
+            downlink: Downlink::new(reader, recv),
+            pending: Vec::new(),
+            at: 0,
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for MuxReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.at < self.pending.len() {
+                let n = (self.pending.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+                self.at += n;
+                if self.at == self.pending.len() {
+                    self.pending.clear();
+                    self.at = 0;
+                }
+                return Ok(n);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            let mut sink = MuxSink(&mut self.pending);
+            let next = self.downlink.step(&mut sink, None);
+            if self.pending.is_empty() {
+                match next {
+                    crate::proxy::lane_pool::Next::Done => {
+                        self.done = true;
+                        return Ok(0);
+                    }
+                    crate::proxy::lane_pool::Next::Idle => {
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    crate::proxy::lane_pool::Next::More | crate::proxy::lane_pool::Next::Retry => {}
+                }
+            } else if matches!(next, crate::proxy::lane_pool::Next::Done) {
+                self.done = true;
+            }
+        }
+    }
+}
+
+struct MuxSink<'a>(&'a mut Vec<u8>);
+
+impl Write for MuxSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            self.write(buf)?;
+            total += buf.len();
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct MuxWriter<W> {
+    outbound: Outbound,
+    writer: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> MuxWriter<W> {
+    pub(crate) fn client(writer: W, send: Cipher) -> Self {
+        Self::new(writer, Outbound::Client(send))
+    }
+
+    fn server(writer: W, response: Response) -> Self {
+        Self::new(writer, Outbound::Server(response))
+    }
+
+    fn new(writer: W, outbound: Outbound) -> Self {
+        Self {
+            outbound,
+            writer,
+            buf: crate::proxy::RelayBuf::with_len(SEAL_HEAD + MAX_CHUNK + TAG_LEN).into_vec(),
+        }
+    }
+}
+
+impl<W: Write> Write for MuxWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let take = (buf.len() - offset).min(MAX_CHUNK);
+            self.buf[SEAL_HEAD..SEAL_HEAD + take].copy_from_slice(&buf[offset..offset + take]);
+            let sealed = match &mut self.outbound {
+                Outbound::Client(send) => seal_all(send, &mut self.buf, take, &mut self.writer),
+                Outbound::Server(response) => {
+                    if response.first_owed {
+                        response.seal_first(&mut self.buf, take, &mut self.writer)
+                    } else {
+                        seal_all(&mut response.send, &mut self.buf, take, &mut self.writer)
+                    }
+                }
+            };
+            sealed?;
+            offset += take;
+        }
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+            self.write(buf)?;
+            total += buf.len();
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, recv: Recv) {
+    pump_relay_outbound(plain, sealed, Outbound::Client(send), recv);
 }
 
 fn pump_relay_outbound(plain: &Connection, sealed: &Connection, outbound: Outbound, recv: Recv) {
