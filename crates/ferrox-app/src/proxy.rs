@@ -15219,36 +15219,32 @@ fn serve_ss_tls_front(
     accounts: Arc<crate::shadowsocks::SsAccounts>,
     freedom: bool,
 ) -> Option<bool> {
-    match inbound_tls_identity(inbound) {
-        Some(server) => {
-            if let Carrier::Xhttp { settings } = &carrier {
-                if crate::xhttp_h3::is_h3(&server.alpn) {
-                    return Some(serve_ss_xhttp_h3(
-                        address, &server, settings, &accounts, freedom,
-                    ));
-                }
-            }
-            spawn_role(
-                address,
-                inbound_role(
-                    inbound,
-                    Role::Shadowsocks {
-                        accounts,
-                        carrier,
-                        freedom,
-                        tls: Some(server),
-                    },
-                ),
-                inbound_tag(inbound),
-            );
-            None
-        }
-        None => {
-            // A refused identity takes only the stream half: a udp relay this config asked for still opens.
-            eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
-            None
+    let Some(server) = inbound_tls_identity(inbound) else {
+        // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+        eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+        return None;
+    };
+    if let Carrier::Xhttp { settings } = &carrier {
+        if crate::xhttp_h3::is_h3(&server.alpn) {
+            return Some(serve_ss_xhttp_h3(
+                address, &server, settings, &accounts, freedom,
+            ));
         }
     }
+    spawn_role(
+        address,
+        inbound_role(
+            inbound,
+            Role::Shadowsocks {
+                accounts,
+                carrier,
+                freedom,
+                tls: Some(server),
+            },
+        ),
+        inbound_tag(inbound),
+    );
+    None
 }
 
 fn serve_shadowsocks_inbound(
@@ -15308,7 +15304,7 @@ fn serve_shadowsocks_inbound(
                     serve_ss_tls_front(address, inbound, carrier, accounts, freedom)
                 {
                     return served;
-                };
+                }
             }
             _ if !matches!(stream_security(inbound), "" | "none") => {
                 let security = stream_security(inbound);
