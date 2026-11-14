@@ -117,11 +117,19 @@ impl Spec {
         } else {
             DEFAULT_PREFIX
         });
+        // macOS only accepts `utunN`, and the reference lets the system name its own device; elsewhere the stable name keeps a restart on the same interface.
+        let name = name
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if cfg!(target_os = "macos") {
+                    String::new()
+                } else {
+                    "ferrox0".to_owned()
+                }
+            });
         Self {
-            name: name
-                .filter(|n| !n.is_empty())
-                .unwrap_or("ferrox0")
-                .to_owned(),
+            name,
             mtu: mtu.filter(|m| *m > 0).unwrap_or(DEFAULT_MTU),
             address,
             prefix,
@@ -347,18 +355,20 @@ fn walk_extensions(mut protocol: u8, mut body: &[u8]) -> Option<(u8, &[u8])> {
     }
 }
 
-/// The flow a quoted packet names, read from the header plus the four port bytes an ICMP error carries. The quote is the packet this handler wrote to the device — remote to client — so its source is the flow's destination and its two ports are reversed. The quoted total length is usually larger than what arrived, so this does not ask the full-packet walk to accept it.
-fn quoted_flow(quoted: &[u8]) -> Option<FlowKey> {
+/// The flow a quoted packet names, read from the header plus the eight transport bytes an ICMP error carries. The quote is the packet this handler wrote to the device — remote to client — so its source is the flow's destination, its destination the flow's source, and its two ports reversed. The quoted total length is usually larger than what arrived, so this does not ask the full-packet walk to accept it.
+fn quoted_flow(quoted: &[u8]) -> Option<(FlowKey, u32)> {
     let first = *quoted.first()?;
-    let (protocol, remote, transport) = if first >> 4 == 4 {
+    let (protocol, remote, client, transport) = if first >> 4 == 4 {
         let header = usize::from(first & 0x0f) * 4;
         if header < IPV4_HEADER || header > quoted.len() {
             return None;
         }
         let remote = *quoted.get(12..16)?.first_chunk::<4>()?;
+        let client = *quoted.get(16..20)?.first_chunk::<4>()?;
         (
             *quoted.get(9)?,
             IpAddr::V4(Ipv4Addr::from(remote)),
+            IpAddr::V4(Ipv4Addr::from(client)),
             quoted.get(header..)?,
         )
     } else if first >> 4 == 6 {
@@ -366,23 +376,34 @@ fn quoted_flow(quoted: &[u8]) -> Option<FlowKey> {
             return None;
         }
         let remote = *quoted.get(8..24)?.first_chunk::<16>()?;
+        let client = *quoted.get(24..40)?.first_chunk::<16>()?;
         let (protocol, transport) = walk_extensions(*quoted.get(6)?, quoted.get(IPV6_HEADER..)?)?;
-        (protocol, IpAddr::V6(Ipv6Addr::from(remote)), transport)
+        (
+            protocol,
+            IpAddr::V6(Ipv6Addr::from(remote)),
+            IpAddr::V6(Ipv6Addr::from(client)),
+            transport,
+        )
     } else {
         return None;
     };
-    if protocol != TCP_PROTO || transport.len() < 4 {
+    if protocol != TCP_PROTO || transport.len() < 8 {
         return None;
     }
-    Some(FlowKey {
-        source_port: u16::from_be_bytes([transport[2], transport[3]]),
-        destination: remote,
-        destination_port: u16::from_be_bytes([transport[0], transport[1]]),
-    })
+    let seq = u32::from_be_bytes(transport[4..8].try_into().ok()?);
+    Some((
+        FlowKey {
+            source: client,
+            source_port: u16::from_be_bytes([transport[2], transport[3]]),
+            destination: remote,
+            destination_port: u16::from_be_bytes([transport[0], transport[1]]),
+        },
+        seq,
+    ))
 }
 
 /// The flow a v4 or v6 ICMP error quotes, when the quoted segment is TCP this handler carried: type 3 over v4, type 1 and packet-too-big type 2 over v6.
-fn icmp_error_flow(protocol: u8, body: &[u8]) -> Option<FlowKey> {
+fn icmp_error_flow(protocol: u8, body: &[u8]) -> Option<(FlowKey, u32)> {
     let quoted = match (protocol, body.first().copied()) {
         (ICMP_PROTO, Some(3)) | (ICMPV6_PROTO, Some(1 | 2)) => body.get(8..)?,
         _ => return None,
@@ -426,14 +447,16 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
+    source: IpAddr,
     source_port: u16,
     destination: IpAddr,
     destination_port: u16,
 }
 
-/// One datagram flow, keyed the same way as a stream flow: the device's own address is implied by the packet's destination.
+/// One datagram flow, keyed the same way as a stream flow: both endpoints, because two clients can pick the same source port towards the same target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpKey {
+    source: IpAddr,
     source_port: u16,
     destination: IpAddr,
     destination_port: u16,
@@ -442,7 +465,7 @@ struct UdpKey {
 /// A flow a thread has left: its entry goes at the next packet, so the packet path pays nothing for the reap.
 enum Ended {
     Stream(FlowKey, u64),
-    Datagram(UdpKey),
+    Datagram(UdpKey, u64),
 }
 
 /// A TUN device: a file descriptor carrying IP packets, with the framing its platform puts in front of each one.
@@ -470,7 +493,17 @@ impl Device {
             use std::os::unix::io::IntoRawFd;
             #[cfg(target_os = "linux")]
             let (device, offload, _) = match crate::tun_stack::build(spec, false, true) {
-                Ok(built) => built,
+                Ok((device, true, multi)) => {
+                    // The kernel enabled UDP segment offload with the TCP ones; the handler does not split an aggregate, so the device is narrowed before its name is released for the plain rebuild.
+                    if crate::tun_stack::tcp_only_offload(&device) {
+                        (device, true, multi)
+                    } else {
+                        drop(device);
+                        let (device, _, multi) = crate::tun_stack::build(spec, false, false)?;
+                        (device, false, multi)
+                    }
+                }
+                Ok((device, false, multi)) => (device, false, multi),
                 Err(error) if offload_refused(&error) => {
                     crate::tun_stack::build(spec, false, false)?
                 }
@@ -981,6 +1014,8 @@ fn build_ipv6_tcp_packet(
 struct Flow {
     /// The generation this entry was inserted at, so a late reaper cannot remove a replacement with the same tuple.
     id: u64,
+    /// The client's initial sequence, so a retransmitted SYN replays the handshake instead of minting a second flow.
+    isn: u32,
     write_half: TcpStream,
     rcv_nxt: Arc<AtomicU32>,
     snd_nxt: Arc<AtomicU32>,
@@ -1036,7 +1071,7 @@ pub(crate) struct Handler {
     relay: Relay,
     associate: Associate,
     flows: HashMap<FlowKey, Flow>,
-    legs: HashMap<UdpKey, UdpSocket>,
+    legs: HashMap<UdpKey, (u64, UdpSocket)>,
     frame: Vec<u8>,
     /// Reused render buffer for every device-bound packet this thread emits (SYN-ACK, pure ACK, ICMP reply), so the emit path allocates nothing in steady state.
     emit: Vec<u8>,
@@ -1044,6 +1079,7 @@ pub(crate) struct Handler {
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
     next_flow_id: u64,
+    next_leg_id: u64,
 }
 
 impl Handler {
@@ -1062,6 +1098,7 @@ impl Handler {
             ended_tx,
             ended_rx,
             next_flow_id: 0,
+            next_leg_id: 0,
         }
     }
 
@@ -1087,8 +1124,10 @@ impl Handler {
                         self.flows.remove(&key);
                     }
                 }
-                Ended::Datagram(key) => {
-                    self.legs.remove(&key);
+                Ended::Datagram(key, id) => {
+                    if self.legs.get(&key).is_some_and(|leg| leg.0 == id) {
+                        self.legs.remove(&key);
+                    }
                 }
             }
         }
@@ -1119,20 +1158,31 @@ impl Handler {
         let relay = association.relay;
         let target = SocketAddr::new(ip.destination, udp.destination_port);
         let key = UdpKey {
+            source: ip.source,
             source_port: udp.source_port,
             destination: ip.destination,
             destination_port: udp.destination_port,
         };
         let leg = match self.legs.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(open_leg(
-                &self.device,
-                relay,
-                (ip.destination, udp.destination_port),
-                (ip.source, udp.source_port),
-                key,
-                &self.ended_tx,
-            )?),
+            std::collections::hash_map::Entry::Occupied(entry) => &mut entry.into_mut().1,
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let id = self.next_leg_id;
+                self.next_leg_id = self.next_leg_id.wrapping_add(1);
+                &mut vacant
+                    .insert((
+                        id,
+                        open_leg(
+                            &self.device,
+                            relay,
+                            (ip.destination, udp.destination_port),
+                            (ip.source, udp.source_port),
+                            key,
+                            id,
+                            &self.ended_tx,
+                        )?,
+                    ))
+                    .1
+            }
         };
         let mut frame = std::mem::take(&mut self.frame);
         let (front, tail) = crate::proxy::socks_udp_parts(&mut frame, &target, payload);
@@ -1149,6 +1199,7 @@ impl Handler {
             return Ok(());
         };
         let key = FlowKey {
+            source: ip.source,
             source_port: tcp.source_port,
             destination: ip.destination,
             destination_port: tcp.destination_port,
@@ -1162,14 +1213,24 @@ impl Handler {
         }
         let mut dead = false;
         if let Some(flow) = self.flows.get_mut(&key) {
-            let end = tcp.seq.wrapping_add(payload.len() as u32);
             let fin = tcp.flags & FLAG_FIN != 0;
-            if !payload.is_empty() {
+            // A device retransmits and can reorder, so only the bytes past `rcv_nxt` reach the proxy: a duplicate is dropped and an overlapping segment is trimmed, never written twice.
+            let rcv = flow.rcv_nxt.load(Relaxed);
+            let len = payload.len() as u32;
+            let gap = rcv.wrapping_sub(tcp.seq);
+            let skip = if gap <= i32::MAX as u32 {
+                gap as usize
+            } else {
+                usize::MAX
+            };
+            let mut end = rcv;
+            if skip < payload.len() {
                 flow.busy.store(true, Relaxed);
-                dead = flow.write_half.write_all(payload).is_err();
+                dead = flow.write_half.write_all(&payload[skip..]).is_err();
+                end = rcv.wrapping_add(len - skip as u32);
                 flow.rcv_nxt.store(end, Relaxed);
             }
-            if fin {
+            if fin && tcp.seq.wrapping_add(len) == flow.rcv_nxt.load(Relaxed) {
                 flow.rcv_nxt.store(end.wrapping_add(1), Relaxed);
                 let _ = flow.write_half.shutdown(Shutdown::Write);
             }
@@ -1207,6 +1268,27 @@ impl Handler {
 
     #[allow(clippy::too_many_lines)]
     fn accept_flow(&mut self, ip: &IpHead, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
+        if let Some(flow) = self.flows.get(&key) {
+            // A retransmitted SYN keeps its flow and only needs the SYN-ACK again; a new SYN on a live tuple ends the old flow first, so its threads and lane cannot outlive it.
+            if flow.isn == tcp.seq {
+                let mut emit = std::mem::take(&mut self.emit);
+                render_tcp_packet_ip(
+                    flow.local,
+                    flow.remote,
+                    flow.isn.wrapping_add(1),
+                    flow.isn.wrapping_add(1),
+                    FLAG_SYN | FLAG_ACK,
+                    65535,
+                    &[],
+                    false,
+                    &mut emit,
+                );
+                let wrote = self.device.write_packet(&emit);
+                self.emit = emit;
+                return wrote;
+            }
+            self.close_flow(key, Some(FLAG_RST | FLAG_ACK));
+        }
         let local_ip = ip.destination;
         let remote_ip = ip.source;
         let local_port = tcp.destination_port;
@@ -1252,6 +1334,7 @@ impl Handler {
             key,
             Flow {
                 id,
+                isn: syn_seq,
                 write_half,
                 rcv_nxt: Arc::clone(&rcv_nxt),
                 snd_nxt: Arc::clone(&snd_nxt),
@@ -1313,6 +1396,7 @@ impl Handler {
                     }
                     Ok(n) => {
                         let seq = snd_nxt.load(Relaxed);
+                        let max = (mss.load(Relaxed) as usize).max(1);
                         let gso = gso_capable && n > max;
                         render_tcp_packet_ip(
                             (local_ip, local_port),
@@ -1387,7 +1471,15 @@ impl Handler {
             self.emit = emit;
             return wrote;
         }
-        if let Some(key) = icmp_error_flow(ip.protocol, body) {
+        if let Some((key, seq)) = icmp_error_flow(ip.protocol, body) {
+            let Some(flow) = self.flows.get(&key) else {
+                return Ok(());
+            };
+            // A forged report names a segment this handler never sent; the quote's sequence has to sit inside what has already gone out.
+            let sent = flow.snd_nxt.load(Relaxed);
+            if seq == sent || sent.wrapping_sub(seq) > u32::MAX / 2 {
+                return Ok(());
+            }
             if let Some(mtu) = reported_mtu(ip.protocol, body) {
                 self.shrink_flow(key, mtu);
             } else {
@@ -1449,6 +1541,7 @@ fn open_leg(
     endpoint: (IpAddr, u16),
     client: (IpAddr, u16),
     key: UdpKey,
+    id: u64,
     ended: &mpsc::Sender<Ended>,
 ) -> io::Result<UdpSocket> {
     let leg = crate::proxy::relay_leg(relay)?;
@@ -1485,7 +1578,7 @@ fn open_leg(
                 break;
             }
         }
-        let _ = ended.send(Ended::Datagram(key));
+        let _ = ended.send(Ended::Datagram(key, id));
     });
     Ok(leg)
 }
@@ -1493,7 +1586,12 @@ fn open_leg(
 pub(crate) fn refusal_reason(spec: &Spec) -> String {
     format!(
         "`{}` (mtu {} B) cannot open a TUN: no ioctl and no FERROX_TUN_FD",
-        spec.name, spec.mtu
+        if spec.name.is_empty() {
+            "default"
+        } else {
+            spec.name.as_str()
+        },
+        spec.mtu
     )
 }
 
@@ -1664,7 +1762,9 @@ mod tests {
         quoted[40] = TCP_PROTO;
         quoted[48..50].copy_from_slice(&443u16.to_be_bytes());
         quoted[50..52].copy_from_slice(&12345u16.to_be_bytes());
-        let flow = quoted_flow(&quoted).unwrap();
+        let (flow, seq) = quoted_flow(&quoted).unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(flow.source, "2001:db8::1".parse::<IpAddr>().unwrap());
         assert_eq!(flow.source_port, 12345);
         assert_eq!(flow.destination_port, 443);
         assert_eq!(flow.destination, "2001:db8::2".parse::<IpAddr>().unwrap());
@@ -2181,6 +2281,7 @@ mod tests {
         handler.dispatch(&buf[..n]).unwrap();
 
         let key = FlowKey {
+            source: IpAddr::V4(client.0.into()),
             source_port: 44444,
             destination: IpAddr::V4(endpoint.0.into()),
             destination_port: 8080,
@@ -2246,6 +2347,7 @@ mod tests {
         handler.dispatch(&buf[..n]).unwrap();
 
         let key = FlowKey {
+            source: client,
             source_port: 44444,
             destination: endpoint,
             destination_port: 8080,
@@ -3077,6 +3179,7 @@ mod tests {
         let n = handler.device.read_packet(buf).unwrap();
         handler.dispatch(&buf[..n]).unwrap();
         FlowKey {
+            source: IpAddr::V4(Ipv4Addr::from(SCRIPT_CLIENT)),
             source_port,
             destination: IpAddr::V4(*destination.ip()),
             destination_port: endpoint.1,
