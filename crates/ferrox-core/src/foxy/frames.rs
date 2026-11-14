@@ -32,16 +32,12 @@ pub struct H2Frame {
 }
 
 impl H2Frame {
-    /// Parses a frame header, refusing a stream id with its reserved bit set because every frame this lane exchanges leaves that bit clear.
+    /// Parses a frame header, ignoring the stream id's reserved bit as RFC 7540 4.1 requires.
     #[must_use]
     pub fn parse(header: &[u8; H2_HEADER]) -> Option<Self> {
-        // Two wide loads bring in length, kind and stream; three reserved bits collapse to one mask plus one byte test.
         let head = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
         let flags = header[4];
-        if head & 0x8000_0080 != 0 || flags & 0x80 != 0 {
-            return None;
-        }
-        let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+        let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
         Some(Self {
             kind: head as u8,
             flags,
@@ -572,18 +568,67 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_bit_is_refused_rather_than_masked() {
-        for slot in [0usize, 3, 4] {
-            let frame = H2Frame {
-                kind: DATA,
-                flags: 0,
-                stream: 1,
-                length: 0,
-            };
-            let mut header = frame.header();
-            header[slot] |= 0x80;
-            assert!(H2Frame::parse(&header).is_none(), "slot {slot}");
-        }
+    fn the_stream_reserved_bit_is_masked_not_refused() {
+        let frame = H2Frame {
+            kind: DATA,
+            flags: 0,
+            stream: 1,
+            length: 0,
+        };
+        let mut header = frame.header();
+        header[5] |= 0x80;
+        let parsed = H2Frame::parse(&header).expect("the reserved bit is ignored");
+        assert_eq!(parsed.stream, 1);
+    }
+
+    #[test]
+    fn the_high_length_bit_is_length_not_a_refusal() {
+        let frame = H2Frame {
+            kind: DATA,
+            flags: 0,
+            stream: 1,
+            length: 0,
+        };
+        let mut header = frame.header();
+        header[0] |= 0x80;
+        let parsed = H2Frame::parse(&header).expect("length bit 23 is not reserved");
+        assert_eq!(parsed.length, 0x80_0000);
+    }
+
+    #[test]
+    fn an_unknown_type_and_flag_are_routed_to_other() {
+        let frame = H2Frame {
+            kind: DATA,
+            flags: 0,
+            stream: 1,
+            length: 0,
+        };
+        let mut header = frame.header();
+        header[3] = 0x80;
+        header[4] = 0x80;
+        let parsed = H2Frame::parse(&header).expect("unknown frames are ignored, not refused");
+        assert_eq!(parsed.kind, 0x80);
+        assert_eq!(parsed.flags, 0x80);
+        assert_eq!(h2_routed(parsed, &[]), H2Routed::Other { kind: 0x80 });
+    }
+
+    #[test]
+    fn an_unknown_flag_on_a_known_frame_is_ignored() {
+        let frame = H2Frame {
+            kind: DATA,
+            flags: 0x80,
+            stream: 1,
+            length: 1,
+        };
+        let parsed = H2Frame::parse(&frame.header()).expect("an unknown flag is ignored");
+        assert_eq!(
+            h2_event(parsed, &[7], 1),
+            H2Event::Data {
+                payload: &[7],
+                end: false,
+                wire: 1,
+            }
+        );
     }
 
     #[test]
