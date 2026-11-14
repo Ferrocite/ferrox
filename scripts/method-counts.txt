@@ -376,6 +376,7 @@ carrier-foxy uplink-bytes-blocked-by-a-parked-leg 0 ferrox-app-foxy::loopback::a
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
 carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
+carrier-foxy stalled-flow-window-update-frames 0 ferrox-app-foxy::loopback::a_flow_that_does_not_read_returns_no_stream_credit
 carrier-foxy padded-frame-credit-octets 0 ferrox-app-foxy::loopback::a_padded_frame_credits_its_whole_wire_payload
 carrier-foxy padded-frame-pad-octets-delivered 0 ferrox-app-foxy::loopback::a_padded_frame_hands_back_only_its_payload
 carrier-foxy padded-frame-staged-bytes-per-payload-byte 1 ferrox-app-foxy::loopback::a_padded_frame_hands_back_only_its_payload
