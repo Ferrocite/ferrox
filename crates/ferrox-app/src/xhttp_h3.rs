@@ -308,9 +308,14 @@ impl H3Reader {
                     self.head_seen = true;
                     if self.head.is_none() && self.status.is_none() {
                         let Some((head, status)) = decode_head(payload, self.expect_request) else {
+                            let missing = if self.expect_request {
+                                "h3 request head is missing"
+                            } else {
+                                "h3 response head is missing"
+                            };
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                "h3 request head is missing",
+                                missing,
                             ));
                         };
                         self.head = head;
@@ -571,7 +576,7 @@ fn decode_head(payload: &[u8], expect_request: bool) -> Option<(Option<Vec<u8>>,
         let head = synth_head(&fields)?;
         Some((Some(head), hpack::qpack_status(payload)))
     } else {
-        Some((None, hpack::qpack_status(payload)))
+        Some((None, Some(hpack::qpack_status(payload)?)))
     }
 }
 
@@ -1511,8 +1516,18 @@ mod tests {
         );
         assert_eq!(
             decode_head(&request, false),
-            Some((None, None)),
-            "a response reader does not synthesize a request head"
+            None,
+            "a response reader refuses a block that names no status"
+        );
+        assert_eq!(
+            decode_head(&[0x01, 0x00, 0xC0, 0x01], false),
+            None,
+            "a dynamic-table prefix leaves no status this lane can read"
+        );
+        assert_eq!(
+            decode_head(&[], false),
+            None,
+            "an empty response head names no status"
         );
 
         let mut status = Vec::new();
