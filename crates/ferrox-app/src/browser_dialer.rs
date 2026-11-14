@@ -625,9 +625,18 @@ mod tests {
         let drain = pipe.find("await drain(to);").expect("drains");
         let send = pipe.find("to.send(event.data);").expect("sends");
         assert!(drain < send, "the pipe drains before it sends");
-        assert!(pipe.contains("queued > HIGH_WATER)"), "the queue is bounded");
-        assert!(pipe.contains("from.close()"), "a stalled pipe closes its source");
-        assert!(pipe.contains("return () => tail;"), "a close can wait for the queue");
+        assert!(
+            pipe.contains("queued > HIGH_WATER)"),
+            "the queue is bounded"
+        );
+        assert!(
+            pipe.contains("from.close()"),
+            "a stalled pipe closes its source"
+        );
+        assert!(
+            pipe.contains("return () => tail;"),
+            "a close can wait for the queue"
+        );
     }
 
     #[test]
