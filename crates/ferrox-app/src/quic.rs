@@ -1983,14 +1983,14 @@ fn set_buffer(sock: &UdpSocket, option: libc::c_int, bytes: i32) {
 }
 
 #[cfg(unix)]
-fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+pub(crate) fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
     set_buffer(sock, libc::SO_RCVBUF, bytes);
 }
 
 /// A macOS socket's send buffer defaults to a few kilobytes, so a burst quiche has already declared sent is refused
 /// by the kernel and lost: the lane asks for the same buffer in both directions and lets the kernel cap it.
 #[cfg(unix)]
-fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
+pub(crate) fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
     set_buffer(sock, libc::SO_SNDBUF, bytes);
 }
 
@@ -2046,7 +2046,7 @@ fn set_buffer(sock: &UdpSocket, option: i32, bytes: i32) {
 }
 
 #[cfg(windows)]
-fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+pub(crate) fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
     set_buffer(
         sock,
         windows_sys::Win32::Networking::WinSock::SO_RCVBUF,
@@ -2065,7 +2065,7 @@ fn send_buffer(sock: &UdpSocket) -> i32 {
 }
 
 #[cfg(windows)]
-fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
+pub(crate) fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
     set_buffer(
         sock,
         windows_sys::Win32::Networking::WinSock::SO_SNDBUF,
