@@ -1,8 +1,10 @@
 #[cfg(test)]
 use super::protocol::write_long;
+#[cfg(test)]
+use super::protocol::Packet;
 use super::protocol::{
-    decode_packet_body, read_long, read_varint_with_length, write_packet, write_string, Packet,
-    MAX_PACKET_BODY_LENGTH, MAX_STRING_LENGTH,
+    read_long, read_varint, read_varint_with_length, varint_size, write_packet, write_string,
+    write_varint, MAX_PACKET_BODY_LENGTH, MAX_PACKET_DATA_LENGTH, MAX_STRING_LENGTH,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -23,6 +25,7 @@ const KEEPALIVE_POLLS: usize = 150;
 pub struct PacketStream<R, W> {
     reader: Mutex<ReadState<R>>,
     writer: Arc<Mutex<W>>,
+    write_buffer: Mutex<Vec<u8>>,
     is_client: bool,
     stop: Arc<AtomicBool>,
     keepalive: Option<JoinHandle<()>>,
@@ -31,17 +34,102 @@ pub struct PacketStream<R, W> {
 struct ReadState<R> {
     reader: R,
     buffer: Vec<u8>,
+    buffer_at: usize,
     pending: Vec<u8>,
+    pending_at: usize,
     chunk: [u8; 8192],
 }
 
+enum Event {
+    Payload(usize),
+    KeepAlive(i64),
+}
+
+enum NextError {
+    Frame(io::Error),
+    Payload(io::Error),
+}
+
 impl<R: Read> ReadState<R> {
-    fn next_packet(&mut self) -> io::Result<Packet> {
+    fn next_event(&mut self, output: &mut [u8], remote_id: i32) -> Result<Event, NextError> {
         loop {
-            if let Some((packet, length)) = buffered_packet(&self.buffer)? {
-                self.buffer.drain(..length);
-                return Ok(packet);
+            let available = &self.buffer[self.buffer_at..];
+            let mut body = available;
+            let (length, prefix) = match read_varint_with_length(&mut body) {
+                Ok(field) => field,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.refill().map_err(NextError::Frame)?;
+                    continue;
+                }
+                Err(error) => return Err(NextError::Frame(error)),
+            };
+            if length < 1 || length as usize > MAX_PACKET_BODY_LENGTH {
+                return Err(NextError::Frame(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read packet: bad length: {length}"),
+                )));
             }
+            let total = prefix + length as usize;
+            if available.len() < total {
+                self.refill().map_err(NextError::Frame)?;
+                continue;
+            }
+            let mut body = &available[prefix..total];
+            let id = read_varint(&mut body).map_err(NextError::Frame)?;
+            if body.len() > MAX_PACKET_DATA_LENGTH {
+                return Err(NextError::Frame(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read packet: bad length: {}", body.len()),
+                )));
+            }
+            if id == remote_id {
+                let payload = match parse_custom_payload_data(&mut body) {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => {
+                        self.advance(total);
+                        continue;
+                    }
+                    Err(error) => return Err(NextError::Payload(error)),
+                };
+                if payload.is_empty() {
+                    self.advance(total);
+                    continue;
+                }
+                let taken = output.len().min(payload.len());
+                output[..taken].copy_from_slice(&payload[..taken]);
+                if taken < payload.len() {
+                    self.pending.extend_from_slice(&payload[taken..]);
+                }
+                self.advance(total);
+                return Ok(Event::Payload(taken));
+            }
+            if id == KEEPALIVE_PACKET {
+                let id = read_long(&mut body).map_err(|error| {
+                    NextError::Payload(io::Error::other(format!(
+                        "read minecraft keep-alive: {error}"
+                    )))
+                })?;
+                self.advance(total);
+                return Ok(Event::KeepAlive(id));
+            }
+            self.advance(total);
+        }
+    }
+
+    fn advance(&mut self, length: usize) {
+        self.buffer_at += length;
+        if self.buffer_at == self.buffer.len() {
+            self.buffer.clear();
+            self.buffer_at = 0;
+        } else if self.buffer_at >= 4096 || self.buffer_at * 2 >= self.buffer.len() {
+            self.buffer.copy_within(self.buffer_at.., 0);
+            self.buffer.truncate(self.buffer.len() - self.buffer_at);
+            self.buffer_at = 0;
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<()> {
+        loop {
             match self.reader.read(&mut self.chunk) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -49,33 +137,15 @@ impl<R: Read> ReadState<R> {
                         "minecraft packet stream closed",
                     ))
                 }
-                Ok(read) => self.buffer.extend_from_slice(&self.chunk[..read]),
+                Ok(read) => {
+                    self.buffer.extend_from_slice(&self.chunk[..read]);
+                    return Ok(());
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
         }
     }
-}
-
-fn buffered_packet(buffer: &[u8]) -> io::Result<Option<(Packet, usize)>> {
-    let mut data = buffer;
-    let (length, prefix) = match read_varint_with_length(&mut data) {
-        Ok(field) => field,
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if length < 1 || length as usize > MAX_PACKET_BODY_LENGTH {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("read packet: bad length: {length}"),
-        ));
-    }
-    let total = prefix + length as usize;
-    if buffer.len() < total {
-        return Ok(None);
-    }
-    let packet = decode_packet_body(&buffer[prefix..total])?;
-    Ok(Some((packet, total)))
 }
 
 impl<R, W> PacketStream<R, W>
@@ -94,10 +164,13 @@ where
             reader: Mutex::new(ReadState {
                 reader,
                 buffer: Vec::new(),
+                buffer_at: 0,
                 pending: Vec::new(),
+                pending_at: 0,
                 chunk: [0; 8192],
             }),
             writer,
+            write_buffer: Mutex::new(Vec::new()),
             is_client,
             stop,
             keepalive,
@@ -157,42 +230,34 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
             .reader
             .lock()
             .map_err(|_| io::Error::other("packet stream reader poisoned"))?;
-        if !reader.pending.is_empty() {
-            let taken = output.len().min(reader.pending.len());
-            output[..taken].copy_from_slice(&reader.pending[..taken]);
-            reader.pending.drain(..taken);
+        if reader.pending_at < reader.pending.len() {
+            let taken = output.len().min(reader.pending.len() - reader.pending_at);
+            output[..taken]
+                .copy_from_slice(&reader.pending[reader.pending_at..reader.pending_at + taken]);
+            reader.pending_at += taken;
+            if reader.pending_at == reader.pending.len() {
+                reader.pending.clear();
+                reader.pending_at = 0;
+            }
             return Ok(taken);
         }
 
         loop {
-            let packet = reader.next_packet().map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("read minecraft packet stream: {error}"),
-                )
-            })?;
-            if packet.id == self.remote_custom_payload_id() {
-                let Some(payload) = parse_custom_payload(&packet)? else {
-                    continue;
-                };
-                if payload.is_empty() {
-                    continue;
-                }
-                let taken = output.len().min(payload.len());
-                output[..taken].copy_from_slice(&payload[..taken]);
-                if taken < payload.len() {
-                    reader.pending.extend_from_slice(&payload[taken..]);
-                }
-                return Ok(taken);
-            }
-
-            if packet.id == KEEPALIVE_PACKET {
-                let mut data = packet.data.as_slice();
-                let id = read_long(&mut data).map_err(|error| {
-                    io::Error::other(format!("read minecraft keep-alive: {error}"))
+            let event = reader
+                .next_event(output, self.remote_custom_payload_id())
+                .map_err(|error| match error {
+                    NextError::Frame(error) => io::Error::new(
+                        error.kind(),
+                        format!("read minecraft packet stream: {error}"),
+                    ),
+                    NextError::Payload(error) => error,
                 })?;
-                if self.is_client {
-                    self.write_keepalive(id)?;
+            match event {
+                Event::Payload(taken) => return Ok(taken),
+                Event::KeepAlive(id) => {
+                    if self.is_client {
+                        self.write_keepalive(id)?;
+                    }
                 }
             }
         }
@@ -215,13 +280,23 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             .writer
             .lock()
             .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
+        let mut frame = self
+            .write_buffer
+            .lock()
+            .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
         let mut written = 0;
         while written < input.len() {
             let end = (written + MAX_PACKET_DATA).min(input.len());
-            let mut data = Vec::with_capacity(CHANNEL.len() + end - written + 1);
-            write_string(&mut data, CHANNEL)?;
-            data.extend_from_slice(&input[written..end]);
-            write_packet(&mut *writer, self.local_custom_payload_id(), &data).map_err(|error| {
+            let id = self.local_custom_payload_id();
+            let body = varint_size(id) + varint_size(8) + CHANNEL.len() + end - written;
+            let body = i32::try_from(body)
+                .map_err(|_| io::Error::other("packet length exceeds a varint"))?;
+            frame.clear();
+            write_varint(&mut *frame, body)?;
+            write_varint(&mut *frame, id)?;
+            write_string(&mut *frame, CHANNEL)?;
+            frame.extend_from_slice(&input[written..end]);
+            writer.write_all(&frame).map_err(|error| {
                 io::Error::other(format!("write minecraft custom payload: {error}"))
             })?;
             written = end;
@@ -273,15 +348,19 @@ impl<R, W> std::fmt::Debug for PacketStream<R, W> {
     }
 }
 
+#[cfg(test)]
 fn parse_custom_payload(packet: &Packet) -> io::Result<Option<&[u8]>> {
-    let mut data = packet.data.as_slice();
-    let channel = read_channel(&mut data).map_err(|error| {
+    parse_custom_payload_data(&mut packet.data.as_slice())
+}
+
+fn parse_custom_payload_data<'a>(data: &mut &'a [u8]) -> io::Result<Option<&'a [u8]>> {
+    let channel = read_channel(data).map_err(|error| {
         io::Error::other(format!("read minecraft custom payload channel: {error}"))
     })?;
     if channel != CHANNEL {
         return Ok(None);
     }
-    Ok(Some(data))
+    Ok(Some(*data))
 }
 
 fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a str> {
@@ -436,6 +515,27 @@ mod tests {
         }
         assert_eq!(frames, 3);
         assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn the_frame_buffer_holds_its_capacity() {
+        let stream = PacketStream::new(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            std::io::sink(),
+            true,
+        );
+        let mut write = &stream;
+        let input = vec![0x33u8; MAX_PACKET_DATA];
+        write.write_all(&input).expect("writes");
+        let capacity = stream.write_buffer.lock().expect("buffer").capacity();
+        for _ in 0..4 {
+            write.write_all(&input).expect("writes");
+            assert_eq!(
+                stream.write_buffer.lock().expect("buffer").capacity(),
+                capacity,
+                "the frame buffer does not grow again"
+            );
+        }
     }
 
     #[test]
