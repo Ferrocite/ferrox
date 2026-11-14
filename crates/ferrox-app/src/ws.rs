@@ -248,6 +248,8 @@ pub(crate) struct WsReader<R: Read = Connection> {
     shared: Arc<Shared>,
     /// Socket bytes this reader has taken but not yet parsed or delivered.
     have: Vec<u8>,
+    /// First byte of `have` no read has initialised yet.
+    have_init: usize,
     /// Cursor into `have`; `have[at..]` is what is left.
     at: usize,
     /// End of the frame being delivered, so a small `read` returns part and the rest stays.
@@ -315,13 +317,8 @@ impl<R: Read> WsReader<R> {
             self.compact();
         }
         let room = READ_AHEAD.max(len);
-        if self.have.capacity() - self.have.len() < room {
-            self.have.reserve(room);
-        }
         let base = self.have.len();
-        unsafe {
-            self.have.set_len(base + room);
-        }
+        ferrox_core::read::init_room(&mut self.have, &mut self.have_init, base + room);
         let taken = loop {
             match self.read.read(&mut self.have[base..]) {
                 Ok(0) => {
@@ -1089,6 +1086,7 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let reader = WsReader {
         read,
         shared: Arc::clone(&shared),
+        have_init: have.len(),
         have,
         at,
         msg_end: 0,
@@ -1325,6 +1323,7 @@ mod tests {
                     read: stream,
                     shared,
                     have: Vec::new(),
+                    have_init: 0,
                     at: 0,
                     msg_end: 0,
                     early: Vec::new(),
@@ -1481,6 +1480,7 @@ mod tests {
                 masked: false,
             }),
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -1516,6 +1516,7 @@ mod tests {
                 masked: false,
             }),
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -1584,6 +1585,7 @@ mod tests {
                 masked: false,
             }),
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -1648,6 +1650,7 @@ mod tests {
                 masked: false,
             }),
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -1768,6 +1771,7 @@ mod tests {
                 masked: false,
             }),
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -1816,6 +1820,7 @@ mod tests {
             read: stream,
             shared,
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -1871,6 +1876,7 @@ mod tests {
             read: std::io::Cursor::new(wire),
             shared,
             have: Vec::new(),
+            have_init: 0,
             at: 0,
             msg_end: 0,
             early: Vec::new(),
@@ -2104,6 +2110,7 @@ mod tests {
                 cut: AtomicUsize::new(0),
                 masked: false,
             }),
+            have_init: have.len(),
             have,
             at: 0,
             msg_end: 0,

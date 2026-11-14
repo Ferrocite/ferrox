@@ -89,7 +89,7 @@ vmess web-socket-staging-copies-per-batch 0 ferrox-app-vmess::tests::a_sealed_ba
 vmess web-socket-carrier-bytes-opened-at-most 1024 ferrox-app-vmess::tests::a_web_socket_carrier_opens_no_batch_buffer
 vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
 vmess replay-keys-held-at-most 131072 ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most
-vmess zero-filled-bytes-per-flow 0 ferrox-app-vmess::tests::the_flows_windows_are_not_zero_filled
+vmess zero-filled-bytes-per-flow 404609 ferrox-app-vmess::tests::the_flows_windows_are_zeroed_once
 vmess response-header-allocations-per-read 0 ferrox-app-vmess::tests::a_response_header_reads_without_allocating
 vmess carrier-reads-per-full-window-of-datagram-frames-at-most 2 ferrox-app-vmess::tests::the_datagram_pump_reads_the_carrier_through_its_window
 shadowsocks host-port-strings-per-datagram 0 ferrox-app-shadowsocks::tests::a_datagram_target_is_resolved_without_a_host_port_string
@@ -321,12 +321,12 @@ carrier-xhttp carry-tail-allocations 0 ferrox-app-xhttp::tests::the_tail_a_body_
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp partly-read-frame-tail-copies 0 ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved
-carrier-xhttp zero-filled-bytes-per-received-frame 0 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled
+carrier-xhttp zero-filled-bytes-per-received-frame 4096 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_zeroed_once
 carrier-xhttp response-head-field-allocations 0 ferrox-app-xhttp_h2::tests::a_response_head_is_split_without_allocating
 carrier-xhttp answer-head-allocations 1 ferrox-app-xhttp::tests::a_padded_answer_is_written_from_one_buffer
 carrier-xhttp tokenish-pad-buffer-allocations 1 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
 carrier-xhttp zero-filled-bytes-per-tokenish-pad 0 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
-carrier-xhttp zero-filled-bytes-per-request-body 0 ferrox-app-xhttp::tests::a_body_read_lands_in_room_it_never_zeroes
+carrier-xhttp zero-filled-bytes-per-request-body 32 ferrox-app-xhttp::tests::a_body_read_zeroes_its_room_once
 carrier-xhttp dial-head-allocations-per-thread 1 ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread
 carrier-xhttp request-head-allocations 5 ferrox-app-xhttp_h2::tests::a_request_block_is_encoded_without_its_temporary_lists
 
@@ -535,7 +535,7 @@ kcp filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter
 kcp mask-chain-wire-overhead-bytes 32 ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask
 kcp mask-read-side-payload-copies-per-datagram 0 ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire
 kcp mask-encode-buffer-allocations-per-frame 0 ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames
-kcp datagram-room-zero-filled-bytes 0 ferrox-core-kcp::listener::tests::the_datagram_room_is_not_zeroed
+kcp datagram-room-zero-filled-bytes 65536 ferrox-core-kcp::listener::tests::the_datagram_room_is_zeroed_once
 kcp listener-session-cap 256 ferrox-core-kcp::listener::tests::the_listener_caps_sessions_before_accept
 kcp oracle-mask-lines-against-the-pinned-go 86 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
 trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
@@ -837,7 +837,7 @@ socks tcp-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_di
 socks datagrams-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_carries_a_datagram_through_the_front
 socks datagram-payload-copies-per-forwarded-datagram 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
 socks datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
-socks front-name-zero-filled-bytes 0 ferrox-app-proxy::tests::a_socks_front_reads_no_buffer_it_zeroed
+socks front-name-zero-filled-bytes 12 ferrox-app-proxy::tests::a_socks_front_zeroes_the_name_once
 socks datagram-rebuild-copies-per-reframed-datagram 1 ferrox-app-proxy::tests::a_datagram_naming_a_host_is_reframed_around_its_payload
 socks client-datagram-payload-copies 0 ferrox-app-proxy::tests::a_client_datagram_hands_its_payload_over_by_pointer
 socks device-datagram-payload-copies 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer

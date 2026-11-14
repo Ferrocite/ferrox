@@ -12,6 +12,7 @@ thread_local! {
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 static ZEROED: AtomicUsize = AtomicUsize::new(0);
+static ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static BUSY: Mutex<()> = Mutex::new(());
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ pub struct Counts {
     pub allocs: usize,
     pub bytes: usize,
     pub zeroed: usize,
+    pub zeroed_bytes: usize,
 }
 
 /// Counts what the closure allocates on this thread, and only that.
@@ -40,6 +42,7 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Counts) {
     ALLOCS.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
     ZEROED.store(0, Ordering::Relaxed);
+    ZEROED_BYTES.store(0, Ordering::Relaxed);
     COUNTING.with(|counting| counting.set(true));
     let out = f();
     drop(window);
@@ -48,6 +51,7 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Counts) {
         allocs: ALLOCS.load(Ordering::Relaxed),
         bytes: BYTES.load(Ordering::Relaxed),
         zeroed: ZEROED.load(Ordering::Relaxed),
+        zeroed_bytes: ZEROED_BYTES.load(Ordering::Relaxed),
     };
     drop(one_at_a_time);
     (out, counts)
@@ -73,6 +77,7 @@ unsafe impl GlobalAlloc for Counting {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             ZEROED.fetch_add(1, Ordering::Relaxed);
+            ZEROED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -111,8 +116,13 @@ mod tests {
             std::hint::black_box(&mine);
         });
         assert_eq!(
-            (counts.allocs, counts.bytes, counts.zeroed),
-            (1, 64, 1),
+            (
+                counts.allocs,
+                counts.bytes,
+                counts.zeroed,
+                counts.zeroed_bytes
+            ),
+            (1, 64, 1, 64),
             "the other thread's 64 KiB is not in a window it was not part of"
         );
     }
@@ -162,7 +172,8 @@ mod tests {
             "the same allocation and the same bytes, and the fill is the only difference"
         );
         assert_eq!(
-            zeroed.zeroed, 1,
+            (zeroed.zeroed, zeroed.zeroed_bytes),
+            (1, 16_384),
             "`vec![0u8; n]` is one zero-filled allocation"
         );
     }

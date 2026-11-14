@@ -38,6 +38,7 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     /// the next read, `[dot..)` is the walk's frontier, and the window is one record
     /// wide while the framing lives. Nothing stages the content again on the way out.
     have: Vec<u8>,
+    have_init: usize,
     dot: usize,
     walk: Walk,
     #[cfg(test)]
@@ -304,6 +305,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             direct: None,
             uuid: *uuid,
             have: Vec::new(),
+            have_init: 0,
             dot: 0,
             walk: Walk {
                 framed: false,
@@ -346,6 +348,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// Hands the link a parked read's framed prefix as the walk's window, before the session.
     pub(crate) fn preload(&mut self, prefix: Vec<u8>) {
         debug_assert!(self.have.is_empty() && self.dot == 0);
+        self.have_init = prefix.len();
         self.have = prefix;
     }
 
@@ -388,6 +391,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             direct: None,
             uuid: *uuid,
             have: Vec::new(),
+            have_init: 0,
             dot: 0,
             walk: Walk {
                 framed: false,
@@ -659,6 +663,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.dot += n;
         if self.dot == self.have.len() {
             self.have = Vec::new();
+            self.have_init = 0;
             self.dot = 0;
         }
         n
@@ -875,19 +880,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         result
     }
 
-    /// Reached only while the framing is live: the read lands in spare capacity held
+    /// Reached only while the framing is live: the read lands in room held
     /// steady at the window, and the cursor is parked where the walk stands — no
     /// staging buffer, no second pass over the frames on the read path.
     fn fill(&mut self) -> std::io::Result<bool> {
         loop {
             self.compact();
             let base = self.have.len();
-            self.have.reserve_exact(WINDOW - base);
-            // The read lands in spare capacity held steady at the window; nothing here copies a framed byte into a staging buffer any more.
-            let read = unsafe {
-                self.have.set_len(WINDOW);
-                self.session.read(&mut self.have[base..])
-            };
+            // The read lands in room held steady at the window; nothing here copies a framed byte into a staging buffer any more.
+            ferrox_core::read::init_room(&mut self.have, &mut self.have_init, WINDOW);
+            let read = self.session.read(&mut self.have[base..]);
             let n = match read {
                 Ok(n) => {
                     self.have.truncate(base + n);

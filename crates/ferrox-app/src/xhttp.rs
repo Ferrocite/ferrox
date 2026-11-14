@@ -3018,7 +3018,7 @@ fn read_body<R: Read>(
     n: usize,
     budget: std::time::Duration,
 ) -> Option<(Vec<u8>, usize)> {
-    let mut buf = crate::proxy::unfilled(n);
+    let mut buf = vec![0u8; n];
     let pre = prefix.len().min(n);
     buf[..pre].copy_from_slice(&prefix[..pre]);
     let mut at = pre;
@@ -5036,10 +5036,9 @@ mod tests {
         }
     }
 
-    /// The body lands in uninitialised room: the read that owns every byte writes it before the
-    /// body is handed on, so zeroing the buffer first was a pass over bytes about to be overwritten.
+    /// The body lands in room zeroed once before the read fills it.
     #[test]
-    fn a_body_read_lands_in_room_it_never_zeroes() {
+    fn a_body_read_zeroes_its_room_once() {
         let wire = [0x5Au8; 64];
         let mut source = std::io::Cursor::new(&wire[..]);
         let (read, counts) = ferrox_core::alloc_count::measure(|| {
@@ -5055,7 +5054,11 @@ mod tests {
         let mut want = b"head-tail".to_vec();
         want.extend_from_slice(&wire[..23]);
         assert_eq!(body, want, "the bytes are the body");
-        assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, 32),
+            "the body's room is zeroed once: {counts:?}"
+        );
     }
 
     /// A poll grain on an armed socket is not the body's end: a POST whose body arrives late still lands.

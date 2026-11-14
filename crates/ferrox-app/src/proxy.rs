@@ -7494,7 +7494,7 @@ fn dns_udp_with(
     let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
     let frame = socks_udp_frame(&mut framed, &target, query);
     client.send(frame).ok()?;
-    let mut response = unfilled(ferrox_core::dns::MESSAGE_MAX + 32);
+    let mut response = vec![0u8; ferrox_core::dns::MESSAGE_MAX + 32];
     let read = client.recv(&mut response).ok()?;
     let (_, payload) = parse_socks_udp(&response[..read])?;
     Some(payload.to_vec())
@@ -7996,6 +7996,7 @@ fn serve_mux_wire(
     let mut handles: Vec<RelayEnd> = Vec::new();
     let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE.max(carried.len()));
     buf.extend_from_slice(carried);
+    let mut read_init = 0usize;
     let mut at = 0;
     let mut staging = Vec::with_capacity(8192);
     loop {
@@ -8028,7 +8029,7 @@ fn serve_mux_wire(
             }
         }
         if !progressed {
-            match read_into_tail(&mut read, &mut buf) {
+            match read_into_tail(&mut read, &mut buf, &mut read_init) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(error) if is_timeout(&error) => {}
@@ -11052,48 +11053,36 @@ pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
     unsafe { buf.set_len(len) }
 }
 
-/// Room for a read to write into without a zero pass first: every byte is written before any
-/// code observes it, so the fill was work generated and thrown away.
+/// Room for a buffer whose writer fills every byte before any code observes it: an encoder,
+/// seal or draw, never a read target.
 #[allow(
     clippy::uninit_vec,
-    reason = "the buffer is a read target: the read that owns every byte writes before any code reads one"
+    reason = "every caller writes the whole range before any code reads it"
 )]
 pub(crate) fn unfilled(len: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(len);
-    // SAFETY: every path hands the buffer to a read that initialises the bytes it reports, and no path reads a byte that was not written.
+    // SAFETY: the caller writes every byte before the buffer is observed.
     unsafe { buf.set_len(len) };
     buf
 }
 
-/// Grows a buffer to `len` without a zero pass and without losing what it already holds: the bytes past the old length are claimed, not written, and the caller fills them. A buffer that grew by `resize(len, 0)` paid a memset of the whole new region for bytes the caller was about to overwrite.
-#[allow(
-    clippy::uninit_vec,
-    reason = "the room is handed straight to a read, and every path that does not fill it truncates"
-)]
+/// Grows a buffer to `len` without losing what it already holds, zeroing only the new tail the
+/// read may touch.
 pub(crate) fn grow_scratch(buf: &mut Vec<u8>, len: usize) {
-    if buf.capacity() < len {
-        buf.reserve_exact(len - buf.len());
-    }
-    // SAFETY: the region past the old length is claimed rather than written, and the caller truncates back to what it filled.
-    unsafe { buf.set_len(len) }
+    buf.resize(len, 0);
 }
 
 /// One relay read's worth of stream bytes: the framing buffer's read room.
 pub(crate) const READ_SLICE: usize = 8 * 1024;
 
-/// Reads straight into the vector's spare capacity, so a relay read is not copied through a second buffer.
-#[allow(
-    clippy::uninit_vec,
-    reason = "the tail is handed straight to `read`, and every path that does not fill it truncates"
-)]
+/// Reads straight into the vector's own tail, zeroing only room no earlier read filled, so a relay read is not copied through a second buffer.
 pub(crate) fn read_into_tail(
     read: &mut (impl Read + ?Sized),
     buf: &mut Vec<u8>,
+    init: &mut usize,
 ) -> std::io::Result<usize> {
     let base = buf.len();
-    buf.reserve(READ_SLICE);
-    // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
-    unsafe { buf.set_len(base + READ_SLICE) };
+    ferrox_core::read::init_room(buf, init, base + READ_SLICE);
     match read.read(&mut buf[base..]) {
         Ok(n) => {
             buf.truncate(base + n);
@@ -20145,7 +20134,7 @@ impl<S, R> DrivenHalf<S, R> {
 impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
     fn read_unmetered(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.scratch.is_empty() {
-            self.scratch = unfilled(DRIVEN_CIPHERTEXT);
+            self.scratch = vec![0u8; DRIVEN_CIPHERTEXT];
         }
         let mut filled = 0usize;
         let mut dry = 0usize;
@@ -27025,14 +27014,19 @@ enum DnsUpstream {
 
 /// One message the source network's own frame carries: a length-prefixed read into the caller's
 /// buffer — the lane reads every message into the one it already owns — and the message's span in it.
-fn read_dns_source<'a>(stream: &mut impl Read, body: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+fn read_dns_source<'a>(
+    stream: &mut impl Read,
+    body: &'a mut Vec<u8>,
+    init: &mut usize,
+) -> Option<&'a [u8]> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).ok()?;
     let size = usize::from(u16::from_be_bytes(head));
     if size > ferrox_core::dns::MESSAGE_MAX {
         return None;
     }
-    resize_scratch(body, size);
+    body.clear();
+    ferrox_core::read::init_room(body, init, size);
     stream.read_exact(body).ok()?;
     Some(body)
 }
@@ -27190,12 +27184,15 @@ fn serve_dns_tcp(mut client: Connection, dns: &DnsOut, asked: &Destination) {
             let mut sink = to_client;
             let mut back = udp_buffer();
             let mut body = Vec::new();
+            let mut body_init = 0usize;
             loop {
                 let wrote = match &mut reader {
-                    DnsUpstream::Tcp(stream) => match read_dns_source(stream, &mut body) {
-                        Some(message) => write_dns_frame(&mut sink, message),
-                        None => return,
-                    },
+                    DnsUpstream::Tcp(stream) => {
+                        match read_dns_source(stream, &mut body, &mut body_init) {
+                            Some(message) => write_dns_frame(&mut sink, message),
+                            None => return,
+                        }
+                    }
                     DnsUpstream::Udp(socket) => match socket.recv(&mut back) {
                         Ok(read) => write_dns_frame(&mut sink, &back[..read]),
                         Err(_) => return,
@@ -27211,7 +27208,8 @@ fn serve_dns_tcp(mut client: Connection, dns: &DnsOut, asked: &Destination) {
     };
     let mut lane: Option<DnsUpstream> = None;
     let mut body = Vec::new();
-    while let Some(message) = read_dns_source(&mut client, &mut body) {
+    let mut body_init = 0usize;
+    while let Some(message) = read_dns_source(&mut client, &mut body, &mut body_init) {
         match ferrox_core::dns::decide(message, &dns.rules, &dns_lookup) {
             ferrox_core::dns::Step::Quiet => {}
             ferrox_core::dns::Step::Reply(answer) => {
@@ -27297,11 +27295,12 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
                         let mut to_up = reader;
                         let mut back = udp_buffer();
                         let mut body = Vec::new();
+                        let mut body_init = 0usize;
                         let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
                         loop {
                             let wrote = match &mut to_up {
                                 DnsUpstream::Tcp(stream) => {
-                                    match read_dns_source(stream, &mut body) {
+                                    match read_dns_source(stream, &mut body, &mut body_init) {
                                         Some(message) => {
                                             let out = socks_udp_frame(&mut framed, &named, message);
                                             let Some(src) = peer.lock().ok().and_then(|slot| *slot)
@@ -27911,8 +27910,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     let Some(lane) = SsUdpLane::open(relay, ss) else {
         return;
     };
-    let mut buf = Vec::new();
-    resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+    let mut buf = vec![0; crate::shadowsocks::DATAGRAM_MAX];
     while let Ok((n, src)) = relay
         .recv_from(&mut buf[crate::shadowsocks::SEAL_ROOM..crate::shadowsocks::SEAL_ROOM + UDP_BUF])
     {
@@ -27946,8 +27944,7 @@ fn spawn_ss_udp_sources(
     let sources = Arc::clone(sources);
     let master = master.clone();
     Some(RelayPool::global().run(move || {
-        let mut buf = Vec::new();
-        resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+        let mut buf = vec![0; crate::shadowsocks::DATAGRAM_MAX];
         let room = crate::shadowsocks::SEAL_ROOM;
         let base = buf.as_ptr() as usize;
         loop {
@@ -33156,10 +33153,6 @@ fn kept_head_rounds_deferred(
     )
 }
 
-#[allow(
-    clippy::uninit_vec,
-    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
-)]
 fn kept_head_into(
     stream: &mut dyn Read,
     limit: usize,
@@ -33180,9 +33173,7 @@ fn kept_head_into(
         if room > 0 {
             want = want.min(room);
         }
-        head.reserve(want);
-        // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
-        unsafe { head.set_len(base + want) };
+        head.resize(base + want, 0);
         let n = match stream.read(&mut head[base..]) {
             Ok(n) => n,
             Err(error) if is_timeout(&error) => {
@@ -33216,10 +33207,6 @@ fn kept_head_into(
     }
 }
 
-#[allow(
-    clippy::uninit_vec,
-    reason = "the tail is handed straight to `read_exact`, and the error path truncates it"
-)]
 fn peek_head_rounds(stream: &mut Connection, limit: usize, budget: Duration) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(512);
     let mut probe = [0u8; 512];
@@ -33247,8 +33234,7 @@ fn peek_head_rounds(stream: &mut Connection, limit: usize, budget: Duration) -> 
             None => n.min(limit - head.len()),
         };
         let base = head.len();
-        head.reserve(want);
-        unsafe { head.set_len(base + want) }
+        head.resize(base + want, 0);
         if stream.read_exact(&mut head[base..]).is_err() {
             head.truncate(base);
             return None;
@@ -35626,7 +35612,7 @@ fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
         3 => {
             let mut len = [0u8; 1];
             read_exact(stream, &mut len).ok()?;
-            let mut name = crate::proxy::unfilled(usize::from(len[0]));
+            let mut name = vec![0u8; usize::from(len[0])];
             read_exact(stream, &mut name).ok()?;
             let mut port = [0u8; 2];
             read_exact(stream, &mut port).ok()?;
@@ -35813,7 +35799,7 @@ fn read_socks_addr_rest(stream: &mut dyn Read, atyp: u8) -> Option<SocketAddr> {
         3 => {
             let mut len = [0u8; 1];
             read_exact(stream, &mut len).ok()?;
-            let mut name = crate::proxy::unfilled(usize::from(len[0]));
+            let mut name = vec![0u8; usize::from(len[0])];
             read_exact(stream, &mut name).ok()?;
             let mut port = [0u8; 2];
             read_exact(stream, &mut port).ok()?;
@@ -39996,18 +39982,22 @@ mod tests {
     /// wait for the reader's parked read: a read that holds the lock across its wait makes
     /// the write wait for that whole wait, and the flow's throughput falls to one buffer
     /// per wait.
-    /// The buffers a SOCKS front reads a name and a credential into are not zeroed: the
-    /// reads fill them in full, so the zero pass in front of them was work generated and
-    /// thrown away. The counting allocator's `zeroed` counter is the witness.
+    /// A SOCKS front zeroes the name's room once: the read fills it, but the buffer handed to
+    /// the read has to be initialised first. The counting allocator's `zeroed` counter is the
+    /// witness.
     #[test]
-    fn a_socks_front_reads_no_buffer_it_zeroed() {
+    fn a_socks_front_zeroes_the_name_once() {
         let mut request = vec![12u8];
         request.extend_from_slice(b"example.test");
         request.extend_from_slice(&443u16.to_be_bytes());
         let mut reader = std::io::Cursor::new(request);
         let (target, counts) =
             ferrox_core::alloc_count::measure(|| read_socks_named(&mut reader, 3));
-        assert_eq!(counts.zeroed, 0, "the name is not zeroed");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, 12),
+            "the name's room is zeroed once"
+        );
         assert_eq!(
             target,
             Some(Destination::Name("example.test".to_owned(), 443))
@@ -42960,9 +42950,10 @@ mod tests {
             inner: std::io::Cursor::new(stream.clone()),
         };
         let mut buf = Vec::with_capacity(READ_SLICE);
+        let mut init = 0usize;
         let mut reads = 0usize;
         loop {
-            match read_into_tail(&mut source, &mut buf) {
+            match read_into_tail(&mut source, &mut buf, &mut init) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     assert!(n <= READ_SLICE, "read {n} exceeds the slice");
@@ -42985,11 +42976,13 @@ mod tests {
     #[test]
     fn a_read_into_the_tail_never_leaves_a_short_buffer() {
         let mut buf = Vec::from(&b"keep"[..]);
-        assert!(read_into_tail(&mut Broken, &mut buf).is_err());
+        let mut init = 0usize;
+        assert!(read_into_tail(&mut Broken, &mut buf, &mut init).is_err());
         assert_eq!(buf, b"keep", "a failed read leaves the bytes already there");
         let mut buf = Vec::from(&b"keep"[..]);
+        let mut init = 0usize;
         assert_eq!(
-            read_into_tail(&mut std::io::empty(), &mut buf).expect("eof"),
+            read_into_tail(&mut std::io::empty(), &mut buf, &mut init).expect("eof"),
             0
         );
         assert_eq!(
@@ -59316,7 +59309,7 @@ mod tests {
         assert!(lane.send(from, second, &mut buf, room, 6));
         let method = ferrox_core::shadowsocks::Method::parse("aes-256-gcm").expect("method");
         let master = ferrox_core::shadowsocks::MasterKey::new(&ss.password, method.key_len());
-        let mut wire = crate::proxy::unfilled(crate::shadowsocks::DATAGRAM_MAX);
+        let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
         let mut opened = Vec::new();
         for _ in 0..2 {
             let (n, uplink) = server
@@ -77652,11 +77645,13 @@ mod dns_lane_tests {
         });
         let mut stream = stream;
         let mut body = Vec::new();
+        let mut body_init = 0usize;
         let ((base, capacity), counts) = ferrox_core::alloc_count::measure(|| {
             let mut base = 0usize;
             let mut capacity = 0usize;
             for (n, frame) in frames.iter().enumerate() {
-                let read = read_dns_source(&mut stream, &mut body).expect("a message");
+                let read =
+                    read_dns_source(&mut stream, &mut body, &mut body_init).expect("a message");
                 assert_eq!(read, frame.as_slice());
                 if n == 0 {
                     base = body.as_ptr() as usize;
@@ -77672,25 +77667,6 @@ mod dns_lane_tests {
         );
         assert_eq!(body.as_ptr() as usize, base, "the buffer never moves");
         assert_eq!(body.capacity(), capacity, "nor grows for them");
-    }
-
-    /// A length-prefixed message lands in the lane's buffer without a zero pass: the read writes every
-    /// byte the length names, so only the two-byte head is taken from zeroed storage.
-    #[test]
-    fn a_stream_lane_message_does_not_zero_its_landing() {
-        let message = [0xa5u8; 48];
-        let mut wire = Vec::with_capacity(message.len() + 2);
-        wire.extend_from_slice(&(message.len() as u16).to_be_bytes());
-        wire.extend_from_slice(&message);
-        let mut stream = std::io::Cursor::new(wire);
-        let mut body = Vec::new();
-        let (read, counts) = ferrox_core::alloc_count::measure(|| {
-            read_dns_source(&mut stream, &mut body)
-                .expect("a message")
-                .to_vec()
-        });
-        assert_eq!(read, message);
-        assert_eq!(counts.zeroed, 0, "the body is written, not zero-filled");
     }
 
     #[test]

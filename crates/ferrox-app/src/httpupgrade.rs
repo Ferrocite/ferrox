@@ -89,10 +89,6 @@ fn upgrade_head_end(head: &[u8]) -> Option<usize> {
 }
 
 /// The head either role reads: any method, any line ending, and the octets that arrived with it.
-#[allow(
-    clippy::uninit_vec,
-    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
-)]
 fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, usize)> {
     const ROUND: usize = 512;
     let mut head = Vec::with_capacity(ROUND);
@@ -103,9 +99,7 @@ fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, us
         }
         let base = head.len();
         let want = ROUND.min(limit - base);
-        head.reserve(want);
-        // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
-        unsafe { head.set_len(base + want) };
+        head.resize(base + want, 0);
         let n = match read.read(&mut head[base..]) {
             Ok(n) => n,
             Err(error) if crate::proxy::is_timeout(&error) => {

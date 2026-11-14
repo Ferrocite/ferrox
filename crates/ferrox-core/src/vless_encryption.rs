@@ -1215,6 +1215,7 @@ struct ReadSide {
     read_stage: ReadStage,
     zero_rtt: Option<(Arc<Client>, Vec<u8>)>,
     wire: Vec<u8>,
+    wire_init: usize,
     wire_pos: usize,
     /// The decrypted record still owed to the caller, as a range of `wire`: the plaintext is the
     /// ciphertext's own bytes, so a record is unmasked and opened where it landed and read from there.
@@ -1225,19 +1226,15 @@ struct ReadSide {
 }
 
 impl ReadSide {
-    /// The octets of one read into the wire buffer's spare capacity, so a record crosses user space
-    /// once; the tail is handed to `read` whole and truncated to what it reports, as the head reader does.
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the tail is handed straight to `read`, and every path truncates it first"
-    )]
+    /// The octets of one read into the wire buffer's owned room, so a record crosses user space
+    /// once; the room is zeroed once, handed to `read` whole and truncated to what it reports.
     fn pull<S: Read>(&mut self, inner: &mut S) -> io::Result<()> {
         let base = self.wire.len();
         if self.wire.capacity() == base {
             self.wire.reserve(MAX_RECORD);
         }
         let room = (self.wire.capacity() - base).min(MAX_RECORD);
-        unsafe { self.wire.set_len(base + room) }
+        crate::read::init_room(&mut self.wire, &mut self.wire_init, base + room);
         let read = inner.read(&mut self.wire[base..]);
         match read {
             Ok(0) => {
@@ -1576,6 +1573,7 @@ impl<S> EncryptedStream<S> {
                 read_stage,
                 zero_rtt: None,
                 wire: Vec::new(),
+                wire_init: 0,
                 wire_pos: 0,
                 plain_from: 0,
                 plain_to: 0,

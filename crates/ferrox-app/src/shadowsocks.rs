@@ -949,7 +949,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut send = send;
     let mut writer = writer;
-    let mut buf = crate::proxy::unfilled(uplink_buffer_len(&send));
+    let mut buf = vec![0u8; uplink_buffer_len(&send)];
     let up_flow = std::sync::Arc::clone(&flow);
     crate::proxy::lane_pool::submit(
         Box::new(move || uplink_step(&mut plain_read, &mut buf, &mut send, &mut writer, &up_flow)),
@@ -1055,7 +1055,7 @@ impl<R: Read> Downlink<R> {
             Recv::StreamReady(rc4) => Self::Stream {
                 read,
                 rc4,
-                buf: crate::proxy::unfilled(READ_CHUNK),
+                buf: vec![0u8; READ_CHUNK],
             },
             Recv::Waiting(..) | Recv::StreamWaiting(..) => Self::Handshake {
                 read,
@@ -1146,7 +1146,7 @@ fn handshake_step<R: Read>(
                     Downlink::Stream {
                         read,
                         rc4,
-                        buf: crate::proxy::unfilled(READ_CHUNK),
+                        buf: vec![0u8; READ_CHUNK],
                     }
                 }
                 _ => unreachable!("only a waiting handshake reads a head"),
@@ -1397,8 +1397,8 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
     }
     let mut by_dest: HashMap<SocketAddr, SocketAddr> = HashMap::new();
     let mut hop = None;
-    let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
-    let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
+    let mut buf = vec![0u8; DATAGRAM_MAX];
+    let mut reply = vec![0u8; DATAGRAM_MAX];
     loop {
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
@@ -1458,8 +1458,8 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
     }
     let mut sources: HashMap<SocketAddr, UdpSource> = HashMap::new();
     let mut probes: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
-    let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
-    let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
+    let mut buf = vec![0u8; DATAGRAM_MAX];
+    let mut reply = vec![0u8; DATAGRAM_MAX];
     let mut rows: Vec<poll_set::Row> = Vec::new();
     let mut owners: Vec<Option<(SocketAddr, bool)>> = Vec::new();
     let idle = crate::budgets::udp_idle();
@@ -1635,7 +1635,7 @@ fn uplink_buffer_len(send: &Uplink) -> usize {
 
 /// A chunk buffer sized once: `open_chunk` writes into a prefix of it, so no read ever grows or re-zeroes it.
 pub(crate) fn wire_buffer() -> Vec<u8> {
-    crate::proxy::unfilled(WIRE_MAX)
+    vec![0u8; WIRE_MAX]
 }
 
 /// Seal what one relay read filled: every chunk of it seals inside its own slot — length into that slot's headroom, tag into its tailroom — and the batch leaves as one vectored write whose slices are exactly the wire bytes a chunk at a time used to be, so a carrier with no `writev` still sees one write per chunk. A payload byte is never copied in user space, and more chunks than the buffer has slots is refused loudly rather than corrupted quietly.
@@ -1766,7 +1766,7 @@ impl<R: Read> ChunkReader<R> {
     fn new(read: R) -> Self {
         Self {
             read,
-            buf: crate::proxy::unfilled(BATCH),
+            buf: vec![0u8; BATCH],
             at: 0,
             end: 0,
             held: None,
@@ -4036,7 +4036,7 @@ mod tests {
         let mut send = Uplink::Aead(
             Cipher::new(method, "an-example-shared-password", &salt).expect("derives"),
         );
-        let mut buf = crate::proxy::unfilled(uplink_buffer_len(&send));
+        let mut buf = vec![0u8; uplink_buffer_len(&send)];
         let mut wire = Vec::new();
         let next = uplink_step(
             &mut Connection::Tcp(server),

@@ -239,6 +239,7 @@ impl Carrier {
 
     fn demux(self: Arc<Self>, mut read: Box<dyn Read + Send>) {
         let mut buf: Vec<u8> = Vec::with_capacity(crate::proxy::READ_SLICE);
+        let mut buf_init = 0usize;
         let mut at = 0;
         loop {
             let mut progressed = false;
@@ -264,7 +265,7 @@ impl Carrier {
                 }
                 at = 0;
             }
-            match crate::proxy::read_into_tail(&mut read, &mut buf) {
+            match crate::proxy::read_into_tail(&mut read, &mut buf, &mut buf_init) {
                 Ok(0) => {
                     self.retire();
                     return;

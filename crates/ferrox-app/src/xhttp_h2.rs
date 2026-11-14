@@ -1814,7 +1814,7 @@ impl H2Conn {
                 }
                 let sid = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7FFF_FFFF;
                 partial.frame = Some((head[3], head[4], sid));
-                partial.body = crate::proxy::unfilled(len);
+                partial.body = vec![0u8; len];
             }
             let Some((kind, flags, sid)) = partial.frame else {
                 return Pumped::Dead;
@@ -2969,7 +2969,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     }
                     return self.end();
                 }
-                self.body = crate::proxy::unfilled(len);
+                self.body = vec![0u8; len];
                 self.body_have = 0;
                 self.frame = (kind, flags, sid);
                 self.phase = Phase::Body;
@@ -3435,7 +3435,7 @@ mod tests {
             };
             for _ in 0..3 {
                 let (len, kind, flags, _) = read_head_bounded(&mut conn.stream).expect("frame");
-                let mut body = crate::proxy::unfilled(len);
+                let mut body = vec![0u8; len];
                 conn.stream.read_exact(&mut body).expect("body");
                 if kind == T_SETTINGS && flags & F_ACK == 0 {
                     write_frame(&mut conn.stream, T_SETTINGS, F_ACK, 0, &[]);
@@ -3528,7 +3528,7 @@ mod tests {
                     return self.held.remove(at).expect("the position just found");
                 }
                 let (len, kind, flags, got) = read_head_bounded(&mut self.stream).expect("frame");
-                let mut body = crate::proxy::unfilled(len);
+                let mut body = vec![0u8; len];
                 self.stream.read_exact(&mut body).expect("body");
                 if kind == T_PING && flags & F_ACK == 0 && body.len() == 8 {
                     write_frame(&mut self.stream, T_PING, F_ACK, 0, &body);
@@ -3603,7 +3603,7 @@ mod tests {
                 let kind = head[3];
                 let flags = head[4];
                 let sid = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7FFF_FFFF;
-                let mut body = crate::proxy::unfilled(len);
+                let mut body = vec![0u8; len];
                 if len > 0 && fill(&mut self.stream, &mut body).is_none() {
                     return false;
                 }
@@ -3739,11 +3739,11 @@ mod tests {
     }
 
     /// The received frame is queued as itself. The DATA chunk and the unterminated header block keep the buffer the loop read the body into, so nothing copies between the frame and the queue: a `to_vec` on that path moves the base pointer and grows or shrinks the allocation, and the assertions carry both.
-    /// The frame's body is not zeroed: the read fills every byte of it, so the zero pass
-    /// in front of the read was work generated and thrown away, once a frame, over the
-    /// whole frame's length. The counting allocator's `zeroed` counter is the witness.
+    /// The frame's body is zeroed once before the read fills it: the earlier shape handed
+    /// `read` a slice over spare capacity, which was undefined behaviour. The counting
+    /// allocator's `zeroed` counter is the witness.
     #[test]
-    fn a_received_frames_body_is_not_zero_filled() {
+    fn a_received_frames_body_is_zeroed_once() {
         let mut bytes = crate::h2::MAGIC.to_vec();
         let body = vec![7u8; 4096];
         bytes.extend_from_slice(&crate::h2::frame_head(body.len(), T_DATA, 0, 1));
@@ -3762,7 +3762,11 @@ mod tests {
                 None,
             );
         });
-        assert_eq!(counts.zeroed, 0, "no frame body is zeroed");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, 4096),
+            "the frame body is zeroed once"
+        );
     }
 
     /// The old shape as a differential oracle: the same fields through the owned list, the borrow
@@ -4398,7 +4402,7 @@ mod tests {
         );
         assert_eq!(got[3], T_GOAWAY, "expected a GOAWAY");
         let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
-        let mut body = crate::proxy::unfilled(len);
+        let mut body = vec![0u8; len];
         assert!(fill(&mut client.stream, &mut body).is_some(), "goaway body");
         assert_eq!(
             u32::from_be_bytes(body[4..8].try_into().unwrap()),
@@ -4434,7 +4438,7 @@ mod tests {
             );
             assert_eq!(got[3], T_GOAWAY, "round {round}: expected a GOAWAY");
             let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
-            let mut body = crate::proxy::unfilled(len);
+            let mut body = vec![0u8; len];
             assert!(
                 fill(&mut client.stream, &mut body).is_some(),
                 "round {round}: goaway body"
