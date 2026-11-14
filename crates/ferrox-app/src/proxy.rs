@@ -35946,11 +35946,7 @@ fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if entries.is_empty() {
-        crate::vmess::Users::single(inbound_id(inbound))
-    } else {
-        crate::vmess::Users::with(entries)
-    }
+    crate::vmess::Users::with(entries)
 }
 
 /// One client a vless inbound serves: the id the wire names and the flow its account is bound to.
@@ -36045,15 +36041,6 @@ fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUser
             Some(seen) => *seen = user,
             None => users.push(user),
         }
-    }
-    if users.is_empty() {
-        users.push(VlessUser {
-            id: inbound_id(inbound),
-            flow: Flow::None,
-            email: String::new(),
-            level: 0,
-            reverse: None,
-        });
     }
     Arc::from(users)
 }
@@ -36321,6 +36308,9 @@ fn inbound_ss_users(
         .and_then(|settings| settings.get("clients").or_else(|| settings.get("users")))
         .and_then(Json::as_arr);
     let Some(listed) = listed else {
+        if password.is_empty() {
+            return crate::shadowsocks::SsUsers::default();
+        }
         return crate::shadowsocks::account(password, method);
     };
     let mut users = Vec::with_capacity(listed.len());
@@ -36488,12 +36478,17 @@ fn inbound_trojan_keys(inbound: &Json) -> std::sync::Arc<[[u8; 56]]> {
             clients
                 .iter()
                 .filter_map(|client| client.get("password").and_then(Json::as_str))
+                .filter(|password| !password.is_empty())
                 .map(trojan_key)
                 .collect()
         })
         .unwrap_or_default();
     if keys.is_empty() {
-        return std::sync::Arc::from([trojan_key(&inbound_password(inbound))]);
+        let password = inbound_password(inbound);
+        if password.is_empty() {
+            return std::sync::Arc::from([]);
+        }
+        return std::sync::Arc::from([trojan_key(&password)]);
     }
     std::sync::Arc::from(keys)
 }
@@ -57396,6 +57391,55 @@ mod tests {
             dialed.lock().expect("dial").len(),
             1,
             "an unsupported command earns no dial"
+        );
+    }
+
+    #[test]
+    fn an_empty_credentials_table_serves_nobody() {
+        let empty = crate::json::parse(r#"{"protocol":"vless","settings":{}}"#).expect("parses");
+        assert!(
+            inbound_users(&empty, &crate::reverse::Portals::default()).is_empty(),
+            "an empty vless table has no nil-uuid account"
+        );
+        let empty = crate::json::parse(r#"{"protocol":"vmess","settings":{}}"#).expect("parses");
+        assert!(
+            inbound_vmess_users(&empty).list().is_empty(),
+            "an empty vmess table has no nil-uuid account"
+        );
+        let malformed = crate::json::parse(
+            r#"{"protocol":"vless","settings":{"clients":[{"id":"not-a-uuid"}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            inbound_users(&malformed, &crate::reverse::Portals::default()).is_empty(),
+            "an unparseable vless id is not replaced with the nil uuid"
+        );
+        let malformed = crate::json::parse(
+            r#"{"protocol":"vmess","settings":{"clients":[{"id":"not-a-uuid"}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            inbound_vmess_users(&malformed).list().is_empty(),
+            "an unparseable vmess id is not replaced with the nil uuid"
+        );
+        let trojan = crate::json::parse(r#"{"protocol":"trojan","settings":{}}"#).expect("parses");
+        assert!(
+            inbound_trojan_keys(&trojan).is_empty(),
+            "an empty trojan table has no empty-password key"
+        );
+        let empty_trojan_password =
+            crate::json::parse(r#"{"protocol":"trojan","settings":{"clients":[{"password":""}]}}"#)
+                .expect("parses");
+        assert!(
+            inbound_trojan_keys(&empty_trojan_password).is_empty(),
+            "a trojan client with an empty password is not served"
+        );
+        let shadowsocks =
+            crate::json::parse(r#"{"protocol":"shadowsocks","settings":{"method":"aes-256-gcm"}}"#)
+                .expect("parses");
+        assert!(
+            inbound_ss_users(&shadowsocks, "", "aes-256-gcm", "test").is_empty(),
+            "a shadowsocks table without a password has no account"
         );
     }
 
