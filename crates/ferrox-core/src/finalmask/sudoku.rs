@@ -985,7 +985,8 @@ fn build_table(password: &str, layout: Layout) -> Option<Table> {
                 layout.encode_group(groups[2]),
                 layout.encode_group(groups[3]),
             ];
-            let rank = rank4(sort4(*groups));
+            // The base patterns store each clue sorted, so the table build only ranks it.
+            let rank = rank4(*groups);
             let bit = 1u64 << (rank & 63);
             let word = rank >> 6;
             if decode_present[word] & bit != 0 {
