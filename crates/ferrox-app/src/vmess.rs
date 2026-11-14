@@ -1535,6 +1535,9 @@ impl<R: Read> ResponseReader<R> {
 
 impl<R: Read> Read for ResponseReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if !self.ready {
             if !read_response(
                 &mut self.inner,
@@ -4145,6 +4148,21 @@ mod tests {
         let mut one = [0u8; 1];
         let _ = reader.read(&mut one);
         assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn the_mux_response_reader_does_not_read_for_an_empty_buffer() {
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Read for Counting {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(0)
+            }
+        }
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader = super::ResponseReader::new(Counting(reads.clone()), [0; 16], [0; 16], 0);
+        assert_eq!(reader.read(&mut []).expect("empty read"), 0);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

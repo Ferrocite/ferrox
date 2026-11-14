@@ -734,6 +734,9 @@ impl<R: Read> MuxReader<R> {
 
 impl<R: Read> Read for MuxReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.at < self.pending.len() {
                 let n = (self.pending.len() - self.at).min(buf.len());
@@ -2345,6 +2348,24 @@ mod tests {
 
     /// Bytes one wire chunk can never exceed: what a single-chunk open is given room for.
     const WIRE_MAX: usize = MAX_CHUNK + TAG_LEN;
+
+    #[test]
+    fn an_empty_mux_read_does_not_touch_the_wire() {
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Read for Counting {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(0)
+            }
+        }
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader = MuxReader::new(
+            Counting(reads.clone()),
+            Recv::Waiting(Method::Aes256Gcm, Vec::new(), Vec::new()),
+        );
+        assert_eq!(reader.read(&mut []).expect("empty read"), 0);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
 
     fn wire_buffer() -> Vec<u8> {
         crate::proxy::RelayBuf::with_len(WIRE_MAX).into_vec()

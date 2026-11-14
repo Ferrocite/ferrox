@@ -17509,19 +17509,12 @@ fn open_ss_mux_2022_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
 }
 
 fn open_ss_mux_carried(ss: &ShadowsocksOut) -> Option<MuxUplink> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    let address = listener.local_addr().ok()?;
+    let (client, server) = crate::reverse::loopback_pair()?;
     let spec = ss.carrier_spec();
-    let client = crate::conn::connect(&crate::conn::Target::Ip(address), budgets::dial()).ok()?;
     thread::spawn(move || {
-        let Ok((server, _)) = listener.accept() else {
-            return;
-        };
-        drop(listener);
         let Some(edge) = resolve_outbound(&spec.address, spec.port) else {
             return;
         };
-        let server = Connection::from(server);
         dial_shadowsocks(&server, &edge, &spec, &ss_mux_target(), Ladder::global());
     });
     let read = client.try_clone().ok()?;
@@ -17652,21 +17645,14 @@ fn open_vmess_mux(vmess: &VmessOut) -> Option<MuxUplink> {
         }
         _ => {}
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    let address = listener.local_addr().ok()?;
+    let (client, server) = crate::reverse::loopback_pair()?;
     let spec = vmess.carrier_spec();
     thread::spawn(move || {
-        let Ok((server, _)) = listener.accept() else {
-            return;
-        };
-        drop(listener);
         let Some(edge) = resolve_outbound(&spec.address, spec.port) else {
             return;
         };
-        let server = Connection::from(server);
         dial_vmess(&server, &edge, &spec, &vmess_mux_target(), Ladder::global());
     });
-    let client = crate::conn::connect(&crate::conn::Target::Ip(address), budgets::dial()).ok()?;
     let read = client.try_clone().ok()?;
     let write = client.try_clone().ok()?;
     let closer = client.try_clone().ok()?;
@@ -59708,12 +59694,13 @@ mod tests {
             .expect("timeout");
         let echo_addr = echo.local_addr().expect("addr");
         let ss = ss2022_mux_out(echo_addr.port(), Carrier::Raw(Chain::default()), &password);
-        let method = ferrox_core::shadowsocks2022::Method::parse(&ss.method).expect("2022 method");
-        let lane = Ss2022UdpLane::open(&ss, method).expect("opens");
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let src = relay.local_addr().expect("addr");
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        assert!(lane.send(&relay, src, dest, b"ping"));
+        let lane = ss_skip_lane(&ss, &relay).expect("opens");
+        assert!(matches!(lane, SsSkipLane::V2022(_)));
+        let mut payload = *b"ping";
+        assert!(lane.send(&relay, src, dest, &mut payload, 0, 4));
         let mut packet = [0u8; 1500];
         let n = echo.recv(&mut packet).expect("receives");
         assert_ne!(&packet[..n], b"ping");
