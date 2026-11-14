@@ -310,6 +310,7 @@ carrier-xhttp data-window-writes 1 ferrox-app-xhttp_h2::tests::a_data_window_lea
 carrier-xhttp packet-up-windows-per-post 2 ferrox-app-xhttp::tests::a_packet_up_upload_batches_what_queues_behind_an_answer
 carrier-xhttp packet-up-bytes-reordered 0 ferrox-app-xhttp::tests::a_packet_up_upload_posts_every_byte_in_order
 carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
+carrier-xhttp h2-body-cap-bytes 4210688 ferrox-app-xhttp_h2::tests::an_unread_body_holds_its_window_and_the_queue_is_capped
 carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
 carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall
 carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled
