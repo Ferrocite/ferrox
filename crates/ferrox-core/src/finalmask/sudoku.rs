@@ -1043,8 +1043,8 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
     let mut patterns: Vec<Vec<[u8; 4]>> = vec![Vec::new(); grids.len()];
     let mut slots = [u32::MAX; SLOTS];
     let mut counts = [0u16; SLOTS];
+    let mut first = [0u16; SLOTS];
     let mut used = [0u16; SLOTS];
-    let mut keys = [0u32; GRID_COUNT];
     let mut groups = [[0u8; 4]; GRID_COUNT];
     for position in positions {
         let mut used_len = 0usize;
@@ -1057,7 +1057,6 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
             ];
             let clue = sort4(clue);
             let key = rank4(clue) as u32;
-            keys[index] = key;
             groups[index] = clue;
             let mut slot = ((key as usize).wrapping_mul(0x9e37_79b1) >> 22) & MASK;
             loop {
@@ -1065,6 +1064,7 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
                 if held == u32::MAX {
                     slots[slot] = key;
                     counts[slot] = 1;
+                    first[slot] = index as u16;
                     used[used_len] = slot as u16;
                     used_len += 1;
                     break;
@@ -1076,23 +1076,14 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
                 slot = (slot + 1) & MASK;
             }
         }
-        for (index, &key) in keys.iter().enumerate() {
-            let mut slot = ((key as usize).wrapping_mul(0x9e37_79b1) >> 22) & MASK;
-            loop {
-                let held = slots[slot];
-                if held == key {
-                    if counts[slot] == 1 {
-                        patterns[index].push(groups[index]);
-                    }
-                    break;
-                }
-                debug_assert_ne!(held, u32::MAX, "the key was counted above");
-                slot = (slot + 1) & MASK;
-            }
-        }
         for &slot in &used[..used_len] {
-            slots[slot as usize] = u32::MAX;
-            counts[slot as usize] = 0;
+            let slot = slot as usize;
+            if counts[slot] == 1 {
+                let index = first[slot] as usize;
+                patterns[index].push(groups[index]);
+            }
+            slots[slot] = u32::MAX;
+            counts[slot] = 0;
         }
     }
     patterns
