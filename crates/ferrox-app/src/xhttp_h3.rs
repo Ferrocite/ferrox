@@ -76,6 +76,7 @@ impl Wire {
 
 /// The request stream as the shared dispatch reads it: HEADERS becomes the H1 head `accept_core`
 /// parses, and every DATA frame after it is body.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct H3Reader {
     wire: Wire,
     buf: Vec<u8>,
@@ -85,6 +86,7 @@ pub(crate) struct H3Reader {
     content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
+    reset: bool,
     head_seen: bool,
     expect_request: bool,
     idle_since: Option<Instant>,
@@ -107,6 +109,7 @@ impl H3Reader {
             content_length: None,
             frame_left: 0,
             ended: false,
+            reset: false,
             head_seen: false,
             expect_request,
             idle_since: None,
@@ -335,7 +338,10 @@ impl H3Reader {
                         self.status = status;
                     }
                 }
-                frames::H3_RESET => self.ended = true,
+                frames::H3_RESET => {
+                    self.ended = true;
+                    self.reset = true;
+                }
                 _ => {}
             }
             self.buf_at = at;
@@ -377,6 +383,12 @@ impl H3Reader {
                     "h3 data frame ended early",
                 ));
             }
+            if self.reset {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "h3 stream was reset",
+                ));
+            }
             return Ok(false);
         }
         if self.frame_left > 0 {
@@ -384,6 +396,12 @@ impl H3Reader {
             return Ok(self.data_available());
         }
         self.step()?;
+        if self.reset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "h3 stream was reset",
+            ));
+        }
         Ok(self.data_available())
     }
 }
@@ -405,6 +423,9 @@ impl H3Reader {
             return Ok(0);
         }
         loop {
+            if self.expired() {
+                return Err(std::io::Error::other("h3 request stalled"));
+            }
             if self.data_available() {
                 let n = self
                     .frame_left
@@ -420,11 +441,20 @@ impl H3Reader {
                 continue;
             }
             if self.ended {
+                if self.reset {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "h3 stream was reset",
+                    ));
+                }
                 return Ok(0);
             }
-            self.fill_room()?;
             self.parse()?;
             let _ = self.head.take();
+            if self.data_available() || self.frame_left > 0 || self.ended {
+                continue;
+            }
+            self.fill_room()?;
         }
     }
 }
@@ -813,6 +843,9 @@ impl Read for ClientStream {
                     }
                 }
                 Err(quiche::Error::Done) => {}
+                Err(quiche::Error::StreamReset(_)) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+                }
                 Err(error) => {
                     return Err(std::io::Error::other(format!("h3 stream read: {error:?}")));
                 }
@@ -1049,6 +1082,7 @@ impl H3Client {
             }
             out.end();
         }
+        reader.set_deadline(Instant::now() + crate::budgets::relay_stall());
         let mut answer = Vec::new();
         let mut buf = [0u8; READ_ROOM];
         loop {
@@ -1070,12 +1104,19 @@ impl H3Client {
                 }
             }
         }
+        let status = reader.status().ok_or_else(|| {
+            out.reset();
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "h3 service answer has no status",
+            )
+        })?;
         if let Some(declared) = reader.content_length() {
             let head_only = head
                 .split_ascii_whitespace()
                 .next()
                 .is_some_and(|method| method.eq_ignore_ascii_case("HEAD"));
-            if !head_only && answer.len() != declared {
+            if !head_only && !matches!(status, 204 | 304) && answer.len() != declared {
                 out.reset();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1083,12 +1124,6 @@ impl H3Client {
                 ));
             }
         }
-        let status = reader.status().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "h3 service answer has no status",
-            )
-        })?;
         Ok((status, answer))
     }
 
@@ -1580,6 +1615,45 @@ mod tests {
             .ask(head, "localhost", None, None)
             .expect_err("a short body is a truncation");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_plain_h3_answer_keeps_a_204_without_a_body() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted(&identity, |wire| {
+            let fields = [
+                (":status".to_owned(), "204".to_owned()),
+                ("content-length".to_owned(), "10".to_owned()),
+            ];
+            let _ = send_fields(wire, frames::H3_HEADERS, &fields);
+        });
+        let client = client(port, roots);
+        let head = "GET /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (status, answer) = client
+            .ask(head, "localhost", None, None)
+            .expect("a 204 has no body whatever the header says");
+        assert_eq!(status, 204);
+        assert_eq!(answer, [0u8; 0]);
+    }
+
+    #[test]
+    fn a_reset_stream_is_an_error_not_a_clean_end() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let client = client(port, roots);
+        let wire = raw_stream(&client);
+        send_frame(&wire, frames::H3_RESET, &[]);
+        let mut reader = H3Reader::new(wire);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            reader
+                .read(&mut buf)
+                .expect_err("a reset is not EOF")
+                .kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
     }
 
     #[test]
