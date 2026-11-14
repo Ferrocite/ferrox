@@ -22182,12 +22182,10 @@ fn dial_ss_xhttp_h3(
     cfg: &ferrox_core::tls::TlsConfig,
 ) {
     let rung = Rung::Xhttp;
-    let address = server.ip().to_string();
-    let port = server.port();
     let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-        crate::xhttp_h3::connect_split(&address, port, &ss.host, settings, cfg)
+        crate::xhttp_h3::connect_split(*server, &ss.host, settings, cfg)
     } else {
-        crate::xhttp_h3::connect_dual_split(&address, port, &ss.host, settings, cfg)
+        crate::xhttp_h3::connect_dual_split(*server, &ss.host, settings, cfg)
     };
     let Some((reader, writer)) = pair else {
         let failure = Failure::new(Stage::SocketConnected, Kind::Unreachable);
