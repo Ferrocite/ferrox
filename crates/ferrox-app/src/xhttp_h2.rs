@@ -3688,7 +3688,7 @@ mod tests {
             staged_request_block("example.test", &settings, "https")
         });
         assert_eq!(block, staged, "the in-place encoder changed the head bytes");
-        assert_eq!(counts.allocs, 6, "{counts:?}");
+        assert_eq!(counts.allocs, 5, "{counts:?}");
         assert_eq!(counts.zeroed, 0, "{counts:?}");
         assert!(
             counts.allocs < staged_counts.allocs,
