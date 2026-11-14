@@ -617,14 +617,17 @@ mod tests {
                     .next()
             })
             .expect("the ws branch");
-        assert!(branch.contains("pipe(ws, target);"));
-        assert!(branch.contains("pipe(target, ws);"));
+        assert!(branch.contains("const flushToTarget = pipe(ws, target);"));
+        assert!(branch.contains("const flushToBridge = pipe(target, ws);"));
+        assert!(branch.contains("Promise.allSettled([flushToTarget(), flushToBridge()])"));
+        assert!(branch.contains("flushed().then("));
         let pipe = PAGE.split("function pipe(").nth(1).expect("the pipe");
         let drain = pipe.find("await drain(to);").expect("drains");
         let send = pipe.find("to.send(event.data);").expect("sends");
         assert!(drain < send, "the pipe drains before it sends");
         assert!(pipe.contains("queued > HIGH_WATER)"), "the queue is bounded");
         assert!(pipe.contains("from.close()"), "a stalled pipe closes its source");
+        assert!(pipe.contains("return () => tail;"), "a close can wait for the queue");
     }
 
     #[test]

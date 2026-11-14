@@ -56,6 +56,7 @@ function pipe(from, to) {
       })
       .then(() => { queued -= size; });
   };
+  return () => tail;
 }
 
 async function run(ws, task) {
@@ -71,12 +72,17 @@ async function run(ws, task) {
     }
     target.binaryType = "arraybuffer";
     let open = false;
-    pipe(ws, target);
-    pipe(target, ws);
+    const flushToTarget = pipe(ws, target);
+    const flushToBridge = pipe(target, ws);
+    const flushed = () => Promise.allSettled([flushToTarget(), flushToBridge()]);
     target.onopen = () => { open = true; try { ws.send("ok"); } catch (_) { target.close(); } };
-    target.onclose = () => ws.close();
+    target.onclose = () => {
+      flushed().then(() => { try { ws.close(); } catch (_) {} });
+    };
     target.onerror = () => { if (!open) try { ws.send("fail"); } catch (_) {} target.close(); };
-    ws.onclose = () => { target.close(); closed(ws); };
+    ws.onclose = () => {
+      flushed().then(() => { try { target.close(); } catch (_) {} closed(ws); });
+    };
     return;
   }
 
