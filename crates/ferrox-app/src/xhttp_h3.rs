@@ -1547,10 +1547,10 @@ mod tests {
                 (":status".to_owned(), "200".to_owned()),
                 ("content-length".to_owned(), "5".to_owned()),
             ];
-            if send_fields(wire, frames::H3_HEADERS, &interim) {
-                if send_fields(wire, frames::H3_HEADERS, &final_head) {
-                    let _ = send_data(wire, b"world");
-                }
+            if send_fields(wire, frames::H3_HEADERS, &interim)
+                && send_fields(wire, frames::H3_HEADERS, &final_head)
+            {
+                let _ = send_data(wire, b"world");
             }
         });
         let client = client(port, roots);
