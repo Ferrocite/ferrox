@@ -16895,14 +16895,13 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
         if let Carrier::Xhttp { settings } = &vless.carrier {
             if crate::xhttp_h3::is_h3(&cfg.alpn) {
                 let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                    crate::xhttp_h3::connect_split(*server, &vless.host, settings, cfg).map(
+                    crate::xhttp_h3::connect_split(server, &vless.host, settings, cfg).map(
                         |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                     )
                 } else {
-                    crate::xhttp_h3::connect_dual_split(*server, &vless.host, settings, cfg)
-                        .map(|(reader, writer)| {
-                            (Box::new(reader) as Box<dyn WindowRead + Send>, writer)
-                        })
+                    crate::xhttp_h3::connect_dual_split(server, &vless.host, settings, cfg).map(
+                        |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                    )
                 };
                 let (read, writer) = pair?;
                 let closer = writer.clone();
@@ -20978,10 +20977,9 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
                     |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                 )
             } else {
-                crate::xhttp_h3::connect_dual_split(*server, &trojan.host, settings, cfg)
-                    .map(|(reader, writer)| {
-                        (Box::new(reader) as Box<dyn WindowRead + Send>, writer)
-                    })
+                crate::xhttp_h3::connect_dual_split(*server, &trojan.host, settings, cfg).map(
+                    |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
+                )
             };
             let Some((reader, writer)) = pair else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
