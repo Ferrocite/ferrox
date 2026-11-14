@@ -411,6 +411,7 @@ pub(crate) struct Front {
     pub(crate) dial: String,
     pub(crate) port: u16,
     pub(crate) disable_sni: bool,
+    pub(crate) provider_id: Option<String>,
 }
 
 /// A broker's front and session keys, from a tactics payload.

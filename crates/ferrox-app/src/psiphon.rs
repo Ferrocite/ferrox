@@ -466,8 +466,92 @@ fn count_field(fields: Option<&Json>, key: &str, default: usize) -> usize {
     number(fields, key).map_or(default, |count| count.min(256) as usize)
 }
 
+/// The reference's token bucket for in-proxy dials; zero disables it.
+fn rate_limit(fields: Option<&Json>) -> Option<(usize, Duration)> {
+    let quantity = number(fields, "InproxyClientDialRateLimitQuantity").unwrap_or(2);
+    if quantity == 0 {
+        return None;
+    }
+    let interval = number(fields, "InproxyClientDialRateLimitIntervalMilliseconds").map_or_else(
+        || {
+            duration_field(
+                fields,
+                "InproxyClientDialRateLimitInterval",
+                Duration::from_millis(500),
+            )
+        },
+        Duration::from_millis,
+    );
+    if interval.is_zero() {
+        return None;
+    }
+    Some((usize::try_from(quantity).unwrap_or(usize::MAX), interval))
+}
+
+/// A provider-keyed duration map; the reference stores Go duration strings.
+fn key_durations(fields: Option<&Json>, key: &str) -> Vec<(String, Duration)> {
+    let Some(Json::Obj(pairs)) = fields.and_then(|fields| fields.get(key)) else {
+        return Vec::new();
+    };
+    pairs
+        .iter()
+        .filter_map(|(provider, value)| {
+            let duration = value.as_str().and_then(go_duration).or_else(|| {
+                value
+                    .as_i64()
+                    .map(|nanos| Duration::from_nanos(u64::try_from(nanos).unwrap_or(0)))
+            })?;
+            Some((provider.clone(), duration))
+        })
+        .collect()
+}
+
 fn probability_field(fields: Option<&Json>, key: &str, default: f64) -> f64 {
     decimal(fields, key).unwrap_or(default).clamp(0.0, 1.0)
+}
+
+/// A `golang.org/x/time/rate` bucket over in-proxy dials.
+struct DialRateLimiter {
+    capacity: f64,
+    rate: f64,
+    state: std::sync::Mutex<(f64, std::time::Instant)>,
+}
+
+impl DialRateLimiter {
+    #[allow(clippy::cast_precision_loss)]
+    fn new(quantity: usize, interval: Duration) -> Self {
+        let capacity = quantity as f64;
+        Self {
+            capacity,
+            rate: capacity / interval.as_secs_f64(),
+            state: std::sync::Mutex::new((capacity, std::time::Instant::now())),
+        }
+    }
+
+    /// Take one token, waiting no later than `deadline`.
+    fn wait(&self, deadline: std::time::Instant) -> bool {
+        let mut state = lock(&self.state);
+        loop {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(state.1).as_secs_f64();
+            state.0 = (state.0 + elapsed * self.rate).min(self.capacity);
+            state.1 = now;
+            if state.0 >= 1.0 {
+                state.0 -= 1.0;
+                return true;
+            }
+            let wait = Duration::from_secs_f64((1.0 - state.0) / self.rate);
+            let Some(at) = now.checked_add(wait) else {
+                return false;
+            };
+            if at > deadline {
+                return false;
+            }
+            drop(state);
+            std::thread::sleep(wait);
+            state = lock(&self.state);
+        }
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -524,6 +608,14 @@ struct Settings {
     inproxy_no_match_failover_personal: f64,
     inproxy_prefer_probability: f64,
     inproxy_force_selection_count: usize,
+    inproxy_rate_limit: Option<(usize, Duration)>,
+    inproxy_api_timeout: Duration,
+    inproxy_debug: bool,
+    inproxy_disable_ipv6_ice: bool,
+    inproxy_disable_inbound_mobile: bool,
+    inproxy_incompatible_networks: Vec<String>,
+    inproxy_network_type: String,
+    inproxy_front_timeouts: Vec<(String, Duration)>,
     reject_countries: Vec<String>,
     reject_cidrs: Vec<String>,
     geoip_path: Option<String>,
@@ -1057,6 +1149,10 @@ impl Inner {
         let inproxy_force_remaining = Arc::new(AtomicUsize::new(
             self.settings.inproxy_force_selection_count,
         ));
+        let rate_limiter = self
+            .settings
+            .inproxy_rate_limit
+            .map(|(quantity, interval)| Arc::new(DialRateLimiter::new(quantity, interval)));
         while offset < limit {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1160,6 +1256,14 @@ impl Inner {
                     .protocols
                     .iter()
                     .all(|protocol| protocol.starts_with("INPROXY-"));
+            let personal_pairing = self.settings.personal_pairing;
+            let incompatible = self.settings.inproxy_incompatible();
+            let inproxy_api_timeout = self
+                .settings
+                .inproxy_api_timeout
+                .mul_f64(self.settings.latency.multiplier());
+            let limiter = rate_limiter.clone();
+            let rate_deadline = Instant::now() + budget;
             let force_remaining = Arc::clone(&inproxy_force_remaining);
             let requests =
                 Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
@@ -1167,16 +1271,32 @@ impl Inner {
                 let lease = replay.begin(server, config_state);
                 let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());
                 let mut selected = lease.server().clone();
-                let use_inproxy = select_inproxy(
+                let mut use_inproxy = select_inproxy(
                     selected.inproxy.is_some() || selected.tls_inproxy.is_some(),
                     selected.direct && !inproxy_only,
                     conduit.is_some(),
                     inproxy_prefer,
                     &force_remaining,
                 );
+                if use_inproxy && incompatible && !personal_pairing && !inproxy_only {
+                    if !selected.direct {
+                        lease.failed();
+                        return Err(
+                            "psiphon: in-proxy dial skipped on incompatible network".to_owned()
+                        );
+                    }
+                    use_inproxy = false;
+                }
                 if use_inproxy {
                     if selected.inproxy.is_none() {
                         selected.inproxy = selected.tls_inproxy.take();
+                    }
+                    if limiter
+                        .as_ref()
+                        .is_some_and(|limiter| !limiter.wait(rate_deadline))
+                    {
+                        lease.failed();
+                        return Err("psiphon: in-proxy dial rate limit expired".to_owned());
                     }
                 } else {
                     selected.inproxy = None;
@@ -1221,6 +1341,7 @@ impl Inner {
                     keepalive,
                     &tls_shape,
                     limit_meek_buffers,
+                    use_inproxy.then_some(inproxy_api_timeout),
                     Some(Arc::clone(&requests)),
                     burst,
                 ) {
@@ -1672,6 +1793,11 @@ impl Inner {
             personal,
             inproxy_stun_servers(&self.settings, &tactics),
             self.settings.inproxy_disable_stun,
+            self.settings.inproxy_disable_ipv6_ice,
+            self.settings.inproxy_disable_inbound_mobile
+                && self.settings.inproxy_network_type == "MOBILE",
+            self.settings.inproxy_debug,
+            self.settings.inproxy_front_timeouts.clone(),
             self.settings.conduit_protocols.clone(),
             self.settings.conduit_timeout,
             self.settings.inproxy_offer_timeout,
@@ -2947,6 +3073,40 @@ impl Settings {
             conduit = true;
             fronted_fallback = false;
         }
+        let inproxy_rate_limit = rate_limit(settings);
+        let inproxy_api_timeout = millis_setting(
+            settings,
+            "InproxyPsiphonAPIRequestTimeoutMilliseconds",
+            10_000,
+            1_000,
+        )
+        .max(Duration::from_secs(1));
+        let inproxy_debug = bool_setting(settings, "InproxyEnableWebRTCDebugLogging");
+        let inproxy_disable_ipv6_ice =
+            bool_setting(settings, "InproxyClientDisableIPv6ICECandidates")
+                || bool_setting(settings, "InproxyDisableIPv6ICECandidates");
+        let inproxy_disable_inbound_mobile =
+            bool_setting(settings, "InproxyClientDisableInboundForMobileNetworks")
+                || bool_setting(settings, "InproxyDisableInboundForMobileNetworks");
+        if settings
+            .and_then(|settings| settings.get("InproxyClientDisableWaitToShareSession"))
+            .and_then(Json::as_bool)
+            == Some(false)
+        {
+            eprintln!(
+                "psiphon: InproxyClientDisableWaitToShareSession=false needs a shared broker client pool; this lane dials one client per session"
+            );
+        }
+        let inproxy_incompatible_networks =
+            string_list(settings, "InproxyClientIncompatibleNetworkTypes")
+                .into_iter()
+                .map(|network| network.to_ascii_uppercase())
+                .collect();
+        let inproxy_network_type = text(settings, "NetworkType")
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let inproxy_front_timeouts =
+            key_durations(settings, "InproxyFrontingProviderClientMaxRequestTimeouts");
         let inproxy_prefer_probability = probability_field(
             settings,
             "InproxyTunnelProtocolPreferProbability",
@@ -3744,6 +3904,14 @@ impl Settings {
             inproxy_no_match_failover_personal,
             inproxy_prefer_probability,
             inproxy_force_selection_count,
+            inproxy_rate_limit,
+            inproxy_api_timeout,
+            inproxy_debug,
+            inproxy_disable_ipv6_ice,
+            inproxy_disable_inbound_mobile,
+            inproxy_incompatible_networks,
+            inproxy_network_type,
+            inproxy_front_timeouts,
             reject_countries,
             reject_cidrs,
             geoip_path,
@@ -3989,6 +4157,14 @@ impl Settings {
         self.conduit_protocols.hash(&mut hasher);
         self.inproxy_prefer_probability.to_bits().hash(&mut hasher);
         self.inproxy_force_selection_count.hash(&mut hasher);
+        self.inproxy_rate_limit.hash(&mut hasher);
+        self.inproxy_api_timeout.hash(&mut hasher);
+        self.inproxy_debug.hash(&mut hasher);
+        self.inproxy_disable_ipv6_ice.hash(&mut hasher);
+        self.inproxy_disable_inbound_mobile.hash(&mut hasher);
+        self.inproxy_incompatible_networks.hash(&mut hasher);
+        self.inproxy_network_type.hash(&mut hasher);
+        self.inproxy_front_timeouts.hash(&mut hasher);
         for key in [
             "InproxyBrokerSpecs",
             "InproxyClientBrokerSpecs",
@@ -4029,6 +4205,13 @@ impl Settings {
             .to_bits()
             .hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// The reference skips in-proxy dial parameters on a client-disallowed network.
+    fn inproxy_incompatible(&self) -> bool {
+        self.inproxy_incompatible_networks
+            .iter()
+            .any(|network| network == &self.inproxy_network_type)
     }
 
     /// Whether a client restriction skips this candidate; the reference coins per candidate.
@@ -5596,6 +5779,11 @@ const KNOWN_SETTINGS: &[&str] = &[
     "InproxyClientSTUNServerAddressesRFC5780",
     "InproxyDisableSTUN",
     "InproxyClientDisableSTUN",
+    "InproxyClientDisablePortMapping",
+    "InproxyDisablePortMapping",
+    "InproxyDisableInboundForMobileNetworks",
+    "InproxyDisableIPv6ICECandidates",
+    "InproxyClientDisableWaitToShareSession",
     "InproxyClientOfferRequestTimeoutMilliseconds",
     "InproxyClientOfferRequestPersonalTimeoutMilliseconds",
     "InproxyClientOfferRetryDelayMilliseconds",
@@ -5613,6 +5801,16 @@ const KNOWN_SETTINGS: &[&str] = &[
     "InproxyAllowClient",
     "InproxyTunnelProtocolPreferProbability",
     "InproxyTunnelProtocolForceSelectionCount",
+    "InproxyClientDialRateLimitQuantity",
+    "InproxyClientDialRateLimitIntervalMilliseconds",
+    "InproxyClientDialRateLimitInterval",
+    "InproxyPsiphonAPIRequestTimeoutMilliseconds",
+    "InproxyEnableWebRTCDebugLogging",
+    "InproxyClientDisableIPv6ICECandidates",
+    "InproxyClientDisableInboundForMobileNetworks",
+    "InproxyClientIncompatibleNetworkTypes",
+    "InproxyFrontingProviderClientMaxRequestTimeouts",
+    "NetworkType",
     "InproxyTunnelProtocolSelectionProbability",
     "inproxyCompartment",
     "protocol_selection",
@@ -6203,10 +6401,14 @@ fn compartment32(text: &str, what: &str) -> Result<[u8; 32], String> {
 }
 
 /// Create the local offer unless the caller supplied SDP.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn webrtc_offer(
     address: IpAddr,
     stun_servers: &[String],
     disable_stun: bool,
+    disable_ipv6_ice: bool,
+    disable_inbound: bool,
+    debug: bool,
     sdp: Option<&str>,
     timeout: std::time::Duration,
     dns_config: &crate::psiphon_dns::Config,
@@ -6219,6 +6421,9 @@ fn webrtc_offer(
         address,
         stun_servers,
         disable_stun,
+        disable_ipv6_ice,
+        disable_inbound,
+        debug,
         timeout,
         dns_config,
         unreliable,
@@ -6329,10 +6534,27 @@ pub(crate) fn broker_offer(
     let mut why = String::new();
     for front in &fronts {
         let timeout = settings.ready.max(std::time::Duration::from_secs(20));
+        let provider = front.provider_id.as_deref().unwrap_or("");
+        let max_request = settings
+            .inproxy_front_timeouts
+            .iter()
+            .find(|(known, _)| known == provider)
+            .map(|(_, timeout)| *timeout)
+            .filter(|timeout| !timeout.is_zero());
+        let offer_timeout = max_request.map_or(settings.inproxy_offer_timeout, |max| {
+            settings.inproxy_offer_timeout.min(max)
+        });
+        let offer_personal_timeout = max_request
+            .map_or(settings.inproxy_offer_personal_timeout, |max| {
+                settings.inproxy_offer_personal_timeout.min(max)
+            });
         let (mut webrtc, generated) = webrtc_offer(
             server.address,
             &inproxy_stun_servers(&settings, &tactics),
             settings.inproxy_disable_stun,
+            settings.inproxy_disable_ipv6_ice,
+            settings.inproxy_disable_inbound_mobile && settings.inproxy_network_type == "MOBILE",
+            settings.inproxy_debug,
             sdp,
             timeout,
             &settings.dns,
@@ -6348,8 +6570,8 @@ pub(crate) fn broker_offer(
             settings.proxy.as_ref(),
             &settings.meek_headers,
             &settings.dns,
-            settings.inproxy_offer_timeout,
-            settings.inproxy_offer_personal_timeout,
+            offer_timeout,
+            offer_personal_timeout,
             settings.inproxy_relay_timeout,
         ) {
             Ok(client) => client,
@@ -6570,6 +6792,7 @@ fn broker_fronts(broker: &crate::psiphon_tactics::Broker) -> Vec<crate::psiphon_
                 dial,
                 port,
                 disable_sni: front.disable_sni,
+                provider_id: front.provider_id.clone(),
             };
             if !fronts
                 .iter()
@@ -6577,6 +6800,8 @@ fn broker_fronts(broker: &crate::psiphon_tactics::Broker) -> Vec<crate::psiphon_
                     existing.host == candidate.host
                         && existing.dial == candidate.dial
                         && existing.port == candidate.port
+                        && existing.disable_sni == candidate.disable_sni
+                        && existing.provider_id == candidate.provider_id
                 })
             {
                 fronts.push(candidate);
@@ -10944,6 +11169,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_in_proxy_rate_limit_reads_config_millis_and_tactics_duration() {
+        let config = json::parse(
+            r#"{"InproxyClientDialRateLimitQuantity":3,"InproxyClientDialRateLimitIntervalMilliseconds":250}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            rate_limit(Some(&config)),
+            Some((3, Duration::from_millis(250)))
+        );
+        let tactics =
+            json::parse(r#"{"InproxyClientDialRateLimitInterval":"2s"}"#).expect("settings");
+        assert_eq!(
+            rate_limit(Some(&tactics)),
+            Some((2, Duration::from_secs(2)))
+        );
+        let disabled = json::parse(
+            r#"{"InproxyClientDialRateLimitQuantity":0,"InproxyClientDialRateLimitInterval":"2s"}"#,
+        )
+        .expect("settings");
+        assert_eq!(rate_limit(Some(&disabled)), None);
+    }
+
+    #[test]
+    fn a_provider_timeout_map_reads_go_durations() {
+        let config = json::parse(
+            r#"{"InproxyFrontingProviderClientMaxRequestTimeouts":{"provider":"7s","bad":"never"}}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            key_durations(
+                Some(&config),
+                "InproxyFrontingProviderClientMaxRequestTimeouts"
+            ),
+            vec![("provider".to_owned(), Duration::from_secs(7))]
+        );
+    }
+
+    #[test]
+    fn an_in_proxy_network_type_marks_itself_incompatible() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"NetworkType":"MOBILE","InproxyClientIncompatibleNetworkTypes":["mobile"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(settings.inproxy_incompatible());
+    }
+
+    #[test]
     fn an_entry_is_five_fields_with_json_last() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshUsername":"u","sshPassword":"p","sshHostKey":"AAAA","region":"US"}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -15184,6 +15459,25 @@ mod tests {
                 .expect("settings")
                 .personal_pairing
         );
+    }
+
+    #[test]
+    fn broker_fronts_keep_distinct_providers_on_one_endpoint() {
+        let fronting = |provider: &str| crate::psiphon_tactics::Fronting {
+            host: "broker.example".to_owned(),
+            addresses: vec!["edge.example:443".to_owned()],
+            disable_sni: false,
+            provider_id: Some(provider.to_owned()),
+        };
+        let broker = crate::psiphon_tactics::Broker {
+            public_key: "pk".to_owned(),
+            root_secret: "rs".to_owned(),
+            fronts: vec![fronting("one"), fronting("two")],
+        };
+        let fronts = broker_fronts(&broker);
+        assert_eq!(fronts.len(), 2);
+        assert_eq!(fronts[0].provider_id.as_deref(), Some("one"));
+        assert_eq!(fronts[1].provider_id.as_deref(), Some("two"));
     }
 
     #[test]

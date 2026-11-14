@@ -1671,6 +1671,7 @@ impl Session {
         keepalive: Option<KeepAlive>,
         shape: &TlsShape,
         limit_meek_buffers: bool,
+        api_timeout: Option<Duration>,
         requests: Option<Arc<dyn ServerRequests>>,
         burst: Option<crate::psiphon_burst::Config>,
     ) -> Result<Self, String> {
@@ -1775,6 +1776,16 @@ impl Session {
             identity.session_id,
             identity.sponsor,
         )?;
+        if let Some(timeout) = api_timeout {
+            output
+                .io
+                .set_timeout(Some(timeout))
+                .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
+            input
+                .io
+                .set_timeout(Some(timeout))
+                .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
+        }
         // A Psiphon server refuses every port forward until this handshake completes.
         let handshake = if identity.disable_api {
             HandshakeState::default()
@@ -1789,6 +1800,16 @@ impl Session {
                 requests.as_deref(),
             )?
         };
+        if api_timeout.is_some() {
+            output
+                .io
+                .set_timeout(None)
+                .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
+            input
+                .io
+                .set_timeout(None)
+                .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
+        }
         control
             .set_timeout(None)
             .map_err(|error| format!("psiphon ssh socket: {error}"))?;

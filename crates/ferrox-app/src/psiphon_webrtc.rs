@@ -33,14 +33,19 @@ pub(crate) struct WebRtc {
     buffer: Vec<u8>,
     events: VecDeque<Event>,
     peer: Option<IpAddr>,
+    debug: bool,
 }
 
 impl WebRtc {
     /// Gather candidates, create the offer SDP, and return the pending answer.
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     pub(crate) fn offer(
         destination: IpAddr,
         stun_servers: &[String],
         disable_stun: bool,
+        disable_ipv6_ice: bool,
+        disable_inbound: bool,
+        debug: bool,
         timeout: Duration,
         dns: &crate::psiphon_dns::Config,
         unreliable: bool,
@@ -50,15 +55,19 @@ impl WebRtc {
             .local_addr()
             .map_err(|error| format!("psiphon webrtc local: {error}"))?;
         let mut rtc = Rtc::new(Instant::now());
-        let host = Candidate::host(local, "udp")
-            .map_err(|error| format!("psiphon webrtc candidate: {error}"))?;
-        let _ = rtc.add_local_candidate(host);
-        if !disable_stun {
+        if !(disable_ipv6_ice && local.is_ipv6()) {
+            let host = Candidate::host(local, "udp")
+                .map_err(|error| format!("psiphon webrtc candidate: {error}"))?;
+            let _ = rtc.add_local_candidate(host);
+        }
+        if !disable_stun && !disable_inbound {
             if let Some(server) = choose_stun(stun_servers) {
                 let stun_timeout = timeout.min(Duration::from_secs(3));
                 if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, dns) {
-                    if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
-                        let _ = rtc.add_local_candidate(candidate);
+                    if !(disable_ipv6_ice && mapped.is_ipv6()) {
+                        if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
+                            let _ = rtc.add_local_candidate(candidate);
+                        }
                     }
                 }
             }
@@ -89,6 +98,7 @@ impl WebRtc {
                 buffer: vec![0u8; MAX_DATAGRAM],
                 events: VecDeque::new(),
                 peer: None,
+                debug,
             },
             offer.to_sdp_string(),
         ))
@@ -215,7 +225,20 @@ impl WebRtc {
                 Output::Event(Event::ChannelOpen(id, _)) if id == self.channel => {
                     self.open = true;
                 }
-                Output::Event(event) => events.push(event),
+                Output::Event(event) => {
+                    if self.debug {
+                        if let Event::ChannelData(data) = &event {
+                            eprintln!(
+                                "psiphon webrtc: channel {:?} data {} bytes",
+                                data.id,
+                                data.data.len()
+                            );
+                        } else {
+                            eprintln!("psiphon webrtc: {event:?}");
+                        }
+                    }
+                    events.push(event);
+                }
             }
         }
     }
@@ -760,12 +783,17 @@ pub(crate) struct BrokerRoute {
 }
 
 /// Everything one in-proxy dial needs: brokers, their fronts, and the compartments.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Conduit {
     routes: Vec<BrokerRoute>,
     common: Vec<[u8; 32]>,
     personal: Vec<[u8; 32]>,
     stun_servers: Vec<String>,
     disable_stun: bool,
+    disable_ipv6_ice: bool,
+    disable_inbound: bool,
+    debug: bool,
+    front_timeouts: Vec<(String, Duration)>,
     protocols: Vec<String>,
     timeout: Duration,
     offer_timeout: Duration,
@@ -784,13 +812,17 @@ pub(crate) struct Conduit {
 
 impl Conduit {
     /// Build a conduit from a tactics payload and the selected compartments.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     pub(crate) fn new(
         routes: Vec<BrokerRoute>,
         common: Vec<[u8; 32]>,
         personal: Vec<[u8; 32]>,
         stun_servers: Vec<String>,
         disable_stun: bool,
+        disable_ipv6_ice: bool,
+        disable_inbound: bool,
+        debug: bool,
+        front_timeouts: Vec<(String, Duration)>,
         protocols: Vec<String>,
         timeout: Duration,
         offer_timeout: Duration,
@@ -822,6 +854,10 @@ impl Conduit {
             personal,
             stun_servers,
             disable_stun,
+            disable_ipv6_ice,
+            disable_inbound,
+            debug,
+            front_timeouts,
             protocols,
             timeout,
             offer_timeout,
@@ -974,10 +1010,25 @@ impl Conduit {
             "QUIC-OSSH" | "FRONTED-MEEK-QUIC-OSSH"
         );
         let budget = self.timeout.min(remaining);
+        let provider = front.provider_id.as_deref().unwrap_or("");
+        let max_request = self
+            .front_timeouts
+            .iter()
+            .find(|(known, _)| known == provider)
+            .map(|(_, timeout)| *timeout)
+            .filter(|timeout| !timeout.is_zero());
+        let offer_timeout =
+            max_request.map_or(self.offer_timeout, |max| self.offer_timeout.min(max));
+        let offer_personal_timeout = max_request.map_or(self.offer_personal_timeout, |max| {
+            self.offer_personal_timeout.min(max)
+        });
         let (mut webrtc, sdp) = WebRtc::offer(
             address,
             &self.stun_servers,
             self.disable_stun,
+            self.disable_ipv6_ice,
+            self.disable_inbound,
+            self.debug,
             budget,
             &self.dns_config,
             unreliable,
@@ -990,8 +1041,8 @@ impl Conduit {
             None,
             &self.headers,
             &self.dns_config,
-            self.offer_timeout.min(remaining),
-            self.offer_personal_timeout.min(remaining),
+            offer_timeout.min(remaining),
+            offer_personal_timeout.min(remaining),
             self.relay_timeout,
         )
         .map_err(|error| (error, false))?;
@@ -1190,6 +1241,9 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[],
             false,
+            false,
+            false,
+            false,
             Duration::from_secs(1),
             &crate::psiphon_dns::Config::from_servers(&[]),
             false,
@@ -1278,6 +1332,9 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &["192.0.2.1:3478".to_owned()],
             true,
+            false,
+            false,
+            false,
             Duration::from_secs(1),
             &crate::psiphon_dns::Config::from_servers(&[]),
             false,
@@ -1299,6 +1356,9 @@ mod tests {
         let (webrtc, sdp) = WebRtc::offer(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[],
+            false,
+            false,
+            false,
             false,
             Duration::from_secs(1),
             &crate::psiphon_dns::Config::from_servers(&[]),
