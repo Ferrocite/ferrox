@@ -18968,6 +18968,21 @@ fn dial_tls_carried_stream(
     headers: &[(String, String)],
     heartbeat: u32,
 ) -> Option<CarrierStream<Box<dyn Read + Send>, Box<dyn Write + Send>>> {
+    if let Carrier::Xhttp { settings } = carrier {
+        if crate::xhttp_h3::is_h3(&tls.alpn) {
+            let address = server.ip().to_string();
+            let port = server.port();
+            let (reader, writer) = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                crate::xhttp_h3::connect_split(&address, port, host, settings, tls)?
+            } else {
+                crate::xhttp_h3::connect_dual_split(&address, port, host, settings, tls)?
+            };
+            return Some(CarrierStream {
+                reader: Box::new(reader) as Box<dyn Read + Send>,
+                writer: Box::new(writer) as Box<dyn Write + Send>,
+            });
+        }
+    }
     let session = dial_tls_session(server, tls, carrier.tcp_mask())?;
     match carrier {
         Carrier::Ws { path, ed } => {
@@ -65155,6 +65170,209 @@ mod tests {
             crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
                 .expect("binds h3");
         let out = tls_vless_out(port, id, Carrier::Xhttp { settings }, client);
+        carrier_echo(out, port);
+    }
+
+    fn socks5_h3_echo(
+        mut reader: Box<dyn WindowRead + Send>,
+        mut writer: crate::xhttp::XhttpWriter,
+        _decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    ) {
+        let mut greeting = [0u8; 2];
+        if reader.read_exact(&mut greeting).is_err() || greeting[0] != 5 {
+            return;
+        }
+        let mut methods = vec![0u8; greeting[1] as usize];
+        if reader.read_exact(&mut methods).is_err() {
+            return;
+        }
+        if writer.write_all(&[5, 0]).is_err() {
+            return;
+        }
+        let mut request = [0u8; 4];
+        if reader.read_exact(&mut request).is_err() {
+            return;
+        }
+        let address = match request[3] {
+            1 => 4,
+            4 => 16,
+            3 => {
+                let mut len = [0u8; 1];
+                if reader.read_exact(&mut len).is_err() {
+                    return;
+                }
+                len[0] as usize
+            }
+            _ => return,
+        };
+        let mut rest = vec![0u8; address + 2];
+        if reader.read_exact(&mut rest).is_err()
+            || writer.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err()
+        {
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if writer.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        writer.finish();
+    }
+
+    fn http_connect_h3_echo(
+        mut reader: Box<dyn WindowRead + Send>,
+        mut writer: crate::xhttp::XhttpWriter,
+        _decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    ) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if reader.read(&mut byte).unwrap_or(0) != 1 {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        if writer.write_all(b"HTTP/1.1 200 OK\r\n\r\n").is_err() {
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if writer.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        writer.finish();
+    }
+
+    fn h3_session_service(
+        settings: &crate::xhttp::XhttpSettings,
+        serve: Arc<crate::xhttp_h2::SessionServe>,
+    ) -> Arc<dyn crate::xhttp_h3::H3Service> {
+        Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+            settings.clone(),
+            serve,
+        ))
+    }
+
+    #[test]
+    fn h3_carries_a_socks5_outbound_echo_over_loopback() {
+        let (identity, client) = h3_loopback_identity();
+        let settings = xhttp_settings_mode("/h3-socks", crate::xhttp::XhttpMode::StreamOne);
+        let service = h3_session_service(
+            &settings,
+            Arc::new(move |reader, writer, decryption| {
+                socks5_h3_echo(reader, writer, decryption);
+            }),
+        );
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = Outbound::Socks(SocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            credential: crate::socks::Credential::default(),
+            version: crate::socks::Version::V5,
+            tls: Some(Arc::new(client)),
+            carrier: Carrier::Xhttp { settings },
+            host: "127.0.0.1".to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
+        });
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h2_carries_a_socks5_outbound_echo_over_loopback() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let settings = xhttp_settings_mode("/h2-socks", crate::xhttp::XhttpMode::StreamOne);
+        let service = crate::xhttp_h2::XhttpSessionService::new(
+            (*settings).clone(),
+            Arc::new(move |reader, writer, decryption| {
+                socks5_h3_echo(reader, writer, decryption);
+            }),
+        );
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept((*server_config).clone(), stream)
+                    .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let out = tls.get_ref().try_clone().expect("dups the transport");
+            let shared = Arc::new(Mutex::new(tls));
+            let out = Arc::new(Mutex::new(Sealed::new(out)));
+            let read = TlsHalf {
+                session: Arc::clone(&shared),
+                out: Arc::clone(&out),
+                driven: None,
+                sleep_on_timeout: true,
+            };
+            let write = TlsHalf {
+                session: shared,
+                out,
+                driven: None,
+                sleep_on_timeout: true,
+            };
+            crate::xhttp_h2::serve_h2_service(read, write, &service, None);
+        });
+        let out = Outbound::Socks(SocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            credential: crate::socks::Credential::default(),
+            version: crate::socks::Version::V5,
+            tls: Some(Arc::new(client_config)),
+            carrier: Carrier::Xhttp { settings },
+            host: "127.0.0.1".to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
+        });
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_an_http_outbound_echo_over_loopback() {
+        let (identity, client) = h3_loopback_identity();
+        let settings = xhttp_settings_mode("/h3-http", crate::xhttp::XhttpMode::StreamOne);
+        let service = h3_session_service(
+            &settings,
+            Arc::new(move |reader, writer, decryption| {
+                http_connect_h3_echo(reader, writer, decryption);
+            }),
+        );
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = Outbound::Http(HttpOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            tls: Some(Arc::new(client)),
+            carrier: Carrier::Xhttp { settings },
+            host: "127.0.0.1".to_owned(),
+            carrier_headers: Vec::new(),
+            heartbeat: 0,
+            headers: Vec::new(),
+            user: None,
+            pass: None,
+        });
         carrier_echo(out, port);
     }
 
