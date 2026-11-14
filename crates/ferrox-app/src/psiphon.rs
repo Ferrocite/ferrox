@@ -507,6 +507,7 @@ struct Settings {
     split_tunnel_own_region: bool,
     split_tunnel_regions: Vec<String>,
     compartment: String,
+    personal_pairing: bool,
     conduit: bool,
     conduit_mode: ConduitMode,
     conduit_timeout: Duration,
@@ -1620,11 +1621,27 @@ impl Inner {
         let servers = load_tactics_entries(&self.settings)?;
         let session_id = hex(&random::<16>());
         let tactics = fetch_tactics_from(&self.settings, &servers, &session_id)?;
-        if tactics.brokers.is_empty() {
-            return Err("psiphon conduit: tactics names no broker".to_owned());
+        let personal = decode_compartment(&self.settings.compartment)?;
+        let configured = configured_inproxy_brokers(&self.settings, self.settings.personal_pairing);
+        let mut brokers = if configured.is_empty() {
+            tactics.brokers.clone()
+        } else {
+            configured
+        };
+        if self.settings.personal_pairing {
+            let max = count_field(
+                self.settings.raw.as_ref(),
+                "InproxyPersonalPairingMaxBrokerSpecCount",
+                3,
+            );
+            brokers = order_personal_brokers(brokers, &personal, max);
+        } else {
+            shuffle_brokers(&mut brokers);
         }
-        let routes = tactics
-            .brokers
+        if brokers.is_empty() {
+            return Err("psiphon conduit: no broker".to_owned());
+        }
+        let routes = brokers
             .iter()
             .map(|broker| crate::psiphon_webrtc::BrokerRoute {
                 broker: crate::psiphon_broker::Broker {
@@ -1634,11 +1651,16 @@ impl Inner {
                 fronts: broker_fronts(broker),
             })
             .collect();
-        let common = decode_compartments(&tactics.compartments)?;
-        let personal = decode_compartment(&self.settings.compartment)?;
+        let configured_compartments = configured_inproxy_compartments(&self.settings);
+        let common = if configured_compartments.is_empty() {
+            decode_compartments(&tactics.compartments)?
+        } else {
+            decode_compartments(&configured_compartments)?
+        };
         let (common, personal) = match self.settings.conduit_mode {
             ConduitMode::Public => (common, Vec::new()),
             ConduitMode::Shirokhorshid => (Vec::new(), vec![personal]),
+            ConduitMode::Auto if self.settings.personal_pairing => (Vec::new(), vec![personal]),
             ConduitMode::Auto => (common, vec![personal]),
         };
         if common.is_empty() && personal.is_empty() {
@@ -3535,11 +3557,14 @@ impl Settings {
             "AETHER_PSIPHON_SPLIT_TUNNEL_OWN_REGION",
         );
         let split_tunnel_regions = split_tunnel_regions(settings);
-        let compartment = text(settings, "InproxyClientPersonalCompartmentID")
+        let explicit_compartment = text(settings, "InproxyClientPersonalCompartmentID")
             .or_else(|| text(settings, "inproxyClientPersonalCompartmentID"))
             .or_else(|| text(settings, "inproxyCompartment"))
             .or_else(|| env("AETHER_PSIPHON_COMPARTMENT"))
-            .unwrap_or_else(|| PRIVATE_COMPARTMENT_ID.to_owned());
+            .filter(|compartment| !compartment.is_empty());
+        let personal_pairing =
+            explicit_compartment.is_some() || conduit_mode == ConduitMode::Shirokhorshid;
+        let compartment = explicit_compartment.unwrap_or_else(|| PRIVATE_COMPARTMENT_ID.to_owned());
         let limit_meek_buffers = flag(
             settings,
             "LimitMeekBufferSizes",
@@ -3702,6 +3727,7 @@ impl Settings {
             split_tunnel_own_region,
             split_tunnel_regions,
             compartment,
+            personal_pairing,
             conduit,
             conduit_mode,
             conduit_timeout,
@@ -3957,10 +3983,22 @@ impl Settings {
             .to_bits()
             .hash(&mut hasher);
         self.region.hash(&mut hasher);
+        self.compartment.hash(&mut hasher);
+        self.personal_pairing.hash(&mut hasher);
         self.conduit.hash(&mut hasher);
         self.conduit_protocols.hash(&mut hasher);
         self.inproxy_prefer_probability.to_bits().hash(&mut hasher);
         self.inproxy_force_selection_count.hash(&mut hasher);
+        for key in [
+            "InproxyBrokerSpecs",
+            "InproxyClientBrokerSpecs",
+            "InproxyPersonalPairingBrokerSpecs",
+            "InproxyClientPersonalPairingBrokerSpecs",
+            "InproxyPersonalPairingMaxBrokerSpecCount",
+            "InproxyCommonCompartmentIDs",
+        ] {
+            format!("{:?}", self.raw.as_ref().and_then(|raw| raw.get(key))).hash(&mut hasher);
+        }
         self.limit_quic_versions.hash(&mut hasher);
         self.quic_noise.hash(&mut hasher);
         self.meek_headers.hash(&mut hasher);
@@ -5566,6 +5604,12 @@ const KNOWN_SETTINGS: &[&str] = &[
     "InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds",
     "InproxyClientNoMatchFailoverProbability",
     "InproxyClientNoMatchFailoverPersonalProbability",
+    "InproxyBrokerSpecs",
+    "InproxyClientBrokerSpecs",
+    "InproxyPersonalPairingBrokerSpecs",
+    "InproxyClientPersonalPairingBrokerSpecs",
+    "InproxyPersonalPairingMaxBrokerSpecCount",
+    "InproxyCommonCompartmentIDs",
     "InproxyAllowClient",
     "InproxyTunnelProtocolPreferProbability",
     "InproxyTunnelProtocolForceSelectionCount",
@@ -6213,10 +6257,26 @@ pub(crate) fn broker_offer(
     let servers = load_tactics_entries(&settings)?;
     let session_id = hex(&random::<16>());
     let tactics = fetch_tactics_from(&settings, &servers, &session_id)?;
-    let broker = tactics
-        .brokers
+    let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
+    let configured = configured_inproxy_brokers(&settings, settings.personal_pairing);
+    let mut brokers = if configured.is_empty() {
+        tactics.brokers.clone()
+    } else {
+        configured
+    };
+    if settings.personal_pairing {
+        let max = count_field(
+            settings.raw.as_ref(),
+            "InproxyPersonalPairingMaxBrokerSpecCount",
+            3,
+        );
+        brokers = order_personal_brokers(brokers, &personal, max);
+    } else {
+        shuffle_brokers(&mut brokers);
+    }
+    let broker = brokers
         .first()
-        .ok_or_else(|| "psiphon broker: tactics names no broker".to_owned())?;
+        .ok_or_else(|| "psiphon broker: no broker".to_owned())?;
     let server = servers
         .iter()
         .find(|server| server.inproxy.is_some())
@@ -6225,12 +6285,25 @@ pub(crate) fn broker_offer(
         .inproxy
         .as_ref()
         .ok_or_else(|| "psiphon broker: no in-proxy destination".to_owned())?;
-    let compartments: Vec<[u8; 32]> = tactics
-        .compartments
-        .iter()
-        .map(|compartment| compartment32(compartment, "tactics compartment"))
-        .collect::<Result<_, _>>()?;
-    let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
+    let configured_compartments = configured_inproxy_compartments(&settings);
+    let compartments: Vec<[u8; 32]> = if configured_compartments.is_empty() {
+        tactics
+            .compartments
+            .iter()
+            .map(|compartment| compartment32(compartment, "tactics compartment"))
+            .collect::<Result<_, _>>()?
+    } else {
+        configured_compartments
+            .iter()
+            .map(|compartment| compartment32(compartment, "configured compartment"))
+            .collect::<Result<_, _>>()?
+    };
+    let (compartments, personal) = match settings.conduit_mode {
+        ConduitMode::Public => (compartments, Vec::new()),
+        ConduitMode::Shirokhorshid => (Vec::new(), vec![personal]),
+        ConduitMode::Auto if settings.personal_pairing => (Vec::new(), vec![personal]),
+        ConduitMode::Auto => (compartments, vec![personal]),
+    };
     let identity = Identity {
         session_id: &session_id,
         authorizations: &settings.authorizations,
@@ -6288,7 +6361,7 @@ pub(crate) fn broker_offer(
         match client.client_offer(
             destination,
             &compartments,
-            &[personal],
+            &personal,
             &generated,
             &crate::psiphon_broker::Metrics::from_identity(&identity),
         ) {
@@ -6325,6 +6398,70 @@ fn inproxy_stun_servers(
         stun.basic = stun.rfc5780;
     }
     stun.basic
+}
+
+/// Configured broker specs win over tactics; the personal-pairing list wins in that mode.
+fn configured_inproxy_brokers(
+    settings: &Settings,
+    personal_pairing: bool,
+) -> Vec<crate::psiphon_tactics::Broker> {
+    let raw = settings.raw.as_ref();
+    let keys: &[&str] = if personal_pairing {
+        &[
+            "InproxyClientPersonalPairingBrokerSpecs",
+            "InproxyPersonalPairingBrokerSpecs",
+            "InproxyClientBrokerSpecs",
+            "InproxyBrokerSpecs",
+        ]
+    } else {
+        &["InproxyClientBrokerSpecs", "InproxyBrokerSpecs"]
+    };
+    keys.iter()
+        .find_map(|key| {
+            let brokers = crate::psiphon_tactics::brokers_from(raw.and_then(|raw| raw.get(key)));
+            (!brokers.is_empty()).then_some(brokers)
+        })
+        .unwrap_or_default()
+}
+
+/// The configured common compartment IDs win over tactics.
+fn configured_inproxy_compartments(settings: &Settings) -> Vec<String> {
+    crate::psiphon_tactics::compartments_from(
+        settings
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("InproxyCommonCompartmentIDs")),
+    )
+}
+
+/// Personal pairing maps one compartment to a reduced broker set, in a stable order.
+fn order_personal_brokers(
+    brokers: Vec<crate::psiphon_tactics::Broker>,
+    compartment: &[u8; 32],
+    max: usize,
+) -> Vec<crate::psiphon_tactics::Broker> {
+    let mut brokers = brokers;
+    let mut state = u64::from_be_bytes(compartment[..8].try_into().unwrap_or([0u8; 8])) | 1;
+    for index in (1..brokers.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let pick = usize::try_from(state % (index as u64 + 1)).unwrap_or(0);
+        brokers.swap(index, pick);
+    }
+    if max > 0 && brokers.len() > max {
+        brokers.truncate(max);
+    }
+    brokers
+}
+
+/// Non-personal pairing tries the configured brokers in a fresh random order.
+fn shuffle_brokers(brokers: &mut [crate::psiphon_tactics::Broker]) {
+    for index in (1..brokers.len()).rev() {
+        let draw = u64::from_be_bytes(crate::psiphon_ssh::dial_random::<8>());
+        let pick = usize::try_from(draw % (index as u64 + 1)).unwrap_or(0);
+        brokers.swap(index, pick);
+    }
 }
 
 fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics, String> {
@@ -14993,6 +15130,60 @@ mod tests {
         .expect("settings");
         assert!(mixed.conduit);
         assert_eq!(mixed.inproxy_prefer_probability, 0.0);
+    }
+
+    #[test]
+    fn client_inproxy_broker_and_compartment_overrides_follow_reference_order() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "InproxyBrokerSpecs":[{"BrokerPublicKey":"generic","BrokerRootObfuscationSecret":"g","BrokerFrontingSpecs":[{"Host":"generic.example"}]}],
+                    "InproxyClientBrokerSpecs":[{"BrokerPublicKey":"client","BrokerRootObfuscationSecret":"c","BrokerFrontingSpecs":[{"Host":"client.example"}]}],
+                    "InproxyPersonalPairingBrokerSpecs":[{"BrokerPublicKey":"personal","BrokerRootObfuscationSecret":"p","BrokerFrontingSpecs":[{"Host":"personal.example"}]}],
+                    "InproxyClientPersonalPairingBrokerSpecs":[{"BrokerPublicKey":"personal-client","BrokerRootObfuscationSecret":"pc","BrokerFrontingSpecs":[{"Host":"personal-client.example"}]}],
+                    "InproxyCommonCompartmentIDs":["common-1"]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let client = configured_inproxy_brokers(&settings, false);
+        assert_eq!(client[0].public_key, "client");
+        let personal = configured_inproxy_brokers(&settings, true);
+        assert_eq!(personal[0].public_key, "personal-client");
+        let ordered = order_personal_brokers(personal.clone(), &[9u8; 32], 1);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(
+            ordered[0],
+            order_personal_brokers(personal, &[9u8; 32], 1)[0]
+        );
+        assert_eq!(
+            configured_inproxy_compartments(&settings),
+            vec!["common-1".to_owned()]
+        );
+
+        let frontless = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyBrokerSpecs":[{"BrokerPublicKey":"generic","BrokerRootObfuscationSecret":"g","BrokerFrontingSpecs":[]}]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            configured_inproxy_brokers(&frontless, false),
+            Vec::<crate::psiphon_tactics::Broker>::new()
+        );
+
+        let explicit = Settings::from_json(Some(
+            &json::parse(r#"{"InproxyClientPersonalCompartmentID":"personal"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(explicit.personal_pairing);
+        assert!(
+            !Settings::from_json(None)
+                .expect("settings")
+                .personal_pairing
+        );
     }
 
     #[test]
