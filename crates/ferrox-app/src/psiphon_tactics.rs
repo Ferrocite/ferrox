@@ -27,6 +27,7 @@ pub(crate) struct Fronting {
     pub(crate) host: String,
     pub(crate) addresses: Vec<String>,
     pub(crate) disable_sni: bool,
+    pub(crate) provider_id: Option<String>,
 }
 
 /// One in-proxy broker a tactics payload names.
@@ -416,10 +417,17 @@ fn fronting(spec: &Json) -> Option<Fronting> {
         .get("DisableSNI")
         .and_then(Json::as_bool)
         .unwrap_or(false);
+    let provider_id = spec
+        .get("FrontingProviderID")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
     Some(Fronting {
         host,
         addresses,
         disable_sni,
+        provider_id,
     })
 }
 
@@ -570,6 +578,7 @@ mod tests {
                     host: "broker.example".to_owned(),
                     addresses: Vec::new(),
                     disable_sni: false,
+                    provider_id: None,
                 }],
             }]
         );
@@ -689,5 +698,15 @@ mod tests {
         assert_eq!(tactics.tag, "tag");
         assert_eq!(tactics.ttl, "2h");
         assert_eq!(tactics.compartments, vec!["c1".to_owned()]);
+    }
+
+    #[test]
+    fn a_fronting_spec_keeps_its_provider_id() {
+        let text = br#"{"Tag":"tag","Tactics":{"Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[{"Host":"broker.example","FrontingProviderID":"provider"}]}]}}}"#;
+        let tactics = parse_payload(text).expect("payload");
+        assert_eq!(
+            tactics.brokers[0].fronts[0].provider_id.as_deref(),
+            Some("provider")
+        );
     }
 }
