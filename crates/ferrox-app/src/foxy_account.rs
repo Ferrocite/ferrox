@@ -606,9 +606,7 @@ impl Endpoint {
         self.host_header = Some(host_header.to_owned());
         // Omitted SNI still has to name the certificate: `VerifyServerName` when the config gives one, the fronted Host otherwise, and the dialed name last.
         self.server_name = Some(if disable_sni {
-            verify_name
-                .map(str::to_owned)
-                .unwrap_or_else(|| host_header.to_owned())
+            verify_name.map_or_else(|| host_header.to_owned(), str::to_owned)
         } else {
             dial.to_owned()
         });

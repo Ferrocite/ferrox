@@ -118,16 +118,16 @@ impl Spec {
             DEFAULT_PREFIX
         });
         // macOS only accepts `utunN`, and the reference lets the system name its own device; elsewhere the stable name keeps a restart on the same interface.
-        let name = name
-            .filter(|n| !n.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
+        let name = name.filter(|n| !n.is_empty()).map_or_else(
+            || {
                 if cfg!(target_os = "macos") {
                     String::new()
                 } else {
                     "ferrox0".to_owned()
                 }
-            });
+            },
+            str::to_owned,
+        );
         Self {
             name,
             mtu: mtu.filter(|m| *m > 0).unwrap_or(DEFAULT_MTU),
@@ -1218,7 +1218,7 @@ impl Handler {
             let rcv = flow.rcv_nxt.load(Relaxed);
             let len = payload.len() as u32;
             let gap = rcv.wrapping_sub(tcp.seq);
-            let skip = if gap <= i32::MAX as u32 {
+            let skip = if i32::try_from(gap).is_ok() {
                 gap as usize
             } else {
                 usize::MAX

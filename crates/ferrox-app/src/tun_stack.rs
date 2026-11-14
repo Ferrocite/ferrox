@@ -157,7 +157,7 @@ pub(crate) fn tcp_only_offload(device: &SyncDevice) -> bool {
     use std::os::fd::AsRawFd as _;
     let mask = libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6;
     // SAFETY: the descriptor is a live TUN the device owns, and `TUNSETOFFLOAD` takes the mask by value.
-    unsafe { libc::ioctl(device.as_raw_fd(), libc::TUNSETOFFLOAD, mask as libc::c_int) == 0 }
+    unsafe { libc::ioctl(device.as_raw_fd(), libc::TUNSETOFFLOAD, mask.cast_signed()) == 0 }
 }
 
 #[allow(clippy::needless_pass_by_value)]
