@@ -22,6 +22,10 @@ use super::MaskRole;
 /// One read asks for this many wire octets at a time; the reference's own reader buffer.
 const READ_CHUNK: usize = 32 * 1024;
 
+/// The number of nondecreasing four-tuples of six-bit groups: `C(67, 4)`.
+const RANK_SPACE: usize = 766_480;
+const RANK_WORDS: usize = RANK_SPACE.div_ceil(64);
+
 /// The 24 orderings of four hint bytes, in the reference's order.
 const PERM4: [[u8; 4]; 24] = [
     [0, 1, 2, 3],
@@ -68,6 +72,7 @@ struct Layout {
     x_mask: u8,
     p_bits: [u8; 2],
     v_bits: [u8; 4],
+    hint_group: [u8; 256],
 }
 
 impl fmt::Debug for Layout {
@@ -87,7 +92,7 @@ impl Layout {
             padding.push(0x80 + i);
             padding.push(0x10 + i);
         }
-        Self {
+        let layout = Self {
             mode: Mode::Entropy,
             hint_mask: 0x90,
             hint_value: 0,
@@ -96,11 +101,13 @@ impl Layout {
             x_mask: 0,
             p_bits: [0; 2],
             v_bits: [0; 4],
-        }
+            hint_group: [0; 256],
+        };
+        layout.with_hint_groups()
     }
 
     fn ascii() -> Self {
-        Self {
+        let layout = Self {
             mode: Mode::Ascii,
             hint_mask: 0x40,
             hint_value: 0x40,
@@ -109,7 +116,9 @@ impl Layout {
             x_mask: 0,
             p_bits: [0; 2],
             v_bits: [0; 4],
-        }
+            hint_group: [0; 256],
+        };
+        layout.with_hint_groups()
     }
 
     fn custom(pattern: &str) -> Option<Self> {
@@ -163,16 +172,32 @@ impl Layout {
         let mut padding = padding[..len].to_vec();
         padding.sort_unstable();
         let pad_marker = *padding.first()?;
-        Some(Self {
-            mode: Mode::Custom,
-            hint_mask: x_mask,
-            hint_value: x_mask,
-            pad_marker,
-            padding,
-            x_mask,
-            p_bits,
-            v_bits,
-        })
+        Some(
+            Self {
+                mode: Mode::Custom,
+                hint_mask: x_mask,
+                hint_value: x_mask,
+                pad_marker,
+                padding,
+                x_mask,
+                p_bits,
+                v_bits,
+                hint_group: [0; 256],
+            }
+            .with_hint_groups(),
+        )
+    }
+
+    fn with_hint_groups(mut self) -> Self {
+        for byte in 0..=255u8 {
+            if self.is_hint(byte) {
+                self.hint_group[byte as usize] =
+                    self.decode_group(byte).expect("a hint has a group");
+            } else {
+                self.hint_group[byte as usize] = u8::MAX;
+            }
+        }
+        self
     }
 
     fn is_hint(&self, byte: u8) -> bool {
@@ -274,7 +299,9 @@ impl Layout {
 /// clue set of the grid, and the reverse key -> octet map.
 struct Table {
     encode: Vec<Vec<[u8; 4]>>,
-    decode: Vec<(u32, u8)>,
+    decode_value: Vec<u8>,
+    decode_rank: Vec<u16>,
+    decode_present: Vec<u64>,
     layout: Layout,
 }
 
@@ -282,18 +309,21 @@ impl fmt::Debug for Table {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Table")
             .field("entries", &self.encode.len())
-            .field("keys", &self.decode.len())
             .field("layout", &self.layout)
             .finish_non_exhaustive()
     }
 }
 
 impl Table {
-    fn decode_byte(&self, key: u32) -> Option<u8> {
-        self.decode
-            .binary_search_by_key(&key, |(k, _)| *k)
-            .ok()
-            .map(|at| self.decode[at].1)
+    fn decode_byte(&self, rank: usize) -> Option<u8> {
+        let bit = 1u64 << (rank & 63);
+        let bits = self.decode_present[rank >> 6];
+        if bits & bit == 0 {
+            return None;
+        }
+        let index =
+            usize::from(self.decode_rank[rank >> 6]) + (bits & (bit - 1)).count_ones() as usize;
+        Some(self.decode_value[index])
     }
 }
 
@@ -394,16 +424,17 @@ impl Encoder {
 
     fn encode_pure(&mut self, p: &[u8]) -> io::Result<()> {
         self.out
-            .reserve(p.len().saturating_mul(10).saturating_add(8));
+            .reserve(p.len().saturating_mul(9).saturating_add(8));
         let mut out = mem::take(&mut self.out);
         let tables = &self.tables;
         let len = tables.len();
         let (padding_min, padding_max) = (self.padding_min, self.padding_max);
+        let pad = padding_max != 0;
         let rng = &mut self.rng;
         let chance = &mut self.chance;
         for &byte in p {
             let table = &tables[self.table_index];
-            if should_pad(rng, chance, padding_min, padding_max)? {
+            if pad && should_pad(rng, chance, padding_min, padding_max)? {
                 push_pure_pad(rng, &mut out, &table.layout)?;
             }
             let choices = table
@@ -420,7 +451,7 @@ impl Encoder {
             let hints = choices[rng.int_n(choices.len())?];
             let perm = PERM4[rng.int_n(PERM4.len())?];
             for index in perm {
-                if should_pad(rng, chance, padding_min, padding_max)? {
+                if pad && should_pad(rng, chance, padding_min, padding_max)? {
                     push_pure_pad(rng, &mut out, &table.layout)?;
                 }
                 out.push(hints[index as usize]);
@@ -428,7 +459,7 @@ impl Encoder {
             self.table_index = next_slot(self.table_index, len);
         }
         let table = &tables[self.table_index];
-        if should_pad(rng, chance, padding_min, padding_max)? {
+        if pad && should_pad(rng, chance, padding_min, padding_max)? {
             push_pure_pad(rng, &mut out, &table.layout)?;
         }
         self.out = out;
@@ -442,17 +473,31 @@ impl Encoder {
         let tables = &self.tables;
         let len = tables.len();
         let (padding_min, padding_max) = (self.padding_min, self.padding_max);
+        let pad = padding_max != 0;
         let rng = &mut self.rng;
         let chance = &mut self.chance;
+        let (chunks, rest) = p.as_chunks::<3>();
+        for chunk in chunks {
+            let word =
+                (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+            for shift in [18, 12, 6, 0] {
+                let layout = &tables[self.group_index].layout;
+                if pad && should_pad(rng, chance, padding_min, padding_max)? {
+                    push_packed_pad(rng, &mut out, layout)?;
+                }
+                out.push(layout.encode_group((word >> shift) as u8 & 0x3f));
+                self.group_index = next_slot(self.group_index, len);
+            }
+        }
         let mut bit_buf = 0u64;
         let mut bit_count = 0u32;
-        for &byte in p {
+        for &byte in rest {
             bit_buf = (bit_buf << 8) | u64::from(byte);
             bit_count += 8;
             while bit_count >= 6 {
                 bit_count -= 6;
                 let layout = &tables[self.group_index].layout;
-                if should_pad(rng, chance, padding_min, padding_max)? {
+                if pad && should_pad(rng, chance, padding_min, padding_max)? {
                     push_packed_pad(rng, &mut out, layout)?;
                 }
                 out.push(layout.encode_group((bit_buf >> bit_count) as u8 & 0x3f));
@@ -466,7 +511,7 @@ impl Encoder {
         }
         if bit_count > 0 {
             let layout = &tables[self.group_index].layout;
-            if should_pad(rng, chance, padding_min, padding_max)? {
+            if pad && should_pad(rng, chance, padding_min, padding_max)? {
                 push_packed_pad(rng, &mut out, layout)?;
             }
             let group = ((bit_buf << (6 - bit_count)) & 0x3f) as u8;
@@ -476,7 +521,7 @@ impl Encoder {
             out.push(next.pad_marker);
         }
         let layout = &tables[self.group_index].layout;
-        if should_pad(rng, chance, padding_min, padding_max)? {
+        if pad && should_pad(rng, chance, padding_min, padding_max)? {
             push_packed_pad(rng, &mut out, layout)?;
         }
         self.out = out;
@@ -587,23 +632,27 @@ impl Reader {
     fn decode_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
         match self.kind {
             ReaderKind::Pure => self.decode_pure(chunk),
-            ReaderKind::Packed => self.decode_packed(chunk),
+            ReaderKind::Packed => {
+                self.decode_packed(chunk);
+                Ok(())
+            }
         }
     }
 
     fn decode_pure(&mut self, chunk: &[u8]) -> io::Result<()> {
         for &byte in chunk {
             let table = &self.tables[self.table_index];
-            if !table.layout.is_hint(byte) {
+            let group = table.layout.hint_group[byte as usize];
+            if group == u8::MAX {
                 continue;
             }
-            self.hint[self.hint_len] = byte;
+            self.hint[self.hint_len] = group;
             self.hint_len += 1;
             if self.hint_len < self.hint.len() {
                 continue;
             }
-            let key = pack_key(sort4(self.hint));
-            let Some(plain) = table.decode_byte(key) else {
+            let rank = rank4(sort4(self.hint));
+            let Some(plain) = table.decode_byte(rank) else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid sudoku hint tuple",
@@ -616,22 +665,17 @@ impl Reader {
         Ok(())
     }
 
-    fn decode_packed(&mut self, chunk: &[u8]) -> io::Result<()> {
+    fn decode_packed(&mut self, chunk: &[u8]) {
         for &byte in chunk {
             let layout = &self.tables[self.group_index].layout;
-            if !layout.is_hint(byte) {
+            let group = layout.hint_group[byte as usize];
+            if group == u8::MAX {
                 if byte == layout.pad_marker {
                     self.bit_buf = 0;
                     self.bit_count = 0;
                 }
                 continue;
             }
-            let Some(group) = layout.decode_group(byte) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid packed sudoku byte",
-                ));
-            };
             self.group_index = next_slot(self.group_index, self.tables.len());
             self.bit_buf = (self.bit_buf << 6) | u64::from(group);
             self.bit_count += 6;
@@ -645,7 +689,6 @@ impl Reader {
                 };
             }
         }
-        Ok(())
     }
 }
 
@@ -916,7 +959,8 @@ fn build_table(password: &str, layout: Layout) -> Option<Table> {
     let seed = i64::from_be_bytes(digest[..8].try_into().ok()?);
     GoRand::new(seed).shuffle(&mut order);
 
-    let mut decode: HashMap<u32, u8> = HashMap::with_capacity(1 << 12);
+    let mut decode = vec![0u8; RANK_SPACE];
+    let mut decode_present = vec![0u64; RANK_WORDS];
     let mut encode: Vec<Vec<[u8; 4]>> = vec![Vec::new(); 256];
     for byte in 0..256usize {
         let list = &patterns[order[byte]];
@@ -931,22 +975,44 @@ fn build_table(password: &str, layout: Layout) -> Option<Table> {
                 layout.encode_group(groups[2]),
                 layout.encode_group(groups[3]),
             ];
-            let key = pack_key(sort4(hints));
-            if let Some(&old) = decode.get(&key) {
-                if old != byte as u8 {
+            let rank = rank4(sort4(*groups));
+            let bit = 1u64 << (rank & 63);
+            let word = rank >> 6;
+            if decode_present[word] & bit != 0 {
+                if decode[rank] != byte as u8 {
                     return None;
                 }
+            } else {
+                decode_present[word] |= bit;
+                decode[rank] = byte as u8;
             }
-            decode.insert(key, byte as u8);
             choices.push(hints);
         }
         encode[byte] = choices;
     }
-    let mut decode: Vec<(u32, u8)> = decode.into_iter().collect();
-    decode.sort_unstable_by_key(|(key, _)| *key);
+    let entries: usize = decode_present
+        .iter()
+        .map(|bits| bits.count_ones() as usize)
+        .sum();
+    if entries > usize::from(u16::MAX) {
+        return None;
+    }
+    let mut decode_value = Vec::with_capacity(entries);
+    let mut decode_rank = Vec::with_capacity(RANK_WORDS);
+    for (word, &bits) in decode_present.iter().enumerate() {
+        decode_rank.push(decode_value.len() as u16);
+        let mut live = bits;
+        while live != 0 {
+            let bit = live.trailing_zeros() as usize;
+            decode_value.push(decode[word * 64 + bit]);
+            live &= live - 1;
+        }
+    }
     Some(Table {
         encode,
-        decode,
+        decode_value,
+        decode_rank,
+        decode_present,
         layout,
     })
 }
@@ -961,7 +1027,7 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
     let positions = hint_positions();
     let mut patterns: Vec<Vec<[u8; 4]>> = vec![Vec::new(); grids.len()];
     for position in positions {
-        let mut counts: HashMap<u32, u16> = HashMap::with_capacity(grids.len());
+        let mut counts: HashMap<usize, u16> = HashMap::with_capacity(grids.len());
         let mut keys = Vec::with_capacity(grids.len());
         let mut groups = Vec::with_capacity(grids.len());
         for grid in grids {
@@ -972,7 +1038,7 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
                 clue_group(grid, position[3]),
             ];
             let clue = sort4(clue);
-            let key = pack_key(clue);
+            let key = rank4(clue);
             keys.push(key);
             groups.push(clue);
             *counts.entry(key).or_insert(0) += 1;
@@ -1050,8 +1116,26 @@ fn sort4(mut v: [u8; 4]) -> [u8; 4] {
     v
 }
 
-fn pack_key(v: [u8; 4]) -> u32 {
-    u32::from_be_bytes(v)
+const fn rank_terms() -> [[u32; 64]; 4] {
+    let mut terms = [[0u32; 64]; 4];
+    let mut value = 0usize;
+    while value < 64 {
+        terms[0][value] = value as u32;
+        terms[1][value] = ((value + 1) * value / 2) as u32;
+        terms[2][value] = ((value + 2) * (value + 1) * value / 6) as u32;
+        terms[3][value] = ((value + 3) * (value + 2) * (value + 1) * value / 24) as u32;
+        value += 1;
+    }
+    terms
+}
+
+static RANK_TERMS: [[u32; 64]; 4] = rank_terms();
+
+fn rank4(v: [u8; 4]) -> usize {
+    (RANK_TERMS[0][v[0] as usize]
+        + RANK_TERMS[1][v[1] as usize]
+        + RANK_TERMS[2][v[2] as usize]
+        + RANK_TERMS[3][v[3] as usize]) as usize
 }
 
 #[cfg(test)]
@@ -1173,6 +1257,23 @@ mod tests {
         let plain: Vec<u8> = (0..=255u8).collect();
         for role in [MaskRole::Client, MaskRole::Server] {
             round_trip(role, &stage("hunter2", "", &[]), &plain);
+        }
+    }
+
+    #[test]
+    fn a_long_plain_stream_round_trips_in_both_directions() {
+        let plain: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        for role in [MaskRole::Client, MaskRole::Server] {
+            round_trip(role, &stage("hunter2", "", &[]), &plain);
+        }
+    }
+
+    #[test]
+    fn packed_tails_keep_every_group() {
+        let config = stage("hunter2", "", &[]);
+        for len in [1usize, 2, 3, 4, 5, 998, 999, 1000, 1001, 1023, 1024, 1025] {
+            let plain: Vec<u8> = (0..len).map(|at| (at * 7) as u8).collect();
+            round_trip(MaskRole::Server, &config, &plain);
         }
     }
 
