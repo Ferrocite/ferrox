@@ -2293,6 +2293,24 @@ impl H2Conn {
 
     /// A trailer block ends the response stream: `END_STREAM` rides the first `HEADERS` and `END_HEADERS` the last, so a block cut across continuations still closes once.
     pub(crate) fn respond_trailers(&self, sid: u32, block: &[u8]) -> bool {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&sid)
+            .cloned()
+        else {
+            return false;
+        };
+        {
+            let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.dead {
+                return false;
+            }
+            if st.finished {
+                return true;
+            }
+        }
         let max = *self
             .max_frame
             .lock()
@@ -2313,19 +2331,14 @@ impl H2Conn {
                 break;
             }
         }
-        let ended = self
-            .streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&sid)
-            .is_some_and(|state| {
-                state.responded.store(true, Ordering::SeqCst);
-                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-                st.finished = true;
-                let ended = st.ended;
-                state.cv.notify_all();
-                ended
-            });
+        state.responded.store(true, Ordering::SeqCst);
+        let ended = {
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.finished = true;
+            let ended = st.ended;
+            state.cv.notify_all();
+            ended
+        };
         if ended {
             self.retire(sid);
         }
@@ -5557,6 +5570,37 @@ mod tests {
             u32::from_be_bytes(bytes[5..9].try_into().unwrap()),
             3,
             "the reset names another stream"
+        );
+    }
+
+    /// A reset stream has no response half left: a late trailer must not put `HEADERS` on an id the peer closed.
+    #[test]
+    fn a_reset_stream_takes_no_trailer() {
+        let (conn, written, _) = bare_conn();
+        let (_reader, _writer, out) = conn.open(1, true).expect("opens");
+        conn.reset_stream(1);
+        let before = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+        assert!(!out.trailers(&block_encode(&[("grpc-status", "0")])));
+        assert_eq!(
+            written.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            before,
+            "a reset stream took a trailer"
+        );
+    }
+
+    /// The response half ends once: a second trailer after the first is accepted as already done and writes nothing.
+    #[test]
+    fn a_finished_stream_sends_its_trailer_once() {
+        let (conn, written, _) = bare_conn();
+        let (_reader, _writer, out) = conn.open(1, false).expect("opens");
+        let block = block_encode(&[("grpc-status", "0")]);
+        assert!(out.trailers(&block));
+        let after = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+        assert!(out.trailers(&block));
+        assert_eq!(
+            written.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            after,
+            "a second trailer repeated the response end"
         );
     }
 

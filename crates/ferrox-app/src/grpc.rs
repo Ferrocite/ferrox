@@ -2081,6 +2081,9 @@ impl MuxSink {
                 batched.end = true;
             }
         }
+        if batched.trailer.is_some() && batched.count > 0 {
+            return None;
+        }
         Some(batched)
     }
 }
@@ -4914,6 +4917,19 @@ mod tests {
         writer.close();
         let peer = peer.lock().unwrap();
         assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &message(b"")));
+    }
+
+    /// A batch that carries both a body and a trailer cannot send both without dropping one, so it is refused rather than half-written.
+    #[test]
+    fn a_batch_with_a_trailer_and_a_body_is_refused() {
+        let data = frame(T_DATA, 0, 1, &message(b"one"));
+        let trailer = frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END,
+            1,
+            &block_encode(&[("grpc-status", "0")]),
+        );
+        assert!(MuxSink::split(&[data.as_slice(), trailer.as_slice()]).is_none());
     }
 
     /// A served call ends with the trailer a grpc-go client reads: the status is the last `HEADERS` block and carries `END_STREAM`.
