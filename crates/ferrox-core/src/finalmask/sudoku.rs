@@ -1034,13 +1034,13 @@ fn base_patterns() -> &'static [Vec<[u8; 4]>] {
 }
 
 fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
+    // A 1024-slot open-addressed table turns the per-position rank count into one probe run over the 288 grids: the hash maps this replaces allocated one table, one key list and one group list for every one of the 1820 positions.
+    const SLOTS: usize = 1024;
+    const MASK: usize = SLOTS - 1;
     let grids = all_grids();
     debug_assert_eq!(grids.len(), GRID_COUNT);
     let positions = hint_positions();
     let mut patterns: Vec<Vec<[u8; 4]>> = vec![Vec::new(); grids.len()];
-    // A 1024-slot open-addressed table turns the per-position rank count into one probe run over the 288 grids: the hash maps this replaces allocated one table, one key list and one group list for every one of the 1820 positions.
-    const SLOTS: usize = 1024;
-    const MASK: usize = SLOTS - 1;
     let mut slots = [u32::MAX; SLOTS];
     let mut counts = [0u16; SLOTS];
     let mut used = [0u16; SLOTS];
