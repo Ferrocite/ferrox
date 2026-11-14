@@ -2253,7 +2253,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 let taken = if ciphertext.is_empty() {
                     0
                 } else {
-                    feed_tls(conn, ciphertext)?
+                    feed_tls(&mut **conn, ciphertext)?
                 };
                 conn.process_new_packets()
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
