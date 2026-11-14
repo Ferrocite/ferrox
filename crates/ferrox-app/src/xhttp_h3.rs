@@ -82,6 +82,7 @@ pub(crate) struct H3Reader {
     buf_at: usize,
     head: Option<Vec<u8>>,
     status: Option<u16>,
+    content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
     head_seen: bool,
@@ -103,6 +104,7 @@ impl H3Reader {
             buf_at: 0,
             head: None,
             status: None,
+            content_length: None,
             frame_left: 0,
             ended: false,
             head_seen: false,
@@ -117,6 +119,10 @@ impl H3Reader {
 
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    fn content_length(&self) -> Option<usize> {
+        self.content_length
     }
 
     /// Whether this POST's own response deadline has passed.
@@ -305,6 +311,10 @@ impl H3Reader {
             at = end;
             match frame.kind {
                 frames::H3_HEADERS => {
+                    let status = hpack::qpack_status(payload);
+                    if status.is_some_and(|code| (100..200).contains(&code)) {
+                        continue;
+                    }
                     self.head_seen = true;
                     if self.head.is_none() && self.status.is_none() {
                         let Some((head, status)) = decode_head(payload, self.expect_request) else {
@@ -318,6 +328,9 @@ impl H3Reader {
                                 missing,
                             ));
                         };
+                        if !self.expect_request {
+                            self.content_length = hpack::qpack_content_length(payload);
+                        }
                         self.head = head;
                         self.status = status;
                     }
@@ -1057,6 +1070,19 @@ impl H3Client {
                 }
             }
         }
+        if let Some(declared) = reader.content_length() {
+            let head_only = head
+                .split_ascii_whitespace()
+                .next()
+                .is_some_and(|method| method.eq_ignore_ascii_case("HEAD"));
+            if !head_only && answer.len() != declared {
+                out.reset();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "h3 service answer was truncated",
+                ));
+            }
+        }
         let status = reader.status().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1352,28 +1378,20 @@ mod tests {
         (identity, roots)
     }
 
-    /// Answer every request with one status and body, without the xhttp dispatch: the shape a plain store service speaks.
-    fn serve_answer(
+    /// Run one scripted answer per request stream, without the xhttp dispatch.
+    fn serve_scripted(
         identity: &ferrox_core::tls::TlsServerConfig,
-        status: &'static str,
-        body: &'static [u8],
+        script: impl Fn(&Wire) + Send + Sync + 'static,
     ) -> u16 {
         let config = quic::serve_config(identity).expect("the h3 server config");
         let sock = quic::bind_datagram_plain("127.0.0.1:0").expect("the h3 server binds");
         let port = sock.local_addr().expect("the h3 server address").port();
         let serve: quic::Serve = Arc::new(move |stream| {
             stream.preface_h3();
-            let wire = Wire::Server(stream.clone());
+            let wire = Wire::Server(stream);
             let mut reader = H3Reader::new(wire.clone());
             let _ = reader.read_head();
-            let length = body.len().to_string();
-            let fields = [
-                (":status".to_owned(), status.to_owned()),
-                ("content-length".to_owned(), length),
-            ];
-            if send_fields(&wire, frames::H3_HEADERS, &fields) {
-                let _ = send_data(&wire, body);
-            }
+            script(&wire);
             wire.fin();
         });
         std::thread::Builder::new()
@@ -1388,6 +1406,24 @@ mod tests {
             })
             .expect("the h3 answer thread");
         port
+    }
+
+    /// Answer every request with one status and body, without the xhttp dispatch: the shape a plain store service speaks.
+    fn serve_answer(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        status: &'static str,
+        body: &'static [u8],
+    ) -> u16 {
+        serve_scripted(identity, move |wire| {
+            let length = body.len().to_string();
+            let fields = [
+                (":status".to_owned(), status.to_owned()),
+                ("content-length".to_owned(), length),
+            ];
+            if send_fields(wire, frames::H3_HEADERS, &fields) {
+                let _ = send_data(wire, body);
+            }
+        })
     }
 
     fn settings() -> XhttpSettings {
@@ -1500,6 +1536,50 @@ mod tests {
             assert_eq!(got.to_string(), status);
             assert_eq!(answer, body);
         }
+    }
+
+    #[test]
+    fn a_plain_h3_answer_skips_an_informational_status() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted(&identity, |wire| {
+            let interim = [(":status".to_owned(), "103".to_owned())];
+            let final_head = [
+                (":status".to_owned(), "200".to_owned()),
+                ("content-length".to_owned(), "5".to_owned()),
+            ];
+            if send_fields(wire, frames::H3_HEADERS, &interim) {
+                if send_fields(wire, frames::H3_HEADERS, &final_head) {
+                    let _ = send_data(wire, b"world");
+                }
+            }
+        });
+        let client = client(port, roots);
+        let head = "POST /o HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n";
+        let (status, answer) = client
+            .ask(head, "localhost", Some(b"hello"), None)
+            .expect("the final h3 answer");
+        assert_eq!(status, 200);
+        assert_eq!(answer, b"world");
+    }
+
+    #[test]
+    fn a_plain_h3_answer_refuses_a_truncated_body() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted(&identity, |wire| {
+            let fields = [
+                (":status".to_owned(), "200".to_owned()),
+                ("content-length".to_owned(), "10".to_owned()),
+            ];
+            if send_fields(wire, frames::H3_HEADERS, &fields) {
+                let _ = send_data(wire, b"short");
+            }
+        });
+        let client = client(port, roots);
+        let head = "GET /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let error = client
+            .ask(head, "localhost", None, None)
+            .expect_err("a short body is a truncation");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1657,6 +1737,11 @@ mod tests {
             counts.allocs, 0,
             "a response reader walks the fields without building them: {counts:?}"
         );
+        assert_eq!(hpack::qpack_content_length(&block), None);
+
+        let mut sized = Vec::new();
+        hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "10")], &mut sized);
+        assert_eq!(hpack::qpack_content_length(&sized), Some(10));
         assert_eq!(
             decode_head(&block, true),
             None,

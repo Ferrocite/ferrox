@@ -555,6 +555,46 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
     status
 }
 
+/// Reads a QPACK block's `content-length` without building its field list, so a response reader can check a short body and still keep its zero-allocation walk.
+pub fn qpack_content_length(block: &[u8]) -> Option<usize> {
+    if *block.first()? != 0 || *block.get(1)? != 0 {
+        return None;
+    }
+    let mut at = 2usize;
+    let mut length = None;
+    while at < block.len() {
+        let first = block[at];
+        let name_is_length = if first & 0x80 != 0 {
+            let index = read_integer(block, &mut at, 6)?;
+            if static_name(index) == Some(b"content-length".as_slice()) {
+                length = Some(0);
+            }
+            continue;
+        } else if first & 0xC0 == 0x40 {
+            if first & 0x10 == 0 {
+                return None;
+            }
+            let index = read_integer(block, &mut at, 4)?;
+            static_name(index) == Some(b"content-length".as_slice())
+        } else if first & 0xE0 == 0x20 {
+            qpack_name(block, &mut at)?.as_bytes() == b"content-length"
+        } else {
+            return None;
+        };
+        let value = string_literal(block, &mut at)?;
+        if name_is_length {
+            length = Some(
+                std::str::from_utf8(value.as_bytes())
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()?,
+            );
+        }
+    }
+    length
+}
+
 /// A static table entry's name, which the `01` pattern names instead of spelling out: the entry's value is not read, only its name.
 fn static_name(index: usize) -> Option<&'static [u8]> {
     QPACK_STATIC.get(index).map(|(name, _)| *name)
