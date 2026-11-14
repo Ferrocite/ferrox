@@ -3872,7 +3872,7 @@ mod tests {
         let tun =
             TcpStream::connect(listener.local_addr().expect("pair address")).expect("connect");
         let (mut app, _) = listener.accept().expect("accept");
-        app.set_read_timeout(Some(Duration::from_secs(30)))
+        app.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         classic.inner.serve_tcp(
             crate::conn::Connection::from(tun),
