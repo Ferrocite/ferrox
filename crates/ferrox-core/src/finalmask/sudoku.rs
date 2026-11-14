@@ -334,7 +334,7 @@ const ENTROPY_DRAWS: usize = 256;
 /// A `getrandom` supply shaped like the reference's `rand/v2` draws: a pool of 64-bit words and
 /// Lemire's multiply-and-reject for the bounded draw.
 struct SudokuRng {
-    cache: [u64; ENTROPY_DRAWS],
+    cache: Box<[u64; ENTROPY_DRAWS]>,
     at: usize,
     #[cfg(test)]
     refills: usize,
@@ -343,7 +343,7 @@ struct SudokuRng {
 impl SudokuRng {
     fn new() -> Self {
         Self {
-            cache: [0; ENTROPY_DRAWS],
+            cache: Box::new([0; ENTROPY_DRAWS]),
             at: ENTROPY_DRAWS,
             #[cfg(test)]
             refills: 0,
