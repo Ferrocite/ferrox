@@ -61058,13 +61058,15 @@ mod tests {
         );
     }
 
-    /// A two-byte length must never truncate, so an oversize payload is a panic, not a wrap.
+    /// A two-byte length must never truncate, so an oversize payload is refused before a byte goes out.
     #[test]
-    #[should_panic(expected = "mux chunk longer than a length field")]
     fn a_relay_payload_longer_than_a_frame_is_refused_not_truncated() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let stream = Connection::connect(("127.0.0.1", port)).expect("dials");
+        let (mut peer, _) = listener.accept().expect("accepts");
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("timeout");
         let shared = Arc::new(Mutex::new(stream));
         let keep = ferrox_core::mux::Outgoing {
             id: 1,
@@ -61075,7 +61077,13 @@ mod tests {
         };
         let mut staging = Vec::new();
         let big = vec![0u8; ferrox_core::mux::CHUNK_MAX + 1];
-        let _ = write_mux_frame(&shared, &mut staging, keep, Some(&big));
+        assert!(!write_mux_frame(&shared, &mut staging, keep, Some(&big)));
+        assert!(staging.is_empty(), "the refusal stages no header");
+        let mut seen = [0u8; 8];
+        assert!(
+            !matches!(peer.read(&mut seen), Ok(n) if n > 0),
+            "the refusal writes no byte"
+        );
     }
 
     /// One pool serves both directions of every session: an idle leg that waits inside the carrier
