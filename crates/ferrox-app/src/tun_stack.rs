@@ -27,8 +27,7 @@ use crate::wireguard::DeviceConfig;
 
 pub(crate) const RX_QUEUE: usize = 1024;
 pub(crate) const TX_QUEUE: usize = 1024;
-/// A writer keeps this many aggregate-sized buffers so GRO never allocates on
-/// the packet path; 32 packets fill one 64 KiB aggregate.
+/// The most packets one write batches; 32 packets fill one 64 KiB aggregate.
 #[cfg(target_os = "linux")]
 const WRITE_BATCH: usize = 64;
 
@@ -162,6 +161,10 @@ pub(crate) fn tcp_only_offload(device: &SyncDevice) -> bool {
 
 #[allow(clippy::needless_pass_by_value)]
 fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outbound) {
+    #[cfg(target_os = "linux")]
+    let headroom = VIRTIO_NET_HDR_LEN;
+    #[cfg(not(target_os = "linux"))]
+    let headroom = 0;
     let (packets, incoming) = mpsc::sync_channel(RX_QUEUE);
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
     let (recycle, reused) = mpsc::sync_channel(RX_QUEUE);
@@ -183,6 +186,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             outgoing,
             stack_out,
             Some(recycle),
+            headroom,
             wake_read,
             stack_failed,
         );
@@ -193,13 +197,14 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             outgoing,
             stack_out,
             Some(recycle),
+            headroom,
             stack_failed,
         );
     });
     let send_device = Arc::clone(&device);
-    thread::spawn(move || send_loop(send_device, writes, offload, &failed));
+    thread::spawn(move || send_loop(send_device, writes, offload, headroom, &failed));
     let mtu = spec.mtu();
-    thread::spawn(move || recv_loop(device, packets, reused, mtu, wake_write));
+    thread::spawn(move || recv_loop(device, packets, reused, mtu, headroom, wake_write));
 }
 
 pub(crate) fn device_config(spec: &Spec) -> DeviceConfig {
@@ -217,12 +222,29 @@ pub(crate) fn device_config(spec: &Spec) -> DeviceConfig {
 }
 
 #[cfg(target_os = "linux")]
+fn take_slot(
+    bufs: &mut [Vec<u8>],
+    index: usize,
+    end: usize,
+    reuse: &Receiver<Vec<u8>>,
+    mtu: usize,
+) -> Vec<u8> {
+    let mut replacement = reuse.try_recv().unwrap_or_default();
+    replacement.clear();
+    replacement.resize(VIRTIO_NET_HDR_LEN + mtu, 0);
+    let mut bytes = std::mem::replace(&mut bufs[index], replacement);
+    bytes.truncate(end);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn recv_loop(
     device: Arc<SyncDevice>,
     packets: SyncSender<Packet>,
     reuse: Receiver<Vec<u8>>,
     mtu: usize,
+    headroom: usize,
     wake: WakeWriter,
 ) {
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
@@ -245,11 +267,15 @@ pub(crate) fn recv_loop(
             if sizes[index] == 0 || end > bufs[index].len() {
                 continue;
             }
-            let bytes = packet_bytes(&reuse, &bufs[index][VIRTIO_NET_HDR_LEN..end]);
+            let bytes = if headroom == VIRTIO_NET_HDR_LEN {
+                take_slot(&mut bufs, index, end, &reuse, mtu)
+            } else {
+                packet_bytes(&reuse, &bufs[index][VIRTIO_NET_HDR_LEN..end])
+            };
             let packet = Packet {
                 peer: [0; 32],
                 bytes,
-                at: 0,
+                at: headroom,
             };
             if packets.send(packet).is_err() {
                 return;
@@ -268,6 +294,7 @@ pub(crate) fn recv_loop(
     packets: SyncSender<Packet>,
     reuse: Receiver<Vec<u8>>,
     mtu: usize,
+    _headroom: usize,
     wake: WakeWriter,
 ) {
     let mut buffer = vec![0u8; mtu.max(1500) + 64];
@@ -299,15 +326,16 @@ fn send_loop(
     device: Arc<SyncDevice>,
     packets: Receiver<Vec<u8>>,
     offload: bool,
+    headroom: usize,
     failed: &AtomicBool,
 ) {
     if !offload {
-        send_plain(device, packets, failed, None);
+        send_packets_offset(device, packets, failed, headroom);
         return;
     }
     let mut gro = GROTable::default();
     let mut pool: Vec<Vec<u8>> = (0..WRITE_BATCH)
-        .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + 65_535))
+        .map(|_| Vec::with_capacity(headroom + 65_535))
         .collect();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH);
     loop {
@@ -316,10 +344,12 @@ fn send_loop(
         };
         batch.clear();
         let mut take = |packet: &[u8], batch: &mut Vec<Vec<u8>>| {
-            let mut buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(65_535));
+            let mut buffer = pool
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(headroom + 65_535));
             buffer.clear();
-            buffer.resize(VIRTIO_NET_HDR_LEN, 0);
-            buffer.extend_from_slice(packet);
+            buffer.resize(headroom, 0);
+            buffer.extend_from_slice(&packet[headroom..]);
             batch.push(buffer);
         };
         take(&packet, &mut batch);
@@ -329,7 +359,7 @@ fn send_loop(
                 Err(_) => break,
             }
         }
-        let written = device.send_multiple(&mut gro, &mut batch, VIRTIO_NET_HDR_LEN);
+        let written = device.send_multiple(&mut gro, &mut batch, headroom);
         for mut buffer in batch.drain(..) {
             buffer.clear();
             pool.push(buffer);
@@ -350,6 +380,7 @@ fn send_loop(
     device: Arc<SyncDevice>,
     packets: Receiver<Vec<u8>>,
     _offload: bool,
+    _headroom: usize,
     failed: &AtomicBool,
 ) {
     send_plain(device, packets, failed, None);
@@ -362,6 +393,22 @@ pub(crate) fn wake_signal(wake: &WakeWriter) {
 
 #[cfg(not(unix))]
 pub(crate) fn wake_signal(_: &WakeWriter) {}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::needless_pass_by_value)]
+fn send_packets_offset(
+    device: Arc<SyncDevice>,
+    packets: Receiver<Vec<u8>>,
+    failed: &AtomicBool,
+    offset: usize,
+) {
+    send_packets(&packets, failed, None, |packet| {
+        let body = packet
+            .get(offset..)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        device.send(body).map(|_| ())
+    });
+}
 
 fn packet_bytes(reuse: &Receiver<Vec<u8>>, source: &[u8]) -> Vec<u8> {
     let mut bytes = reuse.try_recv().unwrap_or_default();
@@ -475,5 +522,21 @@ mod tests {
         });
         assert_eq!(writes, 1, "a dead descriptor stops before the next packet");
         assert!(failed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_received_slot_keeps_its_allocation() {
+        let (_reuse, reused) = mpsc::sync_channel(1);
+        let mut bufs = vec![vec![0u8; VIRTIO_NET_HDR_LEN + 1500]];
+        let base = bufs[0].as_ptr();
+        let capacity = bufs[0].capacity();
+        let end = VIRTIO_NET_HDR_LEN + 60;
+        let bytes = take_slot(&mut bufs, 0, end, &reused, 1500);
+        assert_eq!(bytes.as_ptr(), base, "the slot moved between buffers");
+        assert_eq!(bytes.capacity(), capacity, "the slot reallocated");
+        assert_eq!(bytes.len(), end);
+        assert_ne!(bufs[0].as_ptr(), base, "the batch reused the returned slot");
+        assert_eq!(bufs[0].len(), VIRTIO_NET_HDR_LEN + 1500);
     }
 }
