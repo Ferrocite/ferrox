@@ -1888,6 +1888,7 @@ fn io(
                 }
             }
         }
+        quic::flush_egress(&mut conn, sock);
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
             break;
         }
