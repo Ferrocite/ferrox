@@ -1,7 +1,5 @@
 //! HPACK for HTTP/2 and QPACK for HTTP/3, both answering one question — the status — and refusing any representation needing a table the lane never fills, while both encoders write literals only: one request per stream, no table state, no Huffman. Integers share one prefix scheme: below `2^n - 1` the low `n` bits of one byte, else that maximum plus a base-128 remainder.
 
-use std::sync::OnceLock;
-
 /// The HPACK Huffman code is canonical — consecutive codes per length, each starting where the previous ended shifted left — so one byte per symbol rebuilds every code and a code maps back by its offset within its length.
 const HUFFMAN_BITS: [u8; 257] = [
     13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, //
@@ -40,58 +38,80 @@ struct Huffman {
     symbols: [u16; 257],
     /// Each symbol's canonical code, built by the same walk the decode ranges come from, so encode and decode can never disagree.
     codes: [u32; 257],
-    /// One load resolves every symbol of `PEEK` bits or fewer — which is every ASCII byte — as `(symbol << 5) | length`; zero means no code of that length prefixes the window, and the serial probe takes over from the bits already read. Prefix-freeness makes the entry unique, and Kraft makes the table fill below one write per entry.
+    /// One load resolves every symbol of `PEEK` bits or fewer — which is most printable ASCII bytes — as `(symbol << 5) | length`; zero means no code of that length prefixes the window, and the serial probe takes over from the bits already read. Prefix-freeness makes the entry unique, and Kraft makes the table fill below one write per entry.
     primary: [u16; 1 << PEEK],
 }
 
-fn huffman() -> &'static Huffman {
-    static TABLE: OnceLock<Huffman> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = Huffman {
-            probe: [0; MAX_BITS + 1],
-            base: [0; MAX_BITS + 1],
-            symbols: [0; 257],
-            codes: [0; 257],
-            primary: [0; 1 << PEEK],
-        };
-        let mut next = 0u32;
-        let mut placed = 0usize;
-        let mut previous = 0usize;
-        for bits in SHORTEST..=MAX_BITS {
-            if !HUFFMAN_BITS.contains(&(bits as u8)) {
-                continue;
-            }
+const fn has_length(bits: usize) -> bool {
+    let mut at = 0;
+    while at < HUFFMAN_BITS.len() {
+        if HUFFMAN_BITS[at] as usize == bits {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+const fn huffman_table() -> Huffman {
+    let mut table = Huffman {
+        probe: [0; MAX_BITS + 1],
+        base: [0; MAX_BITS + 1],
+        symbols: [0; 257],
+        codes: [0; 257],
+        primary: [0; 1 << PEEK],
+    };
+    let mut next = 0u32;
+    let mut placed = 0usize;
+    let mut previous = 0usize;
+    let mut bits = SHORTEST;
+    while bits <= MAX_BITS {
+        if has_length(bits) {
             next <<= bits - previous;
             previous = bits;
             let first = next;
             table.base[bits] = placed as u16;
             let mut count = 0u32;
-            for (symbol, length) in HUFFMAN_BITS.iter().enumerate() {
-                if usize::from(*length) != bits {
-                    continue;
+            let mut symbol = 0usize;
+            while symbol < HUFFMAN_BITS.len() {
+                if HUFFMAN_BITS[symbol] as usize == bits {
+                    table.symbols[placed] = symbol as u16;
+                    table.codes[symbol] = first + count;
+                    count += 1;
+                    placed += 1;
+                    next += 1;
                 }
-                table.symbols[placed] = symbol as u16;
-                table.codes[symbol] = first + count;
-                count += 1;
-                placed += 1;
-                next += 1;
+                symbol += 1;
             }
-            table.probe[bits] = (u64::from(first) << 32) | u64::from(count);
+            table.probe[bits] = ((first as u64) << 32) | count as u64;
             if bits <= PEEK {
                 let spread = 1usize << (PEEK - bits);
-                for slot in 0..count as usize {
+                let mut slot = 0usize;
+                while slot < count as usize {
                     let entry =
                         (table.symbols[table.base[bits] as usize + slot] << 5) | bits as u16;
                     let window = (first as usize + slot) << (PEEK - bits);
-                    table.primary[window..window + spread].fill(entry);
+                    let mut at = 0usize;
+                    while at < spread {
+                        table.primary[window + at] = entry;
+                        at += 1;
+                    }
+                    slot += 1;
                 }
             }
         }
-        table
-    })
+        bits += 1;
+    }
+    table
 }
 
-/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. The unread bits sit in one register, refilled a byte at a time, so a symbol costs a shift and a load of the 4096-entry table `huffman()` builds once beside the probe rows — it answers every code of length `PEEK` or shorter, which is the whole ASCII range — and a miss hands the register's high bits to the same serial probe the pre-table decoder ran, for the 13..30-bit codes, without reading a byte for it.
+static HUFFMAN: Huffman = huffman_table();
+
+fn huffman() -> &'static Huffman {
+    &HUFFMAN
+}
+
+/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. The unread bits sit in one register, refilled a byte at a time, so a symbol costs a shift and a load of the 4096-entry static table beside the probe rows — it answers every code of length `PEEK` or shorter, which is most of the printable ASCII range — and a miss hands the register's high bits to the same serial probe the pre-table decoder ran, for the 13..30-bit codes, without reading a byte for it.
 pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let table = huffman();
     // The register is left-justified at the next unread bit, so consuming a symbol is one shift, and `held + 8 * (code.len() - cursor)` is the string's remaining bit count at every point of the walk.
@@ -1050,9 +1070,22 @@ mod tests {
         assert_eq!(out, b"dat");
     }
 
-    /// A coded literal is a `len`-byte window holding at most `8 * len / SHORTEST` symbols, so a buffer sized to `len` overflows on any literal denser than eight bits a symbol and pays a reallocation plus a copy of what it already wrote.
+    /// A coded literal is a `len`-byte window holding at most `8 * len / SHORTEST` symbols, so a buffer sized to `len` overflows on any literal denser than eight bits a symbol and pays a reallocation plus a copy of what it already wrote. The allocator window opens at the first literal so a lazy table build would be counted too.
     #[test]
     fn a_coded_literal_is_decoded_into_one_allocation() {
+        // The fixed fixture keeps every table access inside the window below.
+        let block = [0x82, 0x10, 0x01];
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                let mut at = 0usize;
+                std::hint::black_box(string_literal(std::hint::black_box(&block), &mut at));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (4096, 4096 * 3, 0),
+            "4096 coded statuses take one buffer each and no growth"
+        );
         let decode = |value: &str| {
             let mut coded = Vec::new();
             huffman_encode(value.as_bytes(), &mut coded);
@@ -1067,8 +1100,6 @@ mod tests {
                 Literal::Borrowed(_) => unreachable!("the H bit named a coded literal"),
             }
         };
-        // The table's one-time build allocates, so the window opens only after a decode has already run.
-        decode("200");
         for value in ["200", "12345678", "gzip", "a", "www.cloudflare.com"] {
             let (capacity, coded) = decode(value);
             assert_eq!(
@@ -1081,21 +1112,6 @@ mod tests {
                 "{value}: the bound still holds the string it decodes to"
             );
         }
-        let mut coded = Vec::new();
-        huffman_encode(b"200", &mut coded);
-        let mut block = vec![0x80 | coded.len() as u8];
-        block.extend_from_slice(&coded);
-        let ((), counts) = crate::alloc_count::measure(|| {
-            for _ in 0..4096 {
-                let mut at = 0usize;
-                std::hint::black_box(string_literal(std::hint::black_box(&block), &mut at));
-            }
-        });
-        assert_eq!(
-            (counts.allocs, counts.bytes, counts.zeroed),
-            (4096, 4096 * 3, 0),
-            "4096 coded statuses take one buffer each and no growth"
-        );
     }
 
     #[test]
