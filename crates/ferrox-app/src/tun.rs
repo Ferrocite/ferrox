@@ -415,6 +415,15 @@ fn path_mss(mtu: u32, ipv6: bool) -> u32 {
     mtu.saturating_sub(header).max(SMALLEST_MSS)
 }
 
+/// How much a response read may take: one segment without offload, the whole buffer when the descriptor can split a GSO packet.
+fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
+    if gso {
+        room
+    } else {
+        mss.min(room)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
     source_port: u16,
@@ -1287,7 +1296,7 @@ impl Handler {
             });
             let end = loop {
                 let max = (mss.load(Relaxed) as usize).max(1);
-                let limit = max.min(buf.len());
+                let limit = read_limit(gso_capable, max, buf.len());
                 match read_half.read(&mut buf[..limit]) {
                     Ok(0) => {
                         // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
@@ -1575,6 +1584,13 @@ mod tests {
     #[test]
     fn tcp_head_refuses_short_segment() {
         assert!(tcp_head(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn a_gso_read_can_take_more_than_one_mss() {
+        assert_eq!(read_limit(true, 1400, 65_515), 65_515);
+        assert_eq!(read_limit(false, 1400, 65_515), 1400);
+        assert_eq!(read_limit(false, 1400, 700), 700);
     }
 
     #[test]
