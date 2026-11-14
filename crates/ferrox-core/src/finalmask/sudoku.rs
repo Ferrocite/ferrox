@@ -1239,7 +1239,7 @@ mod tests {
                     for d in 0..4u8 {
                         let mut want = [a, b, c, d];
                         want.sort_unstable();
-                        assert_eq!(sort4([a, b, c, d]), want, "{[a, b, c, d]:?}");
+                        assert_eq!(sort4([a, b, c, d]), want, "{:?}", [a, b, c, d]);
                     }
                 }
             }
