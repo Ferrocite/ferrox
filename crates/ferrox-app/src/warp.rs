@@ -130,6 +130,7 @@ enum Mode {
     WireGuard,
     Masque,
     Gool,
+    GoolClassic,
 }
 
 impl Mode {
@@ -139,8 +140,9 @@ impl Mode {
             "wireguard" | "wg" => Ok(Self::WireGuard),
             "masque" => Ok(Self::Masque),
             "gool" | "wg-over-masque" => Ok(Self::Gool),
+            "gool-classic" | "wiw" | "warp-in-warp" => Ok(Self::GoolClassic),
             other => Err(format!(
-                "warp mode `{other}` is not auto, wireguard, masque or gool"
+                "warp mode `{other}` is not auto, wireguard, masque, gool or gool-classic"
             )),
         }
     }
@@ -151,6 +153,7 @@ impl Mode {
             Self::WireGuard => "wireguard",
             Self::Masque => "masque",
             Self::Gool => "gool",
+            Self::GoolClassic => "gool-classic",
         }
     }
 }
@@ -254,12 +257,14 @@ impl EdgeSpec {
     }
 }
 
-/// The inner hop's explicit identity, file and edge.
+/// The inner hop's explicit identity, files and edge.
 #[derive(Debug, Clone, Default)]
 struct GoolSettings {
     identity_file: Option<PathBuf>,
     inline: Option<Identity>,
     peer: Option<SocketAddr>,
+    wiw_outer: Option<SocketAddr>,
+    wiw_inner: Option<SocketAddr>,
 }
 
 fn gool_settings(settings: &crate::json::Json) -> Result<GoolSettings, String> {
@@ -284,7 +289,30 @@ fn gool_settings(settings: &crate::json::Json) -> Result<GoolSettings, String> {
         identity_file,
         inline,
         peer,
+        wiw_outer: nested_peer(settings, "wiwOuter", "AETHER_WIW_OUTER_PEER")?,
+        wiw_inner: nested_peer(settings, "wiwInner", "AETHER_WIW_INNER_PEER")?,
     })
+}
+
+fn nested_peer(
+    settings: &crate::json::Json,
+    key: &str,
+    environment: &str,
+) -> Result<Option<SocketAddr>, String> {
+    let text = settings
+        .get(key)
+        .and_then(crate::json::Json::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(environment)
+                .ok()
+                .filter(|text| !text.is_empty())
+        });
+    text.map(|text| {
+        parse_endpoint(&text).ok_or_else(|| format!("warp: `{key}` is not an address: `{text}`"))
+    })
+    .transpose()
 }
 
 impl WarpSpec {
@@ -418,10 +446,11 @@ impl WarpSpec {
                     .to_owned(),
             );
         };
-        Ok(derive_sibling_path(
-            &derive_sibling_path(file, "masque"),
-            "gool",
-        ))
+        Ok(if self.mode == Mode::GoolClassic {
+            derive_sibling_path(file, "secondary")
+        } else {
+            derive_sibling_path(&derive_sibling_path(file, "masque"), "gool")
+        })
     }
 
     /// The inner `WireGuard` identity, registered beside the outer one when absent.
@@ -434,7 +463,7 @@ impl WarpSpec {
 
     /// A saved identity's lifecycle, shared by the outer device and gool's inner one.
     fn identity_at(&self, path: &Path, inner: bool) -> Result<Identity, String> {
-        let enroll = !inner && self.mode != Mode::WireGuard;
+        let enroll = !inner && !matches!(self.mode, Mode::WireGuard | Mode::GoolClassic);
         if path.is_file() {
             let saved = match Identity::load(path) {
                 Ok(saved) => saved,
@@ -1553,6 +1582,66 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     Ok(())
 }
 
+/// Place the two `WireGuard` hops on distinct edges, scanning each with the key
+/// that must own it so a verified edge carries the hop it was found for.
+fn resolve_classic_edges(
+    outer: &mut Identity,
+    inner: &mut Identity,
+    spec: &mut WarpSpec,
+) -> Result<(), String> {
+    let mut outer_edge = spec.gool.wiw_outer.or(spec.wg_peer).or(spec.endpoint);
+    let mut inner_edge = spec.gool.wiw_inner.or(spec.gool.peer);
+    if let Some(edge) = outer_edge {
+        println!("[+] using forced outer peer {edge} (probe skipped)");
+    }
+    if let Some(edge) = inner_edge {
+        println!("[+] using forced inner peer {edge} (probe skipped)");
+    }
+    if let Some(mode) = spec.scan {
+        eprintln!("warp: scanning edges in {} mode", mode.label());
+        let timeout = spec.stale.map_or_else(
+            || warp_scan::scan_timeout(mode),
+            |stale| stale.min(warp_scan::scan_timeout(mode)),
+        );
+        if outer_edge.is_none() {
+            let avoid: HashSet<IpAddr> = inner_edge.map(|edge| edge.ip()).into_iter().collect();
+            outer_edge =
+                scan_wireguard_edges(outer, spec, mode, timeout, &HashSet::new(), &avoid, 16)
+                    .into_iter()
+                    .next();
+            if let Some(edge) = outer_edge {
+                println!("[+] selected outer WireGuard endpoint {edge}");
+            }
+        }
+        if inner_edge.is_none() {
+            let avoid: HashSet<IpAddr> = outer_edge.map(|edge| edge.ip()).into_iter().collect();
+            inner_edge =
+                scan_wireguard_edges(inner, spec, mode, timeout, &HashSet::new(), &avoid, 16)
+                    .into_iter()
+                    .next();
+            if let Some(edge) = inner_edge {
+                println!("[+] selected inner WireGuard endpoint {edge}");
+            }
+        }
+        if outer_edge.is_none() {
+            eprintln!("warp: the outer WireGuard sweep found no edge; keeping the API endpoint");
+        }
+        if inner_edge.is_none() {
+            eprintln!("warp: the inner WireGuard sweep found no edge; keeping the API endpoint");
+        }
+    }
+    let outer_edge = outer_edge.unwrap_or(outer.wireguard.endpoint);
+    let inner_edge = inner_edge.unwrap_or(inner.wireguard.endpoint);
+    if outer_edge.ip() == inner_edge.ip() {
+        return Err(format!(
+            "warp gool-classic: the outer edge {outer_edge} and inner edge {inner_edge} share an address; name distinct `wiwOuter`/`wiwInner` peers or enable `scan`"
+        ));
+    }
+    outer.wireguard.endpoint = outer_edge;
+    inner.wireguard.endpoint = inner_edge;
+    Ok(())
+}
+
 fn set_masque_edge(spec: &mut WarpSpec, edge: SocketAddr) {
     spec.masque_address = edge.ip().to_string();
     spec.masque_port = edge.port();
@@ -1565,8 +1654,26 @@ fn scan_wireguard(
     timeout: Duration,
     excluded: &HashSet<SocketAddr>,
 ) -> Option<SocketAddr> {
+    scan_wireguard_edges(identity, spec, mode, timeout, excluded, &HashSet::new(), 1)
+        .into_iter()
+        .next()
+}
+
+fn scan_wireguard_edges(
+    identity: &Identity,
+    spec: &WarpSpec,
+    mode: ScanMode,
+    timeout: Duration,
+    excluded: &HashSet<SocketAddr>,
+    avoid: &HashSet<IpAddr>,
+    limit: usize,
+) -> Vec<SocketAddr> {
     let ironclad = mode == ScanMode::Ironclad;
-    warp_scan::hunt(warp_scan::wg_candidates(mode), mode, excluded, |edge| {
+    let candidates = warp_scan::wg_candidates(mode)
+        .into_iter()
+        .filter(|edge| !avoid.contains(&edge.ip()))
+        .collect();
+    warp_scan::hunt(candidates, mode, excluded, |edge| {
         let local = identity
             .wireguard
             .addresses
@@ -1589,8 +1696,10 @@ fn scan_wireguard(
         }
         Some(rtt)
     })
-    .first()
-    .map(|(edge, _)| *edge)
+    .into_iter()
+    .take(limit)
+    .map(|(edge, _)| edge)
+    .collect()
 }
 
 fn scan_masque(
@@ -1841,6 +1950,7 @@ enum Lane {
     WireGuard,
     Masque,
     Gool,
+    GoolClassic,
 }
 
 /// The outbound: both built halves, the mode that bounds which may run, and
@@ -1851,6 +1961,7 @@ pub(crate) struct WarpOut {
     wireguard: Option<Arc<crate::wg::WireGuardOut>>,
     masque: Option<Arc<crate::masque::MasqueOut>>,
     gool: Option<Arc<GoolOut>>,
+    gool_classic: Option<Arc<GoolClassicOut>>,
     chosen: Mutex<Option<Lane>>,
     probe_host: String,
     probe_port: u16,
@@ -1863,6 +1974,7 @@ impl WarpOut {
             wireguard: None,
             masque: None,
             gool: None,
+            gool_classic: None,
             chosen: Mutex::new(None),
             probe_host: spec.probe_host.clone(),
             probe_port: spec.probe_port,
@@ -1887,17 +1999,24 @@ impl WarpOut {
             spec.identity()?
         };
         if test
-            && spec.mode == Mode::Gool
+            && matches!(spec.mode, Mode::Gool | Mode::GoolClassic)
             && spec.gool.inline.is_none()
             && !spec.gool_path().is_ok_and(|path| path.is_file())
         {
             // The inner device, like the outer, is registered at runtime, not by a config test.
             return Ok(Self::unbuilt(&spec));
         }
-        if !test {
+        let mut inner_identity = None;
+        if spec.mode == Mode::GoolClassic {
+            let mut inner = spec.gool_identity()?;
+            if !test {
+                resolve_classic_edges(&mut identity, &mut inner, &mut spec)?;
+            }
+            inner_identity = Some(inner);
+        } else if !test {
             resolve_edges(&mut identity, &mut spec)?;
         }
-        let wireguard = if matches!(spec.mode, Mode::Masque | Mode::Gool) {
+        let wireguard = if matches!(spec.mode, Mode::Masque | Mode::Gool | Mode::GoolClassic) {
             None
         } else {
             match build_wireguard(&identity, &spec) {
@@ -1911,7 +2030,7 @@ impl WarpOut {
                 }
             }
         };
-        let masque = if matches!(spec.mode, Mode::WireGuard | Mode::Gool) {
+        let masque = if matches!(spec.mode, Mode::WireGuard | Mode::Gool | Mode::GoolClassic) {
             None
         } else if identity.masque.is_none() {
             if spec.mode == Mode::Masque {
@@ -1935,7 +2054,15 @@ impl WarpOut {
         } else {
             None
         };
-        if wireguard.is_none() && masque.is_none() && gool.is_none() {
+        let gool_classic = if spec.mode == Mode::GoolClassic {
+            let inner = inner_identity
+                .as_ref()
+                .ok_or("warp gool-classic: the inner identity was not built")?;
+            Some(Arc::new(build_gool_classic(&identity, inner, &spec)?))
+        } else {
+            None
+        };
+        if wireguard.is_none() && masque.is_none() && gool.is_none() && gool_classic.is_none() {
             return Err("warp: neither half could be built".to_owned());
         }
         Ok(Self {
@@ -1943,6 +2070,7 @@ impl WarpOut {
             wireguard,
             masque,
             gool,
+            gool_classic,
             chosen: Mutex::new(None),
             probe_host: spec.probe_host,
             probe_port: spec.probe_port,
@@ -1956,6 +2084,7 @@ impl WarpOut {
             Mode::WireGuard => return Lane::WireGuard,
             Mode::Masque => return Lane::Masque,
             Mode::Gool => return Lane::Gool,
+            Mode::GoolClassic => return Lane::GoolClassic,
             Mode::Auto => {}
         }
         // The lock spans the race so a second flow waits for the answer instead of probing again.
@@ -1993,15 +2122,24 @@ impl WarpOut {
             Mode::WireGuard => self.wireguard.as_ref().and_then(|half| half.edge()),
             Mode::Masque => self.masque.as_ref().and_then(|half| half.edge()),
             Mode::Gool => self.gool.as_ref().and_then(|gool| gool.edge()),
+            Mode::GoolClassic => self
+                .gool_classic
+                .as_ref()
+                .and_then(|classic| classic.edge()),
             Mode::Auto => match self.chosen.lock().ok().and_then(|chosen| *chosen) {
                 Some(Lane::WireGuard) => self.wireguard.as_ref().and_then(|half| half.edge()),
                 Some(Lane::Masque) => self.masque.as_ref().and_then(|half| half.edge()),
                 Some(Lane::Gool) => self.gool.as_ref().and_then(|gool| gool.edge()),
+                Some(Lane::GoolClassic) => self
+                    .gool_classic
+                    .as_ref()
+                    .and_then(|classic| classic.edge()),
                 None => self
                     .wireguard
                     .as_ref()
                     .and_then(|half| half.edge())
-                    .or_else(|| self.masque.as_ref().and_then(|half| half.edge())),
+                    .or_else(|| self.masque.as_ref().and_then(|half| half.edge()))
+                    .or_else(|| self.gool_classic.as_ref().and_then(|half| half.edge())),
             },
         }
     }
@@ -2028,6 +2166,11 @@ impl WarpOut {
                     gool.inner.serve_tcp(client, asked, prefix);
                 }
             }
+            Lane::GoolClassic => {
+                if let Some(classic) = &self.gool_classic {
+                    classic.inner.serve_tcp(client, asked, prefix);
+                }
+            }
         }
     }
 
@@ -2050,6 +2193,11 @@ impl WarpOut {
             Lane::Gool => {
                 if let Some(gool) = &self.gool {
                     gool.inner.serve_udp(relay, associate);
+                }
+            }
+            Lane::GoolClassic => {
+                if let Some(classic) = &self.gool_classic {
+                    classic.inner.serve_udp(relay, associate);
                 }
             }
         }
@@ -2107,7 +2255,7 @@ fn build_masque(identity: &Identity, spec: &WarpSpec) -> Result<crate::masque::M
 pub(crate) struct GoolOut {
     outer: Arc<crate::masque::MasqueOut>,
     inner: Arc<crate::wg::WireGuardOut>,
-    _forwarder: crate::masque::UdpForwarder,
+    _forwarder: crate::wg_stack::UdpForwarder,
 }
 
 impl GoolOut {
@@ -2144,6 +2292,52 @@ fn build_gool(identity: &Identity, spec: &WarpSpec) -> Result<GoolOut, String> {
     let remote = spec.gool.peer.unwrap_or(inner_identity.wireguard.endpoint);
     let outer = build_masque(identity, spec)?;
     GoolOut::new(outer, &inner_identity, spec, remote)
+}
+
+/// `WireGuard` carried inside another `WireGuard` conversation.
+#[derive(Debug)]
+pub(crate) struct GoolClassicOut {
+    outer: Arc<crate::wg::WireGuardOut>,
+    inner: Arc<crate::wg::WireGuardOut>,
+    _forwarder: crate::wg_stack::UdpForwarder,
+}
+
+impl GoolClassicOut {
+    fn new(
+        outer: crate::wg::WireGuardOut,
+        inner_identity: &Identity,
+        spec: &WarpSpec,
+        remote: SocketAddr,
+    ) -> Result<Self, String> {
+        let outer = Arc::new(outer);
+        let forwarder = outer.udp_forwarder(remote)?;
+        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local);
+        let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
+        let inner = crate::wg::WireGuardOut::new(config)?;
+        Ok(Self {
+            outer,
+            inner: Arc::new(inner),
+            _forwarder: forwarder,
+        })
+    }
+
+    fn edge(&self) -> Option<SocketAddr> {
+        self.outer.edge()
+    }
+}
+
+fn build_gool_classic(
+    outer_identity: &Identity,
+    inner_identity: &Identity,
+    spec: &WarpSpec,
+) -> Result<GoolClassicOut, String> {
+    let remote = spec
+        .gool
+        .wiw_inner
+        .or(spec.gool.peer)
+        .unwrap_or(inner_identity.wireguard.endpoint);
+    let outer = build_wireguard(outer_identity, spec)?;
+    GoolClassicOut::new(outer, inner_identity, spec, remote)
 }
 
 /// The `--register` kinds: one protocol, both hops of a two-hop one, or all five.
@@ -2347,6 +2541,8 @@ pub(crate) fn one_tap(
     mode: &str,
     api: Option<&str>,
     api_address: Option<&str>,
+    wiw_outer: Option<&str>,
+    wiw_inner: Option<&str>,
 ) -> Result<String, String> {
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
@@ -2356,6 +2552,18 @@ pub(crate) fn one_tap(
             path.display()
         ));
     }
+    let wiw_outer = wiw_outer
+        .map(|text| {
+            parse_endpoint(text)
+                .ok_or_else(|| format!("warp: `--wiw-outer` is not an address: `{text}`"))
+        })
+        .transpose()?;
+    let wiw_inner = wiw_inner
+        .map(|text| {
+            parse_endpoint(text)
+                .ok_or_else(|| format!("warp: `--wiw-inner` is not an address: `{text}`"))
+        })
+        .transpose()?;
     let spec = WarpSpec {
         mode,
         register: true,
@@ -2385,22 +2593,30 @@ pub(crate) fn one_tap(
         last_edge: None,
         stale: None,
         cooldown: Duration::from_secs(COOLDOWN_SECS),
-        gool: GoolSettings::default(),
+        gool: GoolSettings {
+            wiw_outer,
+            wiw_inner,
+            ..GoolSettings::default()
+        },
     };
-    let identity = register(&spec, true)?;
-    if mode == Mode::Gool {
+    let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
+    if matches!(mode, Mode::Gool | Mode::GoolClassic) {
         spec.gool_identity()?;
     }
     identity.save(&path)?;
+    let mut settings = vec![
+        ("mode", string(mode.label())),
+        ("identityFile", string(&path.to_string_lossy())),
+    ];
+    if let Some(edge) = wiw_outer {
+        settings.push(("wiwOuter", string(&edge.to_string())));
+    }
+    if let Some(edge) = wiw_inner {
+        settings.push(("wiwInner", string(&edge.to_string())));
+    }
     let outbound = obj_pairs(vec![
         ("protocol", string("warp")),
-        (
-            "settings",
-            obj_pairs(vec![
-                ("mode", string(mode.label())),
-                ("identityFile", string(&path.to_string_lossy())),
-            ]),
-        ),
+        ("settings", obj_pairs(settings)),
     ]);
     let config = obj_pairs(vec![("outbounds", crate::json::Json::Arr(vec![outbound]))]);
     let mut text = String::new();
@@ -2507,11 +2723,16 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
     let mut kind = None;
     let mut wireguard = None;
     let mut masque = None;
+    let mut wiw_outer = None;
+    let mut wiw_inner = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
             "-o" | "--out" | "--identity" | "--config" => base = value(),
             "--mode" => mode = value(),
+            "--gool-classic" => mode = String::from("gool-classic"),
+            "--wiw-outer" => wiw_outer = Some(value()),
+            "--wiw-inner" => wiw_inner = Some(value()),
             "--api" => api = Some(value()),
             "--api-address" => api_address = Some(value()),
             "--wg-config" => wireguard = Some(value()),
@@ -2534,7 +2755,14 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             if wireguard.is_some() || masque.is_some() {
                 usage();
             }
-            one_tap(&base, &mode, api.as_deref(), api_address.as_deref())
+            one_tap(
+                &base,
+                &mode,
+                api.as_deref(),
+                api_address.as_deref(),
+                wiw_outer.as_deref(),
+                wiw_inner.as_deref(),
+            )
         }
         Some(kind) => {
             let mode = match Mode::parse(Some(&mode)) {
@@ -3304,6 +3532,77 @@ mod tests {
     }
 
     #[test]
+    fn a_gool_classic_mode_parses_both_hops() {
+        let spec = WarpSpec::from(
+            &crate::json::parse(
+                r#"{"mode":"gool-classic","register":true,"wiwOuter":"192.0.2.1:2408","wiwInner":"192.0.2.2:2408","goolIdentityFile":"inner.json"}"#,
+            )
+            .expect("settings"),
+        )
+        .expect("a gool-classic spec");
+        assert_eq!(spec.mode, Mode::GoolClassic);
+        assert_eq!(spec.mode.label(), "gool-classic");
+        assert_eq!(
+            spec.gool.wiw_outer,
+            Some("192.0.2.1:2408".parse().expect("the outer peer"))
+        );
+        assert_eq!(
+            spec.gool.wiw_inner,
+            Some("192.0.2.2:2408".parse().expect("the inner peer"))
+        );
+        assert_eq!(
+            Mode::parse(Some("wiw")).expect("the alias"),
+            Mode::GoolClassic
+        );
+    }
+
+    #[test]
+    fn the_gool_classic_inner_identity_derives_beside_the_outer_one() {
+        let spec = WarpSpec {
+            mode: Mode::GoolClassic,
+            identity_file: Some(PathBuf::from("/tmp/warp-identity.json")),
+            ..sample_spec()
+        };
+        assert_eq!(
+            spec.gool_path().expect("the inner path"),
+            PathBuf::from("/tmp/warp-identity-secondary.json")
+        );
+        let gool = WarpSpec {
+            mode: Mode::Gool,
+            ..spec
+        };
+        assert_eq!(
+            gool.gool_path().expect("the inner path"),
+            PathBuf::from("/tmp/warp-identity-masque-gool.json")
+        );
+    }
+
+    #[test]
+    fn the_two_gool_classic_hops_must_land_on_distinct_edges() {
+        let mut outer = sample_identity();
+        let mut inner = sample_identity();
+        let mut spec = sample_spec();
+        spec.mode = Mode::GoolClassic;
+        spec.gool.wiw_outer = Some("192.0.2.1:2408".parse().expect("the outer peer"));
+        spec.gool.wiw_inner = Some("192.0.2.1:2408".parse().expect("the inner peer"));
+        assert_eq!(
+            resolve_classic_edges(&mut outer, &mut inner, &mut spec),
+            Err("warp gool-classic: the outer edge 192.0.2.1:2408 and inner edge 192.0.2.1:2408 share an address; name distinct `wiwOuter`/`wiwInner` peers or enable `scan`".to_owned())
+        );
+
+        spec.gool.wiw_inner = Some("192.0.2.2:2408".parse().expect("a second peer"));
+        resolve_classic_edges(&mut outer, &mut inner, &mut spec).expect("distinct hops");
+        assert_eq!(
+            outer.wireguard.endpoint,
+            "192.0.2.1:2408".parse().expect("outer")
+        );
+        assert_eq!(
+            inner.wireguard.endpoint,
+            "192.0.2.2:2408".parse().expect("inner")
+        );
+    }
+
+    #[test]
     fn a_malformed_gool_peer_is_refused() {
         let reason = WarpSpec::from(
             &crate::json::parse(r#"{"mode":"gool","register":true,"goolPeer":"not-an-address"}"#)
@@ -3465,6 +3764,117 @@ mod tests {
         app.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         gool.inner.serve_tcp(
+            crate::conn::Connection::from(tun),
+            &crate::proxy::Destination::Address(echo_address),
+            b"head",
+        );
+        app.write_all(b"hello").expect("write");
+        let mut answer = [0u8; 9];
+        app.read_exact(&mut answer).expect("read");
+        assert_eq!(&answer, b"headhello");
+    }
+
+    #[test]
+    fn wireguard_rides_inside_wireguard() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+
+        use ferrox_core::foxy::account::hex_encode;
+        use ferrox_core::wireguard::device::public_key;
+
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("echo address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                seen += n;
+                if seen >= 9 {
+                    return;
+                }
+            }
+        });
+
+        let outer_client_private = [0x11; 32];
+        let outer_server_private = [0x22; 32];
+        let inner_client_private = [0x33; 32];
+        let inner_server_private = [0x44; 32];
+        let outer_client_public = public_key(&outer_client_private);
+        let outer_server_public = public_key(&outer_server_private);
+        let inner_client_public = public_key(&inner_client_private);
+        let inner_server_public = public_key(&inner_server_private);
+
+        let inner_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.1.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.1.0.2/32"]}}}}]}}"#,
+            hex_encode(&inner_server_private),
+            hex_encode(&inner_client_public)
+        );
+        let inner_inbound = crate::json::parse(&format!(r#"{{"settings":{inner_settings}}}"#))
+            .expect("an inner wireguard inbound");
+        let inner_port =
+            crate::wg::serve_inbound(&inner_inbound, &freedom_outbound(None), "127.0.0.1:0")
+                .expect("the inner wireguard server serves");
+
+        let outer_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            hex_encode(&outer_server_private),
+            hex_encode(&outer_client_public)
+        );
+        let outer_inbound = crate::json::parse(&format!(r#"{{"settings":{outer_settings}}}"#))
+            .expect("an outer wireguard inbound");
+        let redirect = format!("127.0.0.1:{inner_port}");
+        let outer_port = crate::wg::serve_inbound(
+            &outer_inbound,
+            &freedom_outbound(Some(&redirect)),
+            "127.0.0.1:0",
+        )
+        .expect("the outer wireguard server serves");
+
+        let outer_client = crate::json::parse(&format!(
+            r#"{{"secretKey":"{}","address":["10.0.0.2"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:{outer_port}"}}],"noKernelTun":true}}"#,
+            hex_encode(&outer_client_private),
+            hex_encode(&outer_server_public)
+        ))
+        .expect("an outer wireguard outbound");
+        let config =
+            crate::wireguard::DeviceConfig::from_json(&outer_client).expect("the outer config");
+        let outer = crate::wg::WireGuardOut::new(config).expect("the outer tunnel");
+
+        let inner_identity = Identity {
+            device_id: "wiw".to_owned(),
+            token: String::new(),
+            wireguard: WireGuardIdentity {
+                private: inner_client_private,
+                peer: inner_server_public,
+                endpoint: "192.0.2.9:2408".parse().expect("the inner endpoint"),
+                addresses: vec!["10.1.0.2".parse().expect("the inner address")],
+                reserved: [0; 3],
+            },
+            masque: None,
+        };
+        let spec = WarpSpec::for_command(Mode::GoolClassic, None, None);
+        let remote: SocketAddr = format!("127.0.0.1:{inner_port}")
+            .parse()
+            .expect("the inner peer");
+        let classic = GoolClassicOut::new(outer, &inner_identity, &spec, remote)
+            .expect("the classic chain builds");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun =
+            TcpStream::connect(listener.local_addr().expect("pair address")).expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
+        app.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        classic.inner.serve_tcp(
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",

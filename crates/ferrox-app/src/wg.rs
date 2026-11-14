@@ -362,6 +362,36 @@ impl WireGuardOut {
         );
     }
 
+    /// A fixed-target datagram lane that carries another tunnel's packets
+    /// verbatim, with room for the `WireGuard` header this hop adds.
+    pub(crate) fn udp_forwarder(
+        &self,
+        target: SocketAddr,
+    ) -> Result<wg_stack::UdpForwarder, String> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("wireguard forwarder: cannot bind: {error}"))?;
+        let local = socket
+            .local_addr()
+            .map_err(|error| format!("wireguard forwarder: no local address: {error}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let config = Arc::clone(&self.config);
+        let to_tunnel = self.to_tunnel.clone();
+        let routes = Arc::clone(&self.routes);
+        std::thread::spawn(move || {
+            wg_stack::client_udp_forward(
+                &socket,
+                &config,
+                &to_tunnel,
+                &routes,
+                target,
+                WG_HEADER_SIZE,
+                &thread_stop,
+            );
+        });
+        Ok(wg_stack::UdpForwarder::new(local, stop))
+    }
+
     #[cfg(target_os = "linux")]
     fn serve_tcp_kernel(
         &self,

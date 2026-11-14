@@ -143,7 +143,7 @@ fn usage() -> ! {
     eprintln!(
         "        [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR]"
     );
-    eprintln!("        [--mode auto|wireguard|masque|gool]");
+    eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR]");
     eprintln!(
         "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound"
     );
