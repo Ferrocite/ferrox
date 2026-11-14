@@ -244,6 +244,15 @@ impl SlotRing {
         };
         Some(Self { up, down, first })
     }
+
+    /// The announced tables from the listener's side: the client's uplink is the server's read ring, and the inline first segment belongs to that reader.
+    fn flipped(&self) -> Self {
+        Self {
+            up: self.down.clone(),
+            down: self.up.clone(),
+            first: self.first.clone(),
+        }
+    }
 }
 
 /// The tuned budgets of one carrier instance, with the reference's defaults and caps applied to whatever the config left out.
@@ -2161,12 +2170,17 @@ impl Drop for SlotWriter {
 
 /// The id-addressed reader: poll the head slot until the sequence advances, then ack the watermark so the writer may reuse the slot a lap later.
 struct SlotReader {
+    pump: Arc<SlotPump>,
+    rest: Mutex<(Vec<u8>, usize)>,
+}
+
+/// The polling half, held apart from the reader so the thread does not own the handle whose drop stops it.
+struct SlotPump {
     storage: Arc<dyn Storage>,
     table: SlotTable,
     params: Arc<Params>,
     wake: Arc<Wake>,
-    inbox: Arc<Inbox>,
-    rest: Mutex<(Vec<u8>, usize)>,
+    inbox: Inbox,
     stop: AtomicBool,
     first: Option<Vec<u8>>,
 }
@@ -2179,29 +2193,54 @@ impl SlotReader {
         wake: Arc<Wake>,
         first: Option<Vec<u8>>,
     ) -> Arc<Self> {
-        let reader = Arc::new(Self {
+        let pump = Arc::new(SlotPump {
             storage,
             table,
             params: Arc::clone(params),
             wake,
-            inbox: Arc::new(Inbox::new()),
-            rest: Mutex::new((Vec::new(), 0)),
+            inbox: Inbox::new(),
             stop: AtomicBool::new(false),
             first,
         });
-        let weak = Arc::downgrade(&reader);
+        let running = Arc::clone(&pump);
         std::thread::Builder::new()
             .stack_size(WORKER_STACK)
-            .spawn(move || {
-                let Some(reader) = weak.upgrade() else {
-                    return;
-                };
-                reader.pump();
-            })
+            .spawn(move || running.pump())
             .expect("a slot reader always gets its pump");
-        reader
+        Arc::new(Self {
+            pump,
+            rest: Mutex::new((Vec::new(), 0)),
+        })
     }
 
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        read_mailbox(&self.pump.inbox, &self.rest, buf)
+    }
+
+    fn end(&self) {
+        self.pump.end();
+    }
+}
+
+impl Drop for SlotReader {
+    fn drop(&mut self) {
+        self.pump.end();
+    }
+}
+
+fn overdue(at: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    let since = *at.get_or_insert(now);
+    now.duration_since(since) >= SLOT_STALL
+}
+
+enum Step {
+    Data(Vec<u8>),
+    Idle,
+    Done,
+}
+
+impl SlotPump {
     fn pump(&self) {
         let Some(slots) = self.storage.slot_store() else {
             self.inbox
@@ -2219,88 +2258,95 @@ impl SlotReader {
         }
         let mut delay = SLOT_HUNT_FLOOR;
         let mut active = Instant::now();
-        let mut last = Instant::now();
+        let mut owed: Option<Instant> = None;
         while !self.stop.load(Ordering::Acquire) {
-            if last.elapsed() >= SLOT_STALL {
-                self.inbox
-                    .end(Some("the peer took nothing from the slot ring".to_owned()));
-                return;
-            }
-            let id = &self.table.slots[head as usize % self.table.slots.len()];
-            let description = match slots.read_description(id) {
-                Ok(description) if !description.is_empty() => description,
-                Ok(_) => {
+            match self.segment(slots, head, &mut owed) {
+                Step::Data(data) => {
+                    owed = None;
+                    if !self.inbox.push(data, cap, &self.wake) {
+                        return;
+                    }
+                    let _ = slots.set_slot(&self.table.watermark, &head.to_string(), None);
+                    head += 1;
+                    active = Instant::now();
+                    delay = SLOT_HUNT_FLOOR;
+                }
+                Step::Idle => {
                     delay = self.idle(delay, active);
                     self.wait(delay);
-                    continue;
                 }
-                Err(why) if why.kind() == ErrorKind::NotFound => {
-                    delay = self.idle(delay, active);
-                    self.wait(delay);
-                    continue;
-                }
-                Err(why) => {
-                    self.inbox
-                        .end(Some(format!("the slot description failed: {why}")));
-                    return;
-                }
-            };
-            let Some(frame) = SlotFrame::decode(&description) else {
-                delay = self.idle(delay, active);
-                self.wait(delay);
-                continue;
-            };
-            if frame.seq != head {
-                delay = self.idle(delay, active);
-                self.wait(delay);
-                continue;
+                Step::Done => return,
             }
-            let data = match frame.mode {
-                SLOT_END => {
-                    self.inbox.end(None);
-                    return;
-                }
-                SLOT_ERR => {
-                    self.inbox
-                        .end(Some(format!("the peer reported segment {head} failed")));
-                    return;
-                }
-                SLOT_INLINE => frame.data.unwrap_or_default(),
-                SLOT_MEDIA => {
-                    let body = match slots.read_body(id) {
-                        Ok(body) if frame.holds(&body) => body,
-                        Ok(_) => {
-                            delay = self.idle(delay, active);
-                            self.wait(delay);
-                            continue;
-                        }
-                        Err(why) if why.kind() == ErrorKind::NotFound => {
-                            delay = self.idle(delay, active);
-                            self.wait(delay);
-                            continue;
-                        }
-                        Err(why) => {
-                            self.inbox.end(Some(format!("the slot body failed: {why}")));
-                            return;
-                        }
-                    };
-                    body
-                }
-                _ => {
-                    self.inbox
-                        .end(Some("the slot frame has an unknown mode".to_owned()));
-                    return;
-                }
-            };
-            if !self.inbox.push(data, cap, &self.wake) {
-                return;
-            }
-            let _ = slots.set_slot(&self.table.watermark, &head.to_string(), None);
-            head += 1;
-            active = Instant::now();
-            last = active;
-            delay = SLOT_HUNT_FLOOR;
         }
+    }
+
+    fn segment(&self, slots: &dyn SlotStore, head: u64, owed: &mut Option<Instant>) -> Step {
+        let id = &self.table.slots[head as usize % self.table.slots.len()];
+        let description = match slots.read_description(id) {
+            Ok(description) if !description.is_empty() => description,
+            Ok(_) => {
+                *owed = None;
+                return Step::Idle;
+            }
+            Err(why) if why.kind() == ErrorKind::NotFound => {
+                if overdue(owed) {
+                    self.inbox
+                        .end(Some(format!("slot {id} of segment {head} is gone")));
+                    return Step::Done;
+                }
+                return Step::Idle;
+            }
+            Err(why) => {
+                self.inbox
+                    .end(Some(format!("the slot description failed: {why}")));
+                return Step::Done;
+            }
+        };
+        let Some(frame) = SlotFrame::decode(&description) else {
+            if overdue(owed) {
+                self.inbox.end(Some(format!(
+                    "slot {id} of segment {head} holds an invalid frame"
+                )));
+                return Step::Done;
+            }
+            return Step::Idle;
+        };
+        if frame.seq != head {
+            *owed = None;
+            return Step::Idle;
+        }
+        let data = match frame.mode {
+            SLOT_END => {
+                self.inbox.end(None);
+                return Step::Done;
+            }
+            SLOT_ERR => {
+                self.inbox
+                    .end(Some(format!("the peer reported segment {head} failed")));
+                return Step::Done;
+            }
+            SLOT_INLINE => frame.data.unwrap_or_default(),
+            SLOT_MEDIA => match slots.read_body(id) {
+                Ok(body) if frame.holds(&body) => body,
+                Ok(_) | Err(_) if overdue(owed) => {
+                    self.inbox
+                        .end(Some(format!("segment {head} has no usable body")));
+                    return Step::Done;
+                }
+                Ok(_) => return Step::Idle,
+                Err(why) if why.kind() == ErrorKind::NotFound => return Step::Idle,
+                Err(why) => {
+                    self.inbox.end(Some(format!("the slot body failed: {why}")));
+                    return Step::Done;
+                }
+            },
+            _ => {
+                self.inbox
+                    .end(Some("the slot frame has an unknown mode".to_owned()));
+                return Step::Done;
+            }
+        };
+        Step::Data(data)
     }
 
     fn idle(&self, delay: Duration, active: Instant) -> Duration {
@@ -2318,19 +2364,7 @@ impl SlotReader {
         }
     }
 
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        read_mailbox(&self.inbox, &self.rest, buf)
-    }
-
     fn end(&self) {
-        self.stop.store(true, Ordering::Release);
-        self.inbox.end(None);
-        self.wake.ring();
-    }
-}
-
-impl Drop for SlotReader {
-    fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.inbox.end(None);
         self.wake.ring();
@@ -2665,6 +2699,7 @@ impl Server {
                     .storage
                     .session()
                     .unwrap_or_else(|| Arc::clone(&rd.storage));
+                let ring = ring.flipped();
                 let Ok(conn) = Conn::slot(storage, &rd.params, &ring) else {
                     self.release(session);
                     rd.discard(full);
@@ -7808,13 +7843,9 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(SlotMem::default());
         let params = Arc::new(quick());
         let ring = make_ring(&storage, "session", &params).expect("makes a ring");
-        let reverse = SlotRing {
-            up: ring.down.clone(),
-            down: ring.up.clone(),
-            first: None,
-        };
         let mut client = Conn::slot(Arc::clone(&storage), &params, &ring).expect("client");
-        let mut server = Conn::slot(Arc::clone(&storage), &params, &reverse).expect("server");
+        let mut server =
+            Conn::slot(Arc::clone(&storage), &params, &ring.flipped()).expect("server");
         client.write_all(b"hello").expect("writes");
         client.end_write().expect("ends");
         assert_eq!(read_up_to(&mut server, 5, Duration::from_secs(5)), b"hello");
