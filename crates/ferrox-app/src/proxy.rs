@@ -17437,13 +17437,15 @@ fn open_ss_mux_2022_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
             conn.close();
             return None;
         };
-        let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut session,
             &ss.password,
             &ss.method,
             &ss_mux_target(),
-        )
-        .ok()?;
+        ) else {
+            conn.close();
+            return None;
+        };
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         let close = kcp_close(&conn);
         return Some(MuxUplink {
@@ -17457,13 +17459,15 @@ fn open_ss_mux_2022_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
             conn.close();
             return None;
         };
-        let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut session,
             &ss.password,
             &ss.method,
             &ss_mux_target(),
-        )
-        .ok()?;
+        ) else {
+            conn.close();
+            return None;
+        };
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         let close = kcp_close(&conn);
         return Some(MuxUplink {
@@ -17473,13 +17477,15 @@ fn open_ss_mux_2022_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
         });
     }
     let mut writer = KcpIo::new(Arc::clone(&conn));
-    let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+    let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
         &mut writer,
         &ss.password,
         &ss.method,
         &ss_mux_target(),
-    )
-    .ok()?;
+    ) else {
+        conn.close();
+        return None;
+    };
     let (_, writer, close) = kcp_parts(&conn);
     Some(MuxUplink {
         read: Box::new(crate::shadowsocks2022::MuxReader::new(
@@ -17528,13 +17534,15 @@ fn open_ss_mux_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
             conn.close();
             return None;
         };
-        let (send, recv) = crate::shadowsocks::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
             &mut session,
             &ss.password,
             &ss.method,
             &target,
-        )
-        .ok()?;
+        ) else {
+            conn.close();
+            return None;
+        };
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         let close = kcp_close(&conn);
         return Some(MuxUplink {
@@ -17548,13 +17556,15 @@ fn open_ss_mux_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
             conn.close();
             return None;
         };
-        let (send, recv) = crate::shadowsocks::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
             &mut session,
             &ss.password,
             &ss.method,
             &target,
-        )
-        .ok()?;
+        ) else {
+            conn.close();
+            return None;
+        };
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         let close = kcp_close(&conn);
         return Some(MuxUplink {
@@ -17564,9 +17574,12 @@ fn open_ss_mux_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
         });
     }
     let mut writer = KcpIo::new(Arc::clone(&conn));
-    let (send, recv) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, &target)
-            .ok()?;
+    else {
+        conn.close();
+        return None;
+    };
     let (_, writer, close) = kcp_parts(&conn);
     Some(MuxUplink {
         read: Box::new(crate::shadowsocks::SsMuxReader::new(
@@ -17684,14 +17697,17 @@ fn open_vmess_mux_xdrive(vmess: &VmessOut) -> Option<MuxUplink> {
 
 fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
     let conn = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
-    let (request, send, recv, response_key, response_iv, auth) = crate::vmess::client_request(
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
         &vmess.id,
         vmess.cipher,
         vmess.auth_len,
         vmess.no_termination,
         &vmess_mux_target(),
         1,
-    )?;
+    ) else {
+        conn.close();
+        return None;
+    };
     if let Some(cfg) = vmess.tls.as_deref() {
         let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
             conn.close();
@@ -17705,9 +17721,13 @@ fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
         }
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         let close = kcp_close(&conn);
+        let Some(write) = crate::vmess::CarriedWriter::new(write, send) else {
+            conn.close();
+            return None;
+        };
         return Some(MuxUplink {
             read: Box::new(crate::vmess::CarriedReader::new(read, recv)),
-            write: Box::new(crate::vmess::CarriedWriter::new(write, send)?),
+            write: Box::new(write),
             close,
         });
     }
@@ -17721,9 +17741,13 @@ fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
         return None;
     }
     let (_, writer, close) = kcp_parts(&conn);
+    let Some(write) = crate::vmess::CarriedWriter::new(writer, send) else {
+        conn.close();
+        return None;
+    };
     Some(MuxUplink {
         read: Box::new(crate::vmess::CarriedReader::new(reader, recv)),
-        write: Box::new(crate::vmess::CarriedWriter::new(writer, send)?),
+        write: Box::new(write),
         close,
     })
 }
@@ -24749,6 +24773,9 @@ fn serve_connect_at(
     }
     if let Outbound::Shadowsocks(ss) = out {
         if matches!(ss.carrier, Carrier::Kcp(_)) {
+            if ss.mux.tcp.is_some() && dial_ss_mux(&client, ss, asked) {
+                return;
+            }
             if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
                 dial_ss_kcp(&client, &session, ss, asked);
             }
@@ -59416,11 +59443,11 @@ mod tests {
         }
     }
 
-    fn ss2022_mux_out(port: u16, carrier: Carrier, password: &str) -> ShadowsocksOut {
+    fn ss_mux_out(port: u16, method: &str, password: &str, carrier: Carrier) -> ShadowsocksOut {
         ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
             port,
-            method: "2022-blake3-aes-256-gcm".to_owned(),
+            method: method.to_owned(),
             password: password.to_owned(),
             carrier,
             host: "127.0.0.1".to_owned(),
@@ -59437,6 +59464,10 @@ mod tests {
             headers: Vec::new(),
             heartbeat: 0,
         }
+    }
+
+    fn ss2022_mux_out(port: u16, carrier: Carrier, password: &str) -> ShadowsocksOut {
+        ss_mux_out(port, "2022-blake3-aes-256-gcm", password, carrier)
     }
 
     /// Shadowsocks 2022 has its own reply handshake; a mux session rides it on the raw carrier.
@@ -59493,6 +59524,53 @@ mod tests {
         assert_udp_echo_association("ss2022 udp", &udp, move |socket| {
             serve_socks_udp_shadowsocks(socket, &ss);
         });
+    }
+
+    /// KCP has no loopback shim: the opener writes the protocol handshake on its own session, for both codecs.
+    #[test]
+    fn a_shadowsocks_kcp_mux_carries_a_tcp_stream() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_shadowsocks_kcp_mux_carries_a_tcp_stream",
+        ) {
+            return;
+        }
+        let ss2022 = ferrox_core::b64::encode(&[0x42u8; 32]);
+        for (tag, method, password) in [
+            ("ss kcp", "aes-256-gcm", "an-example-shared-password"),
+            ("ss2022 kcp", "2022-blake3-aes-256-gcm", ss2022.as_str()),
+        ] {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "shadowsocks",
+                    "settings": {{"password": "{password}", "method": "{method}"}},
+                    "streamSettings": {{"network": "kcp"}}}}"#
+            ))
+            .expect("parses");
+            let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            assert!(serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new()
+            ));
+            assert!(matches!(inbound_carrier(&inbound), Carrier::Kcp(_)));
+            thread::sleep(Duration::from_millis(100));
+            let ss = ss_mux_out(port, method, password, inbound_carrier(&inbound));
+            let echo_port = echo_loop();
+            let target = Destination::from(SocketAddr::from(([127, 0, 0, 1], echo_port)));
+            let mut client = tunnel_stream(
+                &Outbound::Shadowsocks(ss),
+                target,
+                Duration::from_secs(30),
+                Front::Socks,
+                tag,
+            )
+            .expect("tunnel");
+            client.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut client), b"ping", "{tag} mux echoes");
+        }
     }
 
     /// A non-raw carrier reaches the same server through the loopback dial, not a second shadowsocks implementation.
