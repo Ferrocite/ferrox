@@ -8,7 +8,6 @@
 //! at table slot `b`. That shuffle is the wire contract — a peer running the pinned reference derives
 //! the same table only if the draw is byte-identical — so [`go_rand`](super::go_rand) reproduces it.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::mem;
@@ -25,6 +24,9 @@ const READ_CHUNK: usize = 32 * 1024;
 /// The number of nondecreasing four-tuples of six-bit groups: `C(67, 4)`.
 const RANK_SPACE: usize = 766_480;
 const RANK_WORDS: usize = RANK_SPACE.div_ceil(64);
+
+/// The 4x4 Latin-square grids the table is drawn from.
+const GRID_COUNT: usize = 288;
 
 /// The 24 orderings of four hint bytes, in the reference's order.
 const PERM4: [[u8; 4]; 24] = [
@@ -73,6 +75,7 @@ struct Layout {
     p_bits: [u8; 2],
     v_bits: [u8; 4],
     hint_group: [u8; 256],
+    wire_group: [u8; 64],
 }
 
 impl fmt::Debug for Layout {
@@ -102,6 +105,7 @@ impl Layout {
             p_bits: [0; 2],
             v_bits: [0; 4],
             hint_group: [0; 256],
+            wire_group: [0; 64],
         };
         layout.with_hint_groups()
     }
@@ -117,6 +121,7 @@ impl Layout {
             p_bits: [0; 2],
             v_bits: [0; 4],
             hint_group: [0; 256],
+            wire_group: [0; 64],
         };
         layout.with_hint_groups()
     }
@@ -183,12 +188,16 @@ impl Layout {
                 p_bits,
                 v_bits,
                 hint_group: [0; 256],
+                wire_group: [0; 64],
             }
             .with_hint_groups(),
         )
     }
 
     fn with_hint_groups(mut self) -> Self {
+        for group in 0..64u8 {
+            self.wire_group[group as usize] = self.encode_group(group);
+        }
         for byte in 0..=255u8 {
             if self.is_hint(byte) {
                 self.hint_group[byte as usize] =
@@ -493,7 +502,7 @@ impl Encoder {
                 if pad && should_pad(rng, chance, padding_min, padding_max)? {
                     push_packed_pad(rng, &mut out, layout)?;
                 }
-                out.push(layout.encode_group((word >> shift) as u8 & 0x3f));
+                out.push(layout.wire_group[((word >> shift) as u8 & 0x3f) as usize]);
                 self.group_index = next_slot(self.group_index, len);
             }
         }
@@ -508,7 +517,7 @@ impl Encoder {
                 if pad && should_pad(rng, chance, padding_min, padding_max)? {
                     push_packed_pad(rng, &mut out, layout)?;
                 }
-                out.push(layout.encode_group((bit_buf >> bit_count) as u8 & 0x3f));
+                out.push(layout.wire_group[((bit_buf >> bit_count) as u8 & 0x3f) as usize]);
                 self.group_index = next_slot(self.group_index, len);
                 bit_buf = if bit_count > 0 {
                     bit_buf & ((1u64 << bit_count) - 1)
@@ -523,7 +532,7 @@ impl Encoder {
                 push_packed_pad(rng, &mut out, layout)?;
             }
             let group = ((bit_buf << (6 - bit_count)) & 0x3f) as u8;
-            out.push(layout.encode_group(group));
+            out.push(layout.wire_group[group as usize]);
             self.group_index = next_slot(self.group_index, len);
             let next = &tables[self.group_index].layout;
             out.push(next.pad_marker);
@@ -978,12 +987,13 @@ fn build_table(password: &str, layout: Layout) -> Option<Table> {
         let mut choices = Vec::with_capacity(list.len());
         for groups in list {
             let hints = [
-                layout.encode_group(groups[0]),
-                layout.encode_group(groups[1]),
-                layout.encode_group(groups[2]),
-                layout.encode_group(groups[3]),
+                layout.wire_group[groups[0] as usize],
+                layout.wire_group[groups[1] as usize],
+                layout.wire_group[groups[2] as usize],
+                layout.wire_group[groups[3] as usize],
             ];
-            let rank = rank4(sort4(*groups));
+            // The base patterns store each clue sorted, so the table build only ranks it.
+            let rank = rank4(*groups);
             let bit = 1u64 << (rank & 63);
             let word = rank >> 6;
             if decode_present[word] & bit != 0 {
@@ -1031,14 +1041,21 @@ fn base_patterns() -> &'static [Vec<[u8; 4]>] {
 }
 
 fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
+    // A 1024-slot open-addressed table turns the per-position rank count into one probe run over the 288 grids: the hash maps this replaces allocated one table, one key list and one group list for every one of the 1820 positions.
+    const SLOTS: usize = 1024;
+    const MASK: usize = SLOTS - 1;
     let grids = all_grids();
+    debug_assert_eq!(grids.len(), GRID_COUNT);
     let positions = hint_positions();
     let mut patterns: Vec<Vec<[u8; 4]>> = vec![Vec::new(); grids.len()];
+    let mut slots = [u32::MAX; SLOTS];
+    let mut counts = [0u16; SLOTS];
+    let mut first = [0u16; SLOTS];
+    let mut used = [0u16; SLOTS];
+    let mut groups = [[0u8; 4]; GRID_COUNT];
     for position in positions {
-        let mut counts: HashMap<usize, u16> = HashMap::with_capacity(grids.len());
-        let mut keys = Vec::with_capacity(grids.len());
-        let mut groups = Vec::with_capacity(grids.len());
-        for grid in grids {
+        let mut used_len = 0usize;
+        for (index, grid) in grids.iter().enumerate() {
             let clue = [
                 clue_group(grid, position[0]),
                 clue_group(grid, position[1]),
@@ -1046,15 +1063,34 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
                 clue_group(grid, position[3]),
             ];
             let clue = sort4(clue);
-            let key = rank4(clue);
-            keys.push(key);
-            groups.push(clue);
-            *counts.entry(key).or_insert(0) += 1;
+            let key = rank4(clue) as u32;
+            groups[index] = clue;
+            let mut slot = ((key as usize).wrapping_mul(0x9e37_79b1) >> 22) & MASK;
+            loop {
+                let held = slots[slot];
+                if held == u32::MAX {
+                    slots[slot] = key;
+                    counts[slot] = 1;
+                    first[slot] = index as u16;
+                    used[used_len] = slot as u16;
+                    used_len += 1;
+                    break;
+                }
+                if held == key {
+                    counts[slot] += 1;
+                    break;
+                }
+                slot = (slot + 1) & MASK;
+            }
         }
-        for (index, key) in keys.into_iter().enumerate() {
-            if counts[&key] == 1 {
+        for &slot in &used[..used_len] {
+            let slot = slot as usize;
+            if counts[slot] == 1 {
+                let index = first[slot] as usize;
                 patterns[index].push(groups[index]);
             }
+            slots[slot] = u32::MAX;
+            counts[slot] = 0;
         }
     }
     patterns
@@ -1119,9 +1155,14 @@ fn clue_group(grid: &[u8; 16], pos: u8) -> u8 {
     ((grid[pos as usize] - 1) << 4) | (pos & 0x0f)
 }
 
-fn sort4(mut v: [u8; 4]) -> [u8; 4] {
-    v.sort_unstable();
-    v
+fn sort4(v: [u8; 4]) -> [u8; 4] {
+    // A five-comparator network sorts four octets without the branchy insertion the standard sort uses.
+    let (a0, a1) = (v[0].min(v[1]), v[0].max(v[1]));
+    let (a2, a3) = (v[2].min(v[3]), v[2].max(v[3]));
+    let (b0, b2) = (a0.min(a2), a0.max(a2));
+    let (b1, b3) = (a1.min(a3), a1.max(a3));
+    let (c1, c2) = (b1.min(b2), b1.max(b2));
+    [b0, c1, c2, b3]
 }
 
 const fn rank_terms() -> [[u32; 64]; 4] {
