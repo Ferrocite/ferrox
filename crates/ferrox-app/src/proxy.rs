@@ -28875,10 +28875,71 @@ fn serve_socks_udp_pool<F, G>(
     }
 }
 
+/// The direct lane a VLESS mux's `skip` policy uses for UDP/443: one association per destination,
+/// with the same dial and reply plumbing the non-mux association runs.
+struct VlessUdpLane {
+    vless: VlessOut,
+    relay: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplink: Option<UdpUplink>,
+}
+
+impl VlessUdpLane {
+    fn new(vless: &VlessOut, relay: &UdpSocket) -> Option<Self> {
+        Some(Self {
+            vless: vless.clone(),
+            relay: relay.try_clone().ok()?,
+            source: Arc::new(Mutex::new(None)),
+            uplink: None,
+        })
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        let redial = match &self.uplink {
+            Some(up) => {
+                up.target != dest
+                    || !matches!(
+                        up.done.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    )
+            }
+            None => true,
+        };
+        if redial {
+            if let Some(old) = self.uplink.take() {
+                (old.close)();
+            }
+            self.uplink =
+                dial_udp_uplink(&self.vless, &dest, &self.relay, Arc::clone(&self.source));
+        }
+        if let Some(up) = &mut self.uplink {
+            if !write_udp_datagram(&mut *up.write, payload) {
+                if let Some(old) = self.uplink.take() {
+                    (old.close)();
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn close(self) {
+        if let Some(old) = self.uplink {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
 fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let Some(pool) = vless.udp_pool() else {
         return;
     };
+    let mut lane: Option<VlessUdpLane> = None;
+    let mut said = false;
     serve_socks_udp_pool(
         relay,
         &pool,
@@ -28886,8 +28947,24 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
         "vless",
         true,
         |dest| vless_udp_target_allowed(vless, dest),
-        |_, _, _, _, _, _| true,
+        |socket, src, dest, buf, at, len| {
+            if lane.is_none() {
+                let Some(open) = VlessUdpLane::new(vless, socket) else {
+                    if !said {
+                        said = true;
+                        eprintln!("vless: udp/443 skip lane unavailable; dropped");
+                    }
+                    return true;
+                };
+                lane = Some(open);
+            }
+            lane.as_mut()
+                .is_some_and(|lane| lane.send(src, dest, &buf[at..at + len]))
+        },
     );
+    if let Some(lane) = lane {
+        lane.close();
+    }
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
@@ -54623,6 +54700,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A peer that waits for the first mux frame must not hold the opener: the response is read by
+    /// the demux thread, not at session startup.
+    #[test]
+    fn a_vmess_kcp_mux_opens_before_the_server_answers() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_vmess_kcp_mux_opens_before_the_server_answers",
+        ) {
+            return;
+        }
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let Carrier::Kcp(config) = inbound_carrier(&inbound) else {
+            panic!("the inbound names kcp");
+        };
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let serve: KcpServe = Arc::new(|conn| {
+            thread::sleep(Duration::from_secs(2));
+            conn.close();
+        });
+        assert!(serve_kcp_bound(
+            &format!("127.0.0.1:{port}"),
+            config,
+            &serve
+        ));
+        thread::sleep(Duration::from_millis(50));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{"network": "kcp"}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        assert!(matches!(vmess.carrier, Carrier::Kcp(_)));
+        let started = Instant::now();
+        let uplink = open_vmess_mux_kcp(&vmess).expect("opens without a response");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the opener waits for a response"
+        );
+        (uplink.close)();
+    }
+
     /// KCP carries the `VMess` mux session the way it carries the direct request; the opener writes the
     /// request and its response seal above the session instead of a loopback carrier.
     #[test]
@@ -58132,6 +58264,75 @@ mod tests {
         join_thread_within(answering, Duration::from_secs(5), "the answering server");
     }
 
+    /// The VLESS mux skip policy leaves the mux for a direct UDP lane; a peer that waits for the
+    /// header and the datagram sees both, and the answer returns through the association.
+    #[test]
+    fn a_vless_skip_policy_uses_the_direct_udp_lane() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let dest: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let header = vless_header(&id, 2, &Destination::from(dest));
+        let answering = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = vec![0u8; header.len()];
+            if read_exact(&mut stream, &mut request).is_err() {
+                return;
+            }
+            let mut buf = udp_buffer();
+            let Some(n) = read_udp_datagram(&mut stream, &mut buf) else {
+                return;
+            };
+            stream.write_all(&[0, 0]).expect("the reply header");
+            assert!(write_udp_datagram(&mut stream, &buf[..n]));
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443: Udp443::Skip,
+            },
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let serving = thread::spawn(move || serve_socks_udp_vless(&relay, &vless));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        let mut head = Vec::new();
+        let frame = socks_udp_frame(&mut head, &dest, b"ping");
+        client.send_to(frame, relay_addr).expect("sends");
+        let mut buf = udp_buffer();
+        let (n, _) = client.recv_from(&mut buf).expect("the echo returns");
+        let (_, payload) = parse_socks_udp(&buf[..n]).expect("a socks frame");
+        assert_eq!(payload, b"ping");
+        join_thread_within(serving, Duration::from_secs(5), "the VLESS skip front");
+        join_thread_within(answering, Duration::from_secs(5), "the answering server");
+    }
+
     /// A response reader that dies is discarded before the next datagram: the association used to
     /// keep writing into a socket whose answers could no longer arrive.
     #[test]
@@ -59694,6 +59895,7 @@ mod tests {
             .expect("timeout");
         let echo_addr = echo.local_addr().expect("addr");
         let ss = ss2022_mux_out(echo_addr.port(), Carrier::Raw(Chain::default()), &password);
+        let method = ferrox_core::shadowsocks2022::Method::parse(&ss.method).expect("2022 method");
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let src = relay.local_addr().expect("addr");
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
@@ -59713,6 +59915,46 @@ mod tests {
         assert_eq!(target, dest);
         assert_eq!(payload, b"ping");
         lane.close();
+    }
+
+    /// The skip policy reaches the 2022 lane through the mux dispatch, not only when the lane is opened directly.
+    #[test]
+    fn a_shadowsocks2022_skip_policy_bypasses_the_mux() {
+        let password = ferrox_core::b64::encode(&[0x44u8; 32]);
+        let method = ferrox_core::shadowsocks2022::Method::parse("2022-blake3-aes-256-gcm")
+            .expect("2022 method");
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let server_port = server.local_addr().expect("addr").port();
+        let mut ss = ss2022_mux_out(server_port, Carrier::Raw(Chain::default()), &password);
+        ss.mux.udp443 = Udp443::Skip;
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let served = Arc::clone(&relay);
+        let serving = thread::spawn(move || serve_socks_udp_shadowsocks(&served, &ss));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let dest: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut frame = Vec::new();
+        let datagram = socks_udp_frame(&mut frame, &dest, b"ping");
+        client
+            .send_to(datagram, relay_addr)
+            .expect("the association relay");
+        let mut packet = [0u8; 1500];
+        let n = server.recv(&mut packet).expect("receives");
+        let psk = ferrox_core::shadowsocks2022::parse_psk_list(&password, method.key_len())
+            .expect("psks")
+            .pop()
+            .expect("psk");
+        let mut open = crate::shadowsocks2022::Datagrams::new();
+        let (target, payload, _) = open.open(&psk, method, &mut packet[..n]).expect("opens");
+        assert_eq!(target, dest);
+        assert_eq!(payload, b"ping");
+        join_thread_within(serving, Duration::from_secs(5), "the ss2022 skip front");
     }
 
     /// KCP has no loopback shim: the opener writes the protocol handshake on its own session, for both codecs.
