@@ -4852,28 +4852,7 @@ fn serve_ss_xhttp_carrier<
             if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
                 paths.push(settings.path.clone());
             }
-            let service = crate::xhttp_h2::XhttpSessionService::new(
-                settings.clone(),
-                Arc::new(move |reader, writer, _decryption| {
-                    if accounts.is_2022 {
-                        crate::shadowsocks2022::serve_xhttp_accepted(
-                            reader,
-                            writer,
-                            &accounts.password,
-                            &accounts.method,
-                            &accounts.identities,
-                            freedom,
-                        );
-                    } else {
-                        crate::shadowsocks::serve_xhttp_accepted(
-                            reader,
-                            writer,
-                            &accounts.users,
-                            freedom,
-                        );
-                    }
-                }),
-            );
+            let service = ss_xhttp_service(&settings, accounts, freedom);
             let until = Instant::now() + crate::budgets::handshake();
             let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut step =
@@ -4892,6 +4871,30 @@ fn serve_ss_xhttp_carrier<
         }),
         Box::new(|| {}),
     );
+}
+
+fn ss_xhttp_service(
+    settings: &crate::xhttp::XhttpSettings,
+    accounts: crate::shadowsocks::SsAccounts,
+    freedom: bool,
+) -> crate::xhttp_h2::XhttpSessionService {
+    crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            if accounts.is_2022 {
+                crate::shadowsocks2022::serve_xhttp_accepted(
+                    reader,
+                    writer,
+                    &accounts.password,
+                    &accounts.method,
+                    &accounts.identities,
+                    freedom,
+                );
+            } else {
+                crate::shadowsocks::serve_xhttp_accepted(reader, writer, &accounts.users, freedom);
+            }
+        }),
+    )
 }
 
 fn serve_shadowsocks_tls(
@@ -15192,6 +15195,58 @@ fn serve_ss_hysteria_front(
     serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
 }
 
+fn serve_ss_xhttp_h3(
+    address: &str,
+    server: &ferrox_core::tls::TlsServerConfig,
+    settings: &crate::xhttp::XhttpSettings,
+    accounts: &crate::shadowsocks::SsAccounts,
+    freedom: bool,
+) -> bool {
+    let service = Arc::new(ss_xhttp_service(settings, accounts.clone(), freedom));
+    match crate::xhttp_h3::serve_inbound(address, server, settings, service, None) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("xhttp h3 on {address}: {error}");
+            false
+        }
+    }
+}
+
+fn serve_ss_tls_front(
+    address: &str,
+    inbound: &Json,
+    carrier: Carrier,
+    accounts: Arc<crate::shadowsocks::SsAccounts>,
+    freedom: bool,
+) -> Option<bool> {
+    let Some(server) = inbound_tls_identity(inbound) else {
+        // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+        eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+        return None;
+    };
+    if let Carrier::Xhttp { settings } = &carrier {
+        if crate::xhttp_h3::is_h3(&server.alpn) {
+            return Some(serve_ss_xhttp_h3(
+                address, &server, settings, &accounts, freedom,
+            ));
+        }
+    }
+    spawn_role(
+        address,
+        inbound_role(
+            inbound,
+            Role::Shadowsocks {
+                accounts,
+                carrier,
+                freedom,
+                tls: Some(server),
+            },
+        ),
+        inbound_tag(inbound),
+    );
+    None
+}
+
 fn serve_shadowsocks_inbound(
     address: &str,
     inbound: &Json,
@@ -15245,24 +15300,10 @@ fn serve_shadowsocks_inbound(
                 serve_xdrive_loop(&settings, address, accept);
             }
             carrier if stream_security(inbound) == "tls" => {
-                // A refused identity takes only the stream half: a udp relay this config asked for still opens.
-                match inbound_tls_identity(inbound) {
-                    Some(server) => spawn_role(
-                        address,
-                        inbound_role(
-                            inbound,
-                            Role::Shadowsocks {
-                                accounts,
-                                carrier,
-                                freedom,
-                                tls: Some(server),
-                            },
-                        ),
-                        inbound_tag(inbound),
-                    ),
-                    None => eprintln!(
-                        "unreadable shadowsocks tls identity on {address}: refused, not served"
-                    ),
+                if let Some(served) =
+                    serve_ss_tls_front(address, inbound, carrier, accounts, freedom)
+                {
+                    return served;
                 }
             }
             _ if !matches!(stream_security(inbound), "" | "none") => {
@@ -21472,6 +21513,14 @@ fn dial_shadowsocks(
     if crate::browser_dialer::active() && dial_ss_browser(client, server, ss, target, ladder) {
         return;
     }
+    if let Carrier::Xhttp { settings } = &ss.carrier {
+        if let Some(cfg) = ss.tls.as_deref() {
+            if crate::xhttp_h3::is_h3(&cfg.alpn) {
+                dial_ss_xhttp_h3(client, server, ss, target, ladder, settings, cfg);
+                return;
+            }
+        }
+    }
     let params = stream_params(&ss.carrier);
     let explicit = rung_of(&ss.carrier);
     if explicit.is_none() {
@@ -22135,9 +22184,56 @@ fn dial_ss_xhttp(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let Some((reader, mut writer)) = xhttp_rung(uplink, &ss.host, &ss.carrier, attempt.path) else {
+    let Some((reader, writer)) = xhttp_rung(uplink, &ss.host, &ss.carrier, attempt.path) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
+    ss_xhttp_relay(client, reader, writer, ss, target, attempt, ladder)
+}
+
+fn dial_ss_xhttp_h3(
+    client: &Connection,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    ladder: &Ladder,
+    settings: &crate::xhttp::XhttpSettings,
+    cfg: &ferrox_core::tls::TlsConfig,
+) {
+    let rung = Rung::Xhttp;
+    let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+        crate::xhttp_h3::connect_split(*server, &ss.host, settings, cfg)
+    } else {
+        crate::xhttp_h3::connect_dual_split(*server, &ss.host, settings, cfg)
+    };
+    let Some((reader, writer)) = pair else {
+        let failure = Failure::new(Stage::SocketConnected, Kind::Unreachable);
+        let _stop = ladder.record_failure(rung, &failure);
+        note_dial_failure(server, failure);
+        return;
+    };
+    let attempt = RungAttempt {
+        rung,
+        path: "",
+        ed: 0,
+        explicit: true,
+    };
+    let reader: Box<dyn WindowRead + Send> = Box::new(reader);
+    let _ = ss_xhttp_relay(client, reader, writer, ss, target, &attempt, ladder);
+}
+
+fn ss_xhttp_relay<R>(
+    client: &Connection,
+    reader: R,
+    mut writer: crate::xhttp::XhttpWriter,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool
+where
+    R: Read + Send + 'static + RelayPoll,
+{
+    let rung = attempt.rung;
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
         let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
@@ -55218,6 +55314,30 @@ mod tests {
         })
     }
 
+    fn tls_ss_out(
+        port: u16,
+        password: &str,
+        method: &str,
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: method.to_owned(),
+            password: password.to_owned(),
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux::default(),
+            pool: Pools::default(),
+            tls: Some(Arc::new(tls)),
+            reality: None,
+            hysteria_roots: None,
+        })
+    }
+
     fn tls_ws_accept(
         read: ServerHalf,
         write: ServerHalf,
@@ -65411,6 +65531,53 @@ mod tests {
             crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
                 .expect("binds h3");
         let out = tls_vmess_out(port, id, Carrier::Xhttp { settings }, client);
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_a_shadowsocks_echo_over_loopback() {
+        let (identity, client) = h3_loopback_identity();
+        let settings = xhttp_settings_mode("/h3-shadowsocks", crate::xhttp::XhttpMode::StreamOne);
+        let accounts = crate::shadowsocks::SsAccounts {
+            users: crate::shadowsocks::account("h3-ss-pass", "aes-256-gcm"),
+            password: "h3-ss-pass".to_owned(),
+            method: "aes-256-gcm".to_owned(),
+            is_2022: false,
+            identities: Vec::new(),
+        };
+        let service = Arc::new(ss_xhttp_service(&settings, accounts, true));
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = tls_ss_out(
+            port,
+            "h3-ss-pass",
+            "aes-256-gcm",
+            Carrier::Xhttp { settings },
+            client,
+        );
+        carrier_echo(out, port);
+    }
+
+    #[test]
+    fn h3_carries_a_shadowsocks2022_echo_over_loopback() {
+        const METHOD: &str = "2022-blake3-aes-256-gcm";
+        let password = ferrox_core::b64::encode(&[0x42u8; 32]);
+        let (identity, client) = h3_loopback_identity();
+        let settings =
+            xhttp_settings_mode("/h3-shadowsocks2022", crate::xhttp::XhttpMode::StreamOne);
+        let accounts = crate::shadowsocks::SsAccounts {
+            users: std::sync::Arc::from([]),
+            password: password.clone(),
+            method: METHOD.to_owned(),
+            is_2022: true,
+            identities: Vec::new(),
+        };
+        let service = Arc::new(ss_xhttp_service(&settings, accounts, true));
+        let port =
+            crate::xhttp_h3::serve_inbound("127.0.0.1:0", &identity, &settings, service, None)
+                .expect("binds h3");
+        let out = tls_ss_out(port, &password, METHOD, Carrier::Xhttp { settings }, client);
         carrier_echo(out, port);
     }
 
