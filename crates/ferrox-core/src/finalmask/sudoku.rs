@@ -1472,9 +1472,10 @@ mod tests {
             writer.write(&mut sink, &plain).expect("encodes");
         }
         let refills = writer.writer.as_ref().expect("a writer").rng.refills;
-        assert_eq!(
-            refills,
-            (PROBE_PLAINTEXT * PROBE_ROUNDS * 2).div_ceil(ENTROPY_DRAWS)
+        let expected = (PROBE_PLAINTEXT * PROBE_ROUNDS * 2).div_ceil(ENTROPY_DRAWS);
+        assert!(
+            (expected..=expected + 1).contains(&refills),
+            "a rejected bounded draw may take one more word: {refills}"
         );
     }
 
