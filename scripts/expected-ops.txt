@@ -187,7 +187,10 @@ append_pem 562
 # untouched and the five decisions still walk 4096 times. ops.yml run 43430333461.
 # The audit's added code moved this frame back to the e12773a6 pair: dns.rs is untouched
 # and the five decisions still walk 4096 times. ops.yml run 43548610074.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893360 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 51893198 by the h3 response-head slice: the added xhttp test changes the
+# workspace's release frame; dns.rs is untouched and the five decisions still walk
+# 4096 times. ops.yml run 43566844229.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893198 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -274,7 +277,7 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # The rebase onto 72406110 puts the 8192 back in: the GSO read and the psiphon
 # timeouts join the same bin; psiphon_shadowsocks.rs is untouched. ops.yml run
 # 43558930890.
-ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
+ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47475578 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
 # Re-blessed 47621538: the xhttp size-line probe adds one test to the same
 # ferrox-app bin, and the release layout puts the 12 Ir back that removing the
 # udp serve wrappers took out; psiphon_shadowsocks.rs is untouched.
@@ -297,7 +300,10 @@ ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shad
 # is untouched. ops.yml run 43430333461.
 # The same added code moved this ferrox-app frame back to the e12773a6 pair;
 # psiphon_shadowsocks.rs is untouched. ops.yml run 43548610074.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47621538 by the h3 response-head slice: its test joins the same
+# ferrox-app bin and the release layout puts the 12 Ir back; psiphon_shadowsocks.rs
+# is untouched. ops.yml run 43566844229.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621538 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is

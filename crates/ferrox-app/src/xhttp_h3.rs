@@ -307,15 +307,19 @@ impl H3Reader {
                 frames::H3_HEADERS => {
                     self.head_seen = true;
                     if self.head.is_none() && self.status.is_none() {
-                        self.head =
-                            hpack::qpack_fields(payload).and_then(|fields| synth_head(&fields));
-                        self.status = hpack::qpack_status(payload);
-                        if self.expect_request && self.head.is_none() {
+                        let Some((head, status)) = decode_head(payload, self.expect_request) else {
+                            let missing = if self.expect_request {
+                                "h3 request head is missing"
+                            } else {
+                                "h3 response head is missing"
+                            };
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                "h3 request head is missing",
+                                missing,
                             ));
-                        }
+                        };
+                        self.head = head;
+                        self.status = status;
                     }
                 }
                 frames::H3_RESET => self.ended = true,
@@ -563,6 +567,17 @@ fn response_fields(head: &str) -> Vec<(String, String)> {
         fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
     }
     fields
+}
+
+/// Decode what the receiving side reads: a request side keeps the synthesized head and the status its upload gates on, a response side keeps only the status and never builds a head it would drop.
+fn decode_head(payload: &[u8], expect_request: bool) -> Option<(Option<Vec<u8>>, Option<u16>)> {
+    if expect_request {
+        let fields = hpack::qpack_fields(payload)?;
+        let head = synth_head(&fields)?;
+        Some((Some(head), hpack::qpack_status(payload)))
+    } else {
+        Some((None, Some(hpack::qpack_status(payload)?)))
+    }
 }
 
 /// The head `accept_core` parses from a request's fields: the same shape the H2 lane synthesises.
@@ -1456,6 +1471,74 @@ mod tests {
         send_data(&wire, b"too early");
         let mut reader = H3Reader::new(wire);
         refused(&mut reader, "early DATA");
+    }
+
+    #[test]
+    fn a_response_head_decodes_only_the_status() {
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("server", "ferrox"),
+            ],
+            &mut block,
+        );
+        let (decoded, counts) = ferrox_core::alloc_count::measure(|| decode_head(&block, false));
+        assert_eq!(decoded, Some((None, Some(200))));
+        assert_eq!(
+            counts.allocs, 0,
+            "a response reader walks the fields without building them: {counts:?}"
+        );
+        assert_eq!(
+            decode_head(&block, true),
+            None,
+            "a response block is not a request head"
+        );
+
+        let mut request = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "POST"),
+                (":path", "/x"),
+                (":authority", "localhost"),
+            ],
+            &mut request,
+        );
+        let (decoded, counts) = ferrox_core::alloc_count::measure(|| decode_head(&request, true));
+        assert!(matches!(
+            decoded,
+            Some((Some(head), None)) if head.starts_with(b"POST /x HTTP/3\r\n")
+        ));
+        assert!(
+            counts.allocs > 0,
+            "the request head is built from its fields: {counts:?}"
+        );
+        assert_eq!(
+            decode_head(&request, false),
+            None,
+            "a response reader refuses a block that names no status"
+        );
+        assert_eq!(
+            decode_head(&[0x01, 0x00, 0xC0, 0x01], false),
+            None,
+            "a dynamic-table prefix leaves no status this lane can read"
+        );
+        assert_eq!(
+            decode_head(&[], false),
+            None,
+            "an empty response head names no status"
+        );
+
+        let mut status = Vec::new();
+        hpack::qpack_literal_many(
+            &[(":method", "POST"), (":path", "/x"), (":status", "500")],
+            &mut status,
+        );
+        assert!(
+            matches!(decode_head(&status, true), Some((Some(_), Some(500)))),
+            "a request head's status still reaches the upload gate"
+        );
     }
 
     #[test]
