@@ -75,6 +75,7 @@ struct Layout {
     p_bits: [u8; 2],
     v_bits: [u8; 4],
     hint_group: [u8; 256],
+    wire_group: [u8; 64],
 }
 
 impl fmt::Debug for Layout {
@@ -104,6 +105,7 @@ impl Layout {
             p_bits: [0; 2],
             v_bits: [0; 4],
             hint_group: [0; 256],
+            wire_group: [0; 64],
         };
         layout.with_hint_groups()
     }
@@ -119,6 +121,7 @@ impl Layout {
             p_bits: [0; 2],
             v_bits: [0; 4],
             hint_group: [0; 256],
+            wire_group: [0; 64],
         };
         layout.with_hint_groups()
     }
@@ -185,12 +188,16 @@ impl Layout {
                 p_bits,
                 v_bits,
                 hint_group: [0; 256],
+                wire_group: [0; 64],
             }
             .with_hint_groups(),
         )
     }
 
     fn with_hint_groups(mut self) -> Self {
+        for group in 0..64u8 {
+            self.wire_group[group as usize] = self.encode_group(group);
+        }
         for byte in 0..=255u8 {
             if self.is_hint(byte) {
                 self.hint_group[byte as usize] =
@@ -495,7 +502,7 @@ impl Encoder {
                 if pad && should_pad(rng, chance, padding_min, padding_max)? {
                     push_packed_pad(rng, &mut out, layout)?;
                 }
-                out.push(layout.encode_group((word >> shift) as u8 & 0x3f));
+                out.push(layout.wire_group[((word >> shift) as u8 & 0x3f) as usize]);
                 self.group_index = next_slot(self.group_index, len);
             }
         }
@@ -510,7 +517,7 @@ impl Encoder {
                 if pad && should_pad(rng, chance, padding_min, padding_max)? {
                     push_packed_pad(rng, &mut out, layout)?;
                 }
-                out.push(layout.encode_group((bit_buf >> bit_count) as u8 & 0x3f));
+                out.push(layout.wire_group[((bit_buf >> bit_count) as u8 & 0x3f) as usize]);
                 self.group_index = next_slot(self.group_index, len);
                 bit_buf = if bit_count > 0 {
                     bit_buf & ((1u64 << bit_count) - 1)
@@ -525,7 +532,7 @@ impl Encoder {
                 push_packed_pad(rng, &mut out, layout)?;
             }
             let group = ((bit_buf << (6 - bit_count)) & 0x3f) as u8;
-            out.push(layout.encode_group(group));
+            out.push(layout.wire_group[group as usize]);
             self.group_index = next_slot(self.group_index, len);
             let next = &tables[self.group_index].layout;
             out.push(next.pad_marker);
@@ -980,10 +987,10 @@ fn build_table(password: &str, layout: Layout) -> Option<Table> {
         let mut choices = Vec::with_capacity(list.len());
         for groups in list {
             let hints = [
-                layout.encode_group(groups[0]),
-                layout.encode_group(groups[1]),
-                layout.encode_group(groups[2]),
-                layout.encode_group(groups[3]),
+                layout.wire_group[groups[0] as usize],
+                layout.wire_group[groups[1] as usize],
+                layout.wire_group[groups[2] as usize],
+                layout.wire_group[groups[3] as usize],
             ];
             // The base patterns store each clue sorted, so the table build only ranks it.
             let rank = rank4(*groups);
