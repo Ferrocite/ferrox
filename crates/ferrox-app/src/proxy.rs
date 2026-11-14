@@ -11523,7 +11523,7 @@ fn dial_vless_browser(
             else {
                 return false;
             };
-            return relay_vless_ws(
+            relay_vless_ws(
                 client,
                 vless,
                 &header,
@@ -11536,7 +11536,7 @@ fn dial_vless_browser(
                     ed: *ed,
                     explicit: false,
                 },
-            );
+            )
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
