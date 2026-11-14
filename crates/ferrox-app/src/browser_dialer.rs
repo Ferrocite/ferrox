@@ -620,7 +620,11 @@ mod tests {
         assert!(branch.contains("const flushToTarget = pipe(ws, target);"));
         assert!(branch.contains("const flushToBridge = pipe(target, ws);"));
         assert!(branch.contains("Promise.allSettled([flushToTarget(), flushToBridge()])"));
-        assert!(branch.contains("flushed().then("));
+        assert_eq!(
+            branch.matches("flushed().then(").count(),
+            3,
+            "both closes and an open error wait for the queue"
+        );
         let pipe = PAGE.split("function pipe(").nth(1).expect("the pipe");
         let drain = pipe.find("await drain(to);").expect("drains");
         let send = pipe.find("to.send(event.data);").expect("sends");

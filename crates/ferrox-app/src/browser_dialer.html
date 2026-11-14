@@ -81,7 +81,14 @@ async function run(ws, task) {
     target.onclose = () => {
       flushed().then(() => { try { ws.close(); } catch (_) {} });
     };
-    target.onerror = () => { if (!open) try { ws.send("fail"); } catch (_) {} target.close(); };
+    target.onerror = () => {
+      if (!open) {
+        try { ws.send("fail"); } catch (_) {}
+        try { target.close(); } catch (_) {}
+        return;
+      }
+      flushed().then(() => { try { target.close(); } catch (_) {} });
+    };
     ws.onclose = () => {
       flushed().then(() => { try { target.close(); } catch (_) {} closed(ws); });
     };
