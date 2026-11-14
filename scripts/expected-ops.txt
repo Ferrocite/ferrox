@@ -271,7 +271,10 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # The rebase onto 4d472b16 takes the 8192 back out of that branch: the h3 xhttp,
 # browser-dialer and finalmask merges join the same bin; psiphon_shadowsocks.rs
 # is untouched. ops.yml run 43555173581.
-ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47475578 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
+# The rebase onto 72406110 puts the 8192 back in: the GSO read and the psiphon
+# timeouts join the same bin; psiphon_shadowsocks.rs is untouched. ops.yml run
+# 43558930890.
+ferrox_app::psiphon_shadowsocks::tests::direct_write_probe 47483770 psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else
 # Re-blessed 47621538: the xhttp size-line probe adds one test to the same
 # ferrox-app bin, and the release layout puts the 12 Ir back that removing the
 # udp serve wrappers took out; psiphon_shadowsocks.rs is untouched.
