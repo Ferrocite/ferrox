@@ -59722,9 +59722,7 @@ mod tests {
             .pop()
             .expect("psk");
         let mut server = crate::shadowsocks2022::Datagrams::new();
-        let (target, payload) = server
-            .open_server(&psk, method, &mut packet[..n])
-            .expect("opens");
+        let (target, payload, _) = server.open(&psk, method, &mut packet[..n]).expect("opens");
         assert_eq!(target, dest);
         assert_eq!(payload, b"ping");
         lane.close();
