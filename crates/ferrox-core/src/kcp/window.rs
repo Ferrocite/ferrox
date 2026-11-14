@@ -341,7 +341,20 @@ impl AckList {
 
     pub fn add(&mut self, number: u32, timestamp: u32) {
         if self.entries.len() >= self.limit {
-            return;
+            // A full list must still carry a new number inside the window: evict a duplicate of a segment already listed (a retransmission), and let a distinct one grow the list, which the receive window already bounds.
+            let evict = self
+                .entries
+                .iter()
+                .position(|entry| entry.number == number)
+                .or_else(|| {
+                    self.entries
+                        .windows(2)
+                        .position(|pair| pair[0].number == pair[1].number)
+                        .map(|at| at + 1)
+                });
+            if let Some(at) = evict {
+                self.entries.remove(at);
+            }
         }
         self.entries.push(AckEntry {
             number,
@@ -696,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_flood_is_bounded_by_the_ack_list_limit() {
+    fn a_duplicate_flood_evicts_a_duplicate_before_a_new_number() {
         let mut l = AckList::for_window(1);
         for timestamp in 0..=ACK_DUPLICATE_ALLOWANCE as u32 + 1 {
             l.add(7, timestamp);
@@ -704,8 +717,15 @@ mod tests {
         assert_eq!(l.entries.len(), 1 + ACK_DUPLICATE_ALLOWANCE);
         assert_eq!(
             l.entries.last().unwrap().timestamp,
-            ACK_DUPLICATE_ALLOWANCE as u32
+            ACK_DUPLICATE_ALLOWANCE as u32 + 1
         );
+        // A full list of duplicates must still take a new number inside the window; refusing it left that segment unacked.
+        l.add(8, 500);
+        let mut acked = Vec::new();
+        l.flush(0, 100, 1024, &mut |seg: &mut AckSegment| {
+            acked.extend_from_slice(&seg.numbers);
+        });
+        assert!(acked.contains(&8), "the new number was dropped");
     }
 
     #[test]
