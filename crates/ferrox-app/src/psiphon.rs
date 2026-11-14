@@ -521,6 +521,8 @@ struct Settings {
     inproxy_await_ready_timeout: Duration,
     inproxy_no_match_failover: f64,
     inproxy_no_match_failover_personal: f64,
+    inproxy_prefer_probability: f64,
+    inproxy_force_selection_count: usize,
     reject_countries: Vec<String>,
     reject_cidrs: Vec<String>,
     geoip_path: Option<String>,
@@ -1051,6 +1053,9 @@ impl Inner {
         let mut last = String::new();
         let mut offset = 0;
         let mut first_batch = true;
+        let inproxy_force_remaining = Arc::new(AtomicUsize::new(
+            self.settings.inproxy_force_selection_count,
+        ));
         while offset < limit {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1132,31 +1137,57 @@ impl Inner {
             let dsl_placeholders = Arc::clone(&self.dsl_placeholders);
             let dsl_retain_failed = self.settings.dsl_retain_failed;
             let dsl_placeholder_ttl = self.settings.dsl_placeholder_ttl;
-            let conduit =
-                if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
-                    match self.conduit() {
-                        Ok(conduit) => Some(conduit),
-                        Err(error) => {
-                            eprintln!("psiphon: conduit unavailable: {error}");
-                            None
-                        }
+            let conduit = if self.settings.conduit
+                && batch
+                    .iter()
+                    .any(|server| server.inproxy.is_some() || server.tls_inproxy.is_some())
+            {
+                match self.conduit() {
+                    Ok(conduit) => Some(conduit),
+                    Err(error) => {
+                        eprintln!("psiphon: conduit unavailable: {error}");
+                        None
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
+            let inproxy_prefer = self.settings.inproxy_prefer_probability;
+            let inproxy_only = !self.settings.protocols.is_empty()
+                && self
+                    .settings
+                    .protocols
+                    .iter()
+                    .all(|protocol| protocol.starts_with("INPROXY-"));
+            let force_remaining = Arc::clone(&inproxy_force_remaining);
             let requests =
                 Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
             let attempt = move |server: &Server| {
                 let lease = replay.begin(server, config_state);
                 let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());
-                let selected = lease.server();
+                let mut selected = lease.server().clone();
+                let use_inproxy = select_inproxy(
+                    selected.inproxy.is_some() || selected.tls_inproxy.is_some(),
+                    selected.direct && !inproxy_only,
+                    conduit.is_some(),
+                    inproxy_prefer,
+                    &force_remaining,
+                );
+                if use_inproxy {
+                    if selected.inproxy.is_none() {
+                        selected.inproxy = selected.tls_inproxy.take();
+                    }
+                } else {
+                    selected.inproxy = None;
+                    selected.tls_inproxy = None;
+                }
                 expire_dsl_placeholder(
                     &dsl_placeholders,
                     &server.host,
                     server.port,
                     dsl_placeholder_ttl,
                 );
-                let timeout = if conduit.is_some() && selected.inproxy.is_some() {
+                let timeout = if use_inproxy {
                     conduit_timeout
                 } else {
                     dial_timeout
@@ -1180,7 +1211,7 @@ impl Inner {
                     ssh_algorithms: ssh_algorithms.as_ref(),
                 };
                 match Session::connect(
-                    selected,
+                    &selected,
                     &identity,
                     timeout,
                     proxy.as_ref(),
@@ -2869,7 +2900,7 @@ impl Settings {
             .or_else(|| {
                 text(settings, "protocol_selection").map(|value| value.to_ascii_lowercase())
             });
-        let conduit = selection.as_deref() == Some("conduit");
+        let mut conduit = selection.as_deref() == Some("conduit");
         let fronted = match selection.as_deref() {
             None => matches!(cdn_profile.as_deref(), Some("fronted")),
             Some("cdn_fronting" | "fronted" | "fronted-meek" | "cdn") => true,
@@ -2879,7 +2910,7 @@ impl Settings {
                 false
             }
         };
-        let fronted_fallback = !conduit && !fronted;
+        let mut fronted_fallback = !conduit && !fronted;
         let selection_cdn = selection_enables_cdn(selection.as_deref());
         let selection_tactics_disabled = selection_disables_tactics(selection.as_deref());
         // Explicit LimitTunnelProtocols wins; otherwise derive from protocolSelection.
@@ -2887,6 +2918,24 @@ impl Settings {
         if protocols.is_empty() {
             protocols = selection_protocols(selection.as_deref());
         }
+        let inproxy_named = protocols
+            .iter()
+            .any(|protocol| protocol.starts_with("INPROXY-"));
+        if inproxy_named {
+            conduit = true;
+            fronted_fallback = false;
+        }
+        let inproxy_prefer_probability = probability_field(
+            settings,
+            "InproxyTunnelProtocolPreferProbability",
+            if selection.as_deref() == Some("conduit") {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        let inproxy_force_selection_count =
+            count_field(settings, "InproxyTunnelProtocolForceSelectionCount", 0);
         let conduit_mode = match text(settings, "conduitMode")
             .or_else(|| text(settings, "conduit_mode"))
             .map(|mode| mode.to_ascii_lowercase())
@@ -3667,6 +3716,8 @@ impl Settings {
             inproxy_await_ready_timeout,
             inproxy_no_match_failover,
             inproxy_no_match_failover_personal,
+            inproxy_prefer_probability,
+            inproxy_force_selection_count,
             reject_countries,
             reject_cidrs,
             geoip_path,
@@ -3908,6 +3959,8 @@ impl Settings {
         self.region.hash(&mut hasher);
         self.conduit.hash(&mut hasher);
         self.conduit_protocols.hash(&mut hasher);
+        self.inproxy_prefer_probability.to_bits().hash(&mut hasher);
+        self.inproxy_force_selection_count.hash(&mut hasher);
         self.limit_quic_versions.hash(&mut hasher);
         self.quic_noise.hash(&mut hasher);
         self.meek_headers.hash(&mut hasher);
@@ -5513,6 +5566,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds",
     "InproxyClientNoMatchFailoverProbability",
     "InproxyClientNoMatchFailoverPersonalProbability",
+    "InproxyAllowClient",
+    "InproxyTunnelProtocolPreferProbability",
+    "InproxyTunnelProtocolForceSelectionCount",
+    "InproxyTunnelProtocolSelectionProbability",
     "inproxyCompartment",
     "protocol_selection",
     "conduitMode",
@@ -6833,6 +6890,28 @@ fn protocol_base(protocol: &str) -> String {
 /// Whether a protocol names a meek transport.
 fn is_meek_protocol(protocol: &str) -> bool {
     protocol.starts_with("FRONTED-MEEK") || protocol.starts_with("UNFRONTED-MEEK")
+}
+
+/// Whether this attempt takes the in-proxy transport rather than a direct one.
+fn select_inproxy(
+    has_inproxy: bool,
+    has_direct: bool,
+    enabled: bool,
+    prefer: f64,
+    force_remaining: &AtomicUsize,
+) -> bool {
+    if !enabled || !has_inproxy {
+        return false;
+    }
+    if force_remaining
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return true;
+    }
+    !has_direct || coin(prefer)
 }
 
 /// The protocol shape an in-proxy name asks for, without its WebRTC and OSSH markers.
@@ -14872,6 +14951,66 @@ mod tests {
         assert_eq!(explicit.inproxy_offer_retry_jitter, 0.25);
         assert_eq!(explicit.inproxy_no_match_failover, 0.4);
         assert_eq!(explicit.inproxy_no_match_failover_personal, 0.9);
+    }
+
+    #[test]
+    fn client_inproxy_prefer_and_force_reach_the_settings() {
+        let default = Settings::from_json(None).expect("settings");
+        assert_eq!(default.inproxy_prefer_probability, 0.0);
+        assert_eq!(default.inproxy_force_selection_count, 0);
+
+        let conduit = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"conduit"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(conduit.conduit);
+        assert_eq!(conduit.inproxy_prefer_probability, 1.0);
+
+        let explicit = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyTunnelProtocolPreferProbability":0.25,"InproxyTunnelProtocolForceSelectionCount":3}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(explicit.inproxy_prefer_probability, 0.25);
+        assert_eq!(explicit.inproxy_force_selection_count, 3);
+
+        let named = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyAllowClient":false,"LimitTunnelProtocols":["INPROXY-WEBRTC-OSSH"]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(named.conduit);
+        assert_eq!(named.inproxy_prefer_probability, 0.0);
+
+        let mixed = Settings::from_json(Some(
+            &json::parse(r#"{"LimitTunnelProtocols":["OSSH","INPROXY-WEBRTC-OSSH"]}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        assert!(mixed.conduit);
+        assert_eq!(mixed.inproxy_prefer_probability, 0.0);
+    }
+
+    #[test]
+    fn an_inproxy_force_count_wins_once_then_prefer_decides() {
+        let force = AtomicUsize::new(2);
+        assert!(select_inproxy(true, true, true, 0.0, &force));
+        assert!(select_inproxy(true, true, true, 0.0, &force));
+        assert!(!select_inproxy(true, true, true, 0.0, &force));
+        assert_eq!(force.load(Ordering::Acquire), 0);
+        assert!(select_inproxy(true, true, true, 1.0, &force));
+    }
+
+    #[test]
+    fn an_inproxy_only_server_stays_inproxy_and_no_conduit_does_not() {
+        let force = AtomicUsize::new(0);
+        assert!(select_inproxy(true, false, true, 0.0, &force));
+        assert!(!select_inproxy(false, true, true, 1.0, &force));
+        assert!(!select_inproxy(true, true, false, 1.0, &force));
     }
 
     #[test]
