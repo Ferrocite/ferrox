@@ -97,6 +97,9 @@ type XmcSlot = std::sync::OnceLock<Result<Xmc, String>>;
 struct XmcWriter {
     stream: TcpStream,
     chain: std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
+    /// The same absolute deadline the reader holds: a peer that stops reading mid-login parks an
+    /// admitted lane no longer than its budget, not for the whole two-minute default.
+    deadline: HandshakeDeadline,
 }
 
 /// A handshake that outlives a peer's interest is a stalled connection, not a slow one; the
@@ -176,8 +179,19 @@ impl<R: ReadClock> std::io::Read for DeadlineReader<R> {
 
 impl std::io::Write for XmcWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(at) = *self.deadline.gate() {
+            let left = at.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "xmc: handshake deadline passed",
+                ));
+            }
+            self.stream
+                .set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
+        }
         let Ok(mut chain) = self.chain.lock() else {
-            return Err(std::io::Error::other("the mask chain is gone"));
+            return Err(io::Error::other("the mask chain is gone"));
         };
         chain.write(&mut &self.stream, buf)
     }
@@ -205,6 +219,7 @@ impl XmcState {
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
                     chain: std::sync::Arc::clone(chain),
+                    deadline: deadline.clone(),
                 };
                 let session = match self.role {
                     ferrox_core::finalmask::MaskRole::Client => {

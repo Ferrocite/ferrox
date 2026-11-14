@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use crate::xhttp::Xmux;
 use crate::xhttp_h2::H2Client;
 
-/// The reference's conf-layer defaults when a config wrote no block (`transport_method.go:458`).
+/// Three connections with a request and lifetime cap are this pool's defaults when a config wrote no
+/// block; the reference normalizes an absent block to zeros, which `getXmuxClient` reads as one
+/// connection with no caps, so the superset is named here rather than cited from a file the pin
+/// does not carry.
 pub(crate) fn defaults() -> Xmux {
     Xmux {
         max_connections: (3, 3),
@@ -103,6 +106,9 @@ impl std::hash::Hash for Identity {
 
 pub(crate) struct Manager {
     bounds: Xmux,
+    /// The two ranged bounds rolled once when the manager is built, as `NewXmuxManager` does, so every session of one destination reads the same pair.
+    max_connections: i64,
+    max_concurrency: i64,
     /// Keeps a TLS identity's address valid for the life of the pool, so a new config cannot be
     /// allocated where a retired one's pointer sat.
     _config: Option<Arc<ferrox_core::tls::TlsConfig>>,
@@ -187,8 +193,12 @@ impl Drop for Lease {
 
 impl Manager {
     pub(crate) fn new(bounds: Xmux, config: Option<Arc<ferrox_core::tls::TlsConfig>>) -> Arc<Self> {
+        let max_connections = roll(bounds.max_connections);
+        let max_concurrency = roll(bounds.max_concurrency);
         Arc::new(Self {
             bounds,
+            max_connections,
+            max_concurrency,
             _config: config,
             entries: Mutex::new(Vec::new()),
         })
@@ -199,9 +209,17 @@ impl Manager {
     pub(crate) fn adopt(&self, conn: Arc<H2Client>) -> Lease {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.retain(|entry| !entry.expired());
+        // A concurrent session may have filled the pool while this one dialled; the cap wins over the new connection, which is dropped.
+        if self.max_connections > 0
+            && entries.len() >= usize::try_from(self.max_connections).unwrap_or(usize::MAX)
+        {
+            if let Some(entry) = entries.iter().min_by_key(|entry| entry.running()).cloned() {
+                return hold_dialed(entry);
+            }
+        }
         let entry = Arc::new(Entry::new(conn, &self.bounds));
         entries.push(Arc::clone(&entry));
-        hold(entry)
+        hold_dialed(entry)
     }
 
     /// `GetExistingXmuxClient` (`mux.go:73`): a session that would rather dial its own transport
@@ -215,13 +233,15 @@ impl Manager {
 
     fn choose(&self, entries: &[Arc<Entry>]) -> Option<Arc<Entry>> {
         if entries.is_empty()
-            || (self.bounds.max_connections.1 > 0
-                && entries.len() < self.bounds.max_connections.1 as usize)
+            || (self.max_connections > 0
+                && entries.len() < usize::try_from(self.max_connections).unwrap_or(usize::MAX))
         {
             return None;
         }
-        let limit = self.bounds.max_concurrency.1;
-        let open = |entry: &Arc<Entry>| limit <= 0 || entry.running() < limit as usize;
+        let limit = self.max_concurrency;
+        let open = |entry: &Arc<Entry>| {
+            limit <= 0 || entry.running() < usize::try_from(limit).unwrap_or(usize::MAX)
+        };
         let count = entries.iter().filter(|entry| open(entry)).count();
         if count == 0 {
             return None;
@@ -229,6 +249,13 @@ impl Manager {
         let at = pick(count);
         entries.iter().filter(|entry| open(entry)).nth(at).cloned()
     }
+}
+
+/// The dialer's own first session: `newXmuxClient` already spent one use when it set the count, so only a reused entry pays here.
+fn hold_dialed(entry: Arc<Entry>) -> Lease {
+    entry.left_requests.fetch_sub(1, Ordering::SeqCst);
+    entry.running.fetch_add(1, Ordering::SeqCst);
+    Lease { entry }
 }
 
 fn hold(entry: Arc<Entry>) -> Lease {
@@ -251,7 +278,7 @@ pub(crate) fn manager(
     config: Option<Arc<ferrox_core::tls::TlsConfig>>,
 ) -> Arc<Manager> {
     let mut managers = MANAGERS.lock().unwrap_or_else(PoisonError::into_inner);
-    // `transport_method.go:458` fills the defaults only for a wholly empty block, so `{}` takes them too.
+    // The defaults stand in only for a wholly empty block, so `{}` takes them too.
     let bounds = bounds
         .filter(|bounds| *bounds != Xmux::default())
         .unwrap_or_else(defaults);
@@ -480,10 +507,18 @@ mod tests {
         let three = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
+            1,
+            "the dialer's own session is the first of the three, not a fourth spend"
+        );
+        assert!(Arc::ptr_eq(&one_conn, three.conn()));
+        drop(three);
+        let four = take(&manager, &create).expect("a lease");
+        assert_eq!(
+            dialed.load(Ordering::SeqCst),
             2,
             "the use count retires the client on the next selection"
         );
-        assert!(!Arc::ptr_eq(&one_conn, three.conn()));
+        assert!(!Arc::ptr_eq(&one_conn, four.conn()));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,7 @@ use base64::Engine as _;
 
 use crate::conn::Connection;
 use crate::json::{self, Json};
+use crate::proxy::WindowRead;
 use crate::ws::{WsReader, WsWriter};
 
 const PAGE: &str = include_str!("browser_dialer.html");
@@ -48,7 +49,43 @@ struct Slot {
     reader: WsReader<Connection>,
     writer: WsWriter,
     /// The connection this slot was queued for stays counted until its relay closes, not merely until its head is read.
+    live: Live,
+}
+
+/// A downlink reader that holds the page slot until the relay drops it.
+pub(crate) struct KeepRead<R> {
+    inner: R,
     _live: Live,
+}
+
+impl<R: Read> Read for KeepRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: WindowRead> WindowRead for KeepRead<R> {
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        self.inner.read_window()
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.inner.parks_on_timeout()
+    }
+
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        self.inner.set_head_progress(progress);
+    }
+
+    fn awaits_head(&self) -> bool {
+        self.inner.awaits_head()
+    }
+}
+
+impl KeepRead<WsReader<Connection>> {
+    fn set_poll(&mut self, every: Option<Duration>) {
+        self.inner.set_poll(every);
+    }
 }
 
 struct Live(Arc<Bridge>);
@@ -196,7 +233,7 @@ impl Bridge {
         let mut slot = Some(Slot {
             reader,
             writer,
-            _live: live,
+            live,
         });
         let queued = {
             let Ok(mut queue) = self.queue.lock() else {
@@ -390,21 +427,30 @@ fn dial_ws_on(bridge: &Bridge, target: &WsTarget<'_>) -> Option<(WsReader<Connec
         authority(target.host, target.port, target.tls)
     );
     let slot = bridge.task(&task("WS", url, extra, true))?;
+    let Slot {
+        reader,
+        mut writer,
+        live,
+    } = slot;
     if !early && !target.first.is_empty() {
-        slot.writer.set_write_timeout(Some(TASK));
-        let sent = slot.writer.send(target.first);
-        slot.writer.set_write_timeout(None);
+        writer.set_write_timeout(Some(TASK));
+        let sent = writer.send(target.first);
+        writer.set_write_timeout(None);
         if !sent {
             return None;
         }
     }
-    Some((slot.reader, slot.writer))
+    writer.keep(crate::ws::Keep::new(Arc::new(live)));
+    Some((reader, writer))
 }
 
-pub(crate) fn dial_get(url: String, parts: &HeadParts) -> Option<WsReader<Connection>> {
+pub(crate) fn dial_get(url: String, parts: &HeadParts) -> Option<KeepRead<WsReader<Connection>>> {
     let bridge = bridge()?;
     let slot = bridge.task(&task("GET", url, http_extra(parts), true))?;
-    Some(slot.reader)
+    Some(KeepRead {
+        inner: slot.reader,
+        _live: slot.live,
+    })
 }
 
 pub(crate) fn dial_packet(method: &str, url: String, parts: &HeadParts, payload: &[u8]) -> bool {

@@ -990,6 +990,10 @@ impl<R: Read> GrpcReader<R> {
     }
 
     fn end(&mut self) -> std::io::Result<Option<(usize, usize)>> {
+        // The status may ride the `HEADERS` trailer after a `DATA` that carried `END_STREAM`; pump first so a later trailer is judged, not read as a clean end.
+        if self.remote_end && self.poll {
+            self.pump_after_end()?;
+        }
         if self.grpc_status_bad {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1001,9 +1005,6 @@ impl<R: Read> GrpcReader<R> {
                 std::io::ErrorKind::InvalidData,
                 format!("gRPC status {status}"),
             ));
-        }
-        if self.remote_end && self.poll {
-            self.pump_after_end()?;
         }
         Ok(None)
     }
@@ -5002,6 +5003,39 @@ mod tests {
         drop(writer);
         let mut got = [0u8; 8];
         let error = reader.read(&mut got).expect_err("status 13 is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A status trailer after a `DATA` that carried `END_STREAM` is still the call's verdict.
+    #[test]
+    fn a_status_trailer_after_an_ended_data_frame_is_an_error() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"one")));
+        wire.extend_from_slice(&frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END,
+            1,
+            &block_encode(&[("grpc-status", "13")]),
+        ));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        reader.poll = true;
+        drop(writer);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("pays the message"), 3);
+        let error = reader
+            .read(&mut got)
+            .expect_err("the trailer after the end is the verdict");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 

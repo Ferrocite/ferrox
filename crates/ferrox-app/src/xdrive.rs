@@ -2165,6 +2165,34 @@ struct Target {
     path: String,
 }
 
+/// Whether a href's host is only reachable from this machine or its network: a store that answers a
+/// `localhost`/RFC 1918/ULA href would turn the proxy into a local port scanner, so those are refused.
+fn local_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") || bare.ends_with(".localhost") {
+        return true;
+    }
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Pages one `LIST` may walk: a store that answers `IsTruncated` forever cannot make the proxy read for it without bound.
+const MAX_LIST_PAGES: usize = 1024;
+
 impl Target {
     fn parse(url: &str) -> Option<Self> {
         let (secure, rest) = url
@@ -2898,7 +2926,9 @@ impl Template {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str()))
                 .collect();
-            let answer = self.http.ask(method, &url, &sent, body, None);
+            let answer = self
+                .http
+                .ask(method, &url, &sent, body, Some(MAX_SEGMENT_BYTES));
             let (status, payload) = match answer {
                 Ok(answer) => answer,
                 Err(why) => return Control::Again(format!("request failed: {why}")),
@@ -2935,6 +2965,14 @@ impl Template {
             .ok_or_else(|| {
                 carrier_error(format!("the response has no href at {}", op.href_path))
             })?;
+        let Some(follow_target) = Target::parse(href) else {
+            return Err(carrier_error("the store href names no origin"));
+        };
+        if local_host(&follow_target.host) {
+            return Err(carrier_error(
+                "the store href names this machine or its LAN, so it is not followed",
+            ));
+        }
         let follow = Op {
             method: op.href_method.clone(),
             url: href.to_owned(),
@@ -3275,7 +3313,12 @@ impl S3 {
         }
         let mut query = s3_query(&pairs);
         let mut seen = HashSet::new();
+        let mut pages = 0usize;
         loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(carrier_error("S3 list pagination did not end"));
+            }
             let (status, payload) = self.ask("GET", "", &query, None)?;
             if status != 200 {
                 return Err(s3_response_error("LIST", status, &payload));
@@ -3831,7 +3874,9 @@ impl Drive {
             if !content.is_empty() {
                 sent.push(("Content-Type", content));
             }
-            let answer = self.http.ask(method, target, &sent, body, None);
+            let answer = self
+                .http
+                .ask(method, target, &sent, body, Some(MAX_SEGMENT_BYTES));
             let (status, payload) = match answer {
                 Ok(answer) => answer,
                 Err(why) => return Control::Again(format!("Drive request failed: {why}")),

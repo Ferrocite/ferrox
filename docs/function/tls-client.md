@@ -8,7 +8,8 @@ and Shadowsocks instead of dialling their configured transport as a bare TCP soc
 
 `tls_carried_parts` reads `streamSettings.security = "tls"` into
 `(Carrier, server name, TlsConfig)`.  The carrier set is raw TCP, `ws`,
-`httpupgrade`, `grpc`, `xhttp`, the TCP `http` header and KCP; the SOCKS and HTTP
+`httpupgrade`, `grpc`, `xhttp`, the TCP `http` header and KCP; an `xhttp` carrier
+whose ALPN names `h3` leaves as QUIC instead of inside `dial_tls_session`; the SOCKS and HTTP
 outbound parsers refuse `quic`, `hysteria`, `masque`, `xdrive` and unknown networks
 rather than silently dialling them raw.  KCP carries the session over UDP, so its
 TLS handshake runs inside the KCP connection and the front's header travels inside
@@ -36,6 +37,7 @@ graph TD
     W -->|httpheader| HH["header-only lane inside TLS"]
     W -->|grpc| G["gRPC frame lane inside TLS"]
     W -->|xhttp| X["xhttp stream(s) inside TLS"]
+    W -->|"xhttp + h3 ALPN"| Q["QUIC session (UDP, not inside the TCP dial)"]
     R --> F["front header: SOCKS5 or HTTP CONNECT"]
     WS --> F
     HU --> F

@@ -1053,6 +1053,10 @@ fn salt_step<R: Read>(
                     },
                 );
             }
+            // A server that answers with the request's own salt puts both directions under one key and the same nonce count, so an observer gets the XOR of two ciphertexts; the spec forbids it.
+            if server_salt == client_salt {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            }
             let Some(cipher) = Cipher::from_psk(method, &psk, &server_salt) else {
                 return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             };
@@ -2264,6 +2268,24 @@ mod tests {
         read_exact(stream, wire).ok()?;
         let plain = recv.open_in_place(wire)?;
         Some(&wire[..plain])
+    }
+
+    /// A server that answers with the request's own salt would reuse one key and one nonce count for
+    /// both directions; the handshake refuses it before it reads the fixed header.
+    #[test]
+    fn a_server_salt_equal_to_the_request_salt_is_refused() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![7u8; method.key_len()];
+        let salt = vec![9u8; method.key_len()];
+        let mut wire = salt.clone();
+        wire.extend_from_slice(&[0u8; 64]);
+        let mut back = Vec::new();
+        let mut link = Downlink::new(std::io::Cursor::new(wire), Recv::Waiting(method, psk, salt));
+        assert_eq!(
+            link.step(&mut back, None),
+            crate::proxy::lane_pool::Next::Done
+        );
+        assert!(back.is_empty(), "a reused salt opened a payload");
     }
 
     /// A writer that has `writev`, which is what the relay's own socket is: it counts calls and

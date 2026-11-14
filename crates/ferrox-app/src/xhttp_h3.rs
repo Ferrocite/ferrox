@@ -558,6 +558,11 @@ fn response_fields(head: &str) -> Vec<(String, String)> {
     fields
 }
 
+/// Whether a field byte can ride an HTTP/1 line: a peer that smuggles `\r\n` through QPACK would write its own headers into the head `accept_core` parses.
+fn h1_safe(bytes: &[u8]) -> bool {
+    !bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+}
+
 /// The head `accept_core` parses from a request's fields: the same shape the H2 lane synthesises.
 fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     let field = |name: &[u8]| {
@@ -568,12 +573,18 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     };
     let method = field(b":method")?;
     let target = field(b":path")?;
+    if !h1_safe(method) || !h1_safe(target) {
+        return None;
+    }
     let mut head = Vec::with_capacity(method.len() + target.len() + 64);
     head.extend_from_slice(method);
     head.push(b' ');
     head.extend_from_slice(target);
     head.extend_from_slice(b" HTTP/3\r\n");
     if let Some(authority) = field(b":authority") {
+        if !h1_safe(authority) {
+            return None;
+        }
         head.extend_from_slice(b"Host: ");
         head.extend_from_slice(authority);
         head.extend_from_slice(b"\r\n");
@@ -581,6 +592,9 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     for (name, value) in fields {
         if name.starts_with(b":") {
             continue;
+        }
+        if name.contains(&b':') || !h1_safe(name) || !h1_safe(value) {
+            return None;
         }
         head.extend_from_slice(name);
         head.extend_from_slice(b": ");
@@ -1354,6 +1368,25 @@ mod tests {
         assert_eq!(got, payload);
         assert_eq!(reader.room.as_ptr(), base, "the same room is reused");
         assert_eq!(reader.room.capacity(), capacity, "no reallocation");
+    }
+
+    /// A field's value cannot smuggle a second head line into the HTTP/1 head `accept_core` parses.
+    #[test]
+    fn a_field_with_crlf_is_refused_not_synthesised() {
+        let fields = vec![
+            (b":method".to_vec(), b"POST".to_vec()),
+            (b":path".to_vec(), b"/x".to_vec()),
+            (b"host".to_vec(), b"localhost".to_vec()),
+            (b"x-a".to_vec(), b"1\r\nContent-Length: 0".to_vec()),
+        ];
+        assert!(synth_head(&fields).is_none());
+        let mut ok = fields.clone();
+        ok[3].1 = b"1".to_vec();
+        let head = synth_head(&ok).expect("a plain field synthesises");
+        assert_eq!(
+            head,
+            b"POST /x HTTP/3\r\nHost: localhost\r\nx-a: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
     }
 
     #[test]

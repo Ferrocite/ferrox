@@ -1412,17 +1412,32 @@ mod tests {
     const PROBE_PLAINTEXT: usize = 4096;
     const PROBE_ROUNDS: usize = 16;
 
+    /// Counts what the mask actually put on the wire, so the probe's upper bound is the encoded
+    /// length rather than the plaintext length the writer returns by construction.
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[inline(never)]
-    fn encode_probe() -> usize {
+    fn encode_probe() -> (usize, usize) {
         let config = stage("probe", "", &[]);
         let mut writer = config.open_write(MaskRole::Client);
         let plain: Vec<u8> = (0..PROBE_PLAINTEXT).map(|at| at as u8).collect();
-        let mut sink = std::io::sink();
+        let mut sink = Count(0);
         let mut total = 0;
         for _ in 0..PROBE_ROUNDS {
             total += writer.write(&mut sink, &plain).expect("encodes");
         }
-        std::hint::black_box(total)
+        std::hint::black_box((total, sink.0))
     }
 
     #[inline(never)]
@@ -1450,7 +1465,16 @@ mod tests {
 
     #[test]
     fn the_sudoku_wire_costs_the_bytes_and_nothing_else() {
-        assert_eq!(encode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
+        let (consumed, wire) = encode_probe();
+        assert_eq!(consumed, PROBE_PLAINTEXT * PROBE_ROUNDS);
+        assert!(
+            wire >= consumed,
+            "the masked wire is never shorter than the plaintext it carries"
+        );
+        assert!(
+            wire <= consumed + PROBE_ROUNDS * 64,
+            "one framing head per write, not one per byte"
+        );
         assert_eq!(decode_probe(), PROBE_PLAINTEXT * PROBE_ROUNDS);
     }
 

@@ -2306,11 +2306,8 @@ impl H2Conn {
         };
         {
             let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if st.dead {
+            if st.dead || st.finished {
                 return false;
-            }
-            if st.finished {
-                return true;
             }
         }
         let max = *self

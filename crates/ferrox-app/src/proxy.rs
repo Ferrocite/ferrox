@@ -15253,6 +15253,12 @@ fn serve_shadowsocks_inbound(
     let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method, configured);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    if udp && udp_accounts.is_none() {
+        // A carrier that frames streams cannot carry datagrams; say so in one line instead of binding nothing and reporting a live inbound.
+        eprintln!(
+            "shadowsocks udp on {address}: the configured carrier carries streams only, so udp is not served"
+        );
+    }
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
     if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom) {
         return served;
@@ -15266,6 +15272,7 @@ fn serve_shadowsocks_inbound(
     if !tcp && !udp {
         return false;
     }
+    let mut served = tcp;
     if tcp {
         match carrier {
             Carrier::Kcp(config) => {
@@ -15319,6 +15326,7 @@ fn serve_shadowsocks_inbound(
         }
     }
     if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
+        served = true;
         thread::spawn(move || {
             if accounts.is_2022 {
                 crate::shadowsocks2022::serve_udp_on(
@@ -15332,7 +15340,7 @@ fn serve_shadowsocks_inbound(
             }
         });
     }
-    true
+    served
 }
 
 /// The inbound's own key, preferring `settings`.

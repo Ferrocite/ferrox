@@ -279,6 +279,24 @@ struct Frame {
 pub(crate) struct WsWriter {
     shared: Arc<Shared>,
     masked: bool,
+    /// Lives while this writer or one of its clones does: the browser bridge frees its page slot only when the relay is done with the carrier, not when the dial returns.
+    keep: Option<Keep>,
+}
+
+/// A handle whose drop marks a carrier finished, kept alive by every clone of the writer that carries it.
+#[derive(Clone)]
+pub(crate) struct Keep(Arc<dyn std::any::Any + Send + Sync>);
+
+impl Keep {
+    pub(crate) fn new(payload: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self(payload)
+    }
+}
+
+impl std::fmt::Debug for Keep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keep")
+    }
 }
 
 impl WsReader<Connection> {
@@ -663,6 +681,11 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
 }
 
 impl WsWriter {
+    /// Tie a handle's lifetime to this writer: it is released with the last clone, which is when the relay closes the carrier.
+    pub(crate) fn keep(&mut self, guard: Keep) {
+        self.keep = Some(guard);
+    }
+
     /// Arm the write side for one bounded task send; `None` hands the socket back to the relay.
     pub(crate) fn set_write_timeout(&self, timeout: Option<std::time::Duration>) {
         let Ok(mut stream) = self.shared.stream.lock() else {
@@ -1127,7 +1150,14 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         handshake: None,
         reads: 0,
     };
-    (reader, WsWriter { shared, masked })
+    (
+        reader,
+        WsWriter {
+            shared,
+            masked,
+            keep: None,
+        },
+    )
 }
 
 impl crate::proxy::CarrierSink for WsWriter {
@@ -1437,6 +1467,7 @@ mod tests {
             let writer = WsWriter {
                 shared: Arc::clone(&shared),
                 masked: false,
+                keep: None,
             };
             let data = vec![0x5au8; len];
             let mut sent = 0;
