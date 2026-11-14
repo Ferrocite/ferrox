@@ -17277,39 +17277,47 @@ fn vless_mux_unserved() -> Option<MuxUplink> {
 }
 
 fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
-    // The 2022 rung answers its own reply handshake before a frame, and its mux reader is not wired yet: the caller dials directly.
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        return None;
+        return open_ss_mux_2022(ss);
     }
     match &ss.carrier {
         Carrier::Hysteria(_) => return open_ss_mux_hysteria(ss),
         Carrier::Xdrive { .. } => return open_ss_mux_xdrive(ss),
+        Carrier::Kcp(_) => return open_ss_mux_kcp(ss),
+        Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc(_)
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. } => return open_ss_mux_carried(ss),
         _ => {}
     }
     let server = resolve_outbound(&ss.address, ss.port)?;
-    let target = Destination::Name(
-        crate::shadowsocks::MUX_HOST.to_owned(),
-        crate::shadowsocks::MUX_PORT,
-    );
-    let (read, write, close): MuxHalves = match (&ss.carrier, ss.tls.as_deref()) {
-        (Carrier::Raw(_), None) => {
-            let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
-            let read = stream.try_clone().ok()?;
-            let write = stream.try_clone().ok()?;
-            (Box::new(read), Box::new(write), connection_closer(&stream))
-        }
-        (Carrier::Raw(_), Some(cfg)) => {
-            let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
-            let (read, write, raw) = session.into_halves()?;
-            let close = connection_closer(&raw);
-            (Box::new(read), Box::new(write), close)
-        }
-        _ => {
-            static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            if SAID.set(()).is_ok() {
-                eprintln!("shadowsocks: mux is served on a raw or tls carrier; dialing directly");
+    let target = ss_mux_target();
+    let (read, write, close): MuxHalves = if let Some(cfg) = ss.reality.as_deref() {
+        let session = dial_reality_session(&server, cfg, ss.carrier.tcp_mask())?;
+        let (read, write, raw) = session.into_halves()?;
+        (Box::new(read), Box::new(write), connection_closer(&raw))
+    } else {
+        match (&ss.carrier, ss.tls.as_deref()) {
+            (Carrier::Raw(_), None) => {
+                let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
+                let read = stream.try_clone().ok()?;
+                let write = stream.try_clone().ok()?;
+                (Box::new(read), Box::new(write), connection_closer(&stream))
             }
-            return None;
+            (Carrier::Raw(_), Some(cfg)) => {
+                let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
+                let (read, write, raw) = session.into_halves()?;
+                let close = connection_closer(&raw);
+                (Box::new(read), Box::new(write), close)
+            }
+            _ => {
+                static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if SAID.set(()).is_ok() {
+                    eprintln!("shadowsocks: this carrier does not pair with mux; dialing directly");
+                }
+                return None;
+            }
         }
     };
     let mut write = write;
@@ -17319,6 +17327,270 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     Some(MuxUplink {
         read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
         write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
+        close,
+    })
+}
+
+fn ss_mux_target() -> Destination {
+    Destination::Name(
+        crate::shadowsocks::MUX_HOST.to_owned(),
+        crate::shadowsocks::MUX_PORT,
+    )
+}
+
+fn open_ss_mux_2022(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    match &ss.carrier {
+        Carrier::Raw(_) => {
+            let server = resolve_outbound(&ss.address, ss.port)?;
+            if let Some(cfg) = ss.reality.as_deref() {
+                let session = dial_reality_session(&server, cfg, ss.carrier.tcp_mask())?;
+                let (read, write, raw) = session.into_halves()?;
+                return ss2022_mux_up(read, write, connection_closer(&raw), ss);
+            }
+            match ss.tls.as_deref() {
+                None => {
+                    let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
+                    let read = stream.try_clone().ok()?;
+                    let write = stream.try_clone().ok()?;
+                    ss2022_mux_up(read, write, connection_closer(&stream), ss)
+                }
+                Some(cfg) => {
+                    let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
+                    let (read, write, raw) = session.into_halves()?;
+                    ss2022_mux_up(read, write, connection_closer(&raw), ss)
+                }
+            }
+        }
+        Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc(_)
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. } => open_ss_mux_carried(ss),
+        Carrier::Hysteria(_) => open_ss_mux_2022_hysteria(ss),
+        Carrier::Xdrive { .. } => open_ss_mux_2022_xdrive(ss),
+        Carrier::Kcp(_) => open_ss_mux_2022_kcp(ss),
+        _ => {
+            static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if SAID.set(()).is_ok() {
+                eprintln!("shadowsocks: this carrier does not pair with mux; dialing directly");
+            }
+            None
+        }
+    }
+}
+
+fn ss2022_mux_up<R, W>(
+    read: R,
+    mut write: W,
+    close: Arc<dyn Fn() + Send + Sync>,
+    ss: &ShadowsocksOut,
+) -> Option<MuxUplink>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+        &mut write,
+        &ss.password,
+        &ss.method,
+        &ss_mux_target(),
+    )
+    .ok()?;
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks2022::MuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks2022::MuxWriter::client(write, send)),
+        close,
+    })
+}
+
+fn open_ss_mux_2022_hysteria(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let dial = ss_hysteria_dial(ss)?;
+    let mut head = Vec::with_capacity(128);
+    let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+        &mut head,
+        &ss.password,
+        &ss.method,
+        &ss_mux_target(),
+    )
+    .ok()?;
+    let flow = crate::hysteria::open(&dial, &head, 0)?;
+    let read = flow.clone();
+    let closer = flow.clone();
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks2022::MuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks2022::MuxWriter::client(flow, send)),
+        close: Arc::new(move || closer.close()),
+    })
+}
+
+fn open_ss_mux_2022_xdrive(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let mut session = xdrive_dial_session(&ss.carrier, &ss.address, ss.port)?;
+    let (send, recv) = crate::shadowsocks2022::client_send_handshake(
+        &mut session,
+        &ss.password,
+        &ss.method,
+        &ss_mux_target(),
+    )
+    .ok()?;
+    let read = session.clone();
+    let close = xdrive_close(&session);
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks2022::MuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks2022::MuxWriter::client(session, send)),
+        close,
+    })
+}
+
+fn open_ss_mux_2022_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let conn = kcp_dial_session(&ss.carrier, &ss.address, ss.port)?;
+    if let Some(cfg) = ss.reality.as_deref() {
+        let Some(mut session) = kcp_reality_connect(&conn, cfg) else {
+            conn.close();
+            return None;
+        };
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            &ss_mux_target(),
+        ) else {
+            conn.close();
+            return None;
+        };
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        let close = kcp_close(&conn);
+        return Some(MuxUplink {
+            read: Box::new(crate::shadowsocks2022::MuxReader::new(read, recv)),
+            write: Box::new(crate::shadowsocks2022::MuxWriter::client(write, send)),
+            close,
+        });
+    }
+    if let Some(cfg) = ss.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
+            conn.close();
+            return None;
+        };
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            &ss_mux_target(),
+        ) else {
+            conn.close();
+            return None;
+        };
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        let close = kcp_close(&conn);
+        return Some(MuxUplink {
+            read: Box::new(crate::shadowsocks2022::MuxReader::new(read, recv)),
+            write: Box::new(crate::shadowsocks2022::MuxWriter::client(write, send)),
+            close,
+        });
+    }
+    let mut writer = KcpIo::new(Arc::clone(&conn));
+    let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        &mut writer,
+        &ss.password,
+        &ss.method,
+        &ss_mux_target(),
+    ) else {
+        conn.close();
+        return None;
+    };
+    let (_, writer, close) = kcp_parts(&conn);
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks2022::MuxReader::new(
+            KcpIo::new(Arc::clone(&conn)),
+            recv,
+        )),
+        write: Box::new(crate::shadowsocks2022::MuxWriter::client(writer, send)),
+        close,
+    })
+}
+
+fn open_ss_mux_carried(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let (client, server) = crate::reverse::loopback_pair()?;
+    let spec = ss.carrier_spec();
+    thread::spawn(move || {
+        let Some(edge) = resolve_outbound(&spec.address, spec.port) else {
+            return;
+        };
+        dial_shadowsocks(&server, &edge, &spec, &ss_mux_target(), Ladder::global());
+    });
+    let read = client.try_clone().ok()?;
+    let write = client.try_clone().ok()?;
+    let closer = client.try_clone().ok()?;
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(write),
+        close,
+    })
+}
+
+fn open_ss_mux_kcp(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    let conn = kcp_dial_session(&ss.carrier, &ss.address, ss.port)?;
+    let target = ss_mux_target();
+    if let Some(cfg) = ss.reality.as_deref() {
+        let Some(mut session) = kcp_reality_connect(&conn, cfg) else {
+            conn.close();
+            return None;
+        };
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            &target,
+        ) else {
+            conn.close();
+            return None;
+        };
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        let close = kcp_close(&conn);
+        return Some(MuxUplink {
+            read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
+            write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
+            close,
+        });
+    }
+    if let Some(cfg) = ss.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
+            conn.close();
+            return None;
+        };
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            &target,
+        ) else {
+            conn.close();
+            return None;
+        };
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        let close = kcp_close(&conn);
+        return Some(MuxUplink {
+            read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
+            write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
+            close,
+        });
+    }
+    let mut writer = KcpIo::new(Arc::clone(&conn));
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, &target)
+    else {
+        conn.close();
+        return None;
+    };
+    let (_, writer, close) = kcp_parts(&conn);
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks::SsMuxReader::new(
+            KcpIo::new(Arc::clone(&conn)),
+            recv,
+        )),
+        write: Box::new(crate::shadowsocks::SsMuxWriter::new(writer, send)),
         close,
     })
 }
@@ -17367,26 +17639,20 @@ fn open_ss_mux_xdrive(ss: &ShadowsocksOut) -> Option<MuxUplink> {
 fn open_vmess_mux(vmess: &VmessOut) -> Option<MuxUplink> {
     match &vmess.carrier {
         Carrier::Xdrive { .. } => return open_vmess_mux_xdrive(vmess),
-        Carrier::Kcp(_) | Carrier::Masque | Carrier::Http | Carrier::Unknown { .. } => {
+        Carrier::Kcp(_) => return open_vmess_mux_kcp(vmess),
+        Carrier::Masque | Carrier::Http | Carrier::Unknown { .. } => {
             return vmess_mux_unserved();
         }
         _ => {}
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    let address = listener.local_addr().ok()?;
+    let (client, server) = crate::reverse::loopback_pair()?;
     let spec = vmess.carrier_spec();
     thread::spawn(move || {
-        let Ok((server, _)) = listener.accept() else {
-            return;
-        };
-        drop(listener);
         let Some(edge) = resolve_outbound(&spec.address, spec.port) else {
             return;
         };
-        let server = Connection::from(server);
         dial_vmess(&server, &edge, &spec, &vmess_mux_target(), Ladder::global());
     });
-    let client = crate::conn::connect(&crate::conn::Target::Ip(address), budgets::dial()).ok()?;
     let read = client.try_clone().ok()?;
     let write = client.try_clone().ok()?;
     let closer = client.try_clone().ok()?;
@@ -17413,15 +17679,69 @@ fn open_vmess_mux_xdrive(vmess: &VmessOut) -> Option<MuxUplink> {
     if session.write_all(&request).is_err() {
         return None;
     }
-    if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
-        return None;
-    }
-    let read = session.clone();
+    let read = crate::vmess::ResponseReader::new(session.clone(), response_key, response_iv, auth);
     let write = session.clone();
     let close = xdrive_close(&session);
     Some(MuxUplink {
         read: Box::new(crate::vmess::CarriedReader::new(read, recv)),
         write: Box::new(crate::vmess::CarriedWriter::new(write, send)?),
+        close,
+    })
+}
+
+fn open_vmess_mux_kcp(vmess: &VmessOut) -> Option<MuxUplink> {
+    let conn = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        &vmess_mux_target(),
+        1,
+    ) else {
+        conn.close();
+        return None;
+    };
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
+            conn.close();
+            return None;
+        };
+        if session.write_all(&request).is_err() {
+            conn.close();
+            return None;
+        }
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        let close = kcp_close(&conn);
+        let Some(write) = crate::vmess::CarriedWriter::new(write, send) else {
+            conn.close();
+            return None;
+        };
+        let read = crate::vmess::ResponseReader::new(read, response_key, response_iv, auth);
+        return Some(MuxUplink {
+            read: Box::new(crate::vmess::CarriedReader::new(read, recv)),
+            write: Box::new(write),
+            close,
+        });
+    }
+    if conn.write(&request).is_err() {
+        conn.close();
+        return None;
+    }
+    let reader = crate::vmess::ResponseReader::new(
+        KcpIo::new(Arc::clone(&conn)),
+        response_key,
+        response_iv,
+        auth,
+    );
+    let (_, writer, close) = kcp_parts(&conn);
+    let Some(write) = crate::vmess::CarriedWriter::new(writer, send) else {
+        conn.close();
+        return None;
+    };
+    Some(MuxUplink {
+        read: Box::new(crate::vmess::CarriedReader::new(reader, recv)),
+        write: Box::new(write),
         close,
     })
 }
@@ -17442,6 +17762,9 @@ fn vmess_mux_target() -> Destination {
 fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
     if matches!(trojan.carrier, Carrier::Kcp(_)) {
         return trojan_mux_kcp(trojan);
+    }
+    if matches!(trojan.carrier, Carrier::Quic) {
+        return open_trojan_mux_quic(trojan);
     }
     if matches!(trojan.carrier, Carrier::Hysteria(_)) {
         return open_trojan_mux_hysteria(trojan);
@@ -17485,6 +17808,28 @@ fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
         });
     }
     trojan_mux_plain(&server, trojan)
+}
+
+fn open_trojan_mux_quic(trojan: &TrojanOut) -> Option<MuxUplink> {
+    let pooled = crate::quic::pumped_stream_within(&trojan_quic_dial(trojan), budgets::dial())?;
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    let mut stream = pooled.stream_handle();
+    if stream.write_all(&header).is_err() {
+        pooled.cancel();
+        return None;
+    }
+    let read = pooled.stream_handle();
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(stream),
+        close,
+    })
 }
 
 fn trojan_mux_target() -> Destination {
@@ -24370,6 +24715,9 @@ fn serve_connect_at(
     }
     if let Outbound::Vmess(vmess) = out {
         if matches!(vmess.carrier, Carrier::Kcp(_)) {
+            if vmess.mux.tcp.is_some() && dial_vmess_mux(&client, vmess, asked) {
+                return;
+            }
             if let Some(session) = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port) {
                 dial_vmess_kcp(&client, &session, vmess, asked);
             }
@@ -24384,6 +24732,9 @@ fn serve_connect_at(
     }
     if let Outbound::Trojan(trojan) = out {
         if matches!(trojan.carrier, Carrier::Quic) {
+            if trojan.mux.tcp.is_some() && dial_trojan_mux(&client, trojan, asked) {
+                return;
+            }
             let header = trojan_header(&trojan.key, 1, asked);
             crate::quic::dial_pooled_with(&client, &trojan_quic_dial(trojan), &header, false);
             return;
@@ -24399,6 +24750,9 @@ fn serve_connect_at(
             return;
         }
         if matches!(trojan.carrier, Carrier::Kcp(_)) {
+            if trojan.mux.tcp.is_some() && dial_trojan_mux(&client, trojan, asked) {
+                return;
+            }
             if let Some(session) = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port) {
                 dial_trojan_kcp(&client, &session, trojan, asked);
             }
@@ -24413,6 +24767,9 @@ fn serve_connect_at(
     }
     if let Outbound::Shadowsocks(ss) = out {
         if matches!(ss.carrier, Carrier::Kcp(_)) {
+            if ss.mux.tcp.is_some() && dial_ss_mux(&client, ss, asked) {
+                return;
+            }
             if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
                 dial_ss_kcp(&client, &session, ss, asked);
             }
@@ -26140,22 +26497,15 @@ fn serve_udp_lane_with(
                 serve_udp_lane_with(relay, dial, associate, None, None);
             }
         }
+        // Every carrier whose mux pool is open takes the same datagram lane: one XUDP flow per destination, framed by the carrier the opener dialled.
+        Outbound::Vless(vless) if vless.mux.udp_manager().is_some() => {
+            serve_socks_udp_vless(relay, vless);
+        }
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Quic) => {
             serve_socks_udp_vless(relay, vless);
         }
         Outbound::Vless(vless)
             if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
-        {
-            serve_socks_udp_vless(relay, vless);
-        }
-        Outbound::Vless(vless)
-            if matches!(vless.carrier, Carrier::Kcp(_)) && vless.mux.tcp.is_some() =>
-        {
-            serve_socks_udp_vless(relay, vless);
-        }
-        Outbound::Vless(vless)
-            if matches!(vless.carrier, Carrier::Hysteria(_))
-                && vless.mux.udp_manager().is_some() =>
         {
             serve_socks_udp_vless(relay, vless);
         }
@@ -26165,16 +26515,7 @@ fn serve_udp_lane_with(
                 crate::hysteria::serve_udp(relay, &dial);
             }
         }
-        Outbound::Vless(vless)
-            if matches!(vless.carrier, Carrier::Xdrive { .. })
-                && vless.mux.udp_manager().is_some() =>
-        {
-            serve_socks_udp_vless(relay, vless);
-        }
-        Outbound::Trojan(trojan)
-            if matches!(trojan.carrier, Carrier::Hysteria(_))
-                && trojan.mux.udp_manager().is_some() =>
-        {
+        Outbound::Trojan(trojan) if trojan.mux.udp_manager().is_some() => {
             serve_socks_udp_trojan(relay, trojan);
         }
         Outbound::Trojan(trojan) if matches!(trojan.carrier, Carrier::Hysteria(_)) => {
@@ -26182,21 +26523,11 @@ fn serve_udp_lane_with(
                 crate::hysteria::serve_udp(relay, &dial);
             }
         }
-        Outbound::Trojan(trojan)
-            if matches!(trojan.carrier, Carrier::Xdrive { .. })
-                && trojan.mux.udp_manager().is_some() =>
-        {
-            serve_socks_udp_trojan(relay, trojan);
-        }
         Outbound::Trojan(trojan) if trojan_udp_carried(&trojan.carrier) => {
             serve_socks_udp_trojan(relay, trojan);
         }
         Outbound::Vmess(vmess) => serve_socks_udp_vmess(relay, vmess),
-        Outbound::Shadowsocks(ss)
-            if matches!(ss.carrier, Carrier::Hysteria(_) | Carrier::Xdrive { .. })
-                && ss.mux.udp_manager().is_some()
-                && ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_none() =>
-        {
+        Outbound::Shadowsocks(ss) if ss.mux.udp_manager().is_some() => {
             serve_socks_udp_shadowsocks(relay, ss);
         }
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
@@ -27871,14 +28202,166 @@ impl SsUdpLane {
     }
 }
 
-fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
-    if let Some(method2022) = ferrox_core::shadowsocks2022::Method::parse(&ss.method) {
-        serve_socks_udp_shadowsocks2022(relay, ss, method2022);
-        return;
+struct Ss2022UdpSource {
+    uplink: UdpSocket,
+    datagrams: crate::shadowsocks2022::Datagrams,
+    last: Instant,
+    done: Arc<AtomicBool>,
+    reader: RelayEnd,
+}
+
+struct Ss2022UdpLane {
+    psks: Vec<Vec<u8>>,
+    psk: Vec<u8>,
+    method: ferrox_core::shadowsocks2022::Method,
+    server: SocketAddr,
+    sources: Mutex<HashMap<SocketAddr, Ss2022UdpSource>>,
+}
+
+impl Ss2022UdpLane {
+    fn open(ss: &ShadowsocksOut, method: ferrox_core::shadowsocks2022::Method) -> Option<Self> {
+        let psks = ferrox_core::shadowsocks2022::parse_psk_list(&ss.password, method.key_len())?;
+        let psk = psks.last()?.clone();
+        let server = resolve_outbound(&ss.address, ss.port)?;
+        Some(Self {
+            psks,
+            psk,
+            method,
+            server,
+            sources: Mutex::new(HashMap::new()),
+        })
     }
+
+    fn send(&self, relay: &UdpSocket, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        let Ok(mut guard) = self.sources.lock() else {
+            return false;
+        };
+        if !guard.contains_key(&src) {
+            if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                let now = Instant::now();
+                let idle = budgets::udp_idle();
+                guard.retain(|_, source| {
+                    let live = now.duration_since(source.last) < idle;
+                    if !live {
+                        source.done.store(true, Ordering::Relaxed);
+                    }
+                    live
+                });
+                if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                    return true;
+                }
+            }
+            let bound = if self.server.is_ipv6() {
+                UdpSocket::bind("[::]:0")
+            } else {
+                UdpSocket::bind("0.0.0.0:0")
+            };
+            let Ok(uplink) = bound else {
+                return true;
+            };
+            if uplink.connect(self.server).is_err() {
+                return true;
+            }
+            let datagrams = crate::shadowsocks2022::Datagrams::new();
+            let source = Arc::new(Mutex::new(Some(src)));
+            let done = Arc::new(AtomicBool::new(false));
+            let Some(reader) = spawn_ss_udp_reader2022(
+                &uplink,
+                relay,
+                &self.psk,
+                self.method,
+                datagrams.client_session(),
+                source,
+                Arc::clone(&done),
+            ) else {
+                return true;
+            };
+            guard.insert(
+                src,
+                Ss2022UdpSource {
+                    uplink,
+                    datagrams,
+                    last: Instant::now(),
+                    done,
+                    reader,
+                },
+            );
+        }
+        let Some(source) = guard.get_mut(&src) else {
+            return true;
+        };
+        source.last = Instant::now();
+        let packet = if self.psks.len() > 1 && !self.method.is_chacha() {
+            source
+                .datagrams
+                .seal_list(self.method, &self.psks, &dest, payload)
+        } else {
+            source
+                .datagrams
+                .seal(&self.psk, self.method, &dest, payload)
+        };
+        if let Some(packet) = packet {
+            let _ = source.uplink.send(packet);
+        }
+        true
+    }
+
+    fn close(self) {
+        let sources: Vec<_> = self
+            .sources
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .into_values()
+            .collect();
+        for source in &sources {
+            source.done.store(true, Ordering::Relaxed);
+        }
+        for source in sources {
+            join(&source.reader);
+        }
+    }
+}
+
+enum SsSkipLane {
+    Legacy(SsUdpLane),
+    V2022(Ss2022UdpLane),
+}
+
+impl SsSkipLane {
+    fn send(
+        &self,
+        socket: &UdpSocket,
+        src: SocketAddr,
+        dest: SocketAddr,
+        buf: &mut [u8],
+        at: usize,
+        len: usize,
+    ) -> bool {
+        match self {
+            Self::Legacy(lane) => lane.send(src, dest, buf, at, len),
+            Self::V2022(lane) => lane.send(socket, src, dest, &buf[at..at + len]),
+        }
+    }
+
+    fn close(self) {
+        match self {
+            Self::Legacy(lane) => lane.close(),
+            Self::V2022(lane) => lane.close(),
+        }
+    }
+}
+
+fn ss_skip_lane(ss: &ShadowsocksOut, socket: &UdpSocket) -> Option<SsSkipLane> {
+    match ferrox_core::shadowsocks2022::Method::parse(&ss.method) {
+        Some(method) => Ss2022UdpLane::open(ss, method).map(SsSkipLane::V2022),
+        None => SsUdpLane::open(socket, ss).map(SsSkipLane::Legacy),
+    }
+}
+
+fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     if ss.mux.udp_manager().is_some() {
         if let Some(pool) = ss.udp_pool() {
-            let mut lane: Option<SsUdpLane> = None;
+            let mut lane: Option<SsSkipLane> = None;
             let mut said = false;
             serve_socks_udp_pool(
                 relay,
@@ -27889,7 +28372,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
                 |_| true,
                 |socket, src, dest, buf, at, len| {
                     if lane.is_none() {
-                        let Some(open) = SsUdpLane::open(socket, ss) else {
+                        let Some(open) = ss_skip_lane(ss, socket) else {
                             if !said {
                                 said = true;
                                 eprintln!("shadowsocks: udp/443 skip lane unavailable; dropped");
@@ -27899,7 +28382,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
                         lane = Some(open);
                     }
                     lane.as_ref()
-                        .is_some_and(|lane| lane.send(src, dest, buf, at, len))
+                        .is_some_and(|lane| lane.send(socket, src, dest, buf, at, len))
                 },
             );
             if let Some(lane) = lane {
@@ -27907,6 +28390,10 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
             }
             return;
         }
+    }
+    if let Some(method2022) = ferrox_core::shadowsocks2022::Method::parse(&ss.method) {
+        serve_socks_udp_shadowsocks2022(relay, ss, method2022);
+        return;
     }
     let Some(lane) = SsUdpLane::open(relay, ss) else {
         return;
@@ -28343,6 +28830,9 @@ fn serve_socks_udp_pool<F, G>(
             }
             Udp443::Allow => {}
         }
+        if len > ferrox_core::mux::CHUNK_MAX {
+            continue;
+        }
         if published != Some(src) {
             if let Ok(mut slot) = source.lock() {
                 *slot = Some(src);
@@ -28385,10 +28875,71 @@ fn serve_socks_udp_pool<F, G>(
     }
 }
 
+/// The direct lane a VLESS mux's `skip` policy uses for UDP/443: one association per destination,
+/// with the same dial and reply plumbing the non-mux association runs.
+struct VlessUdpLane {
+    vless: VlessOut,
+    relay: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplink: Option<UdpUplink>,
+}
+
+impl VlessUdpLane {
+    fn new(vless: &VlessOut, relay: &UdpSocket) -> Option<Self> {
+        Some(Self {
+            vless: vless.clone(),
+            relay: relay.try_clone().ok()?,
+            source: Arc::new(Mutex::new(None)),
+            uplink: None,
+        })
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        let redial = match &self.uplink {
+            Some(up) => {
+                up.target != dest
+                    || !matches!(
+                        up.done.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    )
+            }
+            None => true,
+        };
+        if redial {
+            if let Some(old) = self.uplink.take() {
+                (old.close)();
+            }
+            self.uplink =
+                dial_udp_uplink(&self.vless, &dest, &self.relay, Arc::clone(&self.source));
+        }
+        if let Some(up) = &mut self.uplink {
+            if !write_udp_datagram(&mut *up.write, payload) {
+                if let Some(old) = self.uplink.take() {
+                    (old.close)();
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn close(self) {
+        if let Some(old) = self.uplink {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
 fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let Some(pool) = vless.udp_pool() else {
         return;
     };
+    let mut lane: Option<VlessUdpLane> = None;
+    let mut said = false;
     serve_socks_udp_pool(
         relay,
         &pool,
@@ -28396,8 +28947,24 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
         "vless",
         true,
         |dest| vless_udp_target_allowed(vless, dest),
-        |_, _, _, _, _, _| true,
+        |socket, src, dest, buf, at, len| {
+            if lane.is_none() {
+                let Some(open) = VlessUdpLane::new(vless, socket) else {
+                    if !said {
+                        said = true;
+                        eprintln!("vless: udp/443 skip lane unavailable; dropped");
+                    }
+                    return true;
+                };
+                lane = Some(open);
+            }
+            lane.as_mut()
+                .is_some_and(|lane| lane.send(src, dest, &buf[at..at + len]))
+        },
     );
+    if let Some(lane) = lane {
+        lane.close();
+    }
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
@@ -39763,8 +40330,8 @@ mod tests {
         }
     }
 
-    /// The eight-flow cells each need the whole test pool; running two at once measures the
-    /// harness's parallelism, not the lane scheduler.
+    /// The whole-pool cells — eight-flow and mux-carrier — need the suite to themselves; running
+    /// two at once measures the harness's parallelism, not the lane scheduler.
     static EIGHT_FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -52033,7 +52600,13 @@ mod tests {
 
     fn trojan_mux_probe_port() -> u16 {
         static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-        trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        loop {
+            let port =
+                trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     /// A trojan client that pipelines its first payload with the request header keeps it: the
@@ -54125,6 +54698,107 @@ mod tests {
         vmess.mux = Mux::default();
         xdrive_dispatch_mux_echo("xdrive-vmess-direct", &Outbound::Vmess(vmess));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer that waits for the first mux frame must not hold the opener: the response is read by
+    /// the demux thread, not at session startup.
+    #[test]
+    fn a_vmess_kcp_mux_opens_before_the_server_answers() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_vmess_kcp_mux_opens_before_the_server_answers",
+        ) {
+            return;
+        }
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let Carrier::Kcp(config) = inbound_carrier(&inbound) else {
+            panic!("the inbound names kcp");
+        };
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let serve: KcpServe = Arc::new(|conn| {
+            thread::sleep(Duration::from_secs(2));
+            conn.close();
+        });
+        assert!(serve_kcp_bound(
+            &format!("127.0.0.1:{port}"),
+            config,
+            &serve
+        ));
+        thread::sleep(Duration::from_millis(50));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{"network": "kcp"}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        assert!(matches!(vmess.carrier, Carrier::Kcp(_)));
+        let started = Instant::now();
+        let uplink = open_vmess_mux_kcp(&vmess).expect("opens without a response");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the opener waits for a response"
+        );
+        (uplink.close)();
+    }
+
+    /// KCP carries the `VMess` mux session the way it carries the direct request; the opener writes the
+    /// request and its response seal above the session instead of a loopback carrier.
+    #[test]
+    fn a_vmess_kcp_mux_carries_a_tcp_stream() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_vmess_kcp_mux_carries_a_tcp_stream") {
+            return;
+        }
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let (_, served) = serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None);
+        assert!(served);
+        thread::sleep(Duration::from_millis(50));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{"network": "kcp"}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound");
+        assert!(matches!(&out, Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Kcp(_))));
+        let echo_port = echo_loop();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &out,
+            Destination::from(target),
+            Duration::from_secs(30),
+            Front::Socks,
+            "vmess-kcp-mux",
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
     }
 
     #[test]
@@ -57590,6 +58264,75 @@ mod tests {
         join_thread_within(answering, Duration::from_secs(5), "the answering server");
     }
 
+    /// The VLESS mux skip policy leaves the mux for a direct UDP lane; a peer that waits for the
+    /// header and the datagram sees both, and the answer returns through the association.
+    #[test]
+    fn a_vless_skip_policy_uses_the_direct_udp_lane() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let dest: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let header = vless_header(&id, 2, &Destination::from(dest));
+        let answering = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = vec![0u8; header.len()];
+            if read_exact(&mut stream, &mut request).is_err() {
+                return;
+            }
+            let mut buf = udp_buffer();
+            let Some(n) = read_udp_datagram(&mut stream, &mut buf) else {
+                return;
+            };
+            stream.write_all(&[0, 0]).expect("the reply header");
+            assert!(write_udp_datagram(&mut stream, &buf[..n]));
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443: Udp443::Skip,
+            },
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let serving = thread::spawn(move || serve_socks_udp_vless(&relay, &vless));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        let mut head = Vec::new();
+        let frame = socks_udp_frame(&mut head, &dest, b"ping");
+        client.send_to(frame, relay_addr).expect("sends");
+        let mut buf = udp_buffer();
+        let (n, _) = client.recv_from(&mut buf).expect("the echo returns");
+        let (_, payload) = parse_socks_udp(&buf[..n]).expect("a socks frame");
+        assert_eq!(payload, b"ping");
+        join_thread_within(serving, Duration::from_secs(5), "the VLESS skip front");
+        join_thread_within(answering, Duration::from_secs(5), "the answering server");
+    }
+
     /// A response reader that dies is discarded before the next datagram: the association used to
     /// keep writing into a socket whose answers could no longer arrive.
     #[test]
@@ -59017,6 +59760,297 @@ mod tests {
         assert_eq!(listed, 2, "one account per user");
     }
 
+    fn ss_mux_stream(tag: &'static str, ss: ShadowsocksOut, echo: crate::conn::Listener) {
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in echo.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let (local, _) = front.accept().expect("accepts");
+        let target = Destination::from(SocketAddr::from(([127, 0, 0, 1], echo_port)));
+        let dial = thread::spawn(move || {
+            assert!(dial_ss_mux(&local, &ss, &target), "{tag} opens the mux");
+        });
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping", "{tag} mux echoes");
+        client.shutdown(Shutdown::Both).expect("closes");
+        dial.join().expect("the mux session ends with the client");
+    }
+
+    fn wait_tcp(port: u16, tag: &str) {
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "{tag} listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn ss_mux_out(port: u16, method: &str, password: &str, carrier: Carrier) -> ShadowsocksOut {
+        ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: method.to_owned(),
+            password: password.to_owned(),
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443: Udp443::Reject,
+            },
+            pool: Pools::default(),
+            tls: None,
+            reality: None,
+            hysteria_roots: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        }
+    }
+
+    fn ss2022_mux_out(port: u16, carrier: Carrier, password: &str) -> ShadowsocksOut {
+        ss_mux_out(port, "2022-blake3-aes-256-gcm", password, carrier)
+    }
+
+    /// Shadowsocks 2022 has its own reply handshake; a mux session rides it on the raw carrier.
+    #[test]
+    fn shadowsocks2022_mux_carries_a_stream_through_one_session() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::shadowsocks2022_mux_carries_a_stream_through_one_session",
+        ) {
+            return;
+        }
+        let password = ferrox_core::b64::encode(&[0x42u8; 32]);
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"password": "{password}", "method": "2022-blake3-aes-256-gcm"}}}}"#
+        ))
+        .expect("parses");
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_shadowsocks_inbound(
+            &address,
+            &inbound,
+            true,
+            &std::collections::HashSet::new()
+        ));
+        wait_tcp(port, "ss2022");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
+        ss_mux_stream("ss2022", ss, echo);
+    }
+
+    /// The datagram path selects the 2022 mux before the direct session, and one session carries the target.
+    #[test]
+    fn shadowsocks2022_mux_carries_a_datagram_through_one_session() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::shadowsocks2022_mux_carries_a_datagram_through_one_session",
+        ) {
+            return;
+        }
+        let password = ferrox_core::b64::encode(&[0x42u8; 32]);
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"password": "{password}", "method": "2022-blake3-aes-256-gcm"}}}}"#
+        ))
+        .expect("parses");
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_shadowsocks_inbound(
+            &address,
+            &inbound,
+            true,
+            &std::collections::HashSet::new()
+        ));
+        wait_tcp(port, "ss2022 udp");
+        let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        assert_udp_echo_association("ss2022 udp", &udp, move |socket| {
+            serve_socks_udp_shadowsocks(socket, &ss);
+        });
+    }
+
+    /// The udp/443 skip lane speaks the 2022 datagram format, not the legacy one.
+    #[test]
+    fn a_shadowsocks2022_skip_lane_seals_a_udp_datagram() {
+        let password = ferrox_core::b64::encode(&[0x43u8; 32]);
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        echo.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let echo_addr = echo.local_addr().expect("addr");
+        let ss = ss2022_mux_out(echo_addr.port(), Carrier::Raw(Chain::default()), &password);
+        let method = ferrox_core::shadowsocks2022::Method::parse(&ss.method).expect("2022 method");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let src = relay.local_addr().expect("addr");
+        let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let lane = ss_skip_lane(&ss, &relay).expect("opens");
+        assert!(matches!(lane, SsSkipLane::V2022(_)));
+        let mut payload = *b"ping";
+        assert!(lane.send(&relay, src, dest, &mut payload, 0, 4));
+        let mut packet = [0u8; 1500];
+        let n = echo.recv(&mut packet).expect("receives");
+        assert_ne!(&packet[..n], b"ping");
+        let psk = ferrox_core::shadowsocks2022::parse_psk_list(&password, method.key_len())
+            .expect("psks")
+            .pop()
+            .expect("psk");
+        let mut server = crate::shadowsocks2022::Datagrams::new();
+        let (target, payload, _) = server.open(&psk, method, &mut packet[..n]).expect("opens");
+        assert_eq!(target, dest);
+        assert_eq!(payload, b"ping");
+        lane.close();
+    }
+
+    /// The skip policy reaches the 2022 lane through the mux dispatch, not only when the lane is opened directly.
+    #[test]
+    fn a_shadowsocks2022_skip_policy_bypasses_the_mux() {
+        let password = ferrox_core::b64::encode(&[0x44u8; 32]);
+        let method = ferrox_core::shadowsocks2022::Method::parse("2022-blake3-aes-256-gcm")
+            .expect("2022 method");
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let server_port = server.local_addr().expect("addr").port();
+        let mut ss = ss2022_mux_out(server_port, Carrier::Raw(Chain::default()), &password);
+        ss.mux.udp443 = Udp443::Skip;
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let ingress = Arc::clone(&relay);
+        let serving = thread::spawn(move || serve_socks_udp_shadowsocks(&ingress, &ss));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let dest: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut frame = Vec::new();
+        let datagram = socks_udp_frame(&mut frame, &dest, b"ping");
+        client
+            .send_to(datagram, relay_addr)
+            .expect("the association relay");
+        let mut packet = [0u8; 1500];
+        let n = server.recv(&mut packet).expect("receives");
+        let psk = ferrox_core::shadowsocks2022::parse_psk_list(&password, method.key_len())
+            .expect("psks")
+            .pop()
+            .expect("psk");
+        let mut open = crate::shadowsocks2022::Datagrams::new();
+        let (target, payload, _) = open.open(&psk, method, &mut packet[..n]).expect("opens");
+        assert_eq!(target, dest);
+        assert_eq!(payload, b"ping");
+        join_thread_within(serving, Duration::from_secs(5), "the ss2022 skip front");
+    }
+
+    /// KCP has no loopback shim: the opener writes the protocol handshake on its own session, for both codecs.
+    #[test]
+    fn a_shadowsocks_kcp_mux_carries_a_tcp_stream() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_shadowsocks_kcp_mux_carries_a_tcp_stream",
+        ) {
+            return;
+        }
+        let ss2022 = ferrox_core::b64::encode(&[0x42u8; 32]);
+        for (tag, method, password) in [
+            ("ss kcp", "aes-256-gcm", "an-example-shared-password"),
+            ("ss2022 kcp", "2022-blake3-aes-256-gcm", ss2022.as_str()),
+        ] {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "shadowsocks",
+                    "settings": {{"password": "{password}", "method": "{method}"}},
+                    "streamSettings": {{"network": "kcp"}}}}"#
+            ))
+            .expect("parses");
+            let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            assert!(serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new()
+            ));
+            assert!(matches!(inbound_carrier(&inbound), Carrier::Kcp(_)));
+            thread::sleep(Duration::from_millis(100));
+            let ss = ss_mux_out(port, method, password, inbound_carrier(&inbound));
+            let echo_port = echo_loop();
+            let target = Destination::from(SocketAddr::from(([127, 0, 0, 1], echo_port)));
+            let mut client = tunnel_stream(
+                &Outbound::Shadowsocks(ss),
+                target,
+                Duration::from_secs(30),
+                Front::Socks,
+                tag,
+            )
+            .expect("tunnel");
+            client.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut client), b"ping", "{tag} mux echoes");
+        }
+    }
+
+    /// A non-raw carrier reaches the same server through the loopback dial, not a second shadowsocks implementation.
+    #[test]
+    fn a_shadowsocks_ws_mux_carries_a_tcp_stream() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_shadowsocks_ws_mux_carries_a_tcp_stream",
+        ) {
+            return;
+        }
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks",
+                "settings": {"password": "an-example-shared-password", "method": "aes-256-gcm"},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/ss"}}}"#,
+        )
+        .expect("parses");
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_shadowsocks_inbound(
+            &address,
+            &inbound,
+            true,
+            &std::collections::HashSet::new()
+        ));
+        wait_tcp(port, "ss ws");
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: inbound_carrier(&inbound),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443: Udp443::Reject,
+            },
+            pool: Pools::default(),
+            tls: None,
+            reality: None,
+            hysteria_roots: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        ss_mux_stream("ss ws", ss, echo);
+    }
+
     /// The reference's mux over shadowsocks: the client names `v1.mux.cool` on the request domain, the server opens a session, and a stream inside it echoes.
     #[test]
     fn shadowsocks_mux_carries_a_stream_through_one_session() {
@@ -60273,6 +61307,97 @@ mod tests {
             1,
             "one carrier connection carries every target"
         );
+    }
+
+    /// The dispatch, not the opener: a ws VLESS outbound with mux on reaches the XUDP manager and both targets ride one session.
+    #[test]
+    fn a_socks_udp_association_rides_a_vless_ws_mux_session() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_socks_udp_association_rides_a_vless_ws_mux_session",
+        ) {
+            return;
+        }
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let port = trojan_mux_probe_port();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "ws", "wsSettings": {{"path": "/udp"}}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: inbound_carrier(&inbound),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::on(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        });
+        let first = mux_test_udp_echo();
+        let second = mux_test_udp_echo();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        for (port, word) in [(first, b"ping".as_slice()), (second, b"pong".as_slice())] {
+            let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(&mut datagram, &target);
+            datagram.extend_from_slice(word);
+            udp.send_to(&datagram, relay).expect("sends");
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = udp.recv_from(&mut back).expect("echoes");
+            let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+            assert_eq!(source.port(), target.port());
+            assert_eq!(payload, word);
+        }
     }
 
     #[test]
