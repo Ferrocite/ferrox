@@ -19491,6 +19491,11 @@ trait Drivable {
         None
     }
 
+    /// The meter a kernel receive path must keep counting.
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        None
+    }
+
     /// Arms the read a session performs on its own transport, under its own lock.
     fn arm_own_transport(&self, _grain: Duration) {}
 }
@@ -19503,7 +19508,14 @@ fn settle_ktls<S: ferrox_core::tls::TlsProvider + Drivable>(session: &mut S) -> 
     let Some(fd) = session.ktls_fd() else {
         return false;
     };
-    session.enable_ktls(fd).is_ok()
+    let account = session.ktls_read_account();
+    if session.enable_ktls(fd).is_err() {
+        return false;
+    }
+    if let Some(meter) = account {
+        session.account_ktls_reads(std::sync::Arc::new(move |bytes| meter.read(bytes)));
+    }
+    true
 }
 
 fn transport_ktls_fd(conn: &Connection) -> Option<ferrox_core::tls::RawFd> {
@@ -19536,6 +19548,10 @@ impl Drivable
     fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
         transport_ktls_fd(self.get_ref().get_ref())
     }
+
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        self.get_ref().get_ref().ktls_read_account()
+    }
 }
 
 impl Drivable
@@ -19557,6 +19573,10 @@ impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
     fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
         transport_ktls_fd(self.get_ref())
     }
+
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        self.get_ref().ktls_read_account()
+    }
 }
 
 impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
@@ -19575,6 +19595,10 @@ impl Drivable for ferrox_core::tls::ClientSession<Connection> {
 
     fn ktls_fd(&self) -> Option<ferrox_core::tls::RawFd> {
         transport_ktls_fd(self.get_ref())
+    }
+
+    fn ktls_read_account(&self) -> Option<crate::stats::Meter> {
+        self.get_ref().ktls_read_account()
     }
 
     fn arm_own_transport(&self, grain: Duration) {

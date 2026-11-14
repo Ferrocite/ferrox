@@ -927,6 +927,19 @@ fn read_record<R: Read + ?Sized>(io: &mut R, buf: &mut Vec<u8>) -> Result<(), Tl
     Ok(())
 }
 
+/// Feeds every byte to rustls, whose `read_tls` may accept only one buffer at a time.
+fn feed_tls<C: RecordDriver>(conn: &mut C, ciphertext: &[u8]) -> Result<usize, TlsError> {
+    let mut cursor = std::io::Cursor::new(ciphertext);
+    while (cursor.position() as usize) < ciphertext.len() {
+        let before = cursor.position();
+        conn.read_tls(&mut cursor).map_err(recover)?;
+        if cursor.position() == before {
+            break;
+        }
+    }
+    Ok(cursor.position() as usize)
+}
+
 /// Drives a handshake one TLS record at a time, so no post-handshake record is consumed from the
 /// socket: the kernel must decrypt it after `setsockopt`.
 fn drive_records<C: RecordDriver, S: Stream>(
@@ -944,8 +957,11 @@ fn drive_records<C: RecordDriver, S: Stream>(
             break;
         }
         read_record(io, buf)?;
-        let mut cursor = std::io::Cursor::new(&buf[..]);
-        conn.read_tls(&mut cursor).map_err(recover)?;
+        if feed_tls(conn, &buf[..])? != buf.len() {
+            return Err(TlsError::Other(
+                "rustls left a handshake record unread".to_owned(),
+            ));
+        }
         conn.process_new_packets()
             .map_err(|error| map_error(&error))?;
         buf.clear();
@@ -1253,6 +1269,12 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
 
     fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
         self.install_ktls(fd)
+    }
+
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        if let Some(layer) = &mut self.ktls {
+            layer.account_reads(reads);
+        }
     }
 
     fn closed(&self) -> bool {
@@ -1951,8 +1973,8 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
-    // A kTLS TX starts at sequence zero, so it must not follow a ticket sent before install.
-    config.send_tls13_tickets = if cfg.send_tickets && !cfg.kernel_tx {
+    // A userspace TX starts at sequence zero whatever is offloaded, so a pre-install ticket must not consume it.
+    config.send_tls13_tickets = if cfg.send_tickets && !cfg.kernel_tx && !cfg.kernel_rx {
         2
     } else {
         0
@@ -2231,8 +2253,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 let taken = if ciphertext.is_empty() {
                     0
                 } else {
-                    let mut cursor = std::io::Cursor::new(ciphertext);
-                    conn.read_tls(&mut cursor).map_err(recover)?
+                    feed_tls(conn, ciphertext)?
                 };
                 conn.process_new_packets()
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -2267,6 +2288,12 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 
     fn enable_ktls(&mut self, fd: RawFd) -> std::io::Result<()> {
         self.install_ktls(fd)
+    }
+
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        if let Some(layer) = &mut self.ktls {
+            layer.account_reads(reads);
+        }
     }
 
     fn closed(&self) -> bool {

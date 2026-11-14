@@ -270,6 +270,9 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
+    /// Counts plaintext bytes the kernel decrypts for a metered transport.
+    fn account_ktls_reads(&mut self, _reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {}
+
     /// The ciphertext the caller read from the transport is decrypted, and the plaintext comes
     /// out: the caller read the transport itself, so the wait for the peer's bytes happened
     /// outside this session's lock, and only the decryption is under it. The plaintext's length
@@ -923,6 +926,14 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
             Self::Stock(session) => session.enable_ktls(fd),
             Self::Shaped(session) => session.enable_ktls(fd),
             Self::Legacy(session) => session.enable_ktls(fd),
+        }
+    }
+
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        match self {
+            Self::Stock(session) => session.account_ktls_reads(reads),
+            Self::Shaped(session) => session.account_ktls_reads(reads),
+            Self::Legacy(_) => {}
         }
     }
 

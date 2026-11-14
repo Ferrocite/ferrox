@@ -1479,6 +1479,12 @@ impl<S: Stream> TlsProvider for Session<S> {
         Ok(())
     }
 
+    fn account_ktls_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        if let Some(layer) = &mut self.ktls {
+            layer.account_reads(reads);
+        }
+    }
+
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));

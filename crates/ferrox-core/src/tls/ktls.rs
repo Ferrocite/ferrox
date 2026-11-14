@@ -204,7 +204,7 @@ impl Ktls {
     pub(crate) fn send_control(&self, kind: u8, body: &[u8]) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            let mut control = [0u8; 64];
+            let mut control = Control([0u8; 64]);
             let header = std::mem::size_of::<libc::cmsghdr>();
             let space = cmsg_space(1);
             let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -214,14 +214,14 @@ impl Ktls {
             };
             msg.msg_iov = &raw mut iov;
             msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_control = control.0.as_mut_ptr().cast();
             msg.msg_controllen = space as _;
             unsafe {
-                let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+                let cmsg = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
                 (*cmsg).cmsg_len = cmsg_len(1) as _;
                 (*cmsg).cmsg_level = SOL_TLS;
                 (*cmsg).cmsg_type = TLS_SET_RECORD_TYPE;
-                *control.as_mut_ptr().add(header) = kind;
+                *control.0.as_mut_ptr().add(header) = kind;
                 let wrote = libc::sendmsg(self.fd, &raw const msg, 0);
                 if wrote < 0 {
                     return Err(io::Error::last_os_error());
@@ -247,7 +247,7 @@ impl Ktls {
     pub(crate) fn recv(&mut self) -> io::Result<(u8, usize)> {
         #[cfg(target_os = "linux")]
         {
-            let mut control = [0u8; 64];
+            let mut control = Control([0u8; 64]);
             let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
             let mut iov = libc::iovec {
                 iov_base: self.stage.as_mut_ptr().cast(),
@@ -255,25 +255,33 @@ impl Ktls {
             };
             msg.msg_iov = &raw mut iov;
             msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen = control.len() as _;
+            msg.msg_control = control.0.as_mut_ptr().cast();
+            msg.msg_controllen = control.0.len() as _;
             let got = unsafe { libc::recvmsg(self.fd, &raw mut msg, 0) };
             if got < 0 {
                 return Err(io::Error::last_os_error());
             }
             let len = got as usize;
+            let mut typed = false;
             let kind = unsafe {
-                let cmsg = control.as_ptr().cast::<libc::cmsghdr>();
+                let cmsg = control.0.as_ptr().cast::<libc::cmsghdr>();
                 if msg.msg_controllen >= cmsg_len(0) as _
                     && (*cmsg).cmsg_len >= cmsg_len(1) as _
                     && (*cmsg).cmsg_level == SOL_TLS
                     && (*cmsg).cmsg_type == TLS_GET_RECORD_TYPE
                 {
-                    *control.as_ptr().add(std::mem::size_of::<libc::cmsghdr>())
+                    typed = true;
+                    *control.0.as_ptr().add(std::mem::size_of::<libc::cmsghdr>())
                 } else {
                     23
                 }
             };
+            if len == 0 && !typed {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "ktls: transport closed",
+                ));
+            }
             Ok((kind, len))
         }
         #[cfg(not(target_os = "linux"))]
@@ -304,6 +312,10 @@ const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
 #[cfg(target_os = "linux")]
 const TLS_1_3_VERSION: u16 = 0x0304;
+
+#[cfg(target_os = "linux")]
+#[repr(C, align(16))]
+struct Control([u8; 64]);
 
 #[cfg(target_os = "linux")]
 const fn cmsg_align(len: usize) -> usize {
@@ -416,6 +428,7 @@ pub(crate) struct Layer {
     plain_end: usize,
     inbuf: Vec<u8>,
     out: Vec<u8>,
+    read_account: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
     eof: bool,
 }
 
@@ -464,6 +477,7 @@ impl Layer {
             plain_end: 0,
             inbuf: Vec::new(),
             out: Vec::new(),
+            read_account: None,
             eof: false,
         })
     }
@@ -478,6 +492,11 @@ impl Layer {
 
     pub(crate) fn eof(&self) -> bool {
         self.eof
+    }
+
+    /// Counts plaintext bytes the kernel decrypted for a metered transport.
+    pub(crate) fn account_reads(&mut self, reads: std::sync::Arc<dyn Fn(usize) + Send + Sync>) {
+        self.read_account = Some(reads);
     }
 
     fn deliver(&mut self, buf: &mut [u8]) -> usize {
@@ -585,10 +604,19 @@ impl Layer {
     }
 
     fn read_offloaded(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.eof {
+            return Ok(0);
+        }
         loop {
             let (kind, len) = self.ktls.recv()?;
             match kind {
                 APPLICATION => {
+                    if let Some(account) = &self.read_account {
+                        account(len);
+                    }
+                    if len == 0 {
+                        continue;
+                    }
                     let n = len.min(buf.len());
                     buf[..n].copy_from_slice(self.ktls.stage(n));
                     if n < len {
@@ -607,6 +635,9 @@ impl Layer {
                 ALERT => {
                     let body = self.ktls.stage(len).to_vec();
                     self.handle_alert(&body)?;
+                    if self.eof {
+                        return Ok(0);
+                    }
                 }
                 // A compatibility change_cipher_spec is part of the old version's shape.
                 20 => {}
@@ -625,7 +656,13 @@ impl Layer {
             let want = 5 - self.inbuf.len();
             let mut head = [0u8; 5];
             match io.read(&mut head[..want]) {
-                Ok(0) => return Ok(false),
+                Ok(0) if self.inbuf.is_empty() => return Ok(false),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ktls: record header truncated",
+                    ))
+                }
                 Ok(n) => self.inbuf.extend_from_slice(&head[..n]),
                 Err(error) => return Err(error),
             }
@@ -642,7 +679,12 @@ impl Layer {
             let want = (total - self.inbuf.len()).min(4096);
             let mut chunk = [0u8; 4096];
             match io.read(&mut chunk[..want]) {
-                Ok(0) => return Ok(false),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ktls: record body truncated",
+                    ))
+                }
                 Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
                 Err(error) => return Err(error),
             }
@@ -726,6 +768,9 @@ impl Layer {
         }
         if self.plain_at < self.plain_end {
             return Ok(self.deliver(buf));
+        }
+        if self.eof {
+            return Ok(0);
         }
         if self.rx_offloaded() {
             self.read_offloaded(buf)
@@ -852,16 +897,18 @@ impl Layer {
         }
         self.flush_control_direct(io)?;
         if self.tx_offloaded() {
-            io.write_all(buf)?;
-        } else {
-            self.out.clear();
-            let tx = self
-                .tx
-                .as_mut()
-                .ok_or_else(|| io::Error::other("ktls: no TX keys"))?;
-            record::seal13(tx, APPLICATION, buf, &mut self.out).map_err(io::Error::other)?;
-            io.write_all(&self.out)?;
+            return io.write(buf);
         }
+        self.out.clear();
+        let tx = self
+            .tx
+            .as_mut()
+            .ok_or_else(|| io::Error::other("ktls: no TX keys"))?;
+        seal_chunks(&[buf], &mut self.out, |chunk, out| {
+            record::seal13_parts(tx, APPLICATION, chunk, out)
+        })
+        .map_err(io::Error::other)?;
+        io.write_all(&self.out)?;
         Ok(buf.len())
     }
 
@@ -918,6 +965,7 @@ mod tests {
             plain_end: 0,
             inbuf: Vec::new(),
             out: Vec::new(),
+            read_account: None,
             eof: false,
         }
     }
