@@ -23,6 +23,7 @@ pub mod policy;
 pub mod poly1305;
 pub mod portmap;
 pub mod psiphon;
+pub mod read;
 pub mod realm;
 pub mod record;
 pub mod shadowsocks;

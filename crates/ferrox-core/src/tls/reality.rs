@@ -643,13 +643,10 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello)
             ));
         }
         let at = raw.len();
-        // the read fills the spare capacity or abandons it, so nothing uninitialised is ever part of the buffer
-        raw.reserve(5 + len);
-        raw.extend_from_slice(&header);
-        let grown: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr().add(at + 5), len) };
-        let filled = read_to_fill(io, grown);
-        unsafe { raw.set_len(at + 5 + filled) };
+        raw.resize(at + 5 + len, 0);
+        raw[at..at + 5].copy_from_slice(&header);
+        let filled = read_to_fill(io, &mut raw[at + 5..]);
+        raw.truncate(at + 5 + filled);
         if filled < len {
             return Err((TlsError::Closed, raw));
         }

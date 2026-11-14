@@ -213,7 +213,7 @@ fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
     if length > ferrox_core::dns::MESSAGE_MAX {
         return Err("dns answer over the message bound".to_owned());
     }
-    let mut body = crate::proxy::unfilled(length);
+    let mut body = vec![0u8; length];
     stream
         .read_exact(&mut body)
         .map_err(|error| format!("dns stream answer: {error}"))?;
@@ -259,7 +259,7 @@ fn exchange(
     let mut status = None;
     loop {
         let (len, kind, flags, id) = read_head(&mut stream).ok_or("dns doh closed")?;
-        let mut payload = crate::proxy::unfilled(len);
+        let mut payload = vec![0u8; len];
         stream
             .read_exact(&mut payload)
             .map_err(|error| format!("dns doh read: {error}"))?;
@@ -326,10 +326,9 @@ mod tests {
     };
     use std::io::{Cursor, Read, Write};
 
-    /// The framed answer is read into room no zero pass filled first: the read writes every
-    /// byte the frame reports before the caller sees one. The `zeroed` counter is the witness.
+    /// The framed answer's room is zeroed once before the read fills it.
     #[test]
-    fn a_dns_frame_read_does_not_zero_its_read_target() {
+    fn a_dns_frame_read_zeroes_its_target_once() {
         let body = b"answer-bytes";
         let mut wire = Vec::new();
         wire.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -341,7 +340,11 @@ mod tests {
             body.as_slice(),
             "the bytes are the frame"
         );
-        assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, 12),
+            "the room is zeroed once: {counts:?}"
+        );
     }
 
     struct Wire {
@@ -364,10 +367,9 @@ mod tests {
         }
     }
 
-    /// Each `DoH` frame body is read into room no zero pass filled first: the read writes every
-    /// byte the frame reports before the caller sees one. The `zeroed` counter is the witness.
+    /// Each `DoH` frame body zeroes its room once before the read fills it.
     #[test]
-    fn a_doh_frame_read_does_not_zero_its_read_target() {
+    fn a_doh_frame_read_zeroes_each_target_once() {
         let settings = [0u8, 3, 0, 0, 0, 100];
         let status = block_encode(&[(":status", "200")]);
         let body = b"answer-bytes";
@@ -378,7 +380,7 @@ mod tests {
         wire.extend_from_slice(&status);
         wire.extend_from_slice(&frame_head(body.len(), T_DATA, F_END, 1));
         wire.extend_from_slice(body);
-        let old_zeroed = settings.len() + status.len() + body.len();
+        let expected_zeroed = settings.len() + status.len() + body.len();
         let (answer, counts) = ferrox_core::alloc_count::measure(|| {
             exchange(
                 Wire {
@@ -396,8 +398,9 @@ mod tests {
             "the body is the answer"
         );
         assert_eq!(
-            counts.zeroed, 0,
-            "no frame body is zeroed first ({old_zeroed} bytes before this change): {counts:?}"
+            (counts.zeroed, counts.zeroed_bytes),
+            (3, expected_zeroed),
+            "each frame body is zeroed once: {counts:?}"
         );
     }
 }

@@ -76,6 +76,7 @@ pub struct Session<S: Stream> {
     plain_at: usize,
     plain_end: usize,
     inbuf: Vec<u8>,
+    inbuf_init: usize,
     in_at: usize,
     reply: Vec<u8>,
     out: Vec<u8>,
@@ -280,6 +281,7 @@ impl<S: Stream> Session<S> {
             plain_at: 0,
             plain_end: 0,
             inbuf: Vec::new(),
+            inbuf_init: 0,
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
@@ -966,10 +968,17 @@ impl<S: Stream> Session<S> {
         verify_signature(leaf, scheme, &content, signature)
     }
 
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the read reports the bytes it wrote, and only those join the length"
-    )]
+    /// Appends ciphertext while keeping the initialised-tail watermark honest across a move.
+    fn extend_inbuf(&mut self, bytes: &[u8]) {
+        let cap = self.inbuf.capacity();
+        self.inbuf.extend_from_slice(bytes);
+        if self.inbuf.capacity() == cap {
+            self.inbuf_init = self.inbuf_init.max(self.inbuf.len());
+        } else {
+            self.inbuf_init = self.inbuf.len();
+        }
+    }
+
     fn pump(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
         loop {
             if self.plain_at < self.plain_end {
@@ -993,19 +1002,22 @@ impl<S: Stream> Session<S> {
                 return Ok(filled);
             }
             let at = self.inbuf.len();
-            self.inbuf.reserve(RECORD_READ);
-            // SAFETY: the room is spare capacity, and the length below covers only the bytes `read` reports writing.
-            let room = unsafe {
-                std::slice::from_raw_parts_mut(self.inbuf.as_mut_ptr().add(at), RECORD_READ)
-            };
-            match self.io.read(room) {
+            crate::read::init_room(&mut self.inbuf, &mut self.inbuf_init, at + RECORD_READ);
+            match self.io.read(&mut self.inbuf[at..]) {
                 Ok(0) => {
+                    self.inbuf.truncate(at);
                     self.eof = true;
                     return Ok(0);
                 }
-                Ok(n) => unsafe { self.inbuf.set_len(at + n) },
-                Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
-                Err(error) => return Err(TlsError::from(error)),
+                Ok(n) => self.inbuf.truncate(at + n),
+                Err(error) if TlsError::is_timeout(&error) => {
+                    self.inbuf.truncate(at);
+                    return Err(TlsError::Timeout);
+                }
+                Err(error) => {
+                    self.inbuf.truncate(at);
+                    return Err(TlsError::from(error));
+                }
             }
         }
     }
@@ -1013,8 +1025,8 @@ impl<S: Stream> Session<S> {
     /// Keeps the ciphertext a poll split already consumed, so the next read resumes the record.
     fn stage(&mut self, head: &[u8], body: &[u8], error: TlsError) -> Result<usize, TlsError> {
         if error == TlsError::Timeout {
-            self.inbuf.extend_from_slice(head);
-            self.inbuf.extend_from_slice(body);
+            self.extend_inbuf(head);
+            self.extend_inbuf(body);
         }
         Err(error)
     }
@@ -1070,8 +1082,8 @@ impl<S: Stream> Session<S> {
             if got - body_at < len {
                 // The first record completes where it lies; a later record's tail is staged.
                 if filled != 0 || body_at != 0 || len > buf.len() {
-                    self.inbuf.extend_from_slice(&header);
-                    self.inbuf.extend_from_slice(&buf[body_at..got]);
+                    self.extend_inbuf(&header);
+                    self.extend_inbuf(&buf[body_at..got]);
                     return Ok(filled);
                 }
                 let (body, result) = exact_before(&mut self.io, &mut buf[got..len]);
@@ -1117,7 +1129,7 @@ impl<S: Stream> Session<S> {
             body_at += len;
         }
         if body_at < got {
-            self.inbuf.extend_from_slice(&buf[body_at..got]);
+            self.extend_inbuf(&buf[body_at..got]);
         }
         Ok(filled)
     }
@@ -1236,7 +1248,7 @@ impl<S: Stream> Session<S> {
             }
         }
         if at < ciphertext.len() {
-            self.inbuf.extend_from_slice(&ciphertext[at..]);
+            self.extend_inbuf(&ciphertext[at..]);
         }
         Ok(filled)
     }
@@ -1504,7 +1516,7 @@ impl<S: Stream> TlsProvider for Session<S> {
                 .map_err(std::io::Error::other)?;
             return Ok((filled, ciphertext.len()));
         }
-        self.inbuf.extend_from_slice(ciphertext);
+        self.extend_inbuf(ciphertext);
         let filled = self.process_inbuf(buf).map_err(std::io::Error::other)?;
         Ok((filled, ciphertext.len()))
     }
@@ -2355,6 +2367,7 @@ mod tests {
             plain_at: 0,
             plain_end: 0,
             inbuf: Vec::new(),
+            inbuf_init: 0,
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),

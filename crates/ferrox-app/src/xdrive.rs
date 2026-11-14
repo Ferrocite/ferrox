@@ -1929,6 +1929,7 @@ impl Write for Kind {
 struct Lane {
     kind: Kind,
     buf: Vec<u8>,
+    buf_init: usize,
     at: usize,
 }
 
@@ -1944,6 +1945,7 @@ impl Lane {
         Self {
             kind,
             buf: Vec::with_capacity(crate::proxy::READ_SLICE),
+            buf_init: 0,
             at: 0,
         }
     }
@@ -1952,7 +1954,8 @@ impl Lane {
     fn ready(&mut self) -> io::Result<usize> {
         while self.at >= self.buf.len() {
             self.settle();
-            if crate::proxy::read_into_tail(&mut self.kind, &mut self.buf)? == 0 {
+            if crate::proxy::read_into_tail(&mut self.kind, &mut self.buf, &mut self.buf_init)? == 0
+            {
                 return Ok(0);
             }
         }
@@ -5342,8 +5345,9 @@ mod tests {
         lane.kind.flush().expect("flushes");
         let total = FIRST.len() + SECOND.len() + THIRD.len();
         while lane.buf.len() < total {
-            let read = crate::proxy::read_into_tail(&mut lane.kind, &mut lane.buf)
-                .expect("the origin answers");
+            let read =
+                crate::proxy::read_into_tail(&mut lane.kind, &mut lane.buf, &mut lane.buf_init)
+                    .expect("the origin answers");
             assert_ne!(
                 read,
                 0,

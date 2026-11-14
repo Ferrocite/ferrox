@@ -1161,7 +1161,7 @@ impl<R: Read> Wire<R> {
     fn new(carrier: R) -> Self {
         Self {
             carrier,
-            held: crate::proxy::unfilled(WIRE_LEN),
+            held: vec![0u8; WIRE_LEN],
             start: 0,
             end: 0,
             front: 0,
@@ -1264,16 +1264,10 @@ impl<R: Read> Wire<R> {
 
     /// Read until `want` bytes are buffered. False when the carrier is not to be asked, or
     /// when it has said it has no more.
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the room past the old length is claimed, not written, and the read below writes every byte it reports"
-    )]
     fn fill(&mut self, want: usize, block: bool) -> bool {
         if want > self.held.len() - self.start {
             // A peer that seals a wider chunk than we do gets one bigger buffer, not a refusal.
-            self.held.reserve(self.start + want - self.held.len());
-            // SAFETY: the room past the old length is claimed, not written, and the read below writes every byte it reports.
-            unsafe { self.held.set_len(self.start + want) };
+            self.held.resize(self.start + want, 0);
         }
         while self.buffered() < want {
             if !block {
@@ -1667,7 +1661,7 @@ fn read_open_header(
     if !(38..=4096).contains(&head_len) {
         return None;
     }
-    let mut sealed_head = crate::proxy::unfilled(head_len + TAG_LEN);
+    let mut sealed_head = vec![0u8; head_len + TAG_LEN];
     read_exact(stream, &mut sealed_head).ok()?;
     let head_key = kdf16(instruction, &[b"VMess Header AEAD Key", auth_id, &nonce]);
     let head_full = kdf(instruction, &[b"VMess Header AEAD Nonce", auth_id, &nonce]);
@@ -1824,10 +1818,9 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
     })
 }
 
-/// The relay leg's read window: a read fills every byte the leg reads, so the zero pass
-/// in front of it was work generated and thrown away.
+/// The relay leg's read window: zeroed once before the first read fills it.
 fn relay_window() -> Vec<u8> {
-    crate::proxy::unfilled(READ_PLAIN)
+    vec![0u8; READ_PLAIN]
 }
 
 pub(crate) fn pump_relay_carried<R, W>(
@@ -5002,11 +4995,10 @@ mod tests {
         (writes, got)
     }
 
-    /// The flow's windows are not zeroed: the wire's receive window and the relay leg's
-    /// read window are both read targets, so the zero pass in front of them was work
-    /// generated and thrown away. The counting allocator's `zeroed` counter is the witness.
+    /// The flow's windows are zeroed once: the wire's receive window and the relay leg's
+    /// read window are both read targets, so the room has to be initialised before the read.
     #[test]
-    fn the_flows_windows_are_not_zero_filled() {
+    fn the_flows_windows_are_zeroed_once() {
         let (sealed, _plain, _recv) = frames(&[1000; 3]);
         let carrier = Sealed {
             held: sealed,
@@ -5015,7 +5007,11 @@ mod tests {
             reads: 0,
         };
         let (wire, counts) = ferrox_core::alloc_count::measure(|| Wire::new(carrier));
-        assert_eq!(counts.zeroed, 0, "the wire's window is not zeroed");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, WIRE_LEN),
+            "the wire's window is zeroed once"
+        );
         assert_eq!(counts.allocs, 1, "the wire's window is the only allocation");
         assert_eq!(
             counts.bytes, WIRE_LEN,
@@ -5023,7 +5019,11 @@ mod tests {
         );
         drop(wire);
         let (window, counts) = ferrox_core::alloc_count::measure(relay_window);
-        assert_eq!(counts.zeroed, 0, "the relay leg's window is not zeroed");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, READ_PLAIN),
+            "the relay leg's window is zeroed once"
+        );
         assert_eq!(
             counts.allocs, 1,
             "the relay leg's window is the only allocation"

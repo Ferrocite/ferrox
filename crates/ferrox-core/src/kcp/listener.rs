@@ -41,17 +41,9 @@ fn peek_conversation(buf: &[u8]) -> Option<(u16, bool)> {
     Some((conv, buf[2] == Command::Terminate.to_byte()))
 }
 
-/// The room a datagram is received into: the receive writes the bytes it got and the
-/// rest of the room is never read, so the room is not zeroed first.
-#[allow(
-    clippy::uninit_vec,
-    reason = "the room is a receive target: the receive writes the bytes it reports and no path reads a byte that was not written"
-)]
+/// The room a datagram is received into; the feed thread reuses it, so the zero pass is paid once.
 fn datagram_room() -> Vec<u8> {
-    let mut buf = Vec::with_capacity(DATAGRAM_MAX);
-    // SAFETY: every path hands the room to a receive that initialises the bytes it reports, and no path reads a byte that was not written.
-    unsafe { buf.set_len(DATAGRAM_MAX) };
-    buf
+    vec![0u8; DATAGRAM_MAX]
 }
 
 /// Every conversation to one remote shares one UDP socket and one feed thread; the server keys
@@ -425,13 +417,15 @@ mod tests {
     use crate::kcp::mask::{HeaderKind, Mask, Spec};
 
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
-    /// The room a datagram is received into is not zeroed: the receive writes the bytes
-    /// it got and the rest of the room is never read. The counting allocator's `zeroed`
-    /// counter is the witness.
+    /// The room a datagram is received into is zeroed once per feed thread, not per receive.
     #[test]
-    fn the_datagram_room_is_not_zeroed() {
+    fn the_datagram_room_is_zeroed_once() {
         let (room, counts) = crate::alloc_count::measure(datagram_room);
-        assert_eq!(counts.zeroed, 0, "the room is not zeroed");
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, DATAGRAM_MAX),
+            "the room is zeroed once"
+        );
         assert_eq!(counts.allocs, 1, "the room is one buffer");
         assert_eq!(room.len(), DATAGRAM_MAX, "and it is the whole datagram");
     }
