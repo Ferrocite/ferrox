@@ -327,6 +327,7 @@ carrier-xhttp tokenish-pad-buffer-allocations 1 ferrox-app-xhttp::tests::a_token
 carrier-xhttp zero-filled-bytes-per-tokenish-pad 0 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
 carrier-xhttp zero-filled-bytes-per-request-body 0 ferrox-app-xhttp::tests::a_body_read_lands_in_room_it_never_zeroes
 carrier-xhttp dial-head-allocations-per-thread 1 ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread
+carrier-xhttp request-head-allocations 6 ferrox-app-xhttp_h2::tests::a_request_block_is_encoded_without_its_temporary_lists
 
 carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-veepn credential-window-allocations-per-pair 0 ferrox-core-veepn::tests::the_credential_lands_in_the_callers_window_and_not_in_one_of_its_own

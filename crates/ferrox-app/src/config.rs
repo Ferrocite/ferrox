@@ -3366,15 +3366,20 @@ fn header_line(line: &str) -> Option<(String, String)> {
 pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
     let settings = outbound.get("streamSettings");
     let carrier = stream_carrier(settings);
-    // Only a REALITY stream-one session knows it dials H2 before the handshake, so only that arm is pooled here.
+    // A stream-one session that knows it speaks H2 before the handshake is pooled; H1 and every split mode are not, because the reference disables keep-alives there and a split session is the request.
     if let Carrier::Xhttp { settings: xhttp } = &carrier {
-        let reality_stream_one = settings
+        let stream_one = xhttp.mode == crate::xhttp::XhttpMode::StreamOne;
+        let security = settings
             .and_then(|node| node.get("security"))
-            .and_then(Json::as_str)
-            == Some("reality")
-            && xhttp.mode == crate::xhttp::XhttpMode::StreamOne;
-        if xhttp.xmux.is_some() && !reality_stream_one {
-            eprintln!("xhttp: \"xmux\" bounds are checked, and this tree pools only a REALITY stream-one session, so an H1 or TLS-h2 dial keeps its own connection");
+            .and_then(Json::as_str);
+        let alpn = tls_alpn(settings.and_then(|node| node.get("tlsSettings")));
+        let pooled = stream_one
+            && (security == Some("reality")
+                || (security == Some("tls")
+                    && !crate::xhttp_h3::is_h3(&alpn)
+                    && crate::proxy::tls_offers_h2(&alpn)));
+        if xhttp.xmux.is_some() && !pooled {
+            eprintln!("xhttp: \"xmux\" bounds are checked, and this tree pools only a stream-one H2 session, so an H1 or packet-up/stream-up dial keeps its own connection");
         }
     }
     let key = match &carrier {

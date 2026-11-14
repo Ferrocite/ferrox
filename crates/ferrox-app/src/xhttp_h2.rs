@@ -2092,29 +2092,31 @@ impl H2Client {
 
 fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> {
     let path = crate::xhttp::dial_path(settings);
-    let mut fields: Vec<(String, String)> = vec![
-        (":method".to_owned(), "POST".to_owned()),
-        (":path".to_owned(), path),
-        (":scheme".to_owned(), scheme.to_owned()),
-        (":authority".to_owned(), host.to_owned()),
-    ];
-    for (mut name, value) in crate::xhttp::dial_fields(host, settings) {
+    let referer = crate::xhttp::referer_value(host, settings);
+    let capacity = 16
+        + path.len()
+        + host.len()
+        + referer.len()
+        + crate::headers::masked_len(&settings.headers, crate::headers::FETCH);
+    let mut out = Vec::with_capacity(capacity);
+    crate::h2::push_header(&mut out, ":method", "POST");
+    crate::h2::push_header(&mut out, ":path", &path);
+    crate::h2::push_header(&mut out, ":scheme", scheme);
+    crate::h2::push_header(&mut out, ":authority", host);
+    crate::headers::for_each_masked(&settings.headers, crate::headers::FETCH, |name, value| {
         if name.starts_with(':')
-            || hop_by_hop(&name)
+            || hop_by_hop(name)
             || name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("te")
             || name.eq_ignore_ascii_case("upgrade")
         {
-            continue;
+            return;
         }
-        name.make_ascii_lowercase();
-        fields.push((name, value));
-    }
-    let refs: Vec<(&str, &str)> = fields
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
-    block_encode(&refs)
+        crate::h2::push_lower(&mut out, name, value);
+    });
+    crate::h2::push_header(&mut out, "referer", &referer);
+    crate::h2::push_header(&mut out, "content-type", "application/octet-stream");
+    out
 }
 
 pub(crate) fn connect_split<
@@ -3633,6 +3635,78 @@ mod tests {
             );
         });
         assert_eq!(counts.zeroed, 0, "no frame body is zeroed");
+    }
+
+    /// The old shape as a differential oracle: the same fields through the owned list, the borrow
+    /// list and `block_encode`, so the in-place encoder must reach the same bytes.
+    fn staged_request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> {
+        let path = crate::xhttp::dial_path(settings);
+        let mut fields: Vec<(String, String)> = vec![
+            (":method".to_owned(), "POST".to_owned()),
+            (":path".to_owned(), path),
+            (":scheme".to_owned(), scheme.to_owned()),
+            (":authority".to_owned(), host.to_owned()),
+        ];
+        crate::headers::for_each_masked(&settings.headers, crate::headers::FETCH, |name, value| {
+            if name.starts_with(':')
+                || hop_by_hop(name)
+                || name.eq_ignore_ascii_case("host")
+                || name.eq_ignore_ascii_case("te")
+                || name.eq_ignore_ascii_case("upgrade")
+            {
+                return;
+            }
+            let mut name = name.to_owned();
+            name.make_ascii_lowercase();
+            fields.push((name, value.to_owned()));
+        });
+        fields.push((
+            "referer".to_owned(),
+            crate::xhttp::referer_value(host, settings),
+        ));
+        fields.push((
+            "content-type".to_owned(),
+            "application/octet-stream".to_owned(),
+        ));
+        let refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        crate::h2::block_encode(&refs)
+    }
+
+    /// The dial's head is encoded in place: the four pseudo fields and the filtered carrier fields
+    /// no longer pass through an owned list and a second list of borrows, so the stream pays only
+    /// the block, the path and the referer. The staged oracle holds the bytes.
+    #[test]
+    fn a_request_block_is_encoded_without_its_temporary_lists() {
+        let mut settings = XhttpSettings::stream_one();
+        settings.x_padding_bytes = (1, 1);
+        let (block, counts) =
+            ferrox_core::alloc_count::measure(|| request_block("example.test", &settings, "https"));
+        let (staged, staged_counts) = ferrox_core::alloc_count::measure(|| {
+            staged_request_block("example.test", &settings, "https")
+        });
+        assert_eq!(block, staged, "the in-place encoder changed the head bytes");
+        assert_eq!(counts.allocs, 6, "{counts:?}");
+        assert_eq!(counts.zeroed, 0, "{counts:?}");
+        assert!(
+            counts.allocs < staged_counts.allocs,
+            "in place {counts:?}, staged {staged_counts:?}"
+        );
+
+        let mut carrier = settings;
+        carrier.headers = vec![
+            ("X-Custom".to_owned(), "one".to_owned()),
+            ("Connection".to_owned(), "close".to_owned()),
+            ("User-Agent".to_owned(), "chrome".to_owned()),
+        ];
+        carrier.query = "a=1".to_owned();
+        assert_eq!(
+            request_block("example.test", &carrier, "https"),
+            staged_request_block("example.test", &carrier, "https"),
+            "the in-place encoder changed a carrier head"
+        );
     }
 
     #[test]

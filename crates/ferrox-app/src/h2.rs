@@ -137,28 +137,57 @@ pub(crate) fn block_encode(headers: &[(&str, &str)]) -> Vec<u8> {
     // The block's own length is known before it is written, so the buffer is opened once.
     let mut out = Vec::with_capacity(headers.iter().map(|(n, v)| header_len(n, v)).sum());
     for (name, value) in headers {
-        match (*name, *value) {
-            (":method", "POST") => out.push(0x83),
-            (":method", "GET") => out.push(0x82),
-            (":method", other) => push_named(&mut out, 2, other),
-            (":scheme", "https") => out.push(0x87),
-            (":scheme", "http") => out.push(0x86),
-            (":scheme", other) => push_named(&mut out, 6, other),
-            (":authority", other) => push_named(&mut out, 1, other),
-            (":path", "/") => out.push(0x84),
-            (":path", other) => push_named(&mut out, 4, other),
-            (name, value) => {
-                if let Some(index) = ferrox_core::foxy::hpack::hpack_name(name) {
-                    push_named(&mut out, index, value);
-                } else {
-                    out.push(0x40);
-                    push_value(&mut out, name);
-                    push_value(&mut out, value);
-                }
+        push_header(&mut out, name, value);
+    }
+    out
+}
+
+/// One field whose name reaches HPACK in the lowercase RFC 9113 requires: a short name is folded
+/// on the stack, and only a name past that buffer allocates.
+pub(crate) fn push_lower(out: &mut Vec<u8>, name: &str, value: &str) {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        if name.len() <= 64 {
+            let mut lower = [0u8; 64];
+            let lower = &mut lower[..name.len()];
+            lower.copy_from_slice(name.as_bytes());
+            lower.make_ascii_lowercase();
+            if let Ok(name) = std::str::from_utf8(lower) {
+                push_header(out, name, value);
+                return;
+            }
+        } else {
+            let lower = name.to_ascii_lowercase();
+            push_header(out, &lower, value);
+            return;
+        }
+    }
+    push_header(out, name, value);
+}
+
+/// One field as HPACK writes it: a static-table name when the block's field is one, a literal
+/// otherwise. `request_block` shares this so a dial's head is encoded in place, not through a
+/// temporary list of owned names.
+pub(crate) fn push_header(out: &mut Vec<u8>, name: &str, value: &str) {
+    match (name, value) {
+        (":method", "POST") => out.push(0x83),
+        (":method", "GET") => out.push(0x82),
+        (":method", other) => push_named(out, 2, other),
+        (":scheme", "https") => out.push(0x87),
+        (":scheme", "http") => out.push(0x86),
+        (":scheme", other) => push_named(out, 6, other),
+        (":authority", other) => push_named(out, 1, other),
+        (":path", "/") => out.push(0x84),
+        (":path", other) => push_named(out, 4, other),
+        (name, value) => {
+            if let Some(index) = ferrox_core::foxy::hpack::hpack_name(name) {
+                push_named(out, index, value);
+            } else {
+                out.push(0x40);
+                push_value(out, name);
+                push_value(out, value);
             }
         }
     }
-    out
 }
 
 /// One field line named from the static table, incremental-indexing prefix, so the edge's decoder sees the shape its own request encoder emits.
