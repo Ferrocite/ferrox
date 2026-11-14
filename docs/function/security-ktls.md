@@ -68,5 +68,4 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/tls/ktls.rs
 - symbols: tls_kernel, settle_ktls, transport_ktls_fd
-- go: ./common/ktls/..., ./common/tls/...
 <!-- scope:end -->

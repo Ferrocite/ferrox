@@ -76,14 +76,17 @@ impl Wire {
 
 /// The request stream as the shared dispatch reads it: HEADERS becomes the H1 head `accept_core`
 /// parses, and every DATA frame after it is body.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct H3Reader {
     wire: Wire,
     buf: Vec<u8>,
     buf_at: usize,
     head: Option<Vec<u8>>,
     status: Option<u16>,
+    content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
+    reset: bool,
     head_seen: bool,
     expect_request: bool,
     idle_since: Option<Instant>,
@@ -103,8 +106,10 @@ impl H3Reader {
             buf_at: 0,
             head: None,
             status: None,
+            content_length: None,
             frame_left: 0,
             ended: false,
+            reset: false,
             head_seen: false,
             expect_request,
             idle_since: None,
@@ -117,6 +122,10 @@ impl H3Reader {
 
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    fn content_length(&self) -> Option<usize> {
+        self.content_length
     }
 
     /// Whether this POST's own response deadline has passed.
@@ -305,6 +314,10 @@ impl H3Reader {
             at = end;
             match frame.kind {
                 frames::H3_HEADERS => {
+                    let status = hpack::qpack_status(payload);
+                    if status.is_some_and(|code| (100..200).contains(&code)) {
+                        continue;
+                    }
                     self.head_seen = true;
                     if self.head.is_none() && self.status.is_none() {
                         let Some((head, status)) = decode_head(payload, self.expect_request) else {
@@ -318,11 +331,17 @@ impl H3Reader {
                                 missing,
                             ));
                         };
+                        if !self.expect_request {
+                            self.content_length = hpack::qpack_content_length(payload);
+                        }
                         self.head = head;
                         self.status = status;
                     }
                 }
-                frames::H3_RESET => self.ended = true,
+                frames::H3_RESET => {
+                    self.ended = true;
+                    self.reset = true;
+                }
                 _ => {}
             }
             self.buf_at = at;
@@ -364,6 +383,12 @@ impl H3Reader {
                     "h3 data frame ended early",
                 ));
             }
+            if self.reset {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "h3 stream was reset",
+                ));
+            }
             return Ok(false);
         }
         if self.frame_left > 0 {
@@ -371,6 +396,12 @@ impl H3Reader {
             return Ok(self.data_available());
         }
         self.step()?;
+        if self.reset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "h3 stream was reset",
+            ));
+        }
         Ok(self.data_available())
     }
 }
@@ -383,6 +414,49 @@ fn status_ok(status: Option<u16>) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+impl H3Reader {
+    /// A response body read that keeps waiting past the head instead of treating it as the end, for a client that cannot hand the status back before the body is drained.
+    fn read_answer(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.expired() {
+                return Err(std::io::Error::other("h3 request stalled"));
+            }
+            if self.data_available() {
+                let n = self
+                    .frame_left
+                    .min(self.buf.len() - self.buf_at)
+                    .min(buf.len());
+                buf[..n].copy_from_slice(&self.buf[self.buf_at..self.buf_at + n]);
+                self.buf_at += n;
+                self.frame_left -= n;
+                return Ok(n);
+            }
+            if self.frame_left > 0 {
+                self.fill_data()?;
+                continue;
+            }
+            if self.ended {
+                if self.reset {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "h3 stream was reset",
+                    ));
+                }
+                return Ok(0);
+            }
+            self.parse()?;
+            let _ = self.head.take();
+            if self.data_available() || self.frame_left > 0 || self.ended {
+                continue;
+            }
+            self.fill_room()?;
+        }
+    }
 }
 
 impl Read for H3Reader {
@@ -769,6 +843,9 @@ impl Read for ClientStream {
                     }
                 }
                 Err(quiche::Error::Done) => {}
+                Err(quiche::Error::StreamReset(_)) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+                }
                 Err(error) => {
                     return Err(std::io::Error::other(format!("h3 stream read: {error:?}")));
                 }
@@ -870,6 +947,16 @@ impl H3Client {
         server_name: &str,
         tls: &ferrox_core::tls::TlsConfig,
     ) -> Option<Arc<Self>> {
+        Self::connect_tuned(peer, server_name, tls, None, false)
+    }
+
+    pub(crate) fn connect_tuned(
+        peer: SocketAddr,
+        server_name: &str,
+        tls: &ferrox_core::tls::TlsConfig,
+        quic_params: Option<&ferrox_core::hysteria::QuicParams>,
+        default_bbr: bool,
+    ) -> Option<Arc<Self>> {
         let mut config = if tls.insecure || !tls.cert_pins.is_empty() {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
             config.verify_peer(false);
@@ -881,6 +968,18 @@ impl H3Client {
             quic::quiche_config(&tls.roots, None)?
         };
         config.set_initial_max_data(16 * 1024 * 1024);
+        if let Some(params) = quic_params {
+            if params.cc == Some(ferrox_core::hysteria::Congestion::Brutal) {
+                return None;
+            }
+            quic::apply_hysteria_quic(&mut config, params, false);
+        }
+        let cc = quic_params
+            .and_then(|params| params.cc)
+            .or(default_bbr.then_some(ferrox_core::hysteria::Congestion::Bbr));
+        if let Some(cc) = cc {
+            config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+        }
         let sock = if peer.is_ipv6() {
             UdpSocket::bind("[::]:0").ok()?
         } else {
@@ -894,6 +993,9 @@ impl H3Client {
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut conn = quiche::connect(Some(server_name), &cid, local, peer, &mut config).ok()?;
+        if let Some(list) = &tls.ech_config_list {
+            conn.as_mut().set_ech_config_list(list).ok()?;
+        }
         quic::drive_handshake_by(&mut conn, &sock, local, crate::budgets::handshake())?;
         if !tls.cert_pins.is_empty() {
             let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
@@ -959,6 +1061,70 @@ impl H3Client {
             wire.fin();
         }
         Some((H3Reader::new(wire.clone()), H3StreamOut { wire }))
+    }
+
+    /// One plain HTTP/3 request and its answer: the head becomes HEADERS, the body DATA, and the reply's status and body come back without the xhttp framing.
+    pub(crate) fn ask(
+        self: &Arc<Self>,
+        head: &str,
+        host: &str,
+        body: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        let block = block_from_text(head, host, "https");
+        let (mut reader, out) = self
+            .open(&block, body.is_none())
+            .ok_or_else(|| std::io::Error::other("h3 service lane did not open"))?;
+        if let Some(payload) = body {
+            if !payload.is_empty() && !out.data(payload) {
+                out.reset();
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            out.end();
+        }
+        reader.set_deadline(Instant::now() + crate::budgets::relay_stall());
+        let mut answer = Vec::new();
+        let mut buf = [0u8; READ_ROOM];
+        loop {
+            match reader.read_answer(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if limit.is_some_and(|cap| answer.len().saturating_add(n) > cap) {
+                        out.reset();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "h3 service answer is too long",
+                        ));
+                    }
+                    answer.extend_from_slice(&buf[..n]);
+                }
+                Err(error) => {
+                    out.reset();
+                    return Err(error);
+                }
+            }
+        }
+        let status = reader.status().ok_or_else(|| {
+            out.reset();
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "h3 service answer has no status",
+            )
+        })?;
+        if let Some(declared) = reader.content_length() {
+            let head_only = head
+                .split_ascii_whitespace()
+                .next()
+                .is_some_and(|method| method.eq_ignore_ascii_case("HEAD"));
+            if !head_only && !matches!(status, 204 | 304) && answer.len() != declared {
+                out.reset();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "h3 service answer was truncated",
+                ));
+            }
+        }
+        Ok((status, answer))
     }
 
     fn packet(
@@ -1247,6 +1413,54 @@ mod tests {
         (identity, roots)
     }
 
+    /// Run one scripted answer per request stream, without the xhttp dispatch.
+    fn serve_scripted(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        script: impl Fn(&Wire) + Send + Sync + 'static,
+    ) -> u16 {
+        let config = quic::serve_config(identity).expect("the h3 server config");
+        let sock = quic::bind_datagram_plain("127.0.0.1:0").expect("the h3 server binds");
+        let port = sock.local_addr().expect("the h3 server address").port();
+        let serve: quic::Serve = Arc::new(move |stream| {
+            stream.preface_h3();
+            let wire = Wire::Server(stream);
+            let mut reader = H3Reader::new(wire.clone());
+            let _ = reader.read_head();
+            script(&wire);
+            wire.fin();
+        });
+        std::thread::Builder::new()
+            .name("xhttp-h3-answer".to_owned())
+            .spawn(move || {
+                quic::serve_loop(
+                    Datagram::plain(sock),
+                    &Arc::new(Mutex::new(config)),
+                    &serve,
+                    &Arc::new(AtomicBool::new(false)),
+                );
+            })
+            .expect("the h3 answer thread");
+        port
+    }
+
+    /// Answer every request with one status and body, without the xhttp dispatch: the shape a plain store service speaks.
+    fn serve_answer(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        status: &'static str,
+        body: &'static [u8],
+    ) -> u16 {
+        serve_scripted(identity, move |wire| {
+            let length = body.len().to_string();
+            let fields = [
+                (":status".to_owned(), status.to_owned()),
+                ("content-length".to_owned(), length),
+            ];
+            if send_fields(wire, frames::H3_HEADERS, &fields) {
+                let _ = send_data(wire, body);
+            }
+        })
+    }
+
     fn settings() -> XhttpSettings {
         XhttpSettings {
             path: "/x".to_owned(),
@@ -1333,6 +1547,113 @@ mod tests {
                 Err(_) => return,
             }
         }
+    }
+
+    /// A plain HTTP/3 request keeps its status and body, including a refusal the xhttp framing would treat as a dead stream.
+    #[test]
+    fn a_plain_h3_request_keeps_its_status_and_body() {
+        let (identity, roots) = minted_identity("localhost");
+        let tls = ferrox_core::tls::TlsConfig {
+            server_name: "localhost".to_owned(),
+            roots: roots.into(),
+            alpn: vec![b"h3".to_vec()].into(),
+            ..Default::default()
+        };
+        for (status, body) in [("200", b"world".as_slice()), ("404", b"missing".as_slice())] {
+            let port = serve_answer(&identity, status, body);
+            let client =
+                H3Client::connect(SocketAddr::from(([127, 0, 0, 1], port)), "localhost", &tls)
+                    .expect("the h3 service lane");
+            let head = "POST /o HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n";
+            let (got, answer) = client
+                .ask(head, "localhost", Some(b"hello"), None)
+                .expect("the h3 answer");
+            assert_eq!(got.to_string(), status);
+            assert_eq!(answer, body);
+        }
+    }
+
+    #[test]
+    fn a_plain_h3_answer_skips_an_informational_status() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted(&identity, |wire| {
+            let interim = [(":status".to_owned(), "103".to_owned())];
+            let final_head = [
+                (":status".to_owned(), "200".to_owned()),
+                ("content-length".to_owned(), "5".to_owned()),
+            ];
+            if send_fields(wire, frames::H3_HEADERS, &interim)
+                && send_fields(wire, frames::H3_HEADERS, &final_head)
+            {
+                let _ = send_data(wire, b"world");
+            }
+        });
+        let client = client(port, roots);
+        let head = "POST /o HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n";
+        let (status, answer) = client
+            .ask(head, "localhost", Some(b"hello"), None)
+            .expect("the final h3 answer");
+        assert_eq!(status, 200);
+        assert_eq!(answer, b"world");
+    }
+
+    #[test]
+    fn a_plain_h3_answer_refuses_a_truncated_body() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted(&identity, |wire| {
+            let fields = [
+                (":status".to_owned(), "200".to_owned()),
+                ("content-length".to_owned(), "10".to_owned()),
+            ];
+            if send_fields(wire, frames::H3_HEADERS, &fields) {
+                let _ = send_data(wire, b"short");
+            }
+        });
+        let client = client(port, roots);
+        let head = "GET /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let error = client
+            .ask(head, "localhost", None, None)
+            .expect_err("a short body is a truncation");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_plain_h3_answer_keeps_a_204_without_a_body() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted(&identity, |wire| {
+            let fields = [
+                (":status".to_owned(), "204".to_owned()),
+                ("content-length".to_owned(), "10".to_owned()),
+            ];
+            let _ = send_fields(wire, frames::H3_HEADERS, &fields);
+        });
+        let client = client(port, roots);
+        let head = "GET /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (status, answer) = client
+            .ask(head, "localhost", None, None)
+            .expect("a 204 has no body whatever the header says");
+        assert_eq!(status, 204);
+        assert_eq!(answer, [0u8; 0]);
+    }
+
+    #[test]
+    fn a_reset_stream_is_an_error_not_a_clean_end() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let client = client(port, roots);
+        let wire = raw_stream(&client);
+        send_frame(&wire, frames::H3_RESET, &[]);
+        let mut reader = H3Reader::new(wire);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            reader
+                .read(&mut buf)
+                .expect_err("a reset is not EOF")
+                .kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
     }
 
     #[test]
@@ -1490,6 +1811,11 @@ mod tests {
             counts.allocs, 0,
             "a response reader walks the fields without building them: {counts:?}"
         );
+        assert_eq!(hpack::qpack_content_length(&block), None);
+
+        let mut sized = Vec::new();
+        hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "10")], &mut sized);
+        assert_eq!(hpack::qpack_content_length(&sized), Some(10));
         assert_eq!(
             decode_head(&block, true),
             None,
@@ -1633,5 +1959,27 @@ mod tests {
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("the answer reads");
         assert_eq!(got, b"hello");
+    }
+    #[test]
+    fn a_brutal_h3_param_is_refused_before_a_socket() {
+        let tls = ferrox_core::tls::TlsConfig {
+            insecure: true,
+            ..Default::default()
+        };
+        let params = ferrox_core::hysteria::QuicParams {
+            cc: Some(ferrox_core::hysteria::Congestion::Brutal),
+            ..Default::default()
+        };
+        assert!(
+            H3Client::connect_tuned(
+                SocketAddr::from(([127, 0, 0, 1], 9)),
+                "localhost",
+                &tls,
+                Some(&params),
+                false,
+            )
+            .is_none(),
+            "brutal is a Hysteria sender, not an h3 service controller"
+        );
     }
 }

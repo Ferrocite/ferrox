@@ -285,7 +285,7 @@ const fn crc_tables() -> [[u32; 256]; 8] {
 
 const CRC_TABLES: [[u32; 256]; 8] = crc_tables();
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     let (groups, rest) = data.as_chunks::<8>();
     for chunk in groups {
