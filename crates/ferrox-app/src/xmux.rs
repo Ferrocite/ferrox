@@ -312,10 +312,7 @@ mod tests {
         H2Client::new(std::io::empty(), Sink, None)
     }
 
-    fn take(
-        manager: &Arc<Manager>,
-        create: &impl Fn() -> Option<Arc<H2Client>>,
-    ) -> Option<Lease> {
+    fn take(manager: &Arc<Manager>, create: &impl Fn() -> Option<Arc<H2Client>>) -> Option<Lease> {
         manager
             .existing()
             .or_else(|| create().map(|conn| manager.adopt(conn)))
