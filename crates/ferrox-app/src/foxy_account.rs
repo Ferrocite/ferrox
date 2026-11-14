@@ -305,6 +305,23 @@ impl Reply {
     }
 }
 
+/// Go's `net/http` writes `Host` and the framing headers itself and refuses a control byte, so a configured field must not duplicate or split the head.
+fn usable_header(name: &str, value: &str) -> bool {
+    let reserved = ["host", "content-length", "transfer-encoding", "connection"]
+        .into_iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved));
+    !reserved
+        && !name
+            .bytes()
+            .chain(value.bytes())
+            .any(|byte| byte == b'\r' || byte == b'\n')
+}
+
+/// Cut a configured word at its first control byte so a stray CR or LF cannot end the head early.
+fn head_word(text: &str) -> &str {
+    text.split(['\r', '\n']).next().unwrap_or("")
+}
+
 /// Place the request line, `Host`, the caller's fields and the declared length of the body that follows.
 fn request_head_into(
     out: &mut Vec<u8>,
@@ -314,13 +331,17 @@ fn request_head_into(
     headers: &[(&str, &str)],
     body_len: usize,
 ) {
-    out.extend_from_slice(method.as_bytes());
+    // A configured URL or Host carrying a control byte would end the head early; the reference never forwards one.
+    out.extend_from_slice(head_word(method).as_bytes());
     out.push(b' ');
-    out.extend_from_slice(path.as_bytes());
+    out.extend_from_slice(head_word(path).as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(head_word(host).as_bytes());
     out.extend_from_slice(b"\r\n");
     for (name, value) in headers {
+        if !usable_header(name, value) {
+            continue;
+        }
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
@@ -522,8 +543,10 @@ pub(crate) struct Endpoint {
     pub(crate) insecure: bool,
     /// A domain-fronted `Host` header that differs from the TLS name.
     pub(crate) host_header: Option<String>,
-    /// The SNI a fronted dial sends, which may be empty to omit it.
+    /// The SNI a fronted dial sends; `omit_sni` drops it from the hello while the name still verifies the chain.
     pub(crate) server_name: Option<String>,
+    /// The hello leaves the SNI out while `server_name` still names the certificate.
+    pub(crate) omit_sni: bool,
     /// The names a fronted certificate is verified against, instead of the SNI.
     pub(crate) verify_names: Vec<String>,
     /// The leaf keys a fronted certificate must match.
@@ -558,6 +581,7 @@ impl Endpoint {
             insecure: false,
             host_header: None,
             server_name: None,
+            omit_sni: false,
             verify_names: Vec::new(),
             pins: ferrox_core::foxy::pin::Pins::default(),
         })
@@ -573,15 +597,25 @@ impl Endpoint {
         disable_sni: bool,
         verify_name: Option<&str>,
         pins: Vec<String>,
-    ) -> Self {
+    ) -> Option<Self> {
+        // A mistyped pin must fail the dial rather than silently unpin it; the reference reports "no pin found".
+        let pins = ferrox_core::foxy::pin::Pins::parse_checked(pins)?;
         dial.clone_into(&mut self.host);
         self.port = port;
         self.address = edge_peer(dial, port);
         self.host_header = Some(host_header.to_owned());
-        self.server_name = disable_sni.then(String::new);
+        // Omitted SNI still has to name the certificate: `VerifyServerName` when the config gives one, the fronted Host otherwise, and the dialed name last.
+        self.server_name = Some(if disable_sni {
+            verify_name
+                .map(str::to_owned)
+                .unwrap_or_else(|| host_header.to_owned())
+        } else {
+            dial.to_owned()
+        });
+        self.omit_sni = disable_sni;
         self.verify_names = verify_name.map(str::to_owned).into_iter().collect();
-        self.pins = ferrox_core::foxy::pin::Pins::parse(pins);
-        self
+        self.pins = pins;
+        Some(self)
     }
 
     /// The reference skips verification when system roots are disabled; an untunneled
@@ -626,6 +660,7 @@ impl Endpoint {
                 .server_name
                 .clone()
                 .unwrap_or_else(|| self.host.clone()),
+            omit_sni: self.omit_sni,
             alpn: vec![b"http/1.1".to_vec()].into(),
             roots: std::sync::Arc::clone(&self.roots),
             pins: self.pins.clone(),

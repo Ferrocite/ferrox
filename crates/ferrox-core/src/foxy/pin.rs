@@ -103,6 +103,20 @@ impl Pins {
         }
     }
 
+    /// Parse a configured set, refusing any entry that is not base64 over exactly 32 bytes: a mistyped pin must fail the dial, not silently unpin it.
+    #[must_use]
+    pub fn parse_checked<I: IntoIterator<Item = String>>(pins: I) -> Option<Self> {
+        let mut entries = Vec::new();
+        for pin in pins {
+            let raw = pin.strip_prefix("sha256/").unwrap_or(&pin);
+            let bytes = b64::decode(raw.as_bytes())?;
+            entries.push(<[u8; 32]>::try_from(bytes.as_slice()).ok()?);
+        }
+        Some(Self {
+            entries: std::sync::Arc::from(entries),
+        })
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -211,6 +225,17 @@ mod tests {
         c[inside] ^= 0x01;
         assert_eq!(spki_pin(a.as_ref()), spki_pin(b.as_ref()));
         assert_ne!(spki_pin(a.as_ref()), spki_pin(c.as_ref()));
+    }
+
+    #[test]
+    fn a_mistyped_pin_refuses_the_set_instead_of_unpinning() {
+        let (leaf, _) = certificate(11);
+        let good = spki_pin(&leaf).expect("pin");
+        assert!(Pins::parse_checked([good.clone(), String::new()]).is_none());
+        assert!(Pins::parse_checked([good]).is_some());
+        assert!(
+            Pins::parse_checked(std::iter::empty::<String>()).is_some_and(|pins| pins.is_empty())
+        );
     }
 
     #[test]

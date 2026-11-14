@@ -39,6 +39,8 @@ impl fmt::Debug for ObfuscatedTicket {
 #[allow(clippy::struct_excessive_bools)]
 pub struct TlsConfig {
     pub server_name: String,
+    /// Omit the SNI extension while still verifying `server_name`: Psiphon's `DisableSNI` fronting names the certificate it expects without telling the edge which host it dials. An address name already sends no SNI.
+    pub omit_sni: bool,
     /// The `ALPN` list a client offers, behind one allocation: a config names it once, and the client's own cache keys on it, so a per-dial copy was a vector of vectors paid on every handshake.
     pub alpn: std::sync::Arc<[Vec<u8>]>,
     pub roots: Anchors,
