@@ -1436,6 +1436,9 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
             .unwrap_or(base.max_sending_window),
         mask: base.mask,
         filters: base.filters,
+        max_sessions: num("maxSessions", "max_sessions").map_or(base.max_sessions, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX).max(1)
+        }),
     }
 }
 
