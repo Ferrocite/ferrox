@@ -1,7 +1,7 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -844,16 +844,10 @@ impl Drop for H3Client {
 
 impl H3Client {
     pub(crate) fn connect(
-        address: &str,
-        port: u16,
+        peer: SocketAddr,
         server_name: &str,
         tls: &ferrox_core::tls::TlsConfig,
     ) -> Option<Arc<Self>> {
-        let peers: Vec<SocketAddr> = format!("{address}:{port}")
-            .to_socket_addrs()
-            .ok()?
-            .collect();
-        let peer = *peers.first()?;
         let mut config = if tls.insecure || !tls.cert_pins.is_empty() {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
             config.verify_peer(false);
@@ -1086,12 +1080,11 @@ impl crate::proxy::FrameWrite for NullWrite {
 }
 
 pub(crate) fn is_h3(alpn: &[Vec<u8>]) -> bool {
-    alpn.len() == 1 && alpn[0].eq_ignore_ascii_case(b"h3")
+    alpn.len() == 1 && alpn[0].as_slice() == b"h3"
 }
 
 pub(crate) fn connect_split(
-    address: &str,
-    port: u16,
+    peer: SocketAddr,
     host: &str,
     settings: &XhttpSettings,
     tls: &ferrox_core::tls::TlsConfig,
@@ -1101,7 +1094,7 @@ pub(crate) fn connect_split(
     } else {
         &tls.server_name
     };
-    let client = H3Client::connect(address, port, name, tls)?;
+    let client = H3Client::connect(peer, name, tls)?;
     let head = crate::xhttp::dial_head(host, settings, "", None);
     let block = block_from_text(&head, host, "https");
     let (reader, out) = client.open(&block, false)?;
@@ -1111,8 +1104,7 @@ pub(crate) fn connect_split(
 }
 
 pub(crate) fn connect_dual_split(
-    address: &str,
-    port: u16,
+    peer: SocketAddr,
     host: &str,
     settings: &XhttpSettings,
     tls: &ferrox_core::tls::TlsConfig,
@@ -1122,7 +1114,7 @@ pub(crate) fn connect_dual_split(
     } else {
         &tls.server_name
     };
-    let client = H3Client::connect(address, port, name, tls)?;
+    let client = H3Client::connect(peer, name, tls)?;
     let session = settings.session_id();
     let down = crate::xhttp::downlink_head(host, settings, &session);
     let block = block_from_text(&down, host, "https");
@@ -1258,8 +1250,13 @@ mod tests {
             roots: roots.into(),
             ..Default::default()
         };
-        connect_dual_split("127.0.0.1", port, "localhost", settings, &tls)
-            .expect("the h3 streams open")
+        connect_dual_split(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            "localhost",
+            settings,
+            &tls,
+        )
+        .expect("the h3 streams open")
     }
 
     fn client(port: u16, roots: Vec<Vec<u8>>) -> Arc<H3Client> {
@@ -1268,7 +1265,15 @@ mod tests {
             roots: roots.into(),
             ..Default::default()
         };
-        H3Client::connect("127.0.0.1", port, "localhost", &tls).expect("the h3 client connects")
+        H3Client::connect(SocketAddr::from(([127, 0, 0, 1], port)), "localhost", &tls)
+            .expect("the h3 client connects")
+    }
+
+    #[test]
+    fn an_h3_alpn_is_case_sensitive() {
+        assert!(is_h3(&[b"h3".to_vec()]));
+        assert!(!is_h3(&[b"H3".to_vec()]));
+        assert!(!is_h3(&[b"h3".to_vec(), b"h2".to_vec()]));
     }
 
     fn raw_stream(client: &Arc<H3Client>) -> Wire {
@@ -1377,8 +1382,13 @@ mod tests {
             roots: roots.into(),
             ..Default::default()
         };
-        let (mut reader, writer) = connect_split("127.0.0.1", port, "localhost", &settings, &tls)
-            .expect("the h3 stream opens");
+        let (mut reader, writer) = connect_split(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            "localhost",
+            &settings,
+            &tls,
+        )
+        .expect("the h3 stream opens");
         let payload: Vec<u8> = (0..16 * 1024).map(|byte| (byte % 251) as u8).collect();
         assert!(writer.send(&payload));
         writer.finish();
@@ -1518,8 +1528,13 @@ mod tests {
             roots: roots.into(),
             ..Default::default()
         };
-        let (mut reader, writer) = connect_split("127.0.0.1", port, "localhost", &settings, &tls)
-            .expect("the h3 stream opens");
+        let (mut reader, writer) = connect_split(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            "localhost",
+            &settings,
+            &tls,
+        )
+        .expect("the h3 stream opens");
         assert!(writer.send(b"hello"), "the request body rides DATA");
         writer.finish();
         let mut got = Vec::new();

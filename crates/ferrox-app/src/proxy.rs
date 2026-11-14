@@ -16894,14 +16894,12 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     if let Some(cfg) = vless.tls.as_deref() {
         if let Carrier::Xhttp { settings } = &vless.carrier {
             if crate::xhttp_h3::is_h3(&cfg.alpn) {
-                let address = server.ip().to_string();
-                let port = server.port();
                 let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                    crate::xhttp_h3::connect_split(&address, port, &vless.host, settings, cfg).map(
+                    crate::xhttp_h3::connect_split(*server, &vless.host, settings, cfg).map(
                         |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                     )
                 } else {
-                    crate::xhttp_h3::connect_dual_split(&address, port, &vless.host, settings, cfg)
+                    crate::xhttp_h3::connect_dual_split(*server, &vless.host, settings, cfg)
                         .map(|(reader, writer)| {
                             (Box::new(reader) as Box<dyn WindowRead + Send>, writer)
                         })
@@ -18970,12 +18968,10 @@ fn dial_tls_carried_stream(
 ) -> Option<CarrierStream<Box<dyn Read + Send>, Box<dyn Write + Send>>> {
     if let Carrier::Xhttp { settings } = carrier {
         if crate::xhttp_h3::is_h3(&tls.alpn) {
-            let address = server.ip().to_string();
-            let port = server.port();
             let (reader, writer) = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                crate::xhttp_h3::connect_split(&address, port, host, settings, tls)?
+                crate::xhttp_h3::connect_split(*server, host, settings, tls)?
             } else {
-                crate::xhttp_h3::connect_dual_split(&address, port, host, settings, tls)?
+                crate::xhttp_h3::connect_dual_split(*server, host, settings, tls)?
             };
             return Some(CarrierStream {
                 reader: Box::new(reader) as Box<dyn Read + Send>,
@@ -20517,14 +20513,12 @@ fn dial_vless_tls(
     };
     if let Carrier::Xhttp { settings } = &vless.carrier {
         if crate::xhttp_h3::is_h3(&cfg.alpn) {
-            let address = server.ip().to_string();
-            let port = server.port();
             let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                crate::xhttp_h3::connect_split(&address, port, &vless.host, settings, cfg).map(
+                crate::xhttp_h3::connect_split(*server, &vless.host, settings, cfg).map(
                     |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                 )
             } else {
-                crate::xhttp_h3::connect_dual_split(&address, port, &vless.host, settings, cfg).map(
+                crate::xhttp_h3::connect_dual_split(*server, &vless.host, settings, cfg).map(
                     |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                 )
             };
@@ -20979,14 +20973,12 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     };
     if let Carrier::Xhttp { settings } = &trojan.carrier {
         if crate::xhttp_h3::is_h3(&cfg.alpn) {
-            let address = server.ip().to_string();
-            let port = server.port();
             let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                crate::xhttp_h3::connect_split(&address, port, &trojan.host, settings, cfg).map(
+                crate::xhttp_h3::connect_split(*server, &trojan.host, settings, cfg).map(
                     |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                 )
             } else {
-                crate::xhttp_h3::connect_dual_split(&address, port, &trojan.host, settings, cfg)
+                crate::xhttp_h3::connect_dual_split(*server, &trojan.host, settings, cfg)
                     .map(|(reader, writer)| {
                         (Box::new(reader) as Box<dyn WindowRead + Send>, writer)
                     })
@@ -21365,14 +21357,12 @@ fn dial_vmess_tls(
                     Failure::new(Stage::SocketConnected, Kind::Local),
                 );
             };
-            let address = server.ip().to_string();
-            let port = server.port();
             let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                crate::xhttp_h3::connect_split(&address, port, &vmess.host, settings, cfg).map(
+                crate::xhttp_h3::connect_split(*server, &vmess.host, settings, cfg).map(
                     |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                 )
             } else {
-                crate::xhttp_h3::connect_dual_split(&address, port, &vmess.host, settings, cfg).map(
+                crate::xhttp_h3::connect_dual_split(*server, &vmess.host, settings, cfg).map(
                     |(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer),
                 )
             };
@@ -65317,16 +65307,19 @@ mod tests {
                 ferrox_core::tls::RustlsServerProvider::accept((*server_config).clone(), stream)
                     .expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(RELAY_POLL))
+                .expect("arms the read timeout");
             let out = tls.get_ref().try_clone().expect("dups the transport");
             let shared = Arc::new(Mutex::new(tls));
             let out = Arc::new(Mutex::new(Sealed::new(out)));
-            let read = TlsHalf {
+            let read = TlsHalf::<_, Connection> {
                 session: Arc::clone(&shared),
                 out: Arc::clone(&out),
                 driven: None,
                 sleep_on_timeout: true,
             };
-            let write = TlsHalf {
+            let write = TlsHalf::<_, Connection> {
                 session: shared,
                 out,
                 driven: None,
