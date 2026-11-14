@@ -64,7 +64,7 @@ graph TD
 | seconds-per-api-call | UNBLESSED | CI bench.yml (no cell yet) |
 <!-- counts:end -->
 
-The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen, the observatory snapshot and the routing calls have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs`, `router.rs` and `vmess.rs`; the access log's field scan is measured by `ops.yml` as three open rows, the word scan and the byte scan against the codepoint baseline, and `the_ascii_scan_escapes_exactly_as_the_codepoint_path` holds the bytes equal, so the page itself still quotes no number.
+The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen, the observatory snapshot and the routing calls have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs`, `router.rs` and `vmess.rs`; the access log's field scan is measured by `ops.yml` as three open rows, the word scan and the byte scan against the codepoint baseline; the word scan now checks a clean field thirty-two bytes at a time with AVX2 and falls back to its eight-byte windows for a field with an escape or a tail, and `the_ascii_scan_escapes_exactly_as_the_codepoint_path`, `a_sixteen_byte_window_escapes_like_the_byte_walk` and the widened cases there hold the bytes equal on every window and escape position. Ops run `43554199839` prices the bulk-field word scan at 193,543 retired instructions against 831,181 before the AVX2 window (4.3x), with the 2,737,037-instruction ASCII walk and the 5,493,133-instruction codepoint baseline unchanged; those three stay open `method-ops` rows rather than blessed values, so the table below still quotes no number for them.
 
 ## Time
 
