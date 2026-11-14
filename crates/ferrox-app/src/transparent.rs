@@ -428,7 +428,7 @@ mod freebsd {
     const DIOCNATLOOK: libc::c_ulong = 0xc04c_4417;
 
     // FreeBSD keeps `pfioc_natlook`'s ports 16-bit, so the ioctl struct is 76 bytes, not 84.
-    #[repr(C)]
+    #[repr(C, align(4))]
     struct NatLook {
         source: [u8; 16],
         destination: [u8; 16],
