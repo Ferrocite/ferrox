@@ -106,8 +106,10 @@ struct XmuxSettings {
 }
 
 impl XmuxSettings {
-    fn set(value: &Json) -> u32 {
-        value.get("to").and_then(Json::as_u32).unwrap_or(0)
+    /// The upper bound of an `Int32Range`: an integer or the `"1-4"` range string the reference also accepts.
+    fn set(value: &Json) -> Option<u32> {
+        let (left, right) = crate::xhttp::i32_range(value)?;
+        u32::try_from(left.max(right).max(0)).ok()
     }
 }
 
@@ -148,7 +150,7 @@ impl Settings {
         if service == "s3" && s3.is_none() {
             return None;
         }
-        let xmux = xmux_of(drive);
+        let xmux = xmux_of(drive)?;
         if xmux.max_connections > 0 && xmux.max_concurrency > 0 {
             return None;
         }
@@ -288,25 +290,28 @@ fn s3_of(drive: &Json) -> Option<S3Settings> {
             .get("pathStyle")
             .or_else(|| node.get("path_style"))
             .and_then(Json::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(true),
     })
 }
 
 /// The `xmux` object as the reference reads it, with the same `snake_case` fallback as every other field.
-fn xmux_of(drive: &Json) -> XmuxSettings {
+fn xmux_of(drive: &Json) -> Option<XmuxSettings> {
     let Some(node) = drive.get("xmux") else {
-        return XmuxSettings::default();
+        return Some(XmuxSettings::default());
     };
-    XmuxSettings {
-        max_concurrency: node
-            .get("maxConcurrency")
-            .or_else(|| node.get("max_concurrency"))
-            .map_or(0, XmuxSettings::set),
-        max_connections: node
-            .get("maxConnections")
-            .or_else(|| node.get("max_connections"))
-            .map_or(0, XmuxSettings::set),
+    if !matches!(node, Json::Obj(_) | Json::Null) {
+        return None;
     }
+    let field = |name: &str| -> Option<u32> {
+        match node.get(name).or_else(|| node.get(&snake_case(name))) {
+            Some(value) => XmuxSettings::set(value),
+            None => Some(0),
+        }
+    };
+    Some(XmuxSettings {
+        max_concurrency: field("maxConcurrency")?,
+        max_connections: field("maxConnections")?,
+    })
 }
 
 /// The transport's REALITY identity, and whether it named its own decoy rather than borrowing the lane's host.
@@ -1810,6 +1815,7 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const LINE_CAP: usize = 8 * 1024;
 const HEAD_CAP: usize = 16 * 1024;
+const ERROR_BODY_CAP: usize = 64 * 1024;
 const TOKEN_CAP: usize = 1 << 20;
 const TOKEN_SKEW: Duration = Duration::from_secs(60);
 const TOKEN_LIFE: Duration = Duration::from_secs(3600);
@@ -2001,9 +2007,10 @@ impl Lane {
         Ok(())
     }
 
-    /// Everything the peer has left to say, which is a reply only a `close`ing service can give.
-    fn read_to_eof(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+    /// Everything the peer has left to say, which is a reply only a `close`ing service can give, under the caller's cap.
+    fn read_to_eof(&mut self, out: &mut Vec<u8>, limit: Option<usize>) -> io::Result<()> {
         while self.ready()? > 0 {
+            guard(out.len() + self.buf.len() - self.at, limit)?;
             out.extend_from_slice(&self.buf[self.at..]);
             self.at = self.buf.len();
         }
@@ -2067,6 +2074,13 @@ impl Lane {
                 kept: !closing,
             });
         }
+        let limit = limit.map(|cap| {
+            if (200..300).contains(&status) {
+                cap
+            } else {
+                cap.min(ERROR_BODY_CAP)
+            }
+        });
         let mut body = Vec::new();
         let kept = if transfer {
             self.chunks(&mut body, limit)?;
@@ -2076,7 +2090,7 @@ impl Lane {
             self.append_body(want, &mut body)?;
             !closing
         } else {
-            self.read_to_eof(&mut body)?;
+            self.read_to_eof(&mut body, limit)?;
             false
         };
         Ok(Answer { status, body, kept })
@@ -2100,11 +2114,11 @@ impl Lane {
     }
 }
 
-/// A declared length the caller will not let the store spend.
+/// A body length the caller will not let the store spend.
 fn guard(want: usize, limit: Option<usize>) -> io::Result<()> {
     if limit.is_some_and(|cap| want > cap) {
         return Err(carrier_error(format!(
-            "the service declared {want} bytes past its limit"
+            "the service body reaches {want} bytes past its limit"
         )));
     }
     Ok(())
@@ -3227,7 +3241,10 @@ impl S3 {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str()))
                 .collect();
-            match self.http.ask(method, &url, &sent, body, None) {
+            match self
+                .http
+                .ask(method, &url, &sent, body, Some(MAX_SEGMENT_BYTES))
+            {
                 Ok((status, payload)) if retryable_status(status) => Control::Again(format!(
                     "S3 {method} answered {status}: {}",
                     String::from_utf8_lossy(&payload)
@@ -3362,42 +3379,53 @@ struct S3Page {
 impl S3Page {
     fn parse(payload: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(payload).ok()?;
-        let keys = xml_values(text, "Contents")
-            .into_iter()
-            .filter_map(|item| xml_values(&item, "Key").into_iter().next())
-            .collect();
-        let prefixes = xml_values(text, "CommonPrefixes")
-            .into_iter()
-            .filter_map(|item| xml_values(&item, "Prefix").into_iter().next())
-            .collect();
+        let root = xml_values(text, "ListBucketResult")?.into_iter().next()?;
+        let mut keys = Vec::new();
+        for item in xml_values(root, "Contents")? {
+            keys.push(xml_text(item, "Key")?);
+        }
+        let mut prefixes = Vec::new();
+        for item in xml_values(root, "CommonPrefixes")? {
+            prefixes.push(xml_text(item, "Prefix")?);
+        }
         Some(Self {
-            truncated: xml_values(text, "IsTruncated")
-                .first()
+            truncated: xml_text(root, "IsTruncated")
                 .is_some_and(|value| value.eq_ignore_ascii_case("true")),
-            next: xml_values(text, "NextContinuationToken")
-                .into_iter()
-                .next()
-                .unwrap_or_default(),
+            next: xml_text(root, "NextContinuationToken").unwrap_or_default(),
             keys,
             prefixes,
         })
     }
 }
 
-fn xml_values(text: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
+/// The raw inner text of every `<tag>` element, left encoded so a container keeps its child markup for the next parse.
+fn xml_values<'a>(text: &'a str, tag: &str) -> Option<Vec<&'a str>> {
+    let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
     let mut at = 0;
-    while let Some(start) = text[at..].find(&open) {
-        let start = at + start + open.len();
-        let Some(end) = text[start..].find(&close) else {
-            break;
-        };
-        found.push(xml_decode(&text[start..start + end]));
-        at = start + end + close.len();
+    while let Some(offset) = text[at..].find(&open) {
+        let start = at + offset;
+        let after = &text[start + open.len()..];
+        if !after
+            .chars()
+            .next()
+            .is_some_and(|byte| byte == '>' || byte.is_ascii_whitespace())
+        {
+            at = start + open.len();
+            continue;
+        }
+        let body = start + open.len() + after.find('>')? + 1;
+        let end = text[body..].find(&close)?;
+        found.push(&text[body..body + end]);
+        at = body + end + close.len();
     }
-    found
+    Some(found)
+}
+
+/// The decoded text of the first `<tag>` element, which is the only place an `&amp;` in a key is decoded.
+fn xml_text(text: &str, tag: &str) -> Option<String> {
+    xml_values(text, tag)?.into_iter().next().map(xml_decode)
 }
 
 fn xml_decode(text: &str) -> String {
@@ -3441,7 +3469,7 @@ fn xml_decode(text: &str) -> String {
 
 fn s3_error_code(payload: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(payload).ok()?;
-    xml_values(text, "Code").into_iter().next()
+    xml_text(text, "Code")
 }
 
 fn s3_missing(status: u16, payload: &[u8]) -> bool {
@@ -4126,6 +4154,18 @@ fn share_key(settings: &Settings, front: Option<(&str, u16)>) -> String {
     }
     joined.extend_from_slice(&settings.secrets);
     joined.push(settings.security.clone());
+    if let Some(reality) = &settings.reality {
+        joined.push("reality".to_owned());
+        joined.push(reality.server_name.clone());
+        joined.push(ferrox_core::foxy::account::hex_encode(&reality.public_key));
+        joined.push(ferrox_core::foxy::account::hex_encode(&reality.short_id));
+        joined.push(reality.fingerprint.clone());
+        joined.push(if settings.reality_named {
+            "named".to_owned()
+        } else {
+            "lane-host".to_owned()
+        });
+    }
     if let Some((host, port)) = front {
         let host = if host.contains(':') {
             format!("[{host}]")
@@ -5752,6 +5792,34 @@ mod tests {
             !Arc::ptr_eq(&first, &named.store(None).expect("reopens again")),
             "and so does every secret"
         );
+        let mut reality = settings.clone();
+        reality.reality = Some(Arc::new(RealityClientConfig {
+            server_name: "a.example".to_owned(),
+            public_key: [1; 32],
+            short_id: [0; 8],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+        }));
+        let mut rotated = reality.clone();
+        rotated.reality = Some(Arc::new(RealityClientConfig {
+            server_name: "a.example".to_owned(),
+            public_key: [2; 32],
+            short_id: [0; 8],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+        }));
+        assert_ne!(
+            share_key(&reality, None),
+            share_key(&rotated, None),
+            "a rotated REALITY key is a different store"
+        );
+        let mut other_name = reality.clone();
+        other_name.reality_named = true;
+        assert_ne!(
+            share_key(&reality, None),
+            share_key(&other_name, None),
+            "and so is a named decoy"
+        );
         let mut disk = settings.clone();
         disk.service = "local".to_owned();
         let folder = scratch("shared-local");
@@ -5846,6 +5914,29 @@ mod tests {
         );
     }
 
+    /// XML is decoded at the leaf, and a body that is not one complete `ListBucketResult` is no page at all.
+    #[test]
+    fn an_s3_page_decodes_leaf_entities_once_and_refuses_malformed_xml() {
+        let page = S3Page::parse(
+            br#"<?xml version="1.0"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><Contents><Key>root/a&amp;b/000.seg</Key></Contents><CommonPrefixes><Prefix>root/a&amp;b/sub/</Prefix></CommonPrefixes></ListBucketResult>"#,
+        )
+        .expect("one page");
+        assert_eq!(page.keys, ["root/a&b/000.seg"]);
+        assert_eq!(page.prefixes, ["root/a&b/sub/"]);
+        for body in [
+            &b""[..],
+            b"<Error><Code>NoSuchKey</Code></Error>",
+            b"<ListBucketResult><Contents><Key>a</Key>",
+            b"<ListBucketResult><Contents></Contents></ListBucketResult>",
+        ] {
+            assert!(
+                S3Page::parse(body).is_none(),
+                "not a complete listing: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
     /// A missing S3 key is the polling reader's `NotFound`, not a lane failure.
     #[test]
     fn s3_maps_a_missing_key_to_not_found() {
@@ -5876,26 +5967,41 @@ mod tests {
         )
         .expect("the deprecated spelling");
         assert_eq!(drive.service, "google-drive");
+        for body in [
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":2,"maxConcurrency":"1-4"}}}"#,
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":"1-4","maxConcurrency":2}}}"#,
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":{"from":1,"to":2},"maxConcurrency":2}}}"#,
+        ] {
+            assert!(
+                named(body).is_none(),
+                "the reference refuses both connection bounds at once: {body}"
+            );
+        }
         assert!(
-            named(r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":{"from":1,"to":2},"maxConcurrency":{"from":1,"to":2}}}}"#).is_none(),
-            "the reference refuses both connection bounds at once"
+            named(r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":"1-4"}}}"#).is_some(),
+            "one range bound is accepted"
+        );
+        assert!(
+            named(r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x","xmux":{"maxConnections":3,"maxConcurrency":"-2"}}}"#).is_some(),
+            "a negative bound is a sentinel, not a second bound"
         );
         let s3 = named(
             r#"{"xdriveSettings":{"service":"s3","remoteFolder":"root","secrets":["ak","sk"],"s3":{"endpoint":"https://s3.example","bucket":"store"}}}"#,
         )
-        .expect("virtual-hosted addressing is the default");
-        assert!(!s3.s3.as_ref().expect("s3").path_style);
+        .expect("path style is the default");
+        assert!(s3.s3.as_ref().expect("s3").path_style);
         let built = S3::build(&s3, Http::new(None, None, false, None, 8)).expect("builds");
-        assert_eq!(built.authority, "store.s3.example");
-        assert_eq!(built.base_path, "/");
-        let path_style = named(
-            r#"{"xdriveSettings":{"service":"s3","remoteFolder":"root","secrets":["ak","sk"],"s3":{"endpoint":"https://s3.example","bucket":"store","pathStyle":true}}}"#,
-        )
-        .expect("path style is read");
-        assert!(path_style.s3.as_ref().expect("s3").path_style);
-        let built = S3::build(&path_style, Http::new(None, None, false, None, 8)).expect("builds");
         assert_eq!(built.authority, "s3.example");
         assert_eq!(built.base_path, "/store/");
+        let virtual_hosted = named(
+            r#"{"xdriveSettings":{"service":"s3","remoteFolder":"root","secrets":["ak","sk"],"s3":{"endpoint":"https://s3.example","bucket":"store","pathStyle":false}}}"#,
+        )
+        .expect("virtual-hosted addressing is read");
+        assert!(!virtual_hosted.s3.as_ref().expect("s3").path_style);
+        let built =
+            S3::build(&virtual_hosted, Http::new(None, None, false, None, 8)).expect("builds");
+        assert_eq!(built.authority, "store.s3.example");
+        assert_eq!(built.base_path, "/");
     }
 
     /// REALITY is the store lane's handshake, and an unnamed decoy takes the host the endpoint names.
