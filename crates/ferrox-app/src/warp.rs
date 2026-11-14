@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::warp_scan::{self, Cooldowns, LastEdge, ScanMode};
+use ferrox_core::wireguard::transport::{HEADER_SIZE as WG_HEADER_SIZE, TAG_SIZE as WG_TAG_SIZE};
 
 use base64::Engine as _;
 
@@ -486,7 +487,7 @@ impl WarpSpec {
                 Err(error)
                     if should_reprovision(self.register, error.refused, reprovision_enabled()) =>
                 {
-                    let identity = register(self, !inner && saved.masque.is_some())?;
+                    let identity = register(self, enroll)?;
                     quarantine(path);
                     identity.save(path)?;
                     Ok(identity)
@@ -1597,7 +1598,40 @@ fn resolve_classic_edges(
     if let Some(edge) = inner_edge {
         println!("[+] using forced inner peer {edge} (probe skipped)");
     }
-    if let Some(mode) = spec.scan {
+    let cache_path = spec.last_edge_path();
+    let mut last = LastEdge::load(&cache_path);
+    let mut cooldowns = Cooldowns::new(spec.cooldown);
+    let mut scan = spec.scan;
+    let now = Instant::now();
+    if spec.quick_reconnect {
+        if outer_edge.is_none() {
+            if let Some(edge) = last.get("classic-outer") {
+                if check_wireguard(outer, spec, edge) {
+                    outer_edge = Some(edge);
+                    println!("[+] selected outer WireGuard endpoint {edge}");
+                } else {
+                    cooldowns.hold(edge, now);
+                    scan.get_or_insert(ScanMode::Balanced);
+                    eprintln!("[-] last outer WireGuard edge {edge} did not answer; scanning");
+                }
+            }
+        }
+        if inner_edge.is_none() {
+            if let Some(edge) = last.get("classic-inner") {
+                if check_wireguard(inner, spec, edge) {
+                    inner_edge = Some(edge);
+                    println!("[+] selected inner WireGuard endpoint {edge}");
+                } else {
+                    cooldowns.hold(edge, now);
+                    scan.get_or_insert(ScanMode::Balanced);
+                    eprintln!("[-] last inner WireGuard edge {edge} did not answer; scanning");
+                }
+            }
+        }
+    }
+    cooldowns.purge(now);
+    let excluded = cooldowns.excluded(now);
+    if let Some(mode) = scan {
         eprintln!("warp: scanning edges in {} mode", mode.label());
         let timeout = spec.stale.map_or_else(
             || warp_scan::scan_timeout(mode),
@@ -1605,20 +1639,19 @@ fn resolve_classic_edges(
         );
         if outer_edge.is_none() {
             let avoid: HashSet<IpAddr> = inner_edge.map(|edge| edge.ip()).into_iter().collect();
-            outer_edge =
-                scan_wireguard_edges(outer, spec, mode, timeout, &HashSet::new(), &avoid, 16)
-                    .into_iter()
-                    .next();
+            outer_edge = scan_wireguard_edges(outer, spec, mode, timeout, &excluded, &avoid, 16)
+                .into_iter()
+                .next();
             if let Some(edge) = outer_edge {
                 println!("[+] selected outer WireGuard endpoint {edge}");
             }
         }
         if inner_edge.is_none() {
-            let avoid: HashSet<IpAddr> = outer_edge.map(|edge| edge.ip()).into_iter().collect();
-            inner_edge =
-                scan_wireguard_edges(inner, spec, mode, timeout, &HashSet::new(), &avoid, 16)
-                    .into_iter()
-                    .next();
+            let outer_ip = outer_edge.unwrap_or(outer.wireguard.endpoint).ip();
+            let avoid = HashSet::from([outer_ip]);
+            inner_edge = scan_wireguard_edges(inner, spec, mode, timeout, &excluded, &avoid, 16)
+                .into_iter()
+                .next();
             if let Some(edge) = inner_edge {
                 println!("[+] selected inner WireGuard endpoint {edge}");
             }
@@ -1639,6 +1672,13 @@ fn resolve_classic_edges(
     }
     outer.wireguard.endpoint = outer_edge;
     inner.wireguard.endpoint = inner_edge;
+    if spec.scan.is_some() || spec.quick_reconnect {
+        last.record("classic-outer", outer_edge);
+        last.record("classic-inner", inner_edge);
+        if let Err(error) = last.save(&cache_path) {
+            eprintln!("warp: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -1869,11 +1909,13 @@ fn wireguard_settings(identity: &Identity, spec: &WarpSpec) -> crate::json::Json
     ])
 }
 
-/// The inner hop's settings with its peer moved to the forwarder.
+/// The inner hop's settings with its peer moved to the forwarder and its MTU
+/// bounded by what the outer carrier can hold after this hop's own header.
 fn wireguard_settings_with_endpoint(
     identity: &Identity,
     spec: &WarpSpec,
     endpoint: SocketAddr,
+    mtu: u16,
 ) -> crate::json::Json {
     let mut settings = wireguard_settings(identity, spec);
     let crate::json::Json::Obj(pairs) = &mut settings else {
@@ -1891,9 +1933,22 @@ fn wireguard_settings_with_endpoint(
     };
     *slot = string(&endpoint.to_string());
     if let Some((_, slot)) = pairs.iter_mut().find(|(key, _)| key == "mtu") {
-        *slot = crate::json::Json::Num(f64::from(spec.mtu.min(GOOL_INNER_MTU)));
+        *slot = crate::json::Json::Num(f64::from(mtu));
     }
     settings
+}
+
+/// The inner hop's MTU once the outer `WireGuard` header and the outer IPv4
+/// or IPv6 UDP packet are subtracted from the outer MTU.
+fn classic_inner_mtu(outer_mtu: u16, remote: SocketAddr) -> Result<u16, String> {
+    let carrier = if remote.is_ipv4() { 28 } else { 48 };
+    let overhead = u16::try_from(WG_HEADER_SIZE + WG_TAG_SIZE + carrier)
+        .map_err(|_| "warp gool-classic: the nested overhead does not fit a u16".to_owned())?;
+    outer_mtu.checked_sub(overhead).filter(|mtu| *mtu > 0).ok_or_else(|| {
+        format!(
+            "warp gool-classic: outer MTU {outer_mtu} leaves no room for the inner hop's {overhead}-byte overhead"
+        )
+    })
 }
 
 /// The MASQUE half as the existing `masque` outbound reads it: the enrolled
@@ -2267,7 +2322,8 @@ impl GoolOut {
     ) -> Result<Self, String> {
         let outer = Arc::new(outer);
         let forwarder = outer.udp_forwarder(remote)?;
-        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local);
+        let mtu = spec.mtu.min(GOOL_INNER_MTU);
+        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local, mtu);
         let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
         let inner = crate::wg::WireGuardOut::new(config)?;
         Ok(Self {
@@ -2311,7 +2367,8 @@ impl GoolClassicOut {
     ) -> Result<Self, String> {
         let outer = Arc::new(outer);
         let forwarder = outer.udp_forwarder(remote)?;
-        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local);
+        let mtu = classic_inner_mtu(spec.mtu, remote)?;
+        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local, mtu);
         let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
         let inner = crate::wg::WireGuardOut::new(config)?;
         Ok(Self {
@@ -2585,7 +2642,8 @@ pub(crate) fn one_tap(
         masque_server_name: CONNECT_SNI.to_owned(),
         masque_host: CONNECT_HOST.to_owned(),
         masque_path: "/".to_owned(),
-        scan: None,
+        scan: (mode == Mode::GoolClassic && (wiw_outer.is_none() || wiw_inner.is_none()))
+            .then_some(ScanMode::Balanced),
         peer: None,
         wg_peer: None,
         ironclad_port: IRONCLAD_PORT,
@@ -2600,10 +2658,13 @@ pub(crate) fn one_tap(
         },
     };
     let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
-    if matches!(mode, Mode::Gool | Mode::GoolClassic) {
-        spec.gool_identity()?;
-    }
     identity.save(&path)?;
+    if matches!(mode, Mode::Gool | Mode::GoolClassic) {
+        if let Err(reason) = spec.gool_identity() {
+            let _ = std::fs::remove_file(&path);
+            return Err(reason);
+        }
+    }
     let mut settings = vec![
         ("mode", string(mode.label())),
         ("identityFile", string(&path.to_string_lossy())),
@@ -3631,6 +3692,7 @@ mod tests {
             &identity,
             &spec,
             "127.0.0.1:5000".parse().expect("the forwarder"),
+            GOOL_INNER_MTU,
         );
         let config = crate::wireguard::DeviceConfig::from_json(&settings).expect("the inner hop");
         assert_eq!(
@@ -3638,6 +3700,25 @@ mod tests {
             Some("127.0.0.1:5000".parse().expect("the forwarder"))
         );
         assert_eq!(config.mtu, usize::from(GOOL_INNER_MTU));
+    }
+
+    #[test]
+    fn the_classic_inner_mtu_subtracts_the_header_and_the_outer_packet() {
+        let v4: SocketAddr = "192.0.2.9:2408".parse().expect("an IPv4 edge");
+        let v6: SocketAddr = "[2001:db8::1]:2408".parse().expect("an IPv6 edge");
+        assert_eq!(
+            classic_inner_mtu(1280, v4),
+            Ok(1280 - WG_HEADER_SIZE as u16 - WG_TAG_SIZE as u16 - 28)
+        );
+        assert_eq!(
+            classic_inner_mtu(1280, v6),
+            Ok(1280 - WG_HEADER_SIZE as u16 - WG_TAG_SIZE as u16 - 48)
+        );
+        assert_eq!(
+            classic_inner_mtu(u16::try_from(28 + WG_HEADER_SIZE + WG_TAG_SIZE - 1).expect("small"),
+                v4),
+            Err("warp gool-classic: outer MTU 59 leaves no room for the inner hop's 60-byte overhead".to_owned())
+        );
     }
 
     #[test]

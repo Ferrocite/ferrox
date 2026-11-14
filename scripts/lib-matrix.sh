@@ -32,6 +32,13 @@ matrix_udp_carrier() {
   esac
 }
 
+matrix_nested_carrier() {
+  case "$1" in
+    warp-gool-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # A WARP cell needs an external engine that speaks WARP. At this pin only Aether
 # qualifies: ZeroNet and xray-core are skipped for WARP cells.
 matrix_warp_needs_external_reference() {
@@ -290,9 +297,12 @@ matrix_wireguard_dir() {
   esac
   dir="$root/$dir"
   mkdir -p "$dir"
-  if [[ ! -s "$dir/server.txt" ]]; then
-    "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/server.txt" || return 1
-  fi
+  local pair
+  for pair in server client server-inner client-inner; do
+    if [[ ! -s "$dir/$pair.txt" ]]; then
+      "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/$pair.txt" || return 1
+    fi
+  done
   echo "$dir"
 }
 
@@ -358,6 +368,30 @@ matrix_wireguard_engine_v6() {
   local index
   index="$(matrix_wireguard_index "$1")" || return 1
   printf 'fd00::%d/128\n' "$((index + 2))"
+}
+
+matrix_wireguard_client_private() {
+  matrix_wireguard_key "$(matrix_wireguard_dir)/client.txt" PrivateKey
+}
+
+matrix_wireguard_client_public() {
+  matrix_wireguard_key "$(matrix_wireguard_dir)/client.txt" 'Password (PublicKey)'
+}
+
+matrix_wireguard_inner_server_private() {
+  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/server-inner.txt"
+}
+
+matrix_wireguard_inner_server_public() {
+  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/server-inner.txt"
+}
+
+matrix_wireguard_inner_client_private() {
+  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/client-inner.txt"
+}
+
+matrix_wireguard_inner_client_public() {
+  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/client-inner.txt"
 }
 
 # The server's TLS: the identity the client is asked to trust.
@@ -451,10 +485,10 @@ masque_client_settings() {
 # dialect with a pinned mode, a WireGuard half the pinned mode never dials, and
 # a stream TLS fixture the Aether adapter alone reads for its client identity.
 warp_client_settings() {
-  local port="$1" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==" dir pin
+  local port="$1" mode="${2:-masque}" extra="${3:-}" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==" dir pin
   dir="$(matrix_tls_dir)" || return 1
   pin="$(matrix_tls_spki "$dir/cert.pem")" || return 1
-  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"masque\", \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$pin\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\", \"usage\": \"verify\"}]}}"
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"$mode\"$extra, \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$pin\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\", \"usage\": \"verify\"}]}}"
 }
 
 httpupgrade_settings() {
@@ -597,6 +631,44 @@ wireguard_kernel_client() {
   wireguard_client "$1" "${2:-ferrox}" false
 }
 
+# The outer hop of the WireGuard-in-WireGuard lane: one fixed client key, since
+# the scenario hands every engine the same identity it builds from this config.
+wireguard_classic_server() {
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_server_private)\", \"address\": [\"10.0.0.1/32\", \"fd00::1/128\"], \"mtu\": 1280, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_client_public)\", \"allowedIPs\": [\"10.0.0.2/32\", \"fd00::2/128\"]}]}"
+}
+
+# The inner hop of a nested WARP tunnel: a second WireGuard device, reachable
+# only through the outer carrier, with its own addresses and keypair.
+wireguard_inner_server() {
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_inner_server_private)\", \"address\": [\"10.1.0.1/32\", \"fd01::1/128\"], \"mtu\": 1280, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_inner_client_public)\", \"allowedIPs\": [\"10.1.0.2/32\", \"fd01::2/128\"]}]}"
+}
+
+wireguard_identity() {
+  local private="$1" public="$2" endpoint="$3" v4="$4" v6="$5"
+  echo "{\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$private\", \"publicKey\": \"$public\", \"endpoint\": \"$endpoint\", \"address\": [\"$v4/32\", \"$v6/128\"], \"reserved\": [0, 0, 0]}}"
+}
+
+nested_server_config() {
+  local port="$1" inner_port="$2" outer="$3" inner="$4" client="$5"
+  cat <<EOF
+{"inbounds": [{"tag": "matrix-server", "listen": "127.0.0.1", "port": $port, $outer}, {"tag": "matrix-inner", "listen": "127.0.0.1", "port": $inner_port, $inner}],
+ "outbounds": [{$client}, {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}],
+ "routing": {"rules": [{"type": "field", "inboundTag": ["harness-socks"], "outboundTag": "proxy"}]}}
+EOF
+}
+
+warp_classic_client_settings() {
+  local outer_port="$1" inner_port="$2"
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"gool-classic\", \"identity\": $(wireguard_identity "$(matrix_wireguard_client_private)" "$(matrix_wireguard_server_public)" "127.0.0.1:$outer_port" "10.0.0.2" "fd00::2"), \"goolIdentity\": $(wireguard_identity "$(matrix_wireguard_inner_client_private)" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "10.1.0.2" "fd01::2"), \"wiwOuter\": \"127.0.0.1:$outer_port\", \"wiwInner\": \"127.0.0.1:$inner_port\", \"mtu\": 1280}"
+}
+
+warp_gool_client_settings() {
+  local outer_port="$1" inner_port="$2"
+  local extra
+  extra=", \"goolIdentity\": $(wireguard_identity "$(matrix_wireguard_inner_client_private)" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "10.1.0.2" "fd01::2"), \"goolPeer\": \"127.0.0.1:$inner_port\""
+  warp_client_settings "$outer_port" gool "$extra"
+}
+
 vless_server_vision() {
   echo "\"protocol\": \"vless\", \"settings\": {\"clients\": [{\"id\": \"$UUID\", \"flow\": \"xtls-rprx-vision\"}], \"decryption\": \"none\"}$1"
 }
@@ -729,7 +801,7 @@ http_server() { echo "\"protocol\": \"http\", \"settings\": {}"; }
 http_client() { echo "\"tag\": \"proxy\", \"protocol\": \"http\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1}]}"; }
 
 scenario_config() {
-  local port="$2" cover="${3:-}" cover_json=""
+  local port="$2" cover="${3:-}" inner="${4:-}" cover_json=""
   if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
   case "$1" in
     vless-raw-*) server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
@@ -784,6 +856,8 @@ scenario_config() {
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
     warp-masque-*) server_config "$(masque_server_settings)" "$(warp_client_settings "$port")" "$port" ;;
+    warp-gool-classic-*) nested_server_config "$port" "$inner" "$(wireguard_classic_server)" "$(wireguard_inner_server)" "$(warp_classic_client_settings "$port" "$inner")" ;;
+    warp-gool-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(wireguard_inner_server)" "$(warp_gool_client_settings "$port" "$inner")" ;;
     socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
     http-raw-*) server_config "$(http_server)" "$(http_client "$port")" "$port" ;;
     vmess-*) dispatch_protocol vmess "$1" "$port" "$cover" ;;
@@ -872,6 +946,8 @@ standard_scenarios() {
   echo "trojan-tls-ws-down-8 download 8 256 65536"
   echo "masque-down-8 download 8 256 65536"
   echo "warp-masque-down-8 download 8 256 65536"
+  echo "warp-gool-down-8 download 8 256 65536"
+  echo "warp-gool-classic-down-8 download 8 256 65536"
   echo "vless-ws-ed-down-8 download 8 256 65536"
   echo "vless-tls-ws-ed-down-8 download 8 256 65536"
   echo "vless-httpupgrade-ed-down-8 download 8 256 65536"
@@ -981,6 +1057,16 @@ scenarios() {
       echo "warp-masque-down-16 download 16 128 65536"
       echo "warp-masque-down-64 download 64 64 65536"
       echo "warp-masque-duplex-64 full-duplex 64 64 65536"
+      echo "warp-gool-up-1 upload 1 2048 65536"
+      echo "warp-gool-duplex-8 full-duplex 8 128 65536"
+      echo "warp-gool-down-16 download 16 128 65536"
+      echo "warp-gool-down-64 download 64 64 65536"
+      echo "warp-gool-duplex-64 full-duplex 64 64 65536"
+      echo "warp-gool-classic-up-1 upload 1 2048 65536"
+      echo "warp-gool-classic-duplex-8 full-duplex 8 128 65536"
+      echo "warp-gool-classic-down-16 download 16 128 65536"
+      echo "warp-gool-classic-down-64 download 64 64 65536"
+      echo "warp-gool-classic-duplex-64 full-duplex 64 64 65536"
       echo "wireguard-kernel-raw-up-1 upload 1 2048 65536"
       echo "wireguard-kernel-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-reality-raw-up-1 upload 1 2048 65536"

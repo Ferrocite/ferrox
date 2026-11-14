@@ -110,7 +110,7 @@ def masque_identity(cfg_path, stream):
     ])
 
 
-def wireguard_identity(cfg_path, settings):
+def wireguard_identity(cfg_path, settings, suffix=""):
     """Build the WireGuard identity TOML from the client settings."""
     secret = settings.get("secretKey")
     peers = settings.get("peers") or []
@@ -120,7 +120,8 @@ def wireguard_identity(cfg_path, settings):
     if not public:
         fail("the WireGuard client config has no peer public key")
     local_v4, local_v6 = local_addresses(settings)
-    identity_path = cfg_path.with_name("aether-identity.toml")
+    name = "aether-identity" + (f"-{suffix}" if suffix else "") + ".toml"
+    identity_path = cfg_path.with_name(name)
     return identity(identity_path, [
         ("device_id", '"matrix"'),
         ("access_token", '"matrix"'),
@@ -133,6 +134,16 @@ def wireguard_identity(cfg_path, settings):
         ("wg_peer_public_key", f'"{base64_key(public)}"'),
         ("client_id", '""'),
     ])
+
+
+def inline_wireguard(identity):
+    """Shape an inline warp identity's WireGuard half like client settings."""
+    block = (identity or {}).get("wireguard") or {}
+    return {
+        "secretKey": block.get("privateKey"),
+        "address": block.get("address"),
+        "peers": [{"publicKey": block.get("publicKey")}],
+    }
 
 
 def main():
@@ -173,7 +184,38 @@ def main():
         "AETHER_WG_NO_DATA_CHECK": "1",
         "AETHER_NOIZE": "off",
     })
-    if outbound.get("protocol") == "warp":
+    protocol = outbound.get("protocol")
+    mode = settings.get("mode") if protocol == "warp" else None
+    if protocol == "warp" and mode == "gool":
+        block = settings.get("masque") or {}
+        masque_peer = block.get("address") and f"{block['address']}:{block['port']}"
+        if not masque_peer:
+            fail("the WARP outbound names no MASQUE address and port")
+        inner = settings.get("goolIdentity") or {}
+        inner_peer = settings.get("goolPeer") or endpoint(inline_wireguard(inner))
+        tls = stream.get("tlsSettings") or {}
+        sni = block.get("serverName") or tls.get("serverName") or "carrier.test"
+        outer_config = masque_identity(cfg_path, stream)
+        wireguard_identity(cfg_path, inline_wireguard(inner), "gool")
+        command = [
+            str(real), "--protocol", "gool", "--peer", masque_peer,
+            "--gool-peer", inner_peer, "--masque-sni", sni, "--bind", bind,
+            "--masque-config", str(outer_config), "--no-data-check",
+            "--no-quic-v2", "--log-level", "warn",
+        ]
+    elif protocol == "warp" and mode == "gool-classic":
+        outer = settings.get("identity") or {}
+        inner = settings.get("goolIdentity") or {}
+        outer_peer = settings.get("wiwOuter") or endpoint(inline_wireguard(outer))
+        inner_peer = settings.get("wiwInner") or endpoint(inline_wireguard(inner))
+        primary = wireguard_identity(cfg_path, inline_wireguard(outer))
+        wireguard_identity(cfg_path, inline_wireguard(inner), "secondary")
+        command = [
+            str(real), "--gool-classic", "--wiw-outer", outer_peer,
+            "--wiw-inner", inner_peer, "--bind", bind,
+            "--wg-config", str(primary), "--no-data-check", "--log-level", "warn",
+        ]
+    elif protocol == "warp":
         block = settings.get("masque") or {}
         masque_peer = block.get("address") and f"{block['address']}:{block['port']}"
         if not masque_peer:
@@ -187,7 +229,7 @@ def main():
             "--masque-config", str(config), "--no-data-check",
             "--no-quic-v2", "--log-level", "warn",
         ]
-    elif outbound.get("protocol") == "masque":
+    elif protocol == "masque":
         tls = stream.get("tlsSettings") or {}
         sni = tls.get("serverName") or "carrier.test"
         peer = endpoint(settings)
@@ -198,7 +240,7 @@ def main():
             "--masque-config", str(config), "--no-data-check",
             "--no-quic-v2", "--log-level", "warn",
         ]
-    else:
+    elif protocol == "wireguard":
         peer = endpoint(settings)
         config = wireguard_identity(cfg_path, settings)
         command = [
@@ -206,6 +248,8 @@ def main():
             "--bind", bind, "--wg-config", str(config),
             "--no-data-check", "--log-level", "warn",
         ]
+    else:
+        fail(f"the config has no known outbound protocol: {protocol}")
     env["AETHER_SOCKS"] = bind
     os.execve(str(real), command, env)
 

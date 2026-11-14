@@ -128,15 +128,15 @@ graph TD
 
 No local duration is quoted: every contributor dials through a VPN, so a local race measures the tunnel.
 The scan's bounds are nominal per-mode deadlines (turbo 45 s, balanced 120 s, thorough 300 s, verified 60 s, ironclad 180 s) with a per-candidate verify timeout of 6/6/10/5/15 s (or a shorter `stale`) and a 6 s ironclad HTTP wait; a worker already in a probe can run one timeout past the deadline. These are bounds, not measured durations.
-The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and the WARP data plane is compared in the benchmark matrix's WARP rows — `warp-masque-down-8` in standard, `-down-16`, `-down-64` and `-duplex-64` in full — against Aether in the same cell. ZeroNet is skipped with a reason: its WARP client drops `ADDRESS_ASSIGN` and dials from its configured address, which a shared server's pool has already assigned to another tunnel. A host where the external leg did not build skips the WARP cell with that reason instead of reporting a one-engine comparison. Gool has no CI cell of its own: `wireguard_rides_inside_masque` proves the bytes cross the composed client, and a gool duration against Aether would need Aether's own gool scan and a second WARP device, which the matrix does not provision.
+The race's bound is the 8 s deadline, witnessed by `a_silent_pair_falls_back_at_the_deadline`; throughput of the two halves is the carriers' own CI cells (rows 74 and 76), and every WARP data plane is compared in the benchmark matrix's WARP rows against Aether in the same cell: `warp-masque-down-8`, `warp-gool-down-8` and `warp-gool-classic-down-8` in standard, with `-down-16`, `-down-64` and `-duplex-64` lanes in full. Each nested scenario composes a ferrox server from the outer inbound and an inner WireGuard listener, and the Aether adapter derives the second identity beside the first, so a gool cell no longer needs a second WARP device. ZeroNet is skipped with a reason: its WARP client drops `ADDRESS_ASSIGN` and dials from its configured address, which a shared server's pool has already assigned to another tunnel. A host where the external leg did not build skips the WARP cell with that reason instead of reporting a one-engine comparison.
 
 ## CI scope
 
-What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The dial-side of the row is this page's own unit races, and the throughput comparison is the matrix's WARP rows (`warp-masque-*`): ferrox's warp outbound against Aether in the same cell, which runs only in CI because everything beyond loopback is.
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The dial-side of the row is this page's own unit races, and the throughput comparison is the matrix's WARP rows (`warp-masque-*`, `warp-gool-*`, `warp-gool-classic-*`): ferrox's warp outbound against Aether in the same cell, which runs only in CI because everything beyond loopback is.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/warp.rs, crates/ferrox-app/src/warp_scan.rs
 - symbols: find_warp_outbound
-- scenarios: warp-masque
+- scenarios: warp-masque, warp-gool, warp-gool-classic
 - engines: xray-core, aether, zeronet
 <!-- scope:end -->
