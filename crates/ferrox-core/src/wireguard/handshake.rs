@@ -58,7 +58,6 @@ enum State {
 /// responder calls [`Handshake::consume_initiation`] and
 /// [`Handshake::create_response`]. Both end at [`Handshake::session_keys`], the
 /// only path that zeroes the ephemeral private key and the chain.
-#[derive(Debug)]
 pub struct Handshake {
     state: State,
     hash: [u8; 32],
@@ -71,6 +70,30 @@ pub struct Handshake {
     timestamp: [u8; 12],
     local_index: u32,
     remote_index: u32,
+}
+
+impl std::fmt::Debug for Handshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every other field is key material: `chain_key`, the ephemerals and `static_static` derive the session, and a Debug line must not carry them.
+        f.debug_struct("Handshake")
+            .field("state", &self.state)
+            .field("local_index", &self.local_index)
+            .field("remote_index", &self.remote_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        // `session_keys` zeroes what it consumes; an abandoned or failed handshake reaches Drop with the chain and ephemerals still live.
+        self.hash.zeroize();
+        self.chain_key.zeroize();
+        self.preshared_key.zeroize();
+        self.local_ephemeral.zeroize();
+        self.remote_ephemeral.zeroize();
+        self.static_static.zeroize();
+        self.timestamp.zeroize();
+    }
 }
 
 fn mix_hash(h: &mut [u8; 32], data: &[u8]) {
