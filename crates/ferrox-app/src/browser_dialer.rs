@@ -626,7 +626,7 @@ mod tests {
         let send = pipe.find("to.send(event.data);").expect("sends");
         assert!(drain < send, "the pipe drains before it sends");
         assert!(
-            pipe.contains("queued > HIGH_WATER)"),
+            pipe.contains("queued > HIGH_WATER || frames > 4096)"),
             "the queue is bounded"
         );
         assert!(
@@ -636,6 +636,10 @@ mod tests {
         assert!(
             pipe.contains("return () => tail;"),
             "a close can wait for the queue"
+        );
+        assert!(
+            pipe.contains("frames -= 1;"),
+            "an empty frame is counted too"
         );
     }
 
