@@ -1820,8 +1820,10 @@ mod tests {
             build_ipv6_tcp_packet((remote, 443), (client, 5555), 9, 10, FLAG_ACK, 4096, b"");
         let mut body = vec![2, 0, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&quoted[..IPV6_HEADER + 8]);
-        let key = icmp_error_flow(ICMPV6_PROTO, &body).unwrap();
+        let (key, seq) = icmp_error_flow(ICMPV6_PROTO, &body).unwrap();
+        assert_eq!(seq, 9);
         assert_eq!(key.source_port, 5555);
+        assert_eq!(key.source, client);
         assert_eq!(key.destination, remote);
         assert_eq!(key.destination_port, 443);
     }
@@ -1839,8 +1841,10 @@ mod tests {
         );
         let mut body = vec![3, 0, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&quoted[..IPV4_HEADER + 8]);
-        let key = icmp_error_flow(ICMP_PROTO, &body).unwrap();
+        let (key, seq) = icmp_error_flow(ICMP_PROTO, &body).unwrap();
+        assert_eq!(seq, 9);
         assert_eq!(key.source_port, 5555);
+        assert_eq!(key.source, IpAddr::V4([10, 0, 0, 2].into()));
         assert_eq!(key.destination, IpAddr::V4([203, 0, 113, 7].into()));
         assert_eq!(key.destination_port, 443);
     }
