@@ -20408,15 +20408,41 @@ fn reality_xmux(
         path: settings.path.clone(),
         query: settings.query.clone(),
         h2: true,
-        identity: (
-            reality.server_name.clone(),
-            reality.public_key,
-            reality.short_id,
-            reality.fingerprint.clone(),
-        ),
+        identity: crate::xmux::Identity::Reality {
+            server_name: reality.server_name.clone(),
+            public_key: reality.public_key,
+            short_id: reality.short_id,
+            fingerprint: reality.fingerprint.clone(),
+        },
         log_sink: reality.key_log.as_ref().map(|log| log.path().to_owned()),
     };
-    crate::xmux::manager(key, settings.xmux)
+    crate::xmux::manager(key, settings.xmux, None)
+}
+
+/// The key a TLS xHTTP session shares its pool under: the destination and the exact config a
+/// handshake used, so a pool never answers with a connection another trust store accepted.
+fn tls_xmux(
+    server: &SocketAddr,
+    vless: &VlessOut,
+    tls: Arc<ferrox_core::tls::TlsConfig>,
+    settings: &crate::xhttp::XhttpSettings,
+) -> Arc<crate::xmux::Manager> {
+    let key = crate::xmux::Key {
+        server: *server,
+        host: vless.host.clone(),
+        path: settings.path.clone(),
+        query: settings.query.clone(),
+        h2: true,
+        identity: crate::xmux::Identity::Tls(Arc::as_ptr(&tls) as usize),
+        log_sink: None,
+    };
+    crate::xmux::manager(key, settings.xmux, Some(tls))
+}
+
+/// Whether a TLS config's offer lets a stream-one xHTTP dial speak HTTP/2, the reference's
+/// `decideHTTPVersion` (`dialer.go:82`): an ALPN of exactly `http/1.1` is the one offer that cannot.
+pub(crate) fn tls_offers_h2(alpn: &[Vec<u8>]) -> bool {
+    !(alpn.len() == 1 && alpn[0].eq_ignore_ascii_case(b"http/1.1"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -20545,9 +20571,10 @@ fn dial_vless_tls(
     vless: &VlessOut,
     target: Option<&Destination>,
 ) {
-    let Some(cfg) = vless.tls.as_deref() else {
+    let Some(tls) = vless.tls.as_ref() else {
         return;
     };
+    let cfg = tls.as_ref();
     let Some(header) = vless_request_header(vless, target) else {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     };
@@ -20567,6 +20594,15 @@ fn dial_vless_tls(
             };
             relay_vless_xhttp_session(server, client, vless, &header, reader, writer);
             return;
+        }
+        // A stream-one dial that offers h2 can reuse a pooled connection without a handshake; an `http/1.1`-only offer never looks in the pool.
+        if settings.mode == crate::xhttp::XhttpMode::StreamOne && tls_offers_h2(&cfg.alpn) {
+            let pool = tls_xmux(server, vless, Arc::clone(tls), settings);
+            if let Some(lease) = pool.existing() {
+                if pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
+                    return;
+                }
+            }
         }
     }
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
@@ -20663,6 +20699,23 @@ fn dial_vless_tls(
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
             relay_shared_late(Half::socket(downstream), half, &close);
+        }
+        Carrier::Xhttp { settings }
+            if settings.mode == crate::xhttp::XhttpMode::StreamOne
+                && session
+                    .alpn()
+                    .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2")) =>
+        {
+            let Some(conn) = session.into_halves().and_then(|(reader, writer, raw)| {
+                crate::xhttp_h2::H2Client::new(reader, writer, Some(raw))
+            }) else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            };
+            let pool = tls_xmux(server, vless, Arc::clone(tls), settings);
+            let lease = pool.adopt(conn);
+            if !pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
+                note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
         }
         _ => ride_carrier(
             server,
@@ -20972,14 +21025,13 @@ fn dial_vless_reality(
             }
         }
         Carrier::Xhttp { settings } if settings.mode == crate::xhttp::XhttpMode::StreamOne => {
-            let pool = reality_xmux(server, vless, reality, settings);
-            let lease = pool.lease(|| {
-                let (reader, writer, raw) = session.into_halves()?;
+            let Some(conn) = session.into_halves().and_then(|(reader, writer, raw)| {
                 crate::xhttp_h2::H2Client::new(reader, writer, Some(raw))
-            });
-            let Some(lease) = lease else {
+            }) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
+            let pool = reality_xmux(server, vless, reality, settings);
+            let lease = pool.adopt(conn);
             if !pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
                 note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
@@ -46297,6 +46349,87 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             1,
             "the second REALITY xHTTP session dialled its own transport instead of reusing the pool"
+        );
+    }
+
+    /// A TLS stream-one session negotiates h2, so the second flow opens a stream on the first
+    /// connection; the handshake happened once even though the pool learned the protocol late.
+    #[test]
+    fn two_tls_xhttp_sessions_share_one_pooled_connection() {
+        const WITNESS: &str = "/tls-h2-pool-witness";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let _echo = thread::spawn(move || loop {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let id = [0x51u8; 16];
+        let users = one_vless_user(&id);
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let mut settings = xhttp_settings(WITNESS);
+        settings.xmux = Some(crate::xhttp::Xmux {
+            max_connections: (1, 1),
+            ..crate::xhttp::Xmux::default()
+        });
+        let carrier = Carrier::Xhttp {
+            settings: settings.clone(),
+        };
+        let server_carrier = carrier.clone();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        thread::spawn(move || loop {
+            let Ok((stream, _)) = front.accept() else {
+                return;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let carrier = server_carrier.clone();
+            let server_config = Arc::clone(&server_config);
+            let users = users.clone();
+            thread::spawn(move || {
+                serve_vless_tls(stream, &users, true, &carrier, &server_config, None, None);
+            });
+        });
+        let pair = RealityPair {
+            outbound: tls_vless_out(server_addr.port(), id, carrier, client_config),
+            server: server_addr,
+            target: echo_addr,
+            echo: thread::spawn(|| ()),
+            front: thread::spawn(|| ()),
+        };
+        for _ in 0..2 {
+            let (mut user, dialled) = dial_pair(&pair);
+            let payload: Vec<u8> = (0..4096u32)
+                .map(|index| (index as u8).wrapping_mul(11).wrapping_add(3))
+                .collect();
+            assert_eq!(echo_bulk(&mut user, &payload), payload);
+            drop(user);
+            dialled.join().expect("joins");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the second TLS xHTTP session dialled its own transport instead of reusing the pool"
         );
     }
 

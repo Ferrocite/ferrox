@@ -3382,26 +3382,14 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
 
 /// The regular fields a stream-one dial sends, in the H1 head's order: the configured set, the
 /// padded referer, and the body's type. H2 encodes the same fields as HEADERS.
-pub(crate) fn dial_fields(host: &str, settings: &XhttpSettings) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    for line in crate::headers::masked(&settings.headers, crate::headers::FETCH).split("\r\n") {
-        if let Some((name, value)) = line.split_once(": ") {
-            fields.push((name.to_owned(), value.to_owned()));
-        }
-    }
-    fields.push((
-        "referer".to_owned(),
-        format!(
-            "http://{host}{}?x_padding={}",
-            normalized_path(settings),
-            referer_pad_value(settings)
-        ),
-    ));
-    fields.push((
-        "content-type".to_owned(),
-        "application/octet-stream".to_owned(),
-    ));
-    fields
+/// The `Referer` an H2 dial encodes: the normalized path and the pad, in one string because HPACK
+/// measures the value it writes before it writes it.
+pub(crate) fn referer_value(host: &str, settings: &XhttpSettings) -> String {
+    format!(
+        "http://{host}{}?x_padding={}",
+        normalized_path(settings),
+        referer_pad_value(settings)
+    )
 }
 
 // The reference's `appendToPath` (config.go:529): a segment lands under the trailing slash, never beside it.
@@ -3489,7 +3477,7 @@ fn normalized_path(settings: &XhttpSettings) -> String {
 
 /// The request target a dial writes: the normalized path and the query that rode in with it (`config.go:20`).
 pub(crate) fn dial_path(settings: &XhttpSettings) -> String {
-    target_of(&normalized_path(settings), &settings.query)
+    combine_target(normalized_path(settings), &settings.query)
 }
 
 /// The packet-up and stream-up dial's POST: one POST, chunked framing, the session under the head's own placement. `Connection: close` is the reference dialer's `DisableKeepAlives` (dialer.go:272).

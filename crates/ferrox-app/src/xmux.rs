@@ -31,12 +31,81 @@ pub(crate) struct Key {
     pub(crate) path: String,
     pub(crate) query: String,
     pub(crate) h2: bool,
-    pub(crate) identity: (String, [u8; 32], [u8; 8], String),
+    pub(crate) identity: Identity,
     pub(crate) log_sink: Option<String>,
+}
+
+/// The client a pooled connection authenticated as. REALITY names its material, and TLS pins the
+/// config by address; the manager holds that config so a retired address is never handed out again.
+#[derive(Clone)]
+pub(crate) enum Identity {
+    Reality {
+        server_name: String,
+        public_key: [u8; 32],
+        short_id: [u8; 8],
+        fingerprint: String,
+    },
+    Tls(usize),
+}
+
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Reality {
+                    server_name,
+                    public_key,
+                    short_id,
+                    fingerprint,
+                },
+                Self::Reality {
+                    server_name: other_name,
+                    public_key: other_key,
+                    short_id: other_id,
+                    fingerprint: other_fingerprint,
+                },
+            ) => {
+                server_name == other_name
+                    && public_key == other_key
+                    && short_id == other_id
+                    && fingerprint == other_fingerprint
+            }
+            (Self::Tls(config), Self::Tls(other)) => config == other,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Identity {}
+
+impl std::hash::Hash for Identity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Reality {
+                server_name,
+                public_key,
+                short_id,
+                fingerprint,
+            } => {
+                0u8.hash(state);
+                server_name.hash(state);
+                public_key.hash(state);
+                short_id.hash(state);
+                fingerprint.hash(state);
+            }
+            Self::Tls(config) => {
+                1u8.hash(state);
+                config.hash(state);
+            }
+        }
+    }
 }
 
 pub(crate) struct Manager {
     bounds: Xmux,
+    /// Keeps a TLS identity's address valid for the life of the pool, so a new config cannot be
+    /// allocated where a retired one's pointer sat.
+    _config: Option<Arc<ferrox_core::tls::TlsConfig>>,
     entries: Mutex<Vec<Arc<Entry>>>,
 }
 
@@ -117,28 +186,22 @@ impl Drop for Lease {
 }
 
 impl Manager {
-    pub(crate) fn new(bounds: Xmux) -> Arc<Self> {
+    pub(crate) fn new(bounds: Xmux, config: Option<Arc<ferrox_core::tls::TlsConfig>>) -> Arc<Self> {
         Arc::new(Self {
             bounds,
+            _config: config,
             entries: Mutex::new(Vec::new()),
         })
     }
 
-    /// The reference's `getXmuxClient(create=true)` (`mux.go:66`): reuse a live entry the bounds
-    /// allow, otherwise dial one, and never block — a saturated pool over its target dials fresh,
-    /// as `getXmuxClient` does when every client is filtered out.
-    pub(crate) fn lease(&self, create: impl FnOnce() -> Option<Arc<H2Client>>) -> Option<Lease> {
+    /// The reference's `newXmuxClient` (`mux.go:62`): a session that found no live entry dials its
+    /// own transport and adds it, so a stale entry can never discard the session it just handshook.
+    pub(crate) fn adopt(&self, conn: Arc<H2Client>) -> Lease {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.retain(|entry| !entry.expired());
-        let chosen = self.choose(&entries);
-        let entry = if let Some(entry) = chosen {
-            entry
-        } else {
-            let entry = Arc::new(Entry::new(create()?, &self.bounds));
-            entries.push(Arc::clone(&entry));
-            entry
-        };
-        Some(hold(entry))
+        let entry = Arc::new(Entry::new(conn, &self.bounds));
+        entries.push(Arc::clone(&entry));
+        hold(entry)
     }
 
     /// `GetExistingXmuxClient` (`mux.go:73`): a session that would rather dial its own transport
@@ -182,7 +245,11 @@ type Managers = HashMap<(Key, Xmux), Arc<Manager>>;
 
 static MANAGERS: Mutex<Option<Managers>> = Mutex::new(None);
 
-pub(crate) fn manager(key: Key, bounds: Option<Xmux>) -> Arc<Manager> {
+pub(crate) fn manager(
+    key: Key,
+    bounds: Option<Xmux>,
+    config: Option<Arc<ferrox_core::tls::TlsConfig>>,
+) -> Arc<Manager> {
     let mut managers = MANAGERS.lock().unwrap_or_else(PoisonError::into_inner);
     // `transport_method.go:458` fills the defaults only for a wholly empty block, so `{}` takes them too.
     let bounds = bounds
@@ -191,7 +258,7 @@ pub(crate) fn manager(key: Key, bounds: Option<Xmux>) -> Arc<Manager> {
     let map = managers.get_or_insert_with(HashMap::new);
     Arc::clone(
         map.entry((key, bounds))
-            .or_insert_with(|| Manager::new(bounds)),
+            .or_insert_with(|| Manager::new(bounds, config)),
     )
 }
 
@@ -245,6 +312,12 @@ mod tests {
         H2Client::new(std::io::empty(), Sink, None)
     }
 
+    fn take(manager: &Arc<Manager>, create: &impl Fn() -> Option<Arc<H2Client>>) -> Option<Lease> {
+        manager
+            .existing()
+            .or_else(|| create().map(|conn| manager.adopt(conn)))
+    }
+
     fn counter() -> (Arc<AtomicUsize>, impl Fn() -> Option<Arc<H2Client>>) {
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&count);
@@ -262,12 +335,12 @@ mod tests {
             path: "/bounds".to_owned(),
             query: String::new(),
             h2: true,
-            identity: (
-                "bounds.example".to_owned(),
-                [1; 32],
-                [2; 8],
-                "chrome".to_owned(),
-            ),
+            identity: Identity::Reality {
+                server_name: "bounds.example".to_owned(),
+                public_key: [1; 32],
+                short_id: [2; 8],
+                fingerprint: "chrome".to_owned(),
+            },
             log_sink: None,
         };
         let one = Xmux {
@@ -278,9 +351,9 @@ mod tests {
             max_connections: (2, 2),
             ..Xmux::default()
         };
-        let first = manager(key.clone(), Some(one));
-        let second = manager(key.clone(), Some(two));
-        let again = manager(key, Some(one));
+        let first = manager(key.clone(), Some(one), None);
+        let second = manager(key.clone(), Some(two), None);
+        let again = manager(key, Some(one), None);
         assert!(
             !Arc::ptr_eq(&first, &second),
             "two outbounds with different connection caps shared one pool"
@@ -288,12 +361,63 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &again));
     }
 
+    /// A pool is only as trustworthy as the config that filled it: the same TLS config shares, a
+    /// second one with equal fields does not, and no REALITY pool answers a TLS dial.
+    #[test]
+    fn tls_pools_partition_by_their_exact_config() {
+        let config = Arc::new(ferrox_core::tls::TlsConfig::default());
+        let twin = Arc::new(ferrox_core::tls::TlsConfig::default());
+        let key = |identity| Key {
+            server: "127.0.0.1:4443".parse().expect("an address"),
+            host: "tls.example".to_owned(),
+            path: "/tls".to_owned(),
+            query: String::new(),
+            h2: true,
+            identity,
+            log_sink: None,
+        };
+        let one = manager(
+            key(Identity::Tls(Arc::as_ptr(&config) as usize)),
+            None,
+            Some(Arc::clone(&config)),
+        );
+        let again = manager(
+            key(Identity::Tls(Arc::as_ptr(&config) as usize)),
+            None,
+            Some(Arc::clone(&config)),
+        );
+        let other = manager(
+            key(Identity::Tls(Arc::as_ptr(&twin) as usize)),
+            None,
+            Some(twin),
+        );
+        let reality = manager(
+            key(Identity::Reality {
+                server_name: "tls.example".to_owned(),
+                public_key: [0; 32],
+                short_id: [0; 8],
+                fingerprint: String::new(),
+            }),
+            None,
+            None,
+        );
+        assert!(Arc::ptr_eq(&one, &again), "one config split its own pool");
+        assert!(
+            !Arc::ptr_eq(&one, &other),
+            "two TLS configs shared a pooled connection"
+        );
+        assert!(
+            !Arc::ptr_eq(&one, &reality),
+            "a REALITY and a TLS pool shared a connection"
+        );
+    }
+
     #[test]
     fn the_default_target_dials_three_connections_then_reuses_them() {
-        let manager = Manager::new(defaults());
+        let manager = Manager::new(defaults(), None);
         let (dialed, create) = counter();
         let leased: Vec<Lease> = (0..4)
-            .map(|_| manager.lease(&create).expect("a lease"))
+            .map(|_| take(&manager, &create).expect("a lease"))
             .collect();
         assert_eq!(
             dialed.load(Ordering::SeqCst),
@@ -314,11 +438,11 @@ mod tests {
         let mut bounds = defaults();
         bounds.max_connections = (1, 1);
         bounds.max_concurrency = (1, 1);
-        let manager = Manager::new(bounds);
+        let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        let first = manager.lease(&create).expect("a lease");
+        let first = take(&manager, &create).expect("a lease");
         let first_conn = Arc::clone(first.conn());
-        let second = manager.lease(&create).expect("a lease");
+        let second = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,
@@ -326,7 +450,7 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(&first_conn, second.conn()));
         drop(first);
-        let third = manager.lease(&create).expect("a lease");
+        let third = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,
@@ -340,12 +464,12 @@ mod tests {
         let mut bounds = defaults();
         bounds.max_connections = (1, 1);
         bounds.c_max_reuse_times = (3, 3);
-        let manager = Manager::new(bounds);
+        let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        let one = manager.lease(&create).expect("a lease");
+        let one = take(&manager, &create).expect("a lease");
         let one_conn = Arc::clone(one.conn());
         drop(one);
-        let two = manager.lease(&create).expect("a lease");
+        let two = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             1,
@@ -353,7 +477,7 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&one_conn, two.conn()));
         drop(two);
-        let three = manager.lease(&create).expect("a lease");
+        let three = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,
@@ -366,10 +490,10 @@ mod tests {
     fn the_request_count_retires_an_entry() {
         let mut bounds = defaults();
         bounds.h_max_request_times = (1, 1);
-        let manager = Manager::new(bounds);
+        let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        drop(manager.lease(&create).expect("a lease"));
-        drop(manager.lease(&create).expect("a lease"));
+        drop(take(&manager, &create).expect("a lease"));
+        drop(take(&manager, &create).expect("a lease"));
         assert_eq!(dialed.load(Ordering::SeqCst), 2, "one request per client");
     }
 
@@ -377,7 +501,7 @@ mod tests {
     #[test]
     fn a_lease_chooses_without_allocating() {
         let bounds = defaults();
-        let manager = Manager::new(bounds);
+        let manager = Manager::new(bounds, None);
         let entries: Vec<Arc<Entry>> = (0..3)
             .map(|_| Arc::new(Entry::new(client().expect("a client"), &bounds)))
             .collect();
@@ -390,11 +514,11 @@ mod tests {
     fn the_reusable_seconds_retire_an_entry() {
         let mut bounds = defaults();
         bounds.h_max_reusable_secs = (1, 1);
-        let manager = Manager::new(bounds);
+        let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        drop(manager.lease(&create).expect("a lease"));
+        drop(take(&manager, &create).expect("a lease"));
         std::thread::sleep(Duration::from_millis(1100));
-        let _second = manager.lease(&create).expect("a lease");
+        let _second = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,

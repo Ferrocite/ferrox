@@ -88,29 +88,38 @@ pub(crate) fn masked_len(headers: &[(String, String)], defaults: &[(&str, &str)]
             .sum::<usize>()
 }
 
-/// Append the header lines a dial writes before its blank line: the browser defaults the config did not override, then the config's own headers.
-pub(crate) fn write_masked(
-    out: &mut Vec<u8>,
+/// One callback per header line a dial writes, in order, without staging the lines first: an H1
+/// head appends them, and an H2 head encodes each straight into its block.
+pub(crate) fn for_each_masked(
     headers: &[(String, String)],
     defaults: &[(&str, &str)],
+    mut each: impl FnMut(&str, &str),
 ) {
     for &(name, value) in defaults {
         if !suppressed(headers, name) {
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
+            each(name, value);
         }
     }
     for (name, value) in headers {
         if fixed(name) || (name.eq_ignore_ascii_case("user-agent") && selector(value)) {
             continue;
         }
+        each(name, value);
+    }
+}
+
+/// Append the header lines a dial writes before its blank line: the browser defaults the config did not override, then the config's own headers.
+pub(crate) fn write_masked(
+    out: &mut Vec<u8>,
+    headers: &[(String, String)],
+    defaults: &[(&str, &str)],
+) {
+    for_each_masked(headers, defaults, |name, value| {
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
-    }
+    });
 }
 
 /// The same lines as one `String` for the dials that build their head with `format!`.
