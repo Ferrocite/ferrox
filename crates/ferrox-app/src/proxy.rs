@@ -52370,7 +52370,13 @@ mod tests {
 
     fn trojan_mux_probe_port() -> u16 {
         static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-        trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        loop {
+            let port =
+                trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     /// A trojan client that pipelines its first payload with the request header keeps it: the
