@@ -133,6 +133,9 @@ async function run(ws, task) {
   if (!task.streamResponse) {
     const init = initFor(task);
     init.method = task.method;
+    const abort = new AbortController();
+    init.signal = abort.signal;
+    ws.onclose = () => { try { abort.abort(); } catch (_) {} closed(ws); };
     ws.send("ok");
     ws.onmessage = async (event) => {
       try {

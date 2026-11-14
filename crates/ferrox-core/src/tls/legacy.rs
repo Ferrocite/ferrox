@@ -403,9 +403,10 @@ impl<S: Stream> Session<S> {
             // SAFETY: the session and the context are keyed by the same inputs, so the context minted it.
             unsafe { ssl.set_session(&session) }.map_err(|e| error_stack(&e))?;
         }
-        // A literal address names no virtual host, so it reaches the transport without SNI.
-        if rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
-            .is_ok_and(|name| matches!(name, rustls::pki_types::ServerName::DnsName(_)))
+        // A literal address names no virtual host, so it reaches the transport without SNI, and `omit_sni` asks for the same silence on a name that is still verified.
+        if !cfg.omit_sni
+            && rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
+                .is_ok_and(|name| matches!(name, rustls::pki_types::ServerName::DnsName(_)))
         {
             ssl.set_hostname(&cfg.server_name)
                 .map_err(|e| error_stack(&e))?;

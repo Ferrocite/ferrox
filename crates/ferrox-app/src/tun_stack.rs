@@ -130,7 +130,11 @@ pub(crate) fn build(
             format!("tun mtu {} exceeds 65535", spec.mtu()),
         )
     })?;
-    let mut builder = DeviceBuilder::new().name(spec.name()).mtu(mtu);
+    // An empty name lets the platform pick (`utunN` on macOS); a named device keeps the same interface across restarts.
+    let mut builder = DeviceBuilder::new().mtu(mtu);
+    if !spec.name().is_empty() {
+        builder = builder.name(spec.name());
+    }
     builder = match spec.address() {
         IpAddr::V4(address) => builder.ipv4(address, spec.prefix(), None),
         IpAddr::V6(address) => builder.ipv6(address, spec.prefix()),
@@ -145,6 +149,15 @@ pub(crate) fn build(
     #[cfg(not(target_os = "linux"))]
     let _ = (multi, offload);
     Ok((device, offload, multi))
+}
+
+/// The kernel offers UDP segment offload with the TCP offloads, but this handler dispatches one datagram per read and does not split an aggregate, so the device is narrowed back to the TCP mask the reference takes.
+#[cfg(target_os = "linux")]
+pub(crate) fn tcp_only_offload(device: &SyncDevice) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let mask = libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6;
+    // SAFETY: the descriptor is a live TUN the device owns, and `TUNSETOFFLOAD` takes the mask by value.
+    unsafe { libc::ioctl(device.as_raw_fd(), libc::TUNSETOFFLOAD, mask.cast_signed()) == 0 }
 }
 
 #[allow(clippy::needless_pass_by_value)]

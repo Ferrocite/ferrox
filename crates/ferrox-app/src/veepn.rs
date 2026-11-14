@@ -132,6 +132,7 @@ impl VeepnOut {
                 insecure: false,
                 host_header: None,
                 server_name: None,
+                omit_sni: false,
                 verify_names: Vec::new(),
                 pins: ferrox_core::foxy::pin::Pins::default(),
             });

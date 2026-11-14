@@ -65,7 +65,7 @@ const TUNNEL_DNS: [&str; 2] = ["1.1.1.1", "2606:4700:4700::1111"];
 /// The API reply holds the `WireGuard` half's private key only on this side; the
 /// peer key, endpoint, reserved bytes and tunnel addresses come back over the
 /// wire, and the MASQUE key is the one enrolled after the device exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Identity {
     device_id: String,
     token: String,
@@ -73,7 +73,19 @@ struct Identity {
     masque: Option<MasqueIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token re-registers the device and the two identities hold private keys; neither belongs in a log line.
+        f.debug_struct("Identity")
+            .field("device_id", &self.device_id)
+            .field("token", &"<redacted>")
+            .field("wireguard", &self.wireguard)
+            .field("masque", &self.masque)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct WireGuardIdentity {
     private: [u8; 32],
     peer: [u8; 32],
@@ -82,11 +94,33 @@ struct WireGuardIdentity {
     reserved: [u8; 3],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct MasqueIdentity {
     private: Vec<u8>,
     server: Vec<u8>,
     addresses: Vec<IpAddr>,
+}
+
+impl std::fmt::Debug for WireGuardIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuardIdentity")
+            .field("private", &"<redacted>")
+            .field("peer", &self.peer)
+            .field("endpoint", &self.endpoint)
+            .field("addresses", &self.addresses)
+            .field("reserved", &self.reserved)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MasqueIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasqueIdentity")
+            .field("private", &"<redacted>")
+            .field("server", &"<redacted>")
+            .field("addresses", &self.addresses)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Which half the outbound may use, before the race has answered.

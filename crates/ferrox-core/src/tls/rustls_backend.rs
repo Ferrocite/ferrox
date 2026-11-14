@@ -556,6 +556,8 @@ struct ConfigKey {
     /// The protocol window rustls bakes into the built config.
     min_version: Option<u16>,
     max_version: Option<u16>,
+    /// The SNI mode is baked into the built config, so an omitted SNI must not share a build with a sent one.
+    omit_sni: bool,
     /// The `masterKeyLog` handle rustls bakes into the config: two configs naming different files must not share a build, so the handle's identity is what the key holds.
     master_key_log: Option<Arc<super::MasterKeyLog>>,
     /// The client identity rustls bakes into the config's resolver, swapped by value when the bytes differ.
@@ -571,6 +573,7 @@ impl PartialEq for ConfigKey {
             && self.ech == other.ech
             && self.min_version == other.min_version
             && self.max_version == other.max_version
+            && self.omit_sni == other.omit_sni
             && match (&self.master_key_log, &other.master_key_log) {
                 (None, None) => true,
                 (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
@@ -631,6 +634,8 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
     };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
+    // The name still drives certificate verification; only the extension that tells the edge which host is dialed goes.
+    config.enable_sni = !cfg.omit_sni;
     // xray hands Go an empty session cache unless the config names one, so a stock dial keeps no ticket by default.
     config.resumption = if cfg.resumption {
         rustls::client::Resumption::in_memory_sessions(256)
@@ -725,6 +730,7 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
         ech: cfg.ech_config_list.clone(),
         min_version: cfg.min_version,
         max_version: cfg.max_version,
+        omit_sni: cfg.omit_sni,
         master_key_log: cfg.master_key_log.clone(),
         client_cert: cfg.client_cert.clone(),
     };

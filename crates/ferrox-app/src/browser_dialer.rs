@@ -16,6 +16,7 @@ const POOL: usize = 256;
 const TASK: Duration = Duration::from_secs(8);
 const TASK_TOTAL: Duration = Duration::from_secs(16);
 const CONNECTIONS: usize = 512;
+const CLOSE: Duration = Duration::from_millis(500);
 const HEAD_LIMIT: usize = 16 * 1024;
 
 static BRIDGE: OnceLock<Option<Arc<Bridge>>> = OnceLock::new();
@@ -46,6 +47,8 @@ fn start_from_env() -> Option<Arc<Bridge>> {
 struct Slot {
     reader: WsReader<Connection>,
     writer: WsWriter,
+    /// The connection this slot was queued for stays counted until its relay closes, not merely until its head is read.
+    _live: Live,
 }
 
 struct Live(Arc<Bridge>);
@@ -69,7 +72,30 @@ pub(crate) struct Bridge {
 impl Bridge {
     pub(crate) fn start(addr: &str) -> Option<Arc<Self>> {
         let listener = TcpListener::bind(addr).ok()?;
-        let local = listener.local_addr().ok()?;
+        let mut local = listener.local_addr().ok()?;
+        // The page carries the token and the dialer trusts that page with every request header and payload, so a bridge the network can reach would hand a dial proxy to anyone who opens the port. The reference's page runs beside the proxy, on loopback.
+        let listener = if local.ip().is_loopback() {
+            listener
+        } else if local.ip().is_unspecified() {
+            let narrowed = SocketAddr::new(
+                if local.is_ipv4() {
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                },
+                local.port(),
+            );
+            drop(listener);
+            let listener = TcpListener::bind(narrowed).ok()?;
+            local = listener.local_addr().ok()?;
+            eprintln!("browser dialer: {addr} is a wildcard bind; the bridge listens on {local}");
+            listener
+        } else {
+            eprintln!(
+                "browser dialer: {local} is not a loopback address; the page holds the only credential, so the bridge refuses to serve it"
+            );
+            return None;
+        };
         let token = uuid_v4()?;
         let bridge = Arc::new(Self {
             addr: local,
@@ -111,8 +137,8 @@ impl Bridge {
             if std::thread::Builder::new()
                 .name("browser-page".to_owned())
                 .spawn(move || {
-                    let live = Live(this);
-                    live.0.serve(Connection::Tcp(stream));
+                    let live = Live(Arc::clone(&this));
+                    this.serve(live, Connection::Tcp(stream));
                 })
                 .is_err()
             {
@@ -121,7 +147,7 @@ impl Bridge {
         }
     }
 
-    fn serve(&self, mut stream: Connection) {
+    fn serve(&self, live: Live, mut stream: Connection) {
         let Some((head, at)) = crate::proxy::read_http_head_kept(
             &mut stream,
             HEAD_LIMIT,
@@ -154,7 +180,7 @@ impl Bridge {
             else {
                 return;
             };
-            self.push(reader, writer);
+            self.push(live, reader, writer);
             return;
         }
         let response = format!(
@@ -166,17 +192,31 @@ impl Bridge {
         let _ = stream.shutdown(Shutdown::Both);
     }
 
-    fn push(&self, reader: WsReader<Connection>, writer: WsWriter) {
-        let Ok(mut queue) = self.queue.lock() else {
-            writer.close();
-            return;
+    fn push(&self, live: Live, reader: WsReader<Connection>, writer: WsWriter) {
+        let mut slot = Some(Slot {
+            reader,
+            writer,
+            _live: live,
+        });
+        let queued = {
+            let Ok(mut queue) = self.queue.lock() else {
+                return;
+            };
+            if queue.len() < POOL {
+                if let Some(slot) = slot.take() {
+                    queue.push_back(slot);
+                    self.ready.notify_one();
+                }
+                true
+            } else {
+                false
+            }
         };
-        if queue.len() >= POOL {
-            writer.close();
-            return;
+        if !queued {
+            if let Some(mut slot) = slot {
+                hang_up(&mut slot.writer);
+            }
         }
-        queue.push_back(Slot { reader, writer });
-        self.ready.notify_one();
     }
 
     fn take(&self, deadline: Instant) -> Option<Slot> {
@@ -212,21 +252,20 @@ impl Bridge {
             slot.reader.set_handshake_budget(Some(deadline));
             slot.writer.set_write_timeout(Some(left.min(TASK)));
             if !slot.writer.send_text(text.as_bytes()) {
-                slot.writer.set_write_timeout(None);
-                slot.writer.close();
+                hang_up(&mut slot.writer);
                 continue;
             }
-            let ack = read_ack(&mut slot.reader);
+            let ack = read_ack(&mut slot.reader, deadline);
             slot.writer.set_write_timeout(None);
             slot.reader.set_poll(None);
             slot.reader.set_handshake_budget(None);
             match ack {
                 Ack::Ok => return Some(slot),
                 Ack::Fail => {
-                    slot.writer.close();
+                    hang_up(&mut slot.writer);
                     return None;
                 }
-                Ack::Closed => slot.writer.close(),
+                Ack::Closed => hang_up(&mut slot.writer),
             }
         }
     }
@@ -286,10 +325,23 @@ enum Ack {
     Closed,
 }
 
-fn read_ack(reader: &mut WsReader<Connection>) -> Ack {
+/// A page that stops reading cannot hold the dial thread: a close frame is given half a second, then the writer is left to the socket's own close.
+fn hang_up(writer: &mut WsWriter) {
+    writer.set_write_timeout(Some(CLOSE));
+    writer.close();
+    writer.set_write_timeout(None);
+}
+
+fn read_ack(reader: &mut WsReader<Connection>, deadline: Instant) -> Ack {
     let mut buf = [0u8; 2];
     let mut at = 0;
     while at < buf.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ack::Closed;
+        }
+        // Re-arm each wait to what is left, so a slow trickle cannot outlive the task budget.
+        reader.set_poll(Some(left.min(TASK)));
         match reader.read(&mut buf[at..]) {
             Ok(0) | Err(_) => return Ack::Closed,
             Ok(n) => at += n,
@@ -368,11 +420,16 @@ pub(crate) fn dial_packet(method: &str, url: String, parts: &HeadParts, payload:
     slot.writer.set_write_timeout(Some(TASK));
     let sent = slot.writer.send(payload);
     slot.writer.set_write_timeout(None);
-    if !sent || !matches!(read_ack(&mut slot.reader), Ack::Ok) {
+    if !sent
+        || !matches!(
+            read_ack(&mut slot.reader, Instant::now() + TASK_TOTAL),
+            Ack::Ok
+        )
+    {
         return false;
     }
     slot.reader.set_handshake_budget(None);
-    slot.writer.close();
+    hang_up(&mut slot.writer);
     true
 }
 

@@ -258,9 +258,17 @@ fn write_canonical(value: &Json, out: &mut String) {
 
 fn write_canonical_number(number: f64, out: &mut String) {
     let magnitude = number.abs();
+    if !number.is_finite() {
+        out.push_str("null");
+        return;
+    }
     if magnitude != 0.0 && (magnitude < 1e-6 || magnitude >= 1e21) {
         let text = format!("{number:e}");
-        let (mantissa, exponent) = text.split_once('e').expect("exponent");
+        // A caller may hand `canonical` a value the parser refuses; a signature over it must not abort the process.
+        let Some((mantissa, exponent)) = text.split_once('e') else {
+            out.push_str("null");
+            return;
+        };
         let _ = write!(out, "{mantissa}e");
         if !exponent.starts_with(['-', '+']) {
             out.push('+');
@@ -277,8 +285,9 @@ fn write_canonical_string(text: &str, out: &mut String) {
         match character {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
+            // Go's `encoding/json` short-escapes only `\n`, `\r` and `\t`; a signed entry with either of these must hash the same here.
+            '\u{8}' => out.push_str("\\u0008"),
+            '\u{c}' => out.push_str("\\u000c"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -690,8 +699,10 @@ impl Cursor<'_> {
         let text = std::str::from_utf8(&self.bytes[from..self.pos])
             .map_err(|_| format!("bad number at offset {from}"))?;
         text.parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
             .map(Json::Num)
-            .map_err(|_| format!("bad number at offset {from}"))
+            .ok_or_else(|| format!("bad number at offset {from}"))
     }
 
     fn word(&mut self) -> Result<Json, String> {
@@ -736,8 +747,15 @@ mod tests {
             parse(r#"{"b":"<&>\u2028","a":{"d":1,"c":"\b\f"},"arr":[true,null]}"#).expect("parses");
         assert_eq!(
             canonical(&value),
-            "{\"a\":{\"c\":\"\\b\\f\",\"d\":1},\"arr\":[true,null],\"b\":\"\\u003c\\u0026\\u003e\\u2028\"}"
+            "{\"a\":{\"c\":\"\\u0008\\u000c\",\"d\":1},\"arr\":[true,null],\"b\":\"\\u003c\\u0026\\u003e\\u2028\"}"
         );
+    }
+
+    #[test]
+    fn a_non_finite_number_is_refused_and_rendered_without_a_panic() {
+        assert!(parse("1e999").is_err());
+        assert_eq!(canonical(&Json::Num(f64::INFINITY)), "null");
+        assert_eq!(canonical(&Json::Num(f64::NAN)), "null");
     }
 
     #[test]

@@ -7551,10 +7551,9 @@ fn write_mux_frame(
 ) -> bool {
     // A mux payload is framed, not sealed, so it goes to the socket where it was read: one writev, no copy.
     if let Some(payload) = data {
-        assert!(
-            payload.len() <= ferrox_core::mux::CHUNK_MAX,
-            "mux chunk longer than a length field"
-        );
+        if payload.len() > ferrox_core::mux::CHUNK_MAX {
+            return false;
+        }
         let at = frame.encode_header_into(staging);
         frame.patch_payload_len(staging, at, payload.len());
         write_mux_two(shared, staging, payload)
@@ -7723,10 +7722,9 @@ impl MuxWire {
             Self::Conn(conn) => write_mux_frame(conn, staging, frame, data),
             Self::Tunnel(tunnel) => {
                 if let Some(payload) = data {
-                    assert!(
-                        payload.len() <= ferrox_core::mux::CHUNK_MAX,
-                        "mux chunk longer than a length field"
-                    );
+                    if payload.len() > ferrox_core::mux::CHUNK_MAX {
+                        return false;
+                    }
                     let at = frame.encode_header_into(staging);
                     frame.patch_payload_len(staging, at, payload.len());
                     tunnel.write_frame_parts(staging, payload)
@@ -7742,10 +7740,9 @@ impl MuxWire {
                     return false;
                 };
                 let written = if let Some(payload) = data {
-                    assert!(
-                        payload.len() <= ferrox_core::mux::CHUNK_MAX,
-                        "mux chunk longer than a length field"
-                    );
+                    if payload.len() > ferrox_core::mux::CHUNK_MAX {
+                        return false;
+                    }
                     let at = frame.encode_header_into(staging);
                     frame.patch_payload_len(staging, at, payload.len());
                     stream
@@ -8315,11 +8312,8 @@ impl MuxTcpFlow {
         loop {
             match read_half.read(&mut chunk) {
                 Ok(0) => break,
+                Ok(n) if n > ferrox_core::mux::CHUNK_MAX => break,
                 Ok(n) => {
-                    assert!(
-                        n <= ferrox_core::mux::CHUNK_MAX,
-                        "mux chunk longer than a length field"
-                    );
                     keep.patch_payload_len(&mut scratch, at, n);
                     if !self.wire.write_parts(&scratch, &chunk[..n]) {
                         break;
@@ -11542,8 +11536,7 @@ fn dial_vless_browser(
                     ed: *ed,
                     explicit: false,
                 },
-            );
-            true
+            )
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = browser_xhttp_pair(&host, server.port(), tls, settings)
@@ -16976,47 +16969,23 @@ fn vless_mux_kcp(vless: &VlessOut) -> Option<MuxUplink> {
     let conn = kcp_dial_session(&vless.carrier, &vless.address, vless.port)?;
     let header = vless_mux_header(&vless.id);
     if let Some(cfg) = vless.reality.as_deref() {
-        let Some(mut session) = kcp_reality_connect(&conn, cfg) else {
+        let Some(session) = kcp_reality_connect(&conn, cfg) else {
             kcp_close(&conn)();
             return None;
         };
-        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
-            kcp_close(&conn)();
-            return None;
-        }
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
-        return Some(MuxUplink {
-            read: Box::new(read),
-            write: Box::new(write),
-            close: kcp_close(&conn),
-        });
+        return vless_mux_carried(vless, read, write, kcp_close(&conn), &header);
     }
     if let Some(cfg) = vless.tls.as_deref() {
-        let Some(mut session) = kcp_tls_connect(&conn, cfg) else {
+        let Some(session) = kcp_tls_connect(&conn, cfg) else {
             kcp_close(&conn)();
             return None;
         };
-        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
-            kcp_close(&conn)();
-            return None;
-        }
         let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
-        return Some(MuxUplink {
-            read: Box::new(read),
-            write: Box::new(write),
-            close: kcp_close(&conn),
-        });
+        return vless_mux_carried(vless, read, write, kcp_close(&conn), &header);
     }
-    let (mut read, mut write, close) = kcp_parts(&conn);
-    if write.write_all(&header).is_err() || read_vless_response(&mut read).is_none() {
-        close();
-        return None;
-    }
-    Some(MuxUplink {
-        read: Box::new(read),
-        write: Box::new(write),
-        close,
-    })
+    let (read, write, close) = kcp_parts(&conn);
+    vless_mux_carried(vless, read, write, close, &header)
 }
 
 fn vless_mux_plain(server: &SocketAddr, vless: &VlessOut) -> Option<MuxUplink> {
@@ -17268,6 +17237,18 @@ where
 fn open_vless_mux_hysteria(vless: &VlessOut) -> Option<MuxUplink> {
     let dial = hysteria_dial_session(vless)?;
     let header = vless_mux_header(&vless.id);
+    if vless.encryption.is_some() {
+        // The reply head sits inside the seal, so nothing is skipped at the carrier and the sealed reader takes it.
+        let flow = crate::hysteria::open(&dial, &[], 0)?;
+        let closer = flow.clone();
+        return vless_mux_carried(
+            vless,
+            crate::hysteria::FlowRead::new(flow.clone()),
+            flow,
+            Arc::new(move || closer.close()),
+            &header,
+        );
+    }
     let flow = crate::hysteria::open(&dial, &header, 2)?;
     let read = crate::hysteria::FlowRead::new(flow.clone());
     let closer = flow.clone();
@@ -17279,19 +17260,12 @@ fn open_vless_mux_hysteria(vless: &VlessOut) -> Option<MuxUplink> {
 }
 
 fn open_vless_mux_xdrive(vless: &VlessOut) -> Option<MuxUplink> {
-    let mut session = xdrive_dial_session(&vless.carrier, &vless.address, vless.port)?;
-    if session.write_all(&vless_mux_header(&vless.id)).is_err() {
-        return None;
-    }
-    read_vless_response(&mut session)?;
+    let session = xdrive_dial_session(&vless.carrier, &vless.address, vless.port)?;
+    let header = vless_mux_header(&vless.id);
     let read = session.clone();
     let write = session.clone();
     let close = xdrive_close(&session);
-    Some(MuxUplink {
-        read: Box::new(read),
-        write: Box::new(write),
-        close,
-    })
+    vless_mux_carried(vless, read, write, close, &header)
 }
 
 fn vless_mux_unserved() -> Option<MuxUplink> {
@@ -19178,6 +19152,14 @@ fn browser_xhttp_pair(
     let parts = crate::browser_dialer::head_parts(&head)?;
     if !parts.cookies.is_empty() {
         eprintln!("browser dialer: xhttp cookies cannot reach the target from the page; using the normal dial");
+        return None;
+    }
+    // The page carries no cookie jar and `BrowserPost` refuses cookies, so a cookie placement would open the downlink and then lose every upload; refuse before the GET so the normal dial runs.
+    let (probe, _) = crate::xhttp::packet_head(host, settings, &session, 0, &[]);
+    if crate::browser_dialer::head_parts(&probe).is_some_and(|parts| !parts.cookies.is_empty()) {
+        eprintln!(
+            "browser dialer: xhttp cookie placements cannot upload from the page; using the normal dial"
+        );
         return None;
     }
     let authority = crate::browser_dialer::authority(host, port, tls);
@@ -61076,13 +61058,15 @@ mod tests {
         );
     }
 
-    /// A two-byte length must never truncate, so an oversize payload is a panic, not a wrap.
+    /// A two-byte length must never truncate, so an oversize payload is refused before a byte goes out.
     #[test]
-    #[should_panic(expected = "mux chunk longer than a length field")]
     fn a_relay_payload_longer_than_a_frame_is_refused_not_truncated() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let stream = Connection::connect(("127.0.0.1", port)).expect("dials");
+        let (mut peer, _) = listener.accept().expect("accepts");
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("timeout");
         let shared = Arc::new(Mutex::new(stream));
         let keep = ferrox_core::mux::Outgoing {
             id: 1,
@@ -61093,7 +61077,13 @@ mod tests {
         };
         let mut staging = Vec::new();
         let big = vec![0u8; ferrox_core::mux::CHUNK_MAX + 1];
-        let _ = write_mux_frame(&shared, &mut staging, keep, Some(&big));
+        assert!(!write_mux_frame(&shared, &mut staging, keep, Some(&big)));
+        assert!(staging.is_empty(), "the refusal stages no header");
+        let mut seen = [0u8; 8];
+        assert!(
+            !matches!(peer.read(&mut seen), Ok(n) if n > 0),
+            "the refusal writes no byte"
+        );
     }
 
     /// One pool serves both directions of every session: an idle leg that waits inside the carrier

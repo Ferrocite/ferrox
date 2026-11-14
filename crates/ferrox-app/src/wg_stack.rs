@@ -2799,6 +2799,10 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
+                // The lane is pinned to its first local source: a second process that reaches this socket must not take the replies or feed the target.
+                if app.is_some_and(|bound| bound != sender) {
+                    continue;
+                }
                 app = Some(sender);
                 if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
                     break;
