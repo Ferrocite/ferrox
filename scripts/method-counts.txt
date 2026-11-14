@@ -763,6 +763,7 @@ front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitt
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
 finalmask sudoku-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+finalmask sudoku-entropy-getrandoms 512 ferrox-core-finalmask-sudoku::tests::the_entropy_supply_serves_a_pure_encode
 finalmask sudoku-encoder-capacity-growth 0 ferrox-core-finalmask-sudoku::tests::the_encoder_buffer_holds_its_capacity
 finalmask sudoku-pure-octets-per-plaintext-octet 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
 finalmask sudoku-packed-octets-per-three-octets 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
