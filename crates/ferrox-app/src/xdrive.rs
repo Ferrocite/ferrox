@@ -3,7 +3,8 @@
 use crate::budgets::RELAY_POLL;
 use crate::conn::Connection;
 use crate::json::Json;
-use ferrox_core::tls::{RealityClientConfig, RustlsProvider, TlsConfig, TlsProvider as _};
+use crate::xhttp_h3::H3Client;
+use ferrox_core::tls::{ClientSession, RealityClientConfig, TlsConfig, TlsProvider as _};
 use sha2::Digest as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -38,6 +39,25 @@ const WORKER_STACK: usize = 256 * 1024;
 const DRAIN_WAIT: Duration = Duration::from_millis(500);
 const DRAIN_TRIES: u32 = 120;
 
+const SLOT_MAGIC: &[u8] = b"XDRVSL01";
+const SLOT_HEADER_LEN: usize = 25;
+const SLOT_INLINE_LIMIT: usize = 14 * 1024;
+const SLOT_INLINE_RAMP: usize = 8;
+const SLOT_INLINE: u8 = 1;
+const SLOT_MEDIA: u8 = 2;
+const SLOT_END: u8 = 3;
+const SLOT_ERR: u8 = 4;
+const SLOT_MAX_ID_LEN: usize = 128;
+const SLOT_WRITE_INFLIGHT: usize = 12;
+const SLOT_ACK_RETRY: Duration = Duration::from_millis(30);
+const SLOT_WATERMARK_TTL: Duration = Duration::from_millis(100);
+const SLOT_STALL: Duration = Duration::from_secs(60);
+const SLOT_HUNT_FLOOR: Duration = Duration::from_millis(10);
+const SLOT_HUNT_CEILING: Duration = Duration::from_millis(25);
+const SLOT_TAIL_MIN: Duration = Duration::from_millis(150);
+const SLOT_TAIL_MAX: Duration = Duration::from_millis(800);
+const SLOT_SPARES: usize = 2;
+
 /// One object a listing names, with the payload the listing carried alongside it where the service can hand both at once; an inline entry costs the reader no second request.
 pub(crate) struct Entry {
     name: String,
@@ -54,6 +74,175 @@ pub(crate) trait Storage: Send + Sync {
     /// Whether a batch of gets is worth a thread each: a store read from the local filesystem answers one in less time than a thread takes to start, so the pump reads it in order.
     fn threaded(&self) -> bool {
         true
+    }
+
+    /// The id-addressed slot store a service also implements; a store without one keeps the segmented log.
+    fn slot_store(&self) -> Option<&dyn SlotStore> {
+        None
+    }
+
+    /// One connection's share of the service, with its own lane pool and XMUX counters where the service carries them.
+    fn session(&self) -> Option<Arc<dyn Storage>> {
+        None
+    }
+}
+
+/// The id-addressed face of a store: slots are created once, then updated and read by id so a session needs no listing and no index object.
+pub(crate) trait SlotStore: Send + Sync {
+    fn make_slot(&self, name: &str) -> io::Result<String>;
+    fn set_slot(&self, id: &str, description: &str, body: Option<&[u8]>) -> io::Result<()>;
+    fn read_description(&self, id: &str) -> io::Result<String>;
+    fn read_body(&self, id: &str) -> io::Result<Vec<u8>>;
+}
+
+/// What one slot's description says: which segment it holds, and either the bytes or the size and checksum of the body that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotFrame {
+    seq: u64,
+    mode: u8,
+    size: u32,
+    crc: u32,
+    data: Option<Vec<u8>>,
+}
+
+impl SlotFrame {
+    fn new(seq: u64, mode: u8, data: &[u8]) -> Self {
+        Self {
+            seq,
+            mode,
+            size: data.len().try_into().unwrap_or(u32::MAX),
+            crc: crate::vmess::crc32(data),
+            data: (mode == SLOT_INLINE).then(|| data.to_vec()),
+        }
+    }
+
+    fn encode(&self) -> String {
+        let mut bytes =
+            Vec::with_capacity(SLOT_HEADER_LEN + self.data.as_ref().map_or(0, Vec::len));
+        bytes.extend_from_slice(SLOT_MAGIC);
+        bytes.extend_from_slice(&self.seq.to_be_bytes());
+        bytes.push(self.mode);
+        bytes.extend_from_slice(&self.size.to_be_bytes());
+        bytes.extend_from_slice(&self.crc.to_be_bytes());
+        if let Some(data) = &self.data {
+            bytes.extend_from_slice(data);
+        }
+        ferrox_core::b64::encode(&bytes)
+    }
+
+    fn decode(description: &str) -> Option<Self> {
+        let bytes = ferrox_core::b64::decode(description.as_bytes())?;
+        if bytes.len() < SLOT_HEADER_LEN || &bytes[..SLOT_MAGIC.len()] != SLOT_MAGIC {
+            return None;
+        }
+        let seq = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+        let mode = bytes[16];
+        if !matches!(mode, SLOT_INLINE | SLOT_MEDIA | SLOT_END | SLOT_ERR) {
+            return None;
+        }
+        let frame = Self {
+            seq,
+            mode,
+            size: u32::from_be_bytes(bytes[17..21].try_into().ok()?),
+            crc: u32::from_be_bytes(bytes[21..25].try_into().ok()?),
+            data: (mode == SLOT_INLINE).then(|| bytes[SLOT_HEADER_LEN..].to_vec()),
+        };
+        if let Some(data) = &frame.data {
+            if !frame.holds(data) {
+                return None;
+            }
+        }
+        Some(frame)
+    }
+
+    fn holds(&self, body: &[u8]) -> bool {
+        body.len() == self.size as usize && crate::vmess::crc32(body) == self.crc
+    }
+}
+
+/// One direction's ring: the slot ids and the id of the watermark its reader keeps.
+#[derive(Debug, Clone, Default)]
+struct SlotTable {
+    slots: Vec<String>,
+    watermark: String,
+}
+
+/// What a client announces: the two rings and, when the first segment is small enough, that segment inline to save the listener one read.
+#[derive(Debug, Clone, Default)]
+struct SlotRing {
+    up: SlotTable,
+    down: SlotTable,
+    first: Option<Vec<u8>>,
+}
+
+impl SlotRing {
+    fn encode(&self) -> String {
+        let table = |table: &SlotTable| {
+            Json::Obj(vec![
+                (
+                    "s".to_owned(),
+                    Json::Arr(table.slots.iter().cloned().map(Json::Str).collect()),
+                ),
+                ("w".to_owned(), Json::Str(table.watermark.clone())),
+            ])
+        };
+        let mut pairs = vec![
+            ("u".to_owned(), table(&self.up)),
+            ("d".to_owned(), table(&self.down)),
+        ];
+        if let Some(first) = &self.first {
+            pairs.push((
+                "first".to_owned(),
+                Json::Str(ferrox_core::b64::encode(first)),
+            ));
+        }
+        let mut text = String::new();
+        crate::json::write(&Json::Obj(pairs), &mut text);
+        text
+    }
+
+    fn decode(data: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(data).ok()?;
+        let root = crate::json::parse(text).ok()?;
+        let table = |name: &str| -> Option<SlotTable> {
+            let node = root.get(name)?;
+            let slots = node
+                .get("s")?
+                .as_arr()?
+                .iter()
+                .map(Json::as_str)
+                .map(|slot| slot.map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            let watermark = node.get("w")?.as_str()?.to_owned();
+            Some(SlotTable { slots, watermark })
+        };
+        let up = table("u")?;
+        let down = table("d")?;
+        if up.slots.is_empty()
+            || down.slots.is_empty()
+            || up.watermark.is_empty()
+            || down.watermark.is_empty()
+            || up.slots.len() > MAX_CONCURRENCY
+            || down.slots.len() > MAX_CONCURRENCY
+            || up.watermark.len() > SLOT_MAX_ID_LEN
+            || down.watermark.len() > SLOT_MAX_ID_LEN
+        {
+            return None;
+        }
+        for table in [&up, &down] {
+            if table
+                .slots
+                .iter()
+                .any(|slot| slot.is_empty() || slot.len() > SLOT_MAX_ID_LEN)
+            {
+                return None;
+            }
+        }
+        let first = match root.get("first") {
+            None => None,
+            Some(node) => Some(ferrox_core::b64::decode(node.as_str()?.as_bytes())?),
+        };
+        Some(Self { up, down, first })
     }
 }
 
@@ -79,10 +268,18 @@ pub(crate) struct Settings {
     pub template: Option<Json>,
     pub s3: Option<S3Settings>,
     pub params: Params,
+    /// The reference's `xmux` limits, applied to the per-session lane pool.
+    pub xmux: XmuxSettings,
+    /// The h3 `quicParams`, which shape the QUIC connection when the transport names them.
+    pub quic: Option<ferrox_core::hysteria::QuicParams>,
+    /// The Drive slot path's budgets, whose defaults differ from the segmented log and apply only where the config left the field at zero.
+    pub slot_params: Params,
     /// The transport's `security`, which the reference counts in the identity of a shared store.
     pub security: String,
     /// The transport's own TLS, applied to the lanes the store dials; `None` speaks the url's scheme with system roots.
     pub tls: Option<Arc<TlsConfig>>,
+    /// The `streamSettings` the TLS above came from, kept so a lane can resolve ECH and SNI against its own host.
+    pub tls_stream: Option<Json>,
     /// The transport's REALITY identity, applied instead of TLS when `security` names it.
     pub reality: Option<Arc<RealityClientConfig>>,
     /// Whether the identity named its decoy; otherwise the lane's own host is the name.
@@ -98,11 +295,14 @@ pub(crate) struct S3Settings {
     path_style: bool,
 }
 
-/// The two mutually exclusive `xmux` bounds; their ranges steer the pool once the HTTP/2 lanes land.
+/// The reference's `xmux` block: two mutually exclusive connection/concurrency bounds and the per-connection reuse limits.
 #[derive(Debug, Clone, Default)]
-struct XmuxSettings {
+pub(crate) struct XmuxSettings {
     max_concurrency: u32,
     max_connections: u32,
+    c_max_reuse: u32,
+    h_max_requests: u32,
+    h_max_reusable: u32,
 }
 
 impl XmuxSettings {
@@ -111,6 +311,64 @@ impl XmuxSettings {
         let (left, right) = crate::xhttp::i32_range(value)?;
         u32::try_from(left.max(right).max(0)).ok()
     }
+
+    /// The largest number of idle lanes one origin may keep.
+    fn lane_limit(&self) -> usize {
+        if self.max_connections == 0 {
+            usize::MAX
+        } else {
+            self.max_connections as usize
+        }
+    }
+
+    /// The reference's per-connection request budget, whichever of the two names is lower; zero is unlimited.
+    fn request_limit(&self) -> Option<u32> {
+        match (self.c_max_reuse, self.h_max_requests) {
+            (0, 0) => None,
+            (0, requests) => Some(requests),
+            (reuse, 0) => Some(reuse),
+            (reuse, requests) => Some(reuse.min(requests)),
+        }
+    }
+
+    fn reusable_for(&self) -> Option<Duration> {
+        (self.h_max_reusable > 0).then(|| Duration::from_secs(u64::from(self.h_max_reusable)))
+    }
+}
+
+/// The segmented-log budgets and the slot path's own defaults, read once from the same numbers.
+fn params_of(number: &impl Fn(&str) -> u32) -> (Params, Params) {
+    let segment = number("segmentBytes");
+    let flush = number("flushIntervalMs");
+    let min_poll = number("pollIntervalMs");
+    let max_poll = number("maxPollIntervalMs");
+    let eager = number("eagerWindowMs");
+    let hole = number("holeTimeoutMs");
+    let ttl = number("sessionTtlSeconds");
+    let concurrency = number("concurrency");
+    let params = Params {
+        segment_bytes: bytes_of(segment, DEFAULT_SEGMENT_BYTES, MAX_SEGMENT_BYTES),
+        flush: millis(flush, DEFAULT_FLUSH),
+        min_poll: millis(min_poll, DEFAULT_MIN_POLL),
+        max_poll: millis(max_poll, DEFAULT_MAX_POLL),
+        eager: millis(eager, DEFAULT_EAGER),
+        hole: millis(hole, DEFAULT_HOLE),
+        ttl: seconds(ttl, DEFAULT_TTL),
+        concurrency: count(concurrency, DEFAULT_CONCURRENCY, MAX_CONCURRENCY),
+    }
+    .clamped();
+    let slot_params = Params {
+        flush: millis(if flush == 0 { 10 } else { flush }, DEFAULT_FLUSH),
+        max_poll: millis(if max_poll == 0 { 200 } else { max_poll }, DEFAULT_MAX_POLL),
+        concurrency: count(
+            if concurrency == 0 { 64 } else { concurrency },
+            DEFAULT_CONCURRENCY,
+            MAX_CONCURRENCY,
+        ),
+        ..params.clone()
+    }
+    .clamped();
+    (params, slot_params)
 }
 
 impl Settings {
@@ -125,13 +383,6 @@ impl Settings {
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_owned()
-        };
-        let number = |name: &str| {
-            drive
-                .get(name)
-                .or_else(|| drive.get(&snake_case(name)))
-                .and_then(Json::as_u32)
-                .unwrap_or(0)
         };
         let remote_folder = text("remoteFolder");
         let service = match text("service").as_str() {
@@ -163,6 +414,8 @@ impl Settings {
         if security == "reality" && reality.is_none() {
             return None;
         }
+        let tls = transport_tls(stream, &security).ok()?;
+        let quic = quic_of(drive).ok()?;
         let secrets = drive
             .get("secrets")
             .and_then(Json::as_arr)
@@ -174,29 +427,26 @@ impl Settings {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let params = Params {
-            segment_bytes: bytes_of(
-                number("segmentBytes"),
-                DEFAULT_SEGMENT_BYTES,
-                MAX_SEGMENT_BYTES,
-            ),
-            flush: millis(number("flushIntervalMs"), DEFAULT_FLUSH),
-            min_poll: millis(number("pollIntervalMs"), DEFAULT_MIN_POLL),
-            max_poll: millis(number("maxPollIntervalMs"), DEFAULT_MAX_POLL),
-            eager: millis(number("eagerWindowMs"), DEFAULT_EAGER),
-            hole: millis(number("holeTimeoutMs"), DEFAULT_HOLE),
-            ttl: seconds(number("sessionTtlSeconds"), DEFAULT_TTL),
-            concurrency: count(number("concurrency"), DEFAULT_CONCURRENCY, MAX_CONCURRENCY),
-        }
-        .clamped();
+        let number = |name: &str| {
+            drive
+                .get(name)
+                .or_else(|| drive.get(&snake_case(name)))
+                .and_then(Json::as_u32)
+                .unwrap_or(0)
+        };
+        let (params, slot_params) = params_of(&number);
         Some(Self {
             params,
+            xmux,
+            quic,
+            slot_params,
             template: template_of(drive),
             s3,
             remote_folder,
             service,
             secrets,
-            tls: transport_tls(stream, &security),
+            tls,
+            tls_stream: (security == "tls").then(|| stream.clone()),
             reality,
             reality_named,
             security,
@@ -238,7 +488,38 @@ impl Settings {
 
     /// The store this config names, opened as a client: the session announcement first, then both logs on it.
     pub(crate) fn dial(&self, front: Option<(&str, u16)>) -> io::Result<Conn> {
-        dial(self.store(front)?, &Arc::new(self.params.clone()))
+        let key = share_key(self, front);
+        if let Some(spare) = take_spare(&key, &self.slot_params) {
+            spare.storage.put(
+                &announce_name(&spare.session, unix_nanos(SystemTime::now())),
+                spare.ring.encode().as_bytes(),
+            )?;
+            let params = Arc::new(self.slot_params.clone());
+            let conn = Conn::slot(spare.storage, &params, &spare.ring)?;
+            self.warm_spares(front, key);
+            return Ok(conn);
+        }
+        let storage = self.store(front)?;
+        let storage = storage.session().unwrap_or(storage);
+        let params = self.params_for(&storage);
+        if storage.slot_store().is_some() {
+            if let Ok(conn) = dial_slots(&storage, &params) {
+                if storage.slot_store().is_some() {
+                    self.warm_spares(front, key);
+                }
+                return Ok(conn);
+            }
+        }
+        dial(storage, &params)
+    }
+
+    fn warm_spares(&self, front: Option<(&str, u16)>, key: String) {
+        if self.service != "google-drive" {
+            return;
+        }
+        let settings = self.clone();
+        let front = front.map(|(host, port)| (host.to_owned(), port));
+        warm_spares(settings, front, key);
     }
 
     /// The store this config names, watched as a listener: every accepted session goes to `accept` on a thread of its own.
@@ -247,7 +528,18 @@ impl Settings {
         front: Option<(&str, u16)>,
         accept: Accept,
     ) -> io::Result<Arc<Server>> {
-        Server::serve(self.store(front)?, Arc::new(self.params.clone()), accept)
+        let storage = self.store(front)?;
+        let params = self.params_for(&storage);
+        Server::serve(storage, params, accept)
+    }
+
+    /// The budgets a store uses: the slot path has its own defaults for concurrency, flush and the poll cap.
+    fn params_for(&self, storage: &Arc<dyn Storage>) -> Arc<Params> {
+        Arc::new(if storage.slot_store().is_some() {
+            self.slot_params.clone()
+        } else {
+            self.params.clone()
+        })
     }
 
     /// The template as one text, which is what makes two configs the same store.
@@ -311,7 +603,78 @@ fn xmux_of(drive: &Json) -> Option<XmuxSettings> {
     Some(XmuxSettings {
         max_concurrency: field("maxConcurrency")?,
         max_connections: field("maxConnections")?,
+        c_max_reuse: field("cMaxReuseTimes")?,
+        h_max_requests: field("hMaxRequestTimes")?,
+        h_max_reusable: field("hMaxReusableSecs")?,
     })
+}
+
+/// The h3 `quicParams` block as the reference spells it: windows, idle and keepalive seconds, stream cap, and the two flags quiche can honour.
+fn quic_of(drive: &Json) -> Result<Option<ferrox_core::hysteria::QuicParams>, String> {
+    use ferrox_core::hysteria::{BbrProfile, Congestion, QuicParams};
+    let Some(node) = drive.get("quicParams").or_else(|| drive.get("quic_params")) else {
+        return Ok(None);
+    };
+    if matches!(node, Json::Null) {
+        return Ok(None);
+    }
+    if !matches!(node, Json::Obj(_)) {
+        return Err("quicParams is not an object".to_owned());
+    }
+    let number = |name: &str| -> Result<u32, String> {
+        match node.get(name).or_else(|| node.get(&snake_case(name))) {
+            None | Some(Json::Null) => Ok(0),
+            Some(value) => value
+                .as_u32()
+                .ok_or_else(|| format!("{name} is not a number")),
+        }
+    };
+    let flag = |name: &str| {
+        node.get(name)
+            .or_else(|| node.get(&snake_case(name)))
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+    };
+    let text = |name: &str| {
+        node.get(name)
+            .or_else(|| node.get(&snake_case(name)))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_lowercase()
+    };
+    let cc = match text("congestion").as_str() {
+        "" | "bbr" => Some(Congestion::Bbr),
+        "reno" => Some(Congestion::Reno),
+        "brutal" | "force-brutal" => Some(Congestion::Brutal),
+        other => return Err(format!("unsupported congestion control over h3: {other}")),
+    };
+    let bbr_profile = match text("bbrProfile").as_str() {
+        "" | "standard" => BbrProfile::Standard,
+        "conservative" => BbrProfile::Conservative,
+        "aggressive" => BbrProfile::Aggressive,
+        other => return Err(format!("unknown bbr profile: {other}")),
+    };
+    let window = |name: &str| -> Result<u64, String> {
+        let value = number(name)?;
+        if value != 0 && value < 16384 {
+            return Err(format!("{name} must be at least 16384"));
+        }
+        Ok(u64::from(value))
+    };
+    Ok(Some(QuicParams {
+        cc,
+        bbr_profile,
+        init_stream_window: window("initStreamReceiveWindow")?,
+        max_stream_window: window("maxStreamReceiveWindow")?,
+        init_connection_window: window("initConnReceiveWindow")?,
+        max_connection_window: window("maxConnReceiveWindow")?,
+        max_idle: u64::from(number("maxIdleTimeout")?),
+        keep_alive: u64::from(number("keepAlivePeriod")?),
+        no_path_mtu: flag("disablePathMtuDiscovery"),
+        max_incoming_streams: u64::from(number("maxIncomingStreams")?),
+        disable_stateless_reset: flag("disableStatelessReset"),
+        ..QuicParams::default()
+    }))
 }
 
 /// The transport's REALITY identity, and whether it named its own decoy rather than borrowing the lane's host.
@@ -327,40 +690,37 @@ fn transport_reality(stream: &Json) -> (Option<Arc<RealityClientConfig>>, bool) 
     )
 }
 
-/// The transport's TLS as the store dials it: the config's server name or the url's host, its roots or the system's, and no `ALPN` because the store speaks `HTTP/1.1`.
-fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
-    (security == "tls").then(|| {
-        let tls = stream.get("tlsSettings").unwrap_or(&Json::Null);
-        Arc::new(TlsConfig {
-            server_name: tls
-                .get("serverName")
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            alpn: Vec::new().into(),
-            roots: tls
-                .get("caCertFile")
-                .and_then(Json::as_str)
-                .and_then(crate::config::read_cert_file)
-                .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
-                .unwrap_or_default(),
-            pins: ferrox_core::foxy::pin::Pins::default(),
-            cert_pins: std::sync::Arc::from(Vec::new()),
-            verify_names: std::sync::Arc::default(),
-            cipher_suites: std::sync::Arc::default(),
-            curves: std::sync::Arc::default(),
-            insecure: tls.get("allowInsecure").and_then(Json::as_bool) == Some(true),
-            resumption: true,
-            fingerprint: None,
-            ech_config_list: None,
-            websocket: false,
-            master_key_log: None,
-            client_cert: None,
-            client_random: None,
-            padding: None,
-            ..Default::default()
-        })
-    })
+/// The transport's TLS as the store validates it: every field xray's `tlsSettings` carries except the ECH lookup, which is left to the lane's own host.
+fn transport_tls(stream: &Json, security: &str) -> Result<Option<Arc<TlsConfig>>, String> {
+    if security != "tls" {
+        return Ok(None);
+    }
+    let named = stream
+        .get("tlsSettings")
+        .and_then(|tls| tls.get("serverName"))
+        .and_then(Json::as_str)
+        .is_some_and(|name| !name.is_empty());
+    // ECH may name its own resolver and a name; that query belongs to the origin lane dials, not to this eager parse.
+    let mut stream = stream.clone();
+    if let Json::Obj(pairs) = &mut stream {
+        for (key, value) in pairs {
+            if key.as_str() == "tlsSettings" {
+                if let Json::Obj(tls) = value {
+                    tls.retain(|(key, _)| key.as_str() != "echConfigList");
+                }
+            }
+        }
+    }
+    let outbound = Json::Obj(vec![("streamSettings".to_owned(), stream)]);
+    let mut cfg = (*crate::config::outbound_tls(&outbound, "xdrive.invalid")?).clone();
+    // The store speaks HTTP/1.1 until `h3` is asked for alone; a shaped hello's own h2 offer would otherwise pick a protocol it cannot read.
+    if !crate::xhttp_h3::is_h3(&cfg.alpn) {
+        cfg.alpn = vec![b"http/1.1".to_vec()].into();
+    }
+    if !named {
+        cfg.server_name.clear();
+    }
+    Ok(Some(Arc::new(cfg)))
 }
 
 /// The `snake_case` spelling of a `camelCase` config name, so either form reaches one field.
@@ -1116,6 +1476,42 @@ impl Inbox {
     }
 }
 
+/// Fill from a mailbox and keep the unread tail of a chunk the caller could not take, so a chunk is delivered once and never copied back.
+fn read_mailbox(
+    inbox: &Inbox,
+    rest: &Mutex<(Vec<u8>, usize)>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let mut held = rest.lock().unwrap_or_else(PoisonError::into_inner);
+    if held.1 < held.0.len() {
+        let n = (held.0.len() - held.1).min(buf.len());
+        buf[..n].copy_from_slice(&held.0[held.1..held.1 + n]);
+        held.1 += n;
+        if held.1 == held.0.len() {
+            held.0.clear();
+            held.1 = 0;
+        }
+        return Ok(n);
+    }
+    drop(held);
+    match inbox.take(RELAY_POLL) {
+        Piece::Waited => Err(io::Error::from(ErrorKind::WouldBlock)),
+        Piece::Ended(None) => Err(io::Error::from(ErrorKind::UnexpectedEof)),
+        Piece::Ended(Some(reason)) => Err(carrier_error(reason)),
+        Piece::Chunk(data) => {
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            let mut held = rest.lock().unwrap_or_else(PoisonError::into_inner);
+            held.0 = data;
+            held.1 = n;
+            Ok(n)
+        }
+    }
+}
+
 /// What the polling half of a stream needs of the store, held apart from the mailbox so the pump thread can reach both.
 struct Rd {
     storage: Arc<dyn Storage>,
@@ -1366,34 +1762,7 @@ impl Reader {
 
     /// Fill from the mailbox and keep the unread tail of a chunk the caller could not take, so a chunk is delivered once and never copied back.
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut rest = self.rest.lock().unwrap_or_else(PoisonError::into_inner);
-        if rest.1 < rest.0.len() {
-            let n = (rest.0.len() - rest.1).min(buf.len());
-            buf[..n].copy_from_slice(&rest.0[rest.1..rest.1 + n]);
-            rest.1 += n;
-            if rest.1 == rest.0.len() {
-                rest.0.clear();
-                rest.1 = 0;
-            }
-            return Ok(n);
-        }
-        drop(rest);
-        match self.inbox.take(RELAY_POLL) {
-            Piece::Waited => Err(io::Error::from(ErrorKind::WouldBlock)),
-            Piece::Ended(None) => Err(io::Error::from(ErrorKind::UnexpectedEof)),
-            Piece::Ended(Some(reason)) => Err(carrier_error(reason)),
-            Piece::Chunk(data) => {
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                let mut rest = self.rest.lock().unwrap_or_else(PoisonError::into_inner);
-                rest.0 = data;
-                rest.1 = n;
-                Ok(n)
-            }
-        }
+        read_mailbox(&self.inbox, &self.rest, buf)
     }
 }
 
@@ -1405,34 +1774,632 @@ impl Drop for Reader {
     }
 }
 
-/// One xdrive stream: the two write-ahead logs one session names, with the object store the peer reads and writes beside them.
+/// The buffer half of a slot writer: the segment size ramps from the inline limit to the configured segment as the peer drains, and the ticker coalesces a growing tail the way the log writer does.
+struct SlotWriteState {
+    buf: Vec<u8>,
+    seq: u64,
+    size: usize,
+    full: usize,
+    last_size: usize,
+    held: usize,
+    closed: bool,
+    err: Option<String>,
+}
+
+impl SlotWriteState {
+    fn ready(&mut self) -> bool {
+        let grew = self.buf.len() > self.last_size;
+        self.last_size = self.buf.len();
+        if self.held < MAX_COALESCED_TICKS && self.buf.len() < self.size / 2 {
+            self.held += 1;
+            return false;
+        }
+        if grew && self.held < MAX_COALESCED_TICKS {
+            self.held += 1;
+            return false;
+        }
+        self.held = 0;
+        true
+    }
+}
+
+/// The last watermark a writer saw, cached for the reference's 100 ms so a burst of uploads does not read it once each.
+struct SlotAck {
+    acked: i64,
+    at: Option<Instant>,
+}
+
+/// The id-addressed writer: a segment goes to slot `seq % depth`, and a slot is reused only after the peer's watermark says its previous bytes were taken.
+struct SlotWriter {
+    storage: Arc<dyn Storage>,
+    table: SlotTable,
+    params: Arc<Params>,
+    wake: Arc<Wake>,
+    state: Mutex<SlotWriteState>,
+    room: Condvar,
+    inflight: Mutex<usize>,
+    uploads_done: Condvar,
+    ack: Mutex<SlotAck>,
+    ended: AtomicBool,
+    done: AtomicBool,
+}
+
+impl SlotWriter {
+    fn new(
+        storage: Arc<dyn Storage>,
+        table: SlotTable,
+        params: &Arc<Params>,
+        wake: Arc<Wake>,
+    ) -> io::Result<Arc<Self>> {
+        if storage.slot_store().is_none() {
+            return Err(carrier_error("the store has no slot path"));
+        }
+        let writer = Arc::new(Self {
+            storage,
+            table,
+            params: Arc::clone(params),
+            wake,
+            state: Mutex::new(SlotWriteState {
+                buf: Vec::new(),
+                seq: 0,
+                size: SLOT_INLINE_LIMIT.min(params.segment_bytes),
+                full: 0,
+                last_size: 0,
+                held: 0,
+                closed: false,
+                err: None,
+            }),
+            room: Condvar::new(),
+            inflight: Mutex::new(0),
+            uploads_done: Condvar::new(),
+            ack: Mutex::new(SlotAck {
+                acked: -1,
+                at: None,
+            }),
+            ended: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        });
+        let weak = Arc::downgrade(&writer);
+        let every = params.flush;
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || loop {
+                std::thread::sleep(every);
+                let Some(writer) = weak.upgrade() else {
+                    return;
+                };
+                if writer.done.load(Ordering::Acquire) {
+                    return;
+                }
+                let closed = writer
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .closed;
+                if closed {
+                    return;
+                }
+                let _ = writer.cut(true, false);
+            })
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(writer)
+    }
+
+    fn write(self: &Arc<Self>, data: &[u8]) -> io::Result<usize> {
+        if self.ended.load(Ordering::Acquire) {
+            return Err(io::Error::from(ErrorKind::BrokenPipe));
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(message) = &state.err {
+                return Err(carrier_error(message.clone()));
+            }
+            if state.closed {
+                return Err(io::Error::from(ErrorKind::BrokenPipe));
+            }
+            state.buf.extend_from_slice(data);
+        }
+        loop {
+            let full = {
+                let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(message) = &state.err {
+                    return Err(carrier_error(message.clone()));
+                }
+                state.buf.len() >= state.size
+            };
+            if !full {
+                return Ok(data.len());
+            }
+            self.cut(false, true)?;
+        }
+    }
+
+    /// Take one segment out of the buffer and hand it to an upload worker. The room permit is taken before the lock so a reader that falls behind holds `write` back without holding the state.
+    fn cut(self: &Arc<Self>, due: bool, force: bool) -> io::Result<()> {
+        if !self.acquire_room()? {
+            return Ok(());
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(message) = state.err.clone() {
+            drop(state);
+            self.release_room();
+            return Err(carrier_error(message));
+        }
+        let len = state.buf.len();
+        if len == 0 || (!force && !due && len < state.size) || (!force && due && !state.ready()) {
+            drop(state);
+            self.release_room();
+            return Ok(());
+        }
+        let inflight = *self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        let capacity = self.capacity();
+        if state.size < self.params.segment_bytes
+            && len >= state.size
+            && inflight * 4 > capacity * 3
+        {
+            state.size = self.params.segment_bytes;
+            state.full = 0;
+        }
+        let mut n = len.min(state.size);
+        if len > 4 * SLOT_INLINE_LIMIT {
+            n = len.min(self.params.segment_bytes);
+        }
+        if n > SLOT_INLINE_LIMIT && len <= 2 * capacity * SLOT_INLINE_LIMIT {
+            n = SLOT_INLINE_LIMIT;
+        }
+        if n == state.size && state.size < self.params.segment_bytes {
+            state.full += 1;
+            if state.full == SLOT_INLINE_RAMP {
+                state.full = 0;
+                state.size = (state.size * 2).min(self.params.segment_bytes);
+            }
+        }
+        let rest = state.buf.split_off(n);
+        let chunk = std::mem::replace(&mut state.buf, rest);
+        let seq = state.seq;
+        state.seq += 1;
+        state.last_size = state.buf.len();
+        state.held = 0;
+        drop(state);
+        let writer = Arc::clone(self);
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || writer.upload(seq, chunk))
+            .map_err(|error| {
+                self.release_room();
+                io::Error::other(error.to_string())
+            })?;
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        self.table.slots.len().clamp(1, SLOT_WRITE_INFLIGHT)
+    }
+
+    fn acquire_room(&self) -> io::Result<bool> {
+        let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        let started = Instant::now();
+        while *inflight >= self.capacity() {
+            if self.done.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            if started.elapsed() >= SLOT_STALL {
+                return Err(carrier_error(
+                    "the reader took nothing from the slot ring for a minute",
+                ));
+            }
+            let (guard, _timeout) = self
+                .room
+                .wait_timeout(inflight, SLOT_ACK_RETRY)
+                .unwrap_or_else(PoisonError::into_inner);
+            inflight = guard;
+        }
+        *inflight += 1;
+        Ok(true)
+    }
+
+    fn release_room(&self) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        *inflight = inflight.saturating_sub(1);
+        drop(inflight);
+        self.room.notify_one();
+        self.uploads_done.notify_all();
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn upload(self: Arc<Self>, seq: u64, chunk: Vec<u8>) {
+        let mode = if chunk.len() <= SLOT_INLINE_LIMIT {
+            SLOT_INLINE
+        } else {
+            SLOT_MEDIA
+        };
+        let result = self
+            .await_drained(seq)
+            .and_then(|()| self.set_frame(seq, mode, &chunk));
+        match result {
+            Ok(()) => {}
+            Err(why) => {
+                self.fail(format!("slot {seq} failed: {why}"));
+                let _ = self.set_frame(seq, SLOT_ERR, &[]);
+            }
+        }
+        self.release_room();
+    }
+
+    fn set_frame(&self, seq: u64, mode: u8, data: &[u8]) -> io::Result<()> {
+        let slots = self
+            .storage
+            .slot_store()
+            .ok_or_else(|| carrier_error("the store has no slot path"))?;
+        let id = self
+            .table
+            .slots
+            .get(seq as usize % self.table.slots.len())
+            .ok_or_else(|| carrier_error("the slot ring is empty"))?;
+        let frame = SlotFrame::new(seq, mode, data);
+        let body = (mode == SLOT_MEDIA).then_some(data);
+        slots.set_slot(id, &frame.encode(), body)
+    }
+
+    fn drained(&self, seq: u64) -> io::Result<bool> {
+        let before = i64::try_from(seq).unwrap_or(i64::MAX)
+            - i64::try_from(self.table.slots.len()).unwrap_or(i64::MAX);
+        {
+            let ack = self.ack.lock().unwrap_or_else(PoisonError::into_inner);
+            if ack.acked >= before {
+                return Ok(true);
+            }
+            if ack.at.is_some_and(|at| at.elapsed() < SLOT_WATERMARK_TTL) {
+                return Ok(false);
+            }
+        }
+        let slots = self
+            .storage
+            .slot_store()
+            .ok_or_else(|| carrier_error("the store has no slot path"))?;
+        let description = slots.read_description(&self.table.watermark)?;
+        let acked = if description.is_empty() {
+            -1
+        } else {
+            description
+                .parse::<i64>()
+                .map_err(|why| carrier_error(format!("the watermark is not a number: {why}")))?
+        };
+        let mut ack = self.ack.lock().unwrap_or_else(PoisonError::into_inner);
+        ack.at = Some(Instant::now());
+        if acked > ack.acked {
+            ack.acked = acked;
+        }
+        Ok(ack.acked >= before)
+    }
+
+    fn await_drained(&self, seq: u64) -> io::Result<()> {
+        let started = Instant::now();
+        let mut wait = SLOT_ACK_RETRY;
+        loop {
+            match self.drained(seq) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(_) => wait = (wait * 2).min(Duration::from_secs(2)),
+            }
+            if started.elapsed() >= SLOT_STALL {
+                return Err(carrier_error(
+                    "the reader did not drain the slot ring in time",
+                ));
+            }
+            std::thread::sleep(wait);
+        }
+    }
+
+    fn fail(&self, message: String) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.err.is_none() {
+            state.err = Some(message);
+        }
+        drop(state);
+        self.room.notify_all();
+        self.wake.ring();
+    }
+
+    fn close(self: &Arc<Self>) -> io::Result<()> {
+        if self.ended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.closed = true;
+        }
+        loop {
+            let empty = {
+                let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.buf.is_empty()
+            };
+            if empty {
+                break;
+            }
+            self.cut(false, true)?;
+        }
+        let deadline = Instant::now() + SLOT_STALL;
+        {
+            let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+            while *inflight > 0 {
+                if Instant::now() >= deadline {
+                    return Err(carrier_error("the slot uploads did not finish"));
+                }
+                let (guard, _timeout) = self
+                    .uploads_done
+                    .wait_timeout(inflight, SLOT_ACK_RETRY)
+                    .unwrap_or_else(PoisonError::into_inner);
+                inflight = guard;
+            }
+        }
+        if let Some(message) = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .err
+            .clone()
+        {
+            return Err(carrier_error(message));
+        }
+        let seq = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seq;
+        self.await_drained(seq)?;
+        self.set_frame(seq, SLOT_END, &[])
+    }
+}
+
+impl Drop for SlotWriter {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        self.room.notify_all();
+    }
+}
+
+/// The id-addressed reader: poll the head slot until the sequence advances, then ack the watermark so the writer may reuse the slot a lap later.
+struct SlotReader {
+    storage: Arc<dyn Storage>,
+    table: SlotTable,
+    params: Arc<Params>,
+    wake: Arc<Wake>,
+    inbox: Arc<Inbox>,
+    rest: Mutex<(Vec<u8>, usize)>,
+    stop: AtomicBool,
+    first: Option<Vec<u8>>,
+}
+
+impl SlotReader {
+    fn new(
+        storage: Arc<dyn Storage>,
+        table: SlotTable,
+        params: &Arc<Params>,
+        wake: Arc<Wake>,
+        first: Option<Vec<u8>>,
+    ) -> Arc<Self> {
+        let reader = Arc::new(Self {
+            storage,
+            table,
+            params: Arc::clone(params),
+            wake,
+            inbox: Arc::new(Inbox::new()),
+            rest: Mutex::new((Vec::new(), 0)),
+            stop: AtomicBool::new(false),
+            first,
+        });
+        let weak = Arc::downgrade(&reader);
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                let Some(reader) = weak.upgrade() else {
+                    return;
+                };
+                reader.pump();
+            })
+            .expect("a slot reader always gets its pump");
+        reader
+    }
+
+    fn pump(&self) {
+        let Some(slots) = self.storage.slot_store() else {
+            self.inbox
+                .end(Some("the store has no slot path".to_owned()));
+            return;
+        };
+        let cap = self.params.concurrency.max(1);
+        let mut head = 0u64;
+        if let Some(first) = &self.first {
+            if !self.inbox.push(first.clone(), cap, &self.wake) {
+                return;
+            }
+            head = 1;
+            let _ = slots.set_slot(&self.table.watermark, "0", None);
+        }
+        let mut delay = SLOT_HUNT_FLOOR;
+        let mut active = Instant::now();
+        let mut last = Instant::now();
+        while !self.stop.load(Ordering::Acquire) {
+            if last.elapsed() >= SLOT_STALL {
+                self.inbox
+                    .end(Some("the peer took nothing from the slot ring".to_owned()));
+                return;
+            }
+            let id = &self.table.slots[head as usize % self.table.slots.len()];
+            let description = match slots.read_description(id) {
+                Ok(description) if !description.is_empty() => description,
+                Ok(_) => {
+                    delay = self.idle(delay, active);
+                    self.wait(delay);
+                    continue;
+                }
+                Err(why) if why.kind() == ErrorKind::NotFound => {
+                    delay = self.idle(delay, active);
+                    self.wait(delay);
+                    continue;
+                }
+                Err(why) => {
+                    self.inbox
+                        .end(Some(format!("the slot description failed: {why}")));
+                    return;
+                }
+            };
+            let Some(frame) = SlotFrame::decode(&description) else {
+                delay = self.idle(delay, active);
+                self.wait(delay);
+                continue;
+            };
+            if frame.seq != head {
+                delay = self.idle(delay, active);
+                self.wait(delay);
+                continue;
+            }
+            let data = match frame.mode {
+                SLOT_END => {
+                    self.inbox.end(None);
+                    return;
+                }
+                SLOT_ERR => {
+                    self.inbox
+                        .end(Some(format!("the peer reported segment {head} failed")));
+                    return;
+                }
+                SLOT_INLINE => frame.data.unwrap_or_default(),
+                SLOT_MEDIA => {
+                    let body = match slots.read_body(id) {
+                        Ok(body) if frame.holds(&body) => body,
+                        Ok(_) => {
+                            delay = self.idle(delay, active);
+                            self.wait(delay);
+                            continue;
+                        }
+                        Err(why) if why.kind() == ErrorKind::NotFound => {
+                            delay = self.idle(delay, active);
+                            self.wait(delay);
+                            continue;
+                        }
+                        Err(why) => {
+                            self.inbox.end(Some(format!("the slot body failed: {why}")));
+                            return;
+                        }
+                    };
+                    body
+                }
+                _ => {
+                    self.inbox
+                        .end(Some("the slot frame has an unknown mode".to_owned()));
+                    return;
+                }
+            };
+            if !self.inbox.push(data, cap, &self.wake) {
+                return;
+            }
+            let _ = slots.set_slot(&self.table.watermark, &head.to_string(), None);
+            head += 1;
+            active = Instant::now();
+            last = active;
+            delay = SLOT_HUNT_FLOOR;
+        }
+    }
+
+    fn idle(&self, delay: Duration, active: Instant) -> Duration {
+        if active.elapsed() < self.params.eager {
+            SLOT_HUNT_CEILING
+        } else {
+            (delay * 2).max(SLOT_TAIL_MIN).min(SLOT_TAIL_MAX)
+        }
+    }
+
+    fn wait(&self, delay: Duration) {
+        match self.wake.wait(delay) {
+            Woke::Stopped => self.stop.store(true, Ordering::Release),
+            Woke::Rung | Woke::Waited => {}
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        read_mailbox(&self.inbox, &self.rest, buf)
+    }
+
+    fn end(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.inbox.end(None);
+        self.wake.ring();
+    }
+}
+
+impl Drop for SlotReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.inbox.end(None);
+        self.wake.ring();
+    }
+}
+
+/// One xdrive stream: the two write-ahead logs one session names, or the two slot rings, with the object store the peer reads and writes beside them.
 #[derive(Clone)]
 pub(crate) struct Conn {
-    writer: Arc<Writer>,
-    reader: Arc<Reader>,
+    writer: WriterSide,
+    reader: ReaderSide,
     wake: Arc<Wake>,
     meter: crate::stats::Meter,
+}
+
+#[derive(Clone)]
+enum WriterSide {
+    Wal(Arc<Writer>),
+    Slot(Arc<SlotWriter>),
+}
+
+#[derive(Clone)]
+enum ReaderSide {
+    Wal(Arc<Reader>),
+    Slot(Arc<SlotReader>),
 }
 
 impl Conn {
     fn pair(storage: Arc<dyn Storage>, params: &Arc<Params>, write: String, read: String) -> Self {
         let wake = Arc::new(Wake::new());
         Self {
-            writer: Arc::new(Writer::new(
+            writer: WriterSide::Wal(Arc::new(Writer::new(
                 Arc::clone(&storage),
                 write,
                 params,
                 Arc::clone(&wake),
-            )),
-            reader: Arc::new(Reader::new(
+            ))),
+            reader: ReaderSide::Wal(Arc::new(Reader::new(
                 storage,
                 read,
                 Arc::clone(params),
                 Arc::clone(&wake),
-            )),
+            ))),
             wake,
             meter: crate::stats::Meter::default(),
         }
+    }
+
+    fn slot(storage: Arc<dyn Storage>, params: &Arc<Params>, ring: &SlotRing) -> io::Result<Self> {
+        let wake = Arc::new(Wake::new());
+        let writer = SlotWriter::new(
+            Arc::clone(&storage),
+            ring.up.clone(),
+            params,
+            Arc::clone(&wake),
+        )?;
+        let reader = SlotReader::new(
+            storage,
+            ring.down.clone(),
+            params,
+            Arc::clone(&wake),
+            ring.first.clone(),
+        );
+        Ok(Self {
+            writer: WriterSide::Slot(writer),
+            reader: ReaderSide::Slot(reader),
+            wake,
+            meter: crate::stats::Meter::default(),
+        })
     }
 
     /// Adds counters to the session while keeping the ones it already carries.
@@ -1443,18 +2410,27 @@ impl Conn {
 
     /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.
     pub(crate) fn end_write(&self) -> io::Result<()> {
-        self.writer.close()
+        match &self.writer {
+            WriterSide::Wal(writer) => writer.close(),
+            WriterSide::Slot(writer) => writer.close(),
+        }
     }
 
     /// End the read mailbox too, for a caller that is done with both directions and must not leave its reader parked.
     pub(crate) fn end_read(&self) {
-        self.reader.inbox.end(None);
+        match &self.reader {
+            ReaderSide::Wal(reader) => reader.inbox.end(None),
+            ReaderSide::Slot(reader) => reader.end(),
+        }
     }
 }
 
 impl Read for Conn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.reader.read(buf)?;
+        let n = match &self.reader {
+            ReaderSide::Wal(reader) => reader.read(buf)?,
+            ReaderSide::Slot(reader) => reader.read(buf)?,
+        };
         self.meter.read(n);
         Ok(n)
     }
@@ -1462,7 +2438,10 @@ impl Read for Conn {
 
 impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.writer.write(buf)?;
+        let n = match &self.writer {
+            WriterSide::Wal(writer) => writer.write(buf)?,
+            WriterSide::Slot(writer) => writer.write(buf)?,
+        };
         self.meter.write(n);
         self.wake.ring();
         Ok(n)
@@ -1483,6 +2462,79 @@ pub(crate) fn dial(storage: Arc<dyn Storage>, params: &Arc<Params>) -> io::Resul
         uplink_prefix(&session),
         downlink_prefix(&session),
     ))
+}
+
+/// The client's half on a slot store: make both rings, announce their ids, then open the session without a listing or an index object.
+fn dial_slots(storage: &Arc<dyn Storage>, params: &Arc<Params>) -> io::Result<Conn> {
+    let session = session_id()?;
+    let ring = make_ring(storage, &session, params)?;
+    storage.put(
+        &announce_name(&session, unix_nanos(SystemTime::now())),
+        ring.encode().as_bytes(),
+    )?;
+    Conn::slot(Arc::clone(storage), params, &ring)
+}
+
+/// Make every slot and watermark of a session at once, the way the reference does, so a listener sees a complete ring in one announcement.
+fn make_ring(
+    storage: &Arc<dyn Storage>,
+    session: &str,
+    params: &Arc<Params>,
+) -> io::Result<SlotRing> {
+    let slots = storage
+        .slot_store()
+        .ok_or_else(|| carrier_error("the store has no slot path"))?;
+    let depth = params.concurrency.max(2);
+    let up_prefix = uplink_prefix(session);
+    let down_prefix = downlink_prefix(session);
+    let mut up = vec![String::new(); depth];
+    let mut down = vec![String::new(); depth];
+    let mut up_watermark = String::new();
+    let mut down_watermark = String::new();
+    std::thread::scope(|scope| -> io::Result<()> {
+        let mut jobs = Vec::with_capacity(depth * 2 + 2);
+        for index in 0..depth {
+            let name = format!("{up_prefix}/s{index}");
+            jobs.push((0usize, index, scope.spawn(move || slots.make_slot(&name))));
+        }
+        for index in 0..depth {
+            let name = format!("{down_prefix}/s{index}");
+            jobs.push((1usize, index, scope.spawn(move || slots.make_slot(&name))));
+        }
+        jobs.push((
+            2,
+            0,
+            scope.spawn(|| slots.make_slot(&format!("{up_prefix}/w"))),
+        ));
+        jobs.push((
+            3,
+            0,
+            scope.spawn(|| slots.make_slot(&format!("{down_prefix}/w"))),
+        ));
+        for (side, index, job) in jobs {
+            let id = job
+                .join()
+                .map_err(|_| carrier_error("a slot creation thread panicked"))??;
+            match side {
+                0 => up[index] = id,
+                1 => down[index] = id,
+                2 => up_watermark = id,
+                _ => down_watermark = id,
+            }
+        }
+        Ok(())
+    })?;
+    Ok(SlotRing {
+        up: SlotTable {
+            slots: up,
+            watermark: up_watermark,
+        },
+        down: SlotTable {
+            slots: down,
+            watermark: down_watermark,
+        },
+        first: None,
+    })
 }
 
 /// What a listener hands each accepted session to: the caller's relay, on a thread of its own.
@@ -1597,14 +2649,39 @@ impl Server {
             if !self.claim(session) {
                 continue;
             }
+            let announced = entry
+                .inline
+                .clone()
+                .or_else(|| rd.storage.get(&full).ok())
+                .unwrap_or_default();
+            let conn = if rd.storage.slot_store().is_some() && !announced.is_empty() {
+                let Some(ring) = SlotRing::decode(&announced) else {
+                    self.release(session);
+                    rd.discard(full);
+                    rd.discard(format!("{STREAMS_DIR}/{session}"));
+                    continue;
+                };
+                let storage = rd
+                    .storage
+                    .session()
+                    .unwrap_or_else(|| Arc::clone(&rd.storage));
+                let Ok(conn) = Conn::slot(storage, &rd.params, &ring) else {
+                    self.release(session);
+                    rd.discard(full);
+                    rd.discard(format!("{STREAMS_DIR}/{session}"));
+                    continue;
+                };
+                conn
+            } else {
+                Conn::pair(
+                    Arc::clone(&rd.storage),
+                    &rd.params,
+                    downlink_prefix(session),
+                    uplink_prefix(session),
+                )
+            };
             rd.discard(full);
             accepted = true;
-            let conn = Conn::pair(
-                Arc::clone(&rd.storage),
-                &rd.params,
-                downlink_prefix(session),
-                uplink_prefix(session),
-            );
             let server = Arc::clone(self);
             let handler = Arc::clone(accept);
             let session = session.to_owned();
@@ -1887,7 +2964,7 @@ impl Drop for Hold<'_> {
 /// The stream one service lane rides: plain to a loopback fake, TLS to a real origin.
 enum Kind {
     Plain(Connection),
-    Secure(Box<RustlsProvider<Connection>>),
+    Secure(Box<ClientSession<Connection>>),
     Reality(
         Box<
             ferrox_core::tls::RealityClientSession<
@@ -1930,6 +3007,8 @@ struct Lane {
     kind: Kind,
     buf: Vec<u8>,
     at: usize,
+    uses: u32,
+    born: Instant,
 }
 
 /// A reply and whether its lane can be kept: a peer that said `close`, or that ended the body at EOF, has nothing left to answer.
@@ -1945,6 +3024,8 @@ impl Lane {
             kind,
             buf: Vec::with_capacity(crate::proxy::READ_SLICE),
             at: 0,
+            uses: 0,
+            born: Instant::now(),
         }
     }
 
@@ -2276,14 +3357,22 @@ fn declared_length(method: &str, length: Option<usize>) -> Option<usize> {
 /// The pooled `HTTP/1.1` lanes one object service shares: a lane per in-flight request, kept for the next rather than handshaken again.
 pub(crate) struct Http {
     tls: Option<Arc<TlsConfig>>,
+    tls_stream: Option<Json>,
+    tls_by_origin: Mutex<HashMap<String, Arc<TlsConfig>>>,
     reality: Option<Arc<RealityClientConfig>>,
     reality_named: bool,
     front: Option<(String, u16)>,
+    cap: usize,
+    xmux: XmuxSettings,
+    quic: Option<ferrox_core::hysteria::QuicParams>,
     gate: Gate,
+    conns: Gate,
     lanes: Mutex<HashMap<String, VecDeque<Lane>>>,
+    h3: Mutex<HashMap<String, Arc<H3Client>>>,
 }
 
 impl Http {
+    #[cfg(test)]
     fn new(
         tls: Option<Arc<TlsConfig>>,
         reality: Option<Arc<RealityClientConfig>>,
@@ -2291,14 +3380,91 @@ impl Http {
         front: Option<(String, u16)>,
         cap: usize,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Self::make(
             tls,
+            None,
             reality,
             reality_named,
             front,
+            cap,
+            XmuxSettings::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_stream(
+        tls: Option<Arc<TlsConfig>>,
+        tls_stream: Option<Json>,
+        reality: Option<Arc<RealityClientConfig>>,
+        reality_named: bool,
+        front: Option<(String, u16)>,
+        cap: usize,
+        xmux: XmuxSettings,
+        quic: Option<ferrox_core::hysteria::QuicParams>,
+    ) -> Arc<Self> {
+        Self::make(
+            tls,
+            tls_stream,
+            reality,
+            reality_named,
+            front,
+            cap,
+            xmux,
+            quic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make(
+        tls: Option<Arc<TlsConfig>>,
+        tls_stream: Option<Json>,
+        reality: Option<Arc<RealityClientConfig>>,
+        reality_named: bool,
+        front: Option<(String, u16)>,
+        cap: usize,
+        xmux: XmuxSettings,
+        quic: Option<ferrox_core::hysteria::QuicParams>,
+    ) -> Arc<Self> {
+        let cap = if xmux.max_concurrency == 0 {
+            cap
+        } else {
+            cap.min(xmux.max_concurrency as usize).max(1)
+        };
+        let conns = if xmux.max_connections == 0 {
+            usize::MAX
+        } else {
+            xmux.max_connections as usize
+        };
+        Arc::new(Self {
+            tls,
+            tls_stream,
+            tls_by_origin: Mutex::new(HashMap::new()),
+            reality,
+            reality_named,
+            front,
+            cap,
+            xmux,
+            quic,
             gate: Gate::new(cap),
+            conns: Gate::new(conns),
             lanes: Mutex::new(HashMap::new()),
+            h3: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The same transport settings with fresh lane and h3 pools, so one session can hold its own XMUX share without sharing an idle socket with the next.
+    fn fork(&self) -> Arc<Self> {
+        Self::make(
+            self.tls.clone(),
+            self.tls_stream.clone(),
+            self.reality.clone(),
+            self.reality_named,
+            self.front.clone(),
+            self.cap,
+            self.xmux.clone(),
+            self.quic,
+        )
     }
 
     /// One request and its answer, retried by the caller's ladder: a lane taken from the pool gets one second try on a fresh one, because a server that timed out an idle connection is the ordinary reason a first try fails.
@@ -2321,7 +3487,13 @@ impl Http {
         );
         let key = target.origin();
         let _hold = self.gate.hold();
+        if target.secure && self.h3_enabled() {
+            let head = std::str::from_utf8(&head)
+                .map_err(|_| carrier_error("the service head is not text"))?;
+            return self.ask_h3(&target, head, body, limit);
+        }
         let header_only = method.eq_ignore_ascii_case("HEAD");
+        let _conns = self.conns.hold();
         let pooled = self.borrow(&key);
         if let Some(mut lane) = pooled {
             return match lane.exchange(&head, body, header_only, limit) {
@@ -2352,33 +3524,172 @@ impl Http {
 
     fn borrow(&self, key: &str) -> Option<Lane> {
         let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
-        let queue = lanes.get_mut(key)?;
-        let lane = queue.pop_front();
-        if queue.is_empty() {
-            lanes.remove(key);
+        loop {
+            let lane = {
+                let queue = lanes.get_mut(key)?;
+                queue.pop_front()
+            };
+            let Some(lane) = lane else {
+                lanes.remove(key);
+                return None;
+            };
+            if self
+                .xmux
+                .reusable_for()
+                .is_some_and(|age| lane.born.elapsed() >= age)
+            {
+                continue;
+            }
+            return Some(lane);
         }
-        lane
     }
 
-    fn finish(&self, key: &str, lane: Lane, answer: &Answer) {
+    fn finish(&self, key: &str, mut lane: Lane, answer: &Answer) {
         if !answer.kept {
             return;
         }
-        self.lanes
+        lane.uses = lane.uses.saturating_add(1);
+        if self
+            .xmux
+            .request_limit()
+            .is_some_and(|limit| lane.uses >= limit)
+            || self
+                .xmux
+                .reusable_for()
+                .is_some_and(|age| lane.born.elapsed() >= age)
+        {
+            return;
+        }
+        let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
+        let queue = lanes.entry(key.to_owned()).or_default();
+        if queue.len() >= self.xmux.lane_limit() {
+            return;
+        }
+        queue.push_back(lane);
+    }
+
+    /// The TLS config for one origin: the stream's own, resolved against this host so an ECH lookup and an unnamed SNI name the lane's destination.
+    fn tls_for(&self, target: &Target) -> io::Result<Arc<TlsConfig>> {
+        let key = target.origin();
+        if let Some(cfg) = self
+            .tls_by_origin
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(key.to_owned())
-            .or_default()
-            .push_back(lane);
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cfg);
+        }
+        let Some(stream) = &self.tls_stream else {
+            let mut cfg = self.tls.as_deref().cloned().unwrap_or_default();
+            if cfg.server_name.is_empty() {
+                cfg.server_name.clone_from(&target.host);
+            }
+            if cfg.roots.is_empty() {
+                cfg.roots = crate::quic::system_roots();
+            }
+            return Ok(Arc::new(cfg));
+        };
+        let outbound = Json::Obj(vec![("streamSettings".to_owned(), stream.clone())]);
+        let mut cfg =
+            (*crate::config::outbound_tls(&outbound, &target.host).map_err(carrier_error)?).clone();
+        if !crate::xhttp_h3::is_h3(&cfg.alpn) {
+            cfg.alpn = vec![b"http/1.1".to_vec()].into();
+        }
+        let cfg = Arc::new(cfg);
+        self.tls_by_origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, Arc::clone(&cfg));
+        Ok(cfg)
+    }
+
+    /// Whether the transport asked for `h3` alone, the one ALPN that makes the store leave TCP.
+    fn h3_enabled(&self) -> bool {
+        self.tls
+            .as_ref()
+            .is_some_and(|tls| crate::xhttp_h3::is_h3(&tls.alpn))
+    }
+
+    /// The address a lane dials, which the fronting may move while the url's host keeps naming the service.
+    fn endpoint(&self, target: &Target) -> (String, u16) {
+        match &self.front {
+            Some((front, 0)) => (front.clone(), target.port),
+            Some((front, at)) => (front.clone(), *at),
+            None => (target.host.clone(), target.port),
+        }
+    }
+
+    /// One request over a kept HTTP/3 connection, with the same fresh-lane retry the H1 pool gives a timed-out idle socket.
+    fn ask_h3(
+        &self,
+        target: &Target,
+        head: &str,
+        body: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        let (address, port) = self.endpoint(target);
+        let cfg = self.tls_for(target)?;
+        let key = target.origin();
+        let client = self.h3_client(&key, &address, port, &cfg)?;
+        let first = match client.ask(head, &target.authority(), body, limit) {
+            Ok(answer) => return Ok(answer),
+            Err(first) => first,
+        };
+        self.h3
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        let fresh = self.h3_client(&key, &address, port, &cfg)?;
+        fresh
+            .ask(head, &target.authority(), body, limit)
+            .map_err(|again| {
+                carrier_error(format!(
+                    "the h3 service lane failed twice: {again}; first {first}"
+                ))
+            })
+    }
+
+    fn h3_client(
+        &self,
+        key: &str,
+        address: &str,
+        port: u16,
+        cfg: &TlsConfig,
+    ) -> io::Result<Arc<H3Client>> {
+        if let Some(client) = self
+            .h3
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+        {
+            return Ok(client);
+        }
+        let name = if cfg.server_name.is_empty() {
+            address
+        } else {
+            cfg.server_name.as_str()
+        };
+        let peer = (address, port)
+            .to_socket_addrs()
+            .map_err(|why| carrier_error(format!("resolve {address}:{port}: {why}")))?
+            .next()
+            .ok_or_else(|| carrier_error(format!("{address}:{port} resolves to nothing")))?;
+        let client = H3Client::connect_tuned(peer, name, cfg, self.quic.as_ref(), true)
+            .ok_or_else(|| {
+                carrier_error(format!("h3 service lane cannot reach {address}:{port}"))
+            })?;
+        self.h3
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.to_owned(), Arc::clone(&client));
+        Ok(client)
     }
 
     /// Dial the fronting the outbound names, or the url's own origin, and put TLS on it when the url asks for that scheme.
     fn dial(&self, target: &Target) -> io::Result<Lane> {
-        let (host, port) = match &self.front {
-            Some((front, 0)) => (front.clone(), target.port),
-            Some((front, at)) => (front.clone(), *at),
-            None => (target.host.clone(), target.port),
-        };
+        let (host, port) = self.endpoint(target);
         let peer = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|why| carrier_error(format!("resolve {host}: {why}")))?
@@ -2408,14 +3719,8 @@ impl Http {
         if !target.secure {
             return Ok(Lane::new(Kind::Plain(stream)));
         }
-        let mut cfg = self.tls.as_deref().cloned().unwrap_or_default();
-        if cfg.server_name.is_empty() {
-            cfg.server_name.clone_from(&target.host);
-        }
-        if cfg.roots.is_empty() {
-            cfg.roots = crate::quic::system_roots();
-        }
-        let mut tls = RustlsProvider::connect(&cfg, stream)
+        let cfg = self.tls_for(target)?;
+        let mut tls = ferrox_core::tls::connect(&cfg, stream)
             .map_err(|why| carrier_error(format!("tls {}: {why}", target.host)))?;
         tls.handshake()
             .map_err(|why| carrier_error(format!("handshake {}: {why}", target.host)))?;
@@ -3683,8 +4988,8 @@ pub(crate) struct Drive {
     token_url: String,
     files_url: String,
     upload_url: String,
-    token: Mutex<Token>,
-    ids: Mutex<HashMap<String, String>>,
+    token: Arc<Mutex<Token>>,
+    ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Drive {
@@ -3706,8 +5011,24 @@ impl Drive {
             token_url: DRIVE_TOKEN_URL.to_owned(),
             files_url: DRIVE_FILES_URL.to_owned(),
             upload_url: DRIVE_UPLOAD_URL.to_owned(),
-            token: Mutex::new(Token::default()),
-            ids: Mutex::new(HashMap::new()),
+            token: Arc::new(Mutex::new(Token::default())),
+            ids: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// One connection's Drive client: the token and name cache stay shared, while the lane and h3 pools are its own.
+    fn session(&self) -> Arc<dyn Storage> {
+        Arc::new(Self {
+            http: self.http.fork(),
+            folder: self.folder.clone(),
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            refresh: self.refresh.clone(),
+            token_url: self.token_url.clone(),
+            files_url: self.files_url.clone(),
+            upload_url: self.upload_url.clone(),
+            token: Arc::clone(&self.token),
+            ids: Arc::clone(&self.ids),
         })
     }
 
@@ -3941,6 +5262,45 @@ impl Drive {
             .ok_or_else(|| io::Error::from(ErrorKind::NotFound))
     }
 
+    /// A slot's empty object: the id is the slot, so only the metadata and the empty description matter.
+    fn create_slot(&self, name: &str) -> io::Result<String> {
+        let flat = flatten(name);
+        let mut text = String::new();
+        crate::json::write(
+            &Json::Obj(vec![
+                ("description".to_owned(), Json::Str(String::new())),
+                ("name".to_owned(), Json::Str(flat.clone())),
+                (
+                    "parents".to_owned(),
+                    Json::Arr(vec![Json::Str(self.folder.clone())]),
+                ),
+            ]),
+            &mut text,
+        );
+        let target = format!("{}?fields=id", self.files_url);
+        let (status, payload) = self.ask(
+            "POST",
+            &target,
+            "application/json; charset=UTF-8",
+            Some(text.as_bytes()),
+        )?;
+        if status != 200 {
+            return Err(carrier_error(format!(
+                "Drive slot creation of {name} answered {status}: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+            .map_err(|why| carrier_error(format!("the Drive slot answer is not json: {why}")))?;
+        let id = answer
+            .get("id")
+            .and_then(Json::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| carrier_error(format!("Drive returned no id for {name}")))?;
+        self.remember(&flat, id);
+        Ok(id.to_owned())
+    }
+
     /// The object as Drive stores it: small enough it rides base64 in the metadata, otherwise the metadata and the payload go out as one multipart body.
     fn write(&self, name: &str, data: &[u8]) -> io::Result<()> {
         let flat = flatten(name);
@@ -4128,6 +5488,195 @@ impl Storage for Drive {
         }
         Ok(out)
     }
+
+    fn slot_store(&self) -> Option<&dyn SlotStore> {
+        Some(self)
+    }
+
+    fn session(&self) -> Option<Arc<dyn Storage>> {
+        Some(self.session())
+    }
+}
+
+impl SlotStore for Drive {
+    fn make_slot(&self, name: &str) -> io::Result<String> {
+        self.create_slot(name)
+    }
+
+    fn set_slot(&self, id: &str, description: &str, body: Option<&[u8]>) -> io::Result<()> {
+        let mut metadata = String::new();
+        crate::json::write(
+            &Json::Obj(vec![(
+                "description".to_owned(),
+                Json::Str(description.to_owned()),
+            )]),
+            &mut metadata,
+        );
+        let (target, content, payload) = if let Some(body) = body {
+            let mut multipart = Vec::with_capacity(metadata.len() + body.len() + 128);
+            let _ = write!(
+                multipart,
+                "--{DRIVE_BOUNDARY}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            );
+            multipart.extend_from_slice(metadata.as_bytes());
+            let _ = write!(
+                multipart,
+                "\r\n--{DRIVE_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\n"
+            );
+            multipart.extend_from_slice(body);
+            let _ = write!(multipart, "\r\n--{DRIVE_BOUNDARY}--\r\n");
+            let upload = self
+                .upload_url
+                .split_once('?')
+                .map_or(self.upload_url.as_str(), |(url, _)| url);
+            (
+                format!(
+                    "{upload}/{id}?uploadType=multipart&fields=id&supportsAllDrives=true",
+                    id = path_escape(id)
+                ),
+                format!("multipart/related; boundary={DRIVE_BOUNDARY}"),
+                multipart,
+            )
+        } else {
+            (
+                format!(
+                    "{}/{id}?fields=id&supportsAllDrives=true",
+                    self.files_url,
+                    id = path_escape(id)
+                ),
+                "application/json; charset=UTF-8".to_owned(),
+                metadata.into_bytes(),
+            )
+        };
+        let (status, answer) = self.ask("PATCH", &target, &content, Some(&payload))?;
+        match status {
+            200 => Ok(()),
+            404 => Err(io::Error::from(ErrorKind::NotFound)),
+            other => Err(carrier_error(format!(
+                "Drive slot update of {id} answered {other}: {}",
+                String::from_utf8_lossy(&answer)
+            ))),
+        }
+    }
+
+    fn read_description(&self, id: &str) -> io::Result<String> {
+        let target = format!(
+            "{}/{id}?fields=description&supportsAllDrives=true",
+            self.files_url,
+            id = path_escape(id)
+        );
+        let (status, payload) = self.ask("GET", &target, "", None)?;
+        match status {
+            200 => {
+                let answer =
+                    crate::json::parse(&String::from_utf8_lossy(&payload)).map_err(|why| {
+                        carrier_error(format!("the slot description is not json: {why}"))
+                    })?;
+                Ok(answer
+                    .get("description")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_owned())
+            }
+            404 => Err(io::Error::from(ErrorKind::NotFound)),
+            other => Err(carrier_error(format!(
+                "Drive slot description of {id} answered {other}: {}",
+                String::from_utf8_lossy(&payload)
+            ))),
+        }
+    }
+
+    fn read_body(&self, id: &str) -> io::Result<Vec<u8>> {
+        let target = format!(
+            "{}/{id}?alt=media&supportsAllDrives=true",
+            self.files_url,
+            id = path_escape(id)
+        );
+        let (status, payload) = self.ask("GET", &target, "", None)?;
+        match status {
+            200 => Ok(payload),
+            404 => Err(io::Error::from(ErrorKind::NotFound)),
+            other => Err(carrier_error(format!(
+                "Drive slot body of {id} answered {other}: {}",
+                String::from_utf8_lossy(&payload)
+            ))),
+        }
+    }
+}
+
+/// A ring made before it is needed: the session id, its two tables, and the store that holds them.
+struct Spare {
+    storage: Arc<dyn Storage>,
+    session: String,
+    ring: SlotRing,
+    at: Instant,
+}
+
+static SPARES: LazyLock<Mutex<HashMap<String, VecDeque<Spare>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WARMING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Take a ring younger than two thirds of the session ttl, dropping one that is too old rather than announcing a session the listener would sweep.
+fn take_spare(key: &str, params: &Params) -> Option<Spare> {
+    let mut pools = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+    let queue = pools.get_mut(key)?;
+    while let Some(spare) = queue.pop_front() {
+        if spare.at.elapsed() < params.ttl * 2 / 3 {
+            return Some(spare);
+        }
+    }
+    pools.remove(key);
+    None
+}
+
+/// Fill up to two rings in the background after a slot session opens, so a burst of new connections skips the ring-creation round trips.
+fn warm_spares(settings: Settings, front: Option<(String, u16)>, key: String) {
+    {
+        let mut warming = WARMING.lock().unwrap_or_else(PoisonError::into_inner);
+        if !warming.insert(key.clone()) {
+            return;
+        }
+    }
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(move || {
+            let params = Arc::new(settings.slot_params.clone());
+            let front = front.as_ref().map(|(host, port)| (host.as_str(), *port));
+            while SPARES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .map_or(0, VecDeque::len)
+                < SLOT_SPARES
+            {
+                let Ok(base) = settings.store(front) else {
+                    break;
+                };
+                let storage = base.session().unwrap_or(base);
+                let Ok(session) = session_id() else {
+                    break;
+                };
+                let Ok(ring) = make_ring(&storage, &session, &params) else {
+                    break;
+                };
+                let mut pools = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+                let queue = pools.entry(key.clone()).or_default();
+                if queue.len() >= SLOT_SPARES {
+                    break;
+                }
+                queue.push_back(Spare {
+                    storage,
+                    session,
+                    ring,
+                    at: Instant::now(),
+                });
+            }
+            WARMING
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        })
+        .ok();
 }
 
 /// One store per folder, shared by every session that names it: a token cache and a file-id map are worth one per service, not one per stream.
@@ -4199,12 +5748,15 @@ fn shared(
     if let Some(found) = pool.get(&key) {
         return Ok(Arc::clone(found));
     }
-    let http = Http::new(
+    let http = Http::with_stream(
         settings.tls.clone(),
+        settings.tls_stream.clone(),
         settings.reality.clone(),
         settings.reality_named,
         front.map(|(host, port)| (host.to_owned(), port)),
         cap,
+        settings.xmux.clone(),
+        settings.quic,
     );
     let made = build(settings, http)?;
     pool.insert(key, Arc::clone(&made));
@@ -4406,6 +5958,84 @@ mod tests {
                 "{refused} names no reachable store"
             );
         }
+    }
+
+    /// A TLS store carries the transport's own hello: fingerprint, ECH config and the unnamed server the lane fills per origin.
+    #[test]
+    fn a_tls_store_lane_keeps_the_fingerprint_and_ech_fields() {
+        let named =
+            |text: &str| Settings::from_json(Some(&crate::json::parse(text).expect("parses")));
+        let settings = named(
+            r#"{"security":"tls","tlsSettings":{"allowInsecure":true,"fingerprint":"chrome","echConfigList":"not base64"},"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x"}}"#,
+        )
+        .expect("names a store");
+        let tls = settings.tls.clone().expect("the lane speaks tls");
+        assert!(tls.server_name.is_empty(), "the lane fills the url's host");
+        assert_eq!(
+            tls.alpn.as_ref(),
+            [b"http/1.1".to_vec()].as_slice(),
+            "the store offers only the protocol it speaks"
+        );
+        assert!(
+            tls.fingerprint.as_ref().is_some_and(|f| f.is_shaped()),
+            "the hello is the one chrome sends"
+        );
+        assert!(
+            tls.ech_config_list.is_none(),
+            "the eager parse leaves an ECH lookup to the lane's own host"
+        );
+        let http = Http::with_stream(
+            settings.tls.clone(),
+            settings.tls_stream.clone(),
+            None,
+            false,
+            None,
+            2,
+            XmuxSettings::default(),
+            None,
+        );
+        let target = Target::parse("https://store.example/o").expect("names an origin");
+        let lane = http.tls_for(&target).expect("resolves the lane tls");
+        assert_eq!(
+            lane.ech_config_list.as_deref(),
+            Some([1, 1, 4, 5, 1, 4].as_slice()),
+            "a malformed ECH config still rides the refusal slot"
+        );
+        assert!(
+            named(
+                r#"{"security":"tls","tlsSettings":{"allowInsecure":true,"fingerprint":"bogus"},"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x"}}"#,
+            )
+            .is_none(),
+            "a fingerprint no table knows refuses the store"
+        );
+    }
+
+    /// A lane with no `serverName` takes the origin it dials, and the h1 narrowing survives the per-origin reparse.
+    #[test]
+    fn a_tls_lane_names_the_origin_it_dials() {
+        let stream = crate::json::parse(
+            r#"{"security":"tls","tlsSettings":{"allowInsecure":true},"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x"}}"#,
+        )
+        .expect("parses");
+        let settings = Settings::from_json(Some(&stream)).expect("names a store");
+        let http = Http::with_stream(
+            settings.tls.clone(),
+            settings.tls_stream.clone(),
+            None,
+            false,
+            None,
+            2,
+            XmuxSettings::default(),
+            None,
+        );
+        let target = Target::parse("https://store.example:8443/o").expect("names an origin");
+        let cfg = http.tls_for(&target).expect("resolves the lane tls");
+        assert_eq!(cfg.server_name, "store.example");
+        assert_eq!(
+            cfg.alpn.as_ref(),
+            [b"http/1.1".to_vec()].as_slice(),
+            "the store offers only the protocol it speaks"
+        );
     }
 
     #[test]
@@ -5307,8 +6937,12 @@ mod tests {
             ),
             s3: None,
             params: quick(),
+            xmux: XmuxSettings::default(),
+            quic: None,
+            slot_params: quick(),
             security: String::new(),
             tls: None,
+            tls_stream: None,
             reality: None,
             reality_named: false,
         }
@@ -5559,8 +7193,12 @@ mod tests {
             template: None,
             s3: None,
             params: quick(),
+            xmux: XmuxSettings::default(),
+            quic: None,
+            slot_params: quick(),
             security: String::new(),
             tls: None,
+            tls_stream: None,
             reality: None,
             reality_named: false,
         };
@@ -5869,8 +7507,12 @@ mod tests {
                 path_style: true,
             }),
             params: quick(),
+            xmux: XmuxSettings::default(),
+            quic: None,
+            slot_params: quick(),
             security: String::new(),
             tls: None,
+            tls_stream: None,
             reality: None,
             reality_named: false,
         }
@@ -6047,5 +7689,202 @@ mod tests {
         let second = fake.text(1);
         assert!(second.starts_with("PUT /o/abc HTTP/1.1"), "{second}");
         assert!(second.ends_with("\r\n\r\nx"), "{second}");
+    }
+    /// An id-addressed store in memory, so the slot ring can be exercised without an HTTP origin.
+    #[derive(Default)]
+    struct SlotMem {
+        slots: Mutex<HashMap<String, (String, Vec<u8>)>>,
+        next: AtomicU64,
+    }
+
+    impl SlotMem {
+        fn id(&self) -> String {
+            format!("slot-{}", self.next.fetch_add(1, Ordering::AcqRel))
+        }
+    }
+
+    impl SlotStore for SlotMem {
+        fn make_slot(&self, _name: &str) -> io::Result<String> {
+            let id = self.id();
+            self.slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id.clone(), (String::new(), Vec::new()));
+            Ok(id)
+        }
+
+        fn set_slot(&self, id: &str, description: &str, body: Option<&[u8]>) -> io::Result<()> {
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            let slot = slots
+                .get_mut(id)
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+            slot.0 = description.to_owned();
+            if let Some(body) = body {
+                slot.1 = body.to_vec();
+            }
+            Ok(())
+        }
+
+        fn read_description(&self, id: &str) -> io::Result<String> {
+            self.slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(id)
+                .map(|slot| slot.0.clone())
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))
+        }
+
+        fn read_body(&self, id: &str) -> io::Result<Vec<u8>> {
+            self.slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(id)
+                .map(|slot| slot.1.clone())
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound))
+        }
+    }
+
+    impl Storage for SlotMem {
+        fn put(&self, _name: &str, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get(&self, _name: &str) -> io::Result<Vec<u8>> {
+            Err(io::Error::from(ErrorKind::NotFound))
+        }
+
+        fn delete(&self, _name: &str) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn list(&self, _prefix: &str) -> io::Result<Vec<Entry>> {
+            Ok(Vec::new())
+        }
+
+        fn slot_store(&self) -> Option<&dyn SlotStore> {
+            Some(self)
+        }
+    }
+
+    #[test]
+    fn a_slot_frame_round_trips_and_rejects_a_forged_body() {
+        let frame = SlotFrame::new(7, SLOT_INLINE, b"hello");
+        let encoded = frame.encode();
+        assert_eq!(SlotFrame::decode(&encoded), Some(frame.clone()));
+        let mut bytes = ferrox_core::b64::decode(encoded.as_bytes()).expect("base64");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        let forged = ferrox_core::b64::encode(&bytes);
+        assert!(
+            SlotFrame::decode(&forged).is_none(),
+            "a body that does not match its checksum is not a frame"
+        );
+        let media = SlotFrame::new(8, SLOT_MEDIA, b"body");
+        assert!(SlotFrame::decode(&media.encode()).is_some_and(|f| !f.holds(b"other")));
+    }
+
+    #[test]
+    fn a_slot_ring_round_trips() {
+        let ring = SlotRing {
+            up: SlotTable {
+                slots: vec!["a".to_owned(), "b".to_owned()],
+                watermark: "w1".to_owned(),
+            },
+            down: SlotTable {
+                slots: vec!["c".to_owned(), "d".to_owned()],
+                watermark: "w2".to_owned(),
+            },
+            first: Some(b"first".to_vec()),
+        };
+        let decoded = SlotRing::decode(ring.encode().as_bytes()).expect("decodes");
+        assert_eq!(decoded.up.slots, ring.up.slots);
+        assert_eq!(decoded.down.watermark, ring.down.watermark);
+        assert_eq!(decoded.first, ring.first);
+        assert!(SlotRing::decode(b"not a ring").is_none());
+    }
+
+    #[test]
+    fn a_slot_ring_carries_a_stream_both_ways() {
+        let storage: Arc<dyn Storage> = Arc::new(SlotMem::default());
+        let params = Arc::new(quick());
+        let ring = make_ring(&storage, "session", &params).expect("makes a ring");
+        let reverse = SlotRing {
+            up: ring.down.clone(),
+            down: ring.up.clone(),
+            first: None,
+        };
+        let mut client = Conn::slot(Arc::clone(&storage), &params, &ring).expect("client");
+        let mut server = Conn::slot(Arc::clone(&storage), &params, &reverse).expect("server");
+        client.write_all(b"hello").expect("writes");
+        client.end_write().expect("ends");
+        assert_eq!(read_up_to(&mut server, 5, Duration::from_secs(5)), b"hello");
+        let mut one = [0u8; 1];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match server.read(&mut one) {
+                Err(why) if why.kind() == ErrorKind::UnexpectedEof => break,
+                Err(why) if why.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {}
+                other => panic!("the end frame closes the read side: {other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn xmux_retires_a_lane_at_its_request_budget() {
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = origin.local_addr().expect("addr").port();
+        let lane = Lane::new(Kind::Plain(
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        ));
+        drop(origin);
+        let http = Http::with_stream(
+            None,
+            None,
+            None,
+            false,
+            None,
+            8,
+            XmuxSettings {
+                max_connections: 2,
+                c_max_reuse: 2,
+                ..XmuxSettings::default()
+            },
+            None,
+        );
+        let answer = Answer {
+            status: 200,
+            body: Vec::new(),
+            kept: true,
+        };
+        http.finish("origin", lane, &answer);
+        let lane = http
+            .borrow("origin")
+            .expect("the first request keeps the lane");
+        http.finish("origin", lane, &answer);
+        assert!(
+            http.borrow("origin").is_none(),
+            "cMaxReuseTimes 2 retires the lane after its second request"
+        );
+    }
+    #[test]
+    fn quic_params_reach_the_h3_lane_and_refuse_brutal() {
+        let named = Settings::from_json(Some(&crate::json::parse(
+            r#"{"security":"tls","tlsSettings":{"serverName":"store.example"},"xdriveSettings":{"service":"google-drive","remoteFolder":"root","secrets":["id","secret","refresh"],"xmux":{"maxConnections":2,"hMaxRequestTimes":3,"hMaxReusableSecs":60},"quicParams":{"congestion":"bbr","initStreamReceiveWindow":65536,"maxStreamReceiveWindow":131072,"initConnReceiveWindow":65536,"maxConnReceiveWindow":131072,"maxIdleTimeout":30,"keepAlivePeriod":10,"maxIncomingStreams":64,"disablePathMtuDiscovery":true}}}"#,
+        ).expect("parses"))).expect("names a drive");
+        let quic = named.quic.expect("quicParams are read");
+        assert_eq!(quic.init_stream_window, 65536);
+        assert_eq!(quic.max_idle, 30);
+        assert_eq!(quic.keep_alive, 10);
+        assert!(quic.no_path_mtu);
+        assert_eq!(named.xmux.max_connections, 2);
+        assert_eq!(named.xmux.request_limit(), Some(3));
+        assert_eq!(named.xmux.reusable_for(), Some(Duration::from_secs(60)));
+        let brutal = Settings::from_json(Some(&crate::json::parse(
+            r#"{"xdriveSettings":{"service":"google-drive","remoteFolder":"root","secrets":["id","secret","refresh"],"quicParams":{"congestion":"brutal"}}}"#,
+        ).expect("parses")))
+        .expect("a TCP store still accepts a Hysteria-only controller");
+        assert_eq!(
+            brutal.quic.expect("quicParams are read").cc,
+            Some(ferrox_core::hysteria::Congestion::Brutal)
+        );
     }
 }
