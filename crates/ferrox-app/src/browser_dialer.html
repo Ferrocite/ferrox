@@ -34,6 +34,33 @@ async function drain(ws) {
   }
 }
 
+function pipe(from, to) {
+  let tail = Promise.resolve();
+  let queued = 0;
+  let frames = 0;
+  from.onmessage = (event) => {
+    const size = event.data.byteLength ?? event.data.size ?? event.data.length ?? 0;
+    queued += size;
+    frames += 1;
+    if (queued > HIGH_WATER || frames > 4096) {
+      try { from.close(); } catch (_) {}
+      try { to.close(); } catch (_) {}
+      return;
+    }
+    tail = tail
+      .then(async () => {
+        if (to.readyState !== WebSocket.OPEN) throw new Error("closed");
+        await drain(to);
+        to.send(event.data);
+      })
+      .catch(() => {
+        try { to.close(); } catch (_) {}
+      })
+      .then(() => { queued -= size; frames -= 1; });
+  };
+  return () => tail;
+}
+
 async function run(ws, task) {
   if (task.method === "WS") {
     const extra = task.extra || {};
@@ -47,16 +74,24 @@ async function run(ws, task) {
     }
     target.binaryType = "arraybuffer";
     let open = false;
-    ws.onmessage = (event) => {
-      if (target.readyState === WebSocket.OPEN) {
-        try { target.send(event.data); } catch (_) { target.close(); }
-      }
-    };
+    const flushToTarget = pipe(ws, target);
+    const flushToBridge = pipe(target, ws);
+    const flushed = () => Promise.allSettled([flushToTarget(), flushToBridge()]);
     target.onopen = () => { open = true; try { ws.send("ok"); } catch (_) { target.close(); } };
-    target.onmessage = (event) => ws.send(event.data);
-    target.onclose = () => ws.close();
-    target.onerror = () => { if (!open) try { ws.send("fail"); } catch (_) {} target.close(); };
-    ws.onclose = () => { target.close(); closed(ws); };
+    target.onclose = () => {
+      flushed().then(() => { try { ws.close(); } catch (_) {} });
+    };
+    target.onerror = () => {
+      if (!open) {
+        try { ws.send("fail"); } catch (_) {}
+        try { target.close(); } catch (_) {}
+        return;
+      }
+      flushed().then(() => { try { target.close(); } catch (_) {} });
+    };
+    ws.onclose = () => {
+      flushed().then(() => { try { target.close(); } catch (_) {} closed(ws); });
+    };
     return;
   }
 

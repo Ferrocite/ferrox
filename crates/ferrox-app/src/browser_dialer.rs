@@ -608,6 +608,46 @@ mod tests {
     }
 
     #[test]
+    fn the_websocket_branch_drains_both_directions() {
+        let branch = PAGE
+            .split("if (task.method === \"WS\")")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("if (task.method === \"GET\" && task.streamResponse)")
+                    .next()
+            })
+            .expect("the ws branch");
+        assert!(branch.contains("const flushToTarget = pipe(ws, target);"));
+        assert!(branch.contains("const flushToBridge = pipe(target, ws);"));
+        assert!(branch.contains("Promise.allSettled([flushToTarget(), flushToBridge()])"));
+        assert_eq!(
+            branch.matches("flushed().then(").count(),
+            3,
+            "both closes and an open error wait for the queue"
+        );
+        let pipe = PAGE.split("function pipe(").nth(1).expect("the pipe");
+        let drain = pipe.find("await drain(to);").expect("drains");
+        let send = pipe.find("to.send(event.data);").expect("sends");
+        assert!(drain < send, "the pipe drains before it sends");
+        assert!(
+            pipe.contains("queued > HIGH_WATER || frames > 4096)"),
+            "the queue is bounded"
+        );
+        assert!(
+            pipe.contains("from.close()"),
+            "a stalled pipe closes its source"
+        );
+        assert!(
+            pipe.contains("return () => tail;"),
+            "a close can wait for the queue"
+        );
+        assert!(
+            pipe.contains("frames -= 1;"),
+            "an empty frame is counted too"
+        );
+    }
+
+    #[test]
     fn dial_ws_crosses_the_browser_bridge() {
         let target = std::net::TcpListener::bind("127.0.0.1:0").expect("binds target");
         let target_addr = target.local_addr().expect("target addr");
