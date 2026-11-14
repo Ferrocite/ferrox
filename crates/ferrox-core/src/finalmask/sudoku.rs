@@ -640,9 +640,35 @@ impl Reader {
     }
 
     fn decode_pure(&mut self, chunk: &[u8]) -> io::Result<()> {
-        for &byte in chunk {
+        let mut at = 0;
+        while at < chunk.len() {
+            if self.hint_len == 0 && at + self.hint.len() <= chunk.len() {
+                let table = &self.tables[self.table_index];
+                let hint_group = &table.layout.hint_group;
+                let hints = [
+                    hint_group[chunk[at] as usize],
+                    hint_group[chunk[at + 1] as usize],
+                    hint_group[chunk[at + 2] as usize],
+                    hint_group[chunk[at + 3] as usize],
+                ];
+                if hints.iter().all(|&hint| hint != u8::MAX) {
+                    let rank = rank4(sort4(hints));
+                    let Some(plain) = table.decode_byte(rank) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid sudoku hint tuple",
+                        ));
+                    };
+                    self.pending.push(plain);
+                    self.table_index = next_slot(self.table_index, self.tables.len());
+                    at += self.hint.len();
+                    continue;
+                }
+            }
+            let byte = chunk[at];
             let table = &self.tables[self.table_index];
             let group = table.layout.hint_group[byte as usize];
+            at += 1;
             if group == u8::MAX {
                 continue;
             }
@@ -1112,7 +1138,21 @@ fn clue_group(grid: &[u8; 16], pos: u8) -> u8 {
 }
 
 fn sort4(mut v: [u8; 4]) -> [u8; 4] {
-    v.sort_unstable();
+    if v[0] > v[1] {
+        v.swap(0, 1);
+    }
+    if v[2] > v[3] {
+        v.swap(2, 3);
+    }
+    if v[0] > v[2] {
+        v.swap(0, 2);
+    }
+    if v[1] > v[3] {
+        v.swap(1, 3);
+    }
+    if v[1] > v[2] {
+        v.swap(1, 2);
+    }
     v
 }
 
@@ -1188,6 +1228,21 @@ mod tests {
     fn every_grid_has_a_unique_clue_set() {
         for (index, list) in base_patterns().iter().enumerate() {
             assert!(!list.is_empty(), "grid {index} has no clue set");
+        }
+    }
+
+    #[test]
+    fn the_four_hint_sort_is_the_arrays_own_order() {
+        for a in 0..4u8 {
+            for b in 0..4u8 {
+                for c in 0..4u8 {
+                    for d in 0..4u8 {
+                        let mut want = [a, b, c, d];
+                        want.sort_unstable();
+                        assert_eq!(sort4([a, b, c, d]), want, "{:?}", [a, b, c, d]);
+                    }
+                }
+            }
         }
     }
 

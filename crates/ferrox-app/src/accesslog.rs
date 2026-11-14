@@ -230,12 +230,51 @@ fn needs_escape(word: u64) -> bool {
         != 0
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn escape_mask(bytes: *const u8) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_and_si256, _mm256_andnot_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
+        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
+    };
+    let data = unsafe { _mm256_loadu_si256(bytes.cast()) };
+    let printable = _mm256_and_si256(
+        _mm256_cmpgt_epi8(data, _mm256_set1_epi8(0x20)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), data),
+    );
+    let brackets = _mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(data, _mm256_set1_epi8(b'\\'.cast_signed())),
+            _mm256_cmpeq_epi8(data, _mm256_set1_epi8(b'['.cast_signed())),
+        ),
+        _mm256_cmpeq_epi8(data, _mm256_set1_epi8(b']'.cast_signed())),
+    );
+    let bad = _mm256_or_si256(
+        _mm256_andnot_si256(printable, _mm256_set1_epi8(-1)),
+        brackets,
+    );
+    _mm256_movemask_epi8(bad) as u32
+}
+
 /// A field holds one token: a path, tag or account that carries a control byte, whitespace or a
 /// bracket is escaped, not written through, so nothing a peer names can start a second field or record.
 fn push_escaped(out: &mut String, value: &str) {
     let bytes = value.as_bytes();
     let mut start = 0;
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        while at + 32 <= bytes.len() {
+            // SAFETY: the feature is present and the load stays inside the thirty-two bytes still ahead.
+            let mask = unsafe { escape_mask(bytes.as_ptr().add(at)) };
+            if mask == 0 {
+                at += 32;
+                continue;
+            }
+            at += mask.trailing_zeros() as usize;
+            break;
+        }
+    }
     while at + 8 <= bytes.len() {
         if at + 16 <= bytes.len() {
             let lo = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
@@ -500,10 +539,23 @@ mod tests {
         let input = format!("{}\u{80}", "a".repeat(15));
         check(&input, &format!("{}\\u{{80}}", "a".repeat(15)));
 
-        for len in [15, 16, 17, 31, 32, 33] {
+        for len in [15, 16, 17, 31, 32, 33, 63, 64, 65] {
             let input = "a".repeat(len);
             check(&input, &input);
         }
+
+        for at in [0, 1, 15, 16, 17, 31, 32, 33, 63] {
+            let mut bytes = vec![b'a'; 64];
+            bytes[at] = b'\\';
+            let input = String::from_utf8(bytes).expect("ascii");
+            check(
+                &input,
+                &format!("{}\\\\{}", "a".repeat(at), "a".repeat(63 - at)),
+            );
+        }
+
+        let input = format!("{}\u{80}", "a".repeat(32));
+        check(&input, &format!("{}\\u{{80}}", "a".repeat(32)));
     }
 
     /// The merged byte-position walk, kept as the number the word scan has to beat.
