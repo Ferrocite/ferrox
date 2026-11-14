@@ -65519,10 +65519,7 @@ mod tests {
     #[test]
     fn h3_carries_a_shadowsocks_echo_over_loopback() {
         let (identity, client) = h3_loopback_identity();
-        let settings = xhttp_settings_mode(
-            "/h3-shadowsocks",
-            crate::xhttp::XhttpMode::StreamOne,
-        );
+        let settings = xhttp_settings_mode("/h3-shadowsocks", crate::xhttp::XhttpMode::StreamOne);
         let accounts = crate::shadowsocks::SsAccounts {
             users: crate::shadowsocks::account("h3-ss-pass", "aes-256-gcm"),
             password: "h3-ss-pass".to_owned(),
@@ -65549,10 +65546,8 @@ mod tests {
         const METHOD: &str = "2022-blake3-aes-256-gcm";
         let password = ferrox_core::b64::encode(&[0x42u8; 32]);
         let (identity, client) = h3_loopback_identity();
-        let settings = xhttp_settings_mode(
-            "/h3-shadowsocks2022",
-            crate::xhttp::XhttpMode::StreamOne,
-        );
+        let settings =
+            xhttp_settings_mode("/h3-shadowsocks2022", crate::xhttp::XhttpMode::StreamOne);
         let accounts = crate::shadowsocks::SsAccounts {
             users: std::sync::Arc::from([]),
             password: password.clone(),
