@@ -8,7 +8,6 @@
 //! at table slot `b`. That shuffle is the wire contract — a peer running the pinned reference derives
 //! the same table only if the draw is byte-identical — so [`go_rand`](super::go_rand) reproduces it.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::mem;
@@ -25,6 +24,9 @@ const READ_CHUNK: usize = 32 * 1024;
 /// The number of nondecreasing four-tuples of six-bit groups: `C(67, 4)`.
 const RANK_SPACE: usize = 766_480;
 const RANK_WORDS: usize = RANK_SPACE.div_ceil(64);
+
+/// The 4x4 Latin-square grids the table is drawn from.
+const GRID_COUNT: usize = 288;
 
 /// The 24 orderings of four hint bytes, in the reference's order.
 const PERM4: [[u8; 4]; 24] = [
@@ -1032,13 +1034,20 @@ fn base_patterns() -> &'static [Vec<[u8; 4]>] {
 
 fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
     let grids = all_grids();
+    debug_assert_eq!(grids.len(), GRID_COUNT);
     let positions = hint_positions();
     let mut patterns: Vec<Vec<[u8; 4]>> = vec![Vec::new(); grids.len()];
+    // A 1024-slot open-addressed table turns the per-position rank count into one probe run over the 288 grids: the hash maps this replaces allocated one table, one key list and one group list for every one of the 1820 positions.
+    const SLOTS: usize = 1024;
+    const MASK: usize = SLOTS - 1;
+    let mut slots = [u32::MAX; SLOTS];
+    let mut counts = [0u16; SLOTS];
+    let mut used = [0u16; SLOTS];
+    let mut keys = [0u32; GRID_COUNT];
+    let mut groups = [[0u8; 4]; GRID_COUNT];
     for position in positions {
-        let mut counts: HashMap<usize, u16> = HashMap::with_capacity(grids.len());
-        let mut keys = Vec::with_capacity(grids.len());
-        let mut groups = Vec::with_capacity(grids.len());
-        for grid in grids {
+        let mut used_len = 0usize;
+        for (index, grid) in grids.iter().enumerate() {
             let clue = [
                 clue_group(grid, position[0]),
                 clue_group(grid, position[1]),
@@ -1046,15 +1055,43 @@ fn build_base_patterns() -> Vec<Vec<[u8; 4]>> {
                 clue_group(grid, position[3]),
             ];
             let clue = sort4(clue);
-            let key = rank4(clue);
-            keys.push(key);
-            groups.push(clue);
-            *counts.entry(key).or_insert(0) += 1;
-        }
-        for (index, key) in keys.into_iter().enumerate() {
-            if counts[&key] == 1 {
-                patterns[index].push(groups[index]);
+            let key = rank4(clue) as u32;
+            keys[index] = key;
+            groups[index] = clue;
+            let mut slot = ((key as usize).wrapping_mul(0x9e37_79b1) >> 22) & MASK;
+            loop {
+                let held = slots[slot];
+                if held == u32::MAX {
+                    slots[slot] = key;
+                    counts[slot] = 1;
+                    used[used_len] = slot as u16;
+                    used_len += 1;
+                    break;
+                }
+                if held == key {
+                    counts[slot] += 1;
+                    break;
+                }
+                slot = (slot + 1) & MASK;
             }
+        }
+        for (index, &key) in keys.iter().enumerate() {
+            let mut slot = ((key as usize).wrapping_mul(0x9e37_79b1) >> 22) & MASK;
+            loop {
+                let held = slots[slot];
+                if held == key {
+                    if counts[slot] == 1 {
+                        patterns[index].push(groups[index]);
+                    }
+                    break;
+                }
+                debug_assert_ne!(held, u32::MAX, "the key was counted above");
+                slot = (slot + 1) & MASK;
+            }
+        }
+        for &slot in &used[..used_len] {
+            slots[slot as usize] = u32::MAX;
+            counts[slot as usize] = 0;
         }
     }
     patterns
