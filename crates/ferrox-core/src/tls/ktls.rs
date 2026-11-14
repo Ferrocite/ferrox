@@ -277,10 +277,7 @@ impl Ktls {
                 }
             };
             if len == 0 && !typed {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "ktls: transport closed",
-                ));
+                return Ok((CLOSE, 0));
             }
             Ok((kind, len))
         }
@@ -610,6 +607,10 @@ impl Layer {
         loop {
             let (kind, len) = self.ktls.recv()?;
             match kind {
+                CLOSE => {
+                    self.eof = true;
+                    return Ok(0);
+                }
                 APPLICATION => {
                     if let Some(account) = &self.read_account {
                         account(len);
@@ -919,10 +920,11 @@ impl Layer {
     ) -> io::Result<()> {
         self.flush_control_direct(io)?;
         if self.tx_offloaded() {
+            self.out.clear();
             for part in parts {
-                io.write_all(part)?;
+                self.out.extend_from_slice(part);
             }
-            return Ok(());
+            return io.write_all(&self.out);
         }
         self.out.clear();
         let tx = self
