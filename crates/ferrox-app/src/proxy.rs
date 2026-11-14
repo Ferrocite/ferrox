@@ -59935,8 +59935,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
         let relay_addr = relay.local_addr().expect("addr");
-        let served = Arc::clone(&relay);
-        let serving = thread::spawn(move || serve_socks_udp_shadowsocks(&served, &ss));
+        let ingress = Arc::clone(&relay);
+        let serving = thread::spawn(move || serve_socks_udp_shadowsocks(&ingress, &ss));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let dest: SocketAddr = "127.0.0.1:443".parse().expect("addr");
         let mut frame = Vec::new();
