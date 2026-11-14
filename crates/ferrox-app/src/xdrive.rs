@@ -52,6 +52,7 @@ const SLOT_WRITE_INFLIGHT: usize = 12;
 const SLOT_ACK_RETRY: Duration = Duration::from_millis(30);
 const SLOT_WATERMARK_TTL: Duration = Duration::from_millis(100);
 const SLOT_STALL: Duration = Duration::from_secs(60);
+const SLOT_CLOSE_GRACE: Duration = Duration::from_secs(10);
 const SLOT_HUNT_FLOOR: Duration = Duration::from_millis(10);
 const SLOT_HUNT_CEILING: Duration = Duration::from_millis(25);
 const SLOT_TAIL_MIN: Duration = Duration::from_millis(150);
@@ -240,7 +241,9 @@ impl SlotRing {
         }
         let first = match root.get("first") {
             None => None,
-            Some(node) => Some(ferrox_core::b64::decode(node.as_str()?.as_bytes())?),
+            Some(node) => {
+                ferrox_core::b64::decode(node.as_str()?.as_bytes()).filter(|data| !data.is_empty())
+            }
         };
         Some(Self { up, down, first })
     }
@@ -424,7 +427,16 @@ impl Settings {
             return None;
         }
         let tls = transport_tls(stream, &security).ok()?;
-        let quic = quic_of(drive).ok()?;
+        let quic = quic_of(stream, drive).ok()?;
+        if quic
+            .as_ref()
+            .is_some_and(|params| params.cc == Some(ferrox_core::hysteria::Congestion::Brutal))
+            && tls
+                .as_ref()
+                .is_some_and(|tls| crate::xhttp_h3::is_h3(&tls.alpn))
+        {
+            return None;
+        }
         let secrets = drive
             .get("secrets")
             .and_then(Json::as_arr)
@@ -619,9 +631,17 @@ fn xmux_of(drive: &Json) -> Option<XmuxSettings> {
 }
 
 /// The h3 `quicParams` block as the reference spells it: windows, idle and keepalive seconds, stream cap, and the two flags quiche can honour.
-fn quic_of(drive: &Json) -> Result<Option<ferrox_core::hysteria::QuicParams>, String> {
+fn quic_of(
+    stream: &Json,
+    drive: &Json,
+) -> Result<Option<ferrox_core::hysteria::QuicParams>, String> {
     use ferrox_core::hysteria::{BbrProfile, Congestion, QuicParams};
-    let Some(node) = drive.get("quicParams").or_else(|| drive.get("quic_params")) else {
+    let node = stream
+        .get("finalmask")
+        .and_then(|mask| mask.get("quicParams").or_else(|| mask.get("quic_params")))
+        .or_else(|| drive.get("quicParams"))
+        .or_else(|| drive.get("quic_params"));
+    let Some(node) = node else {
         return Ok(None);
     };
     if matches!(node, Json::Null) {
@@ -1424,7 +1444,7 @@ impl Inbox {
     fn push(&self, chunk: Vec<u8>, cap: usize, wake: &Wake) -> bool {
         let mut queue = self.chunks.lock().unwrap_or_else(PoisonError::into_inner);
         while queue.len() >= cap {
-            if wake.stopped() {
+            if wake.stopped() || self.ended.load(Ordering::Acquire) {
                 return false;
             }
             census!("xdrive-inbox-room", crate::census::NO_FD, Some(DRAIN_WAIT));
@@ -1434,6 +1454,9 @@ impl Inbox {
                 .unwrap_or_else(PoisonError::into_inner);
             queue = guard;
         }
+        if self.ended.load(Ordering::Acquire) {
+            return false;
+        }
         queue.push_back(chunk);
         drop(queue);
         self.got.notify_one();
@@ -1442,10 +1465,12 @@ impl Inbox {
 
     /// End the stream for the reader, once: no reason is a clean `.end`, a reason is a refusal, which is how the reference splits `io.EOF` from a latched error.
     fn end(&self, reason: Option<String>) {
+        let queue = self.chunks.lock().unwrap_or_else(PoisonError::into_inner);
         if self.ended.swap(true, Ordering::AcqRel) {
             return;
         }
         *self.err.lock().unwrap_or_else(PoisonError::into_inner) = reason;
+        drop(queue);
         self.got.notify_all();
         self.room.notify_all();
     }
@@ -1829,6 +1854,7 @@ struct SlotWriter {
     inflight: Mutex<usize>,
     uploads_done: Condvar,
     ack: Mutex<SlotAck>,
+    progress: Mutex<Instant>,
     ended: AtomicBool,
     done: AtomicBool,
 }
@@ -1865,6 +1891,7 @@ impl SlotWriter {
                 acked: -1,
                 at: None,
             }),
+            progress: Mutex::new(Instant::now()),
             ended: AtomicBool::new(false),
             done: AtomicBool::new(false),
         });
@@ -2078,6 +2105,7 @@ impl SlotWriter {
         ack.at = Some(Instant::now());
         if acked > ack.acked {
             ack.acked = acked;
+            *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
         }
         Ok(ack.acked >= before)
     }
@@ -2091,7 +2119,19 @@ impl SlotWriter {
                 Ok(false) => {}
                 Err(_) => wait = (wait * 2).min(Duration::from_secs(2)),
             }
-            if started.elapsed() >= SLOT_STALL {
+            let still = self
+                .progress
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .elapsed();
+            let closed = self
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .closed;
+            if (started.elapsed() >= SLOT_STALL && still >= SLOT_STALL)
+                || (closed && still >= SLOT_CLOSE_GRACE)
+            {
                 return Err(carrier_error(
                     "the reader did not drain the slot ring in time",
                 ));
@@ -2254,7 +2294,9 @@ impl SlotPump {
                 return;
             }
             head = 1;
-            let _ = slots.set_slot(&self.table.watermark, "0", None);
+            if !self.watermark(slots, 0) {
+                return;
+            }
         }
         let mut delay = SLOT_HUNT_FLOOR;
         let mut active = Instant::now();
@@ -2266,7 +2308,9 @@ impl SlotPump {
                     if !self.inbox.push(data, cap, &self.wake) {
                         return;
                     }
-                    let _ = slots.set_slot(&self.table.watermark, &head.to_string(), None);
+                    if !self.watermark(slots, head) {
+                        return;
+                    }
                     head += 1;
                     active = Instant::now();
                     delay = SLOT_HUNT_FLOOR;
@@ -2297,9 +2341,12 @@ impl SlotPump {
                 return Step::Idle;
             }
             Err(why) => {
-                self.inbox
-                    .end(Some(format!("the slot description failed: {why}")));
-                return Step::Done;
+                if overdue(owed) {
+                    self.inbox
+                        .end(Some(format!("the slot description failed: {why}")));
+                    return Step::Done;
+                }
+                return Step::Idle;
             }
         };
         let Some(frame) = SlotFrame::decode(&description) else {
@@ -2328,16 +2375,13 @@ impl SlotPump {
             SLOT_INLINE => frame.data.unwrap_or_default(),
             SLOT_MEDIA => match slots.read_body(id) {
                 Ok(body) if frame.holds(&body) => body,
-                Ok(_) | Err(_) if overdue(owed) => {
-                    self.inbox
-                        .end(Some(format!("segment {head} has no usable body")));
-                    return Step::Done;
-                }
-                Ok(_) => return Step::Idle,
-                Err(why) if why.kind() == ErrorKind::NotFound => return Step::Idle,
-                Err(why) => {
-                    self.inbox.end(Some(format!("the slot body failed: {why}")));
-                    return Step::Done;
+                Ok(_) | Err(_) => {
+                    if overdue(owed) {
+                        self.inbox
+                            .end(Some(format!("segment {head} has no usable body")));
+                        return Step::Done;
+                    }
+                    return Step::Idle;
                 }
             },
             _ => {
@@ -2347,6 +2391,29 @@ impl SlotPump {
             }
         };
         Step::Data(data)
+    }
+
+    /// The watermark is the writer's permission to reuse a slot, so a failed write is retried until the stream stops rather than leaving the peer to stall out.
+    fn watermark(&self, slots: &dyn SlotStore, head: u64) -> bool {
+        let started = Instant::now();
+        let mut wait = SLOT_ACK_RETRY;
+        loop {
+            match slots.set_slot(&self.table.watermark, &head.to_string(), None) {
+                Ok(()) => return true,
+                Err(why) => {
+                    if self.stop.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    if started.elapsed() >= SLOT_STALL {
+                        self.inbox
+                            .end(Some(format!("the slot watermark failed: {why}")));
+                        return false;
+                    }
+                    std::thread::sleep(wait);
+                    wait = (wait * 2).min(Duration::from_secs(2));
+                }
+            }
+        }
     }
 
     fn idle(&self, delay: Duration, active: Instant) -> Duration {
@@ -2579,6 +2646,7 @@ pub(crate) type Accept = Arc<dyn Fn(Conn) + Send + Sync>;
 struct Claims {
     active: HashSet<String>,
     handled: HashMap<String, Instant>,
+    seen: HashMap<String, Instant>,
     idle: HashMap<String, Instant>,
 }
 
@@ -2640,6 +2708,13 @@ impl Server {
             .remove(session);
     }
 
+    /// Undo a claim whose announcement could not be read yet, so the next poll reads it again.
+    fn unclaim(&self, session: &str) {
+        let mut claims = self.claims.lock().unwrap_or_else(PoisonError::into_inner);
+        claims.active.remove(session);
+        claims.handled.remove(session);
+    }
+
     /// Poll the announcement folder on the same backoff as a stream: a busy listener stays at the fast interval, a quiet one sleeps out to the cap.
     fn accept(self: &Arc<Self>, rd: &Rd, accept: &Accept) {
         let mut delay = rd.params.min_poll;
@@ -2666,16 +2741,30 @@ impl Server {
         let Ok(listed) = rd.storage.list(SESSIONS_DIR) else {
             return false;
         };
+        let now = Instant::now();
+        let seen = {
+            let mut claims = self.claims.lock().unwrap_or_else(PoisonError::into_inner);
+            let present: HashSet<&str> = listed.iter().map(|entry| entry.name.as_str()).collect();
+            claims
+                .seen
+                .retain(|name, _| present.contains(name.as_str()));
+            listed
+                .iter()
+                .map(|entry| {
+                    let at = *claims.seen.entry(entry.name.clone()).or_insert(now);
+                    (entry.name.clone(), at)
+                })
+                .collect::<HashMap<_, _>>()
+        };
         let mut accepted = false;
         for entry in listed {
             let full = format!("{SESSIONS_DIR}/{}", entry.name);
-            let Some((session, at)) = parse_announce(&entry.name) else {
+            let Some((session, _)) = parse_announce(&entry.name) else {
                 rd.discard(full);
                 continue;
             };
-            if unix_nanos(SystemTime::now()) - at
-                > i64::try_from(rd.params.ttl.as_nanos()).unwrap_or(i64::MAX)
-            {
+            let first = seen.get(&entry.name).copied().unwrap_or(now);
+            if now.duration_since(first) > rd.params.ttl {
                 rd.discard(full);
                 rd.discard(format!("{STREAMS_DIR}/{session}"));
                 continue;
@@ -2683,33 +2772,42 @@ impl Server {
             if !self.claim(session) {
                 continue;
             }
-            let announced = entry
-                .inline
-                .clone()
-                .or_else(|| rd.storage.get(&full).ok())
-                .unwrap_or_default();
-            let conn = if rd.storage.slot_store().is_some() && !announced.is_empty() {
-                let Some(ring) = SlotRing::decode(&announced) else {
-                    self.release(session);
-                    rd.discard(full);
-                    rd.discard(format!("{STREAMS_DIR}/{session}"));
-                    continue;
-                };
-                let storage = rd
-                    .storage
-                    .session()
-                    .unwrap_or_else(|| Arc::clone(&rd.storage));
-                let ring = ring.flipped();
-                let Ok(conn) = Conn::slot(storage, &rd.params, &ring) else {
-                    self.release(session);
-                    rd.discard(full);
-                    rd.discard(format!("{STREAMS_DIR}/{session}"));
-                    continue;
-                };
-                conn
+            let slot = rd.storage.slot_store().is_some();
+            let announced = if slot {
+                match entry.inline.clone() {
+                    Some(data) => data,
+                    None => {
+                        if let Ok(data) = rd.storage.get(&full) {
+                            data
+                        } else {
+                            self.unclaim(session);
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let session_storage = rd
+                .storage
+                .session()
+                .unwrap_or_else(|| Arc::clone(&rd.storage));
+            let conn = if slot && !announced.is_empty() {
+                SlotRing::decode(&announced)
+                    .and_then(|ring| {
+                        Conn::slot(Arc::clone(&session_storage), &rd.params, &ring.flipped()).ok()
+                    })
+                    .unwrap_or_else(|| {
+                        Conn::pair(
+                            session_storage,
+                            &rd.params,
+                            downlink_prefix(session),
+                            uplink_prefix(session),
+                        )
+                    })
             } else {
                 Conn::pair(
-                    Arc::clone(&rd.storage),
+                    session_storage,
                     &rd.params,
                     downlink_prefix(session),
                     uplink_prefix(session),
@@ -6628,6 +6726,17 @@ mod tests {
         store
             .put("streams/gone/c2s/000000000.seg", b"orphan")
             .expect("its bytes");
+        server
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seen
+            .insert(
+                "1000-gone".to_owned(),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(3600))
+                    .expect("the test clock is past the epoch"),
+            );
         let opened = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&opened);
         let accept: Accept = Arc::new(move |_: Conn| {
@@ -7835,6 +7944,14 @@ mod tests {
         assert_eq!(decoded.up.slots, ring.up.slots);
         assert_eq!(decoded.down.watermark, ring.down.watermark);
         assert_eq!(decoded.first, ring.first);
+        let mut empty = ring;
+        empty.first = Some(Vec::new());
+        assert_eq!(
+            SlotRing::decode(empty.encode().as_bytes())
+                .expect("an empty first still decodes")
+                .first,
+            None
+        );
         assert!(SlotRing::decode(b"not a ring").is_none());
     }
 
@@ -7899,7 +8016,7 @@ mod tests {
     #[test]
     fn quic_params_reach_the_h3_lane_and_refuse_brutal() {
         let named = Settings::from_json(Some(&crate::json::parse(
-            r#"{"security":"tls","tlsSettings":{"serverName":"store.example"},"xdriveSettings":{"service":"google-drive","remoteFolder":"root","secrets":["id","secret","refresh"],"xmux":{"maxConnections":2,"hMaxRequestTimes":3,"hMaxReusableSecs":60},"quicParams":{"congestion":"bbr","initStreamReceiveWindow":65536,"maxStreamReceiveWindow":131072,"initConnReceiveWindow":65536,"maxConnReceiveWindow":131072,"maxIdleTimeout":30,"keepAlivePeriod":10,"maxIncomingStreams":64,"disablePathMtuDiscovery":true}}}"#,
+            r#"{"security":"tls","tlsSettings":{"serverName":"store.example"},"finalmask":{"quicParams":{"congestion":"bbr","initStreamReceiveWindow":65536,"maxStreamReceiveWindow":131072,"initConnReceiveWindow":65536,"maxConnReceiveWindow":131072,"maxIdleTimeout":30,"keepAlivePeriod":10,"maxIncomingStreams":64,"disablePathMtuDiscovery":true}},"xdriveSettings":{"service":"google-drive","remoteFolder":"root","secrets":["id","secret","refresh"],"xmux":{"maxConnections":2,"hMaxRequestTimes":3,"hMaxReusableSecs":60}}}"#,
         ).expect("parses"))).expect("names a drive");
         let quic = named.quic.expect("quicParams are read");
         assert_eq!(quic.init_stream_window, 65536);
