@@ -6,10 +6,14 @@ use std::io;
 use std::net::SocketAddr;
 
 /// Whether a redirect lookup exists on this host.
-pub(crate) const REDIRECT: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+pub(crate) const REDIRECT: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd"
+));
 
 /// Whether a transparent listener can receive traffic addressed to another host.
-pub(crate) const TPROXY: bool = cfg!(target_os = "linux");
+pub(crate) const TPROXY: bool = cfg!(any(target_os = "linux", target_os = "freebsd"));
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
@@ -19,9 +23,15 @@ pub(crate) use linux::{
 #[cfg(target_os = "macos")]
 pub(crate) use darwin::{original_destination, set_transparent};
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(target_os = "freebsd")]
+pub(crate) use freebsd::{original_destination, set_transparent};
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
 pub(crate) use other::original_destination;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub(crate) use other::set_transparent;
 
 #[cfg(not(target_os = "linux"))]
@@ -406,7 +416,153 @@ mod darwin {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "freebsd")]
+mod freebsd {
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::os::fd::AsRawFd;
+
+    const PF_IN: u8 = 1;
+    const PF_OUT: u8 = 2;
+    const DIOCNATLOOK: libc::c_ulong = 0xc04c_4417;
+
+    // FreeBSD keeps `pfioc_natlook`'s ports 16-bit, so the ioctl struct is 76 bytes, not 84.
+    #[repr(C, align(4))]
+    struct NatLook {
+        source: [u8; 16],
+        destination: [u8; 16],
+        reply_source: [u8; 16],
+        reply_destination: [u8; 16],
+        source_port: [u8; 2],
+        destination_port: [u8; 2],
+        reply_source_port: [u8; 2],
+        reply_destination_port: [u8; 2],
+        family: u8,
+        protocol: u8,
+        direction: u8,
+        pad: [u8; 1],
+    }
+
+    const _: () = assert!(size_of::<NatLook>() == 76);
+    const _: () = assert!(std::mem::offset_of!(NatLook, source_port) == 64);
+    const _: () = assert!(std::mem::offset_of!(NatLook, family) == 72);
+    const _: () = assert!(std::mem::offset_of!(NatLook, direction) == 74);
+    const _: () = assert!(DIOCNATLOOK == 0xc04c_4417);
+
+    fn enable(fd: libc::c_int, level: libc::c_int, name: libc::c_int) -> io::Result<()> {
+        let value: libc::c_int = 1;
+        // SAFETY: `value` outlives the call and `fd` is the caller's live socket.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::from_ref(&value).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(crate) fn set_transparent(socket: &socket2::Socket, v6: bool) -> io::Result<()> {
+        if v6 {
+            enable(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_BINDANY)
+                .or_else(|_| enable(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_BINDANY))
+        } else {
+            enable(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_BINDANY)
+        }
+    }
+
+    pub(crate) fn original_destination(
+        _fd: libc::c_int,
+        peer: SocketAddr,
+        local: Option<SocketAddr>,
+    ) -> io::Result<SocketAddr> {
+        let file = std::fs::File::open("/dev/pf")?;
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+        let local = local.map(|local| SocketAddr::new(local.ip().to_canonical(), local.port()));
+        // SAFETY: an all-zero struct is valid.
+        let mut look: NatLook = unsafe { zeroed() };
+        look.protocol = libc::IPPROTO_TCP as u8;
+        match peer.ip() {
+            IpAddr::V4(ip) => {
+                look.family = libc::AF_INET as u8;
+                look.source[..4].copy_from_slice(&ip.octets());
+                let destination = match local.map(|local| local.ip()) {
+                    Some(IpAddr::V4(ip)) if !ip.is_unspecified() => ip,
+                    _ => Ipv4Addr::LOCALHOST,
+                };
+                look.destination[..4].copy_from_slice(&destination.octets());
+            }
+            IpAddr::V6(ip) => {
+                look.family = libc::AF_INET6 as u8;
+                look.source.copy_from_slice(&ip.octets());
+                let destination = match local.map(|local| local.ip()) {
+                    Some(IpAddr::V6(ip)) if !ip.is_unspecified() => ip,
+                    _ => Ipv6Addr::LOCALHOST,
+                };
+                look.destination.copy_from_slice(&destination.octets());
+            }
+        }
+        look.source_port.copy_from_slice(&peer.port().to_be_bytes());
+        look.destination_port
+            .copy_from_slice(&local.map_or(0, |local| local.port()).to_be_bytes());
+        for direction in [PF_OUT, PF_IN] {
+            look.direction = direction;
+            // SAFETY: the argument is a live `pfioc_natlook` the kernel writes back into.
+            let result = unsafe {
+                libc::ioctl(file.as_raw_fd(), DIOCNATLOOK, std::ptr::from_mut(&mut look))
+            };
+            if result == 0 {
+                return reply_destination(&look);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    fn reply_destination(look: &NatLook) -> io::Result<SocketAddr> {
+        let port = u16::from_be_bytes(look.reply_destination_port);
+        match look.family as libc::c_int {
+            libc::AF_INET => {
+                let octets: [u8; 4] = look.reply_destination[..4].try_into().expect("four octets");
+                Ok(SocketAddr::new(Ipv4Addr::from(octets).into(), port))
+            }
+            libc::AF_INET6 => Ok(SocketAddr::new(
+                Ipv6Addr::from(look.reply_destination).into(),
+                port,
+            )),
+            _ => Err(io::Error::other("unknown address family")),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_freebsd_nat_look_reply_port_keeps_its_network_order() {
+            let mut look: NatLook = unsafe { zeroed() };
+            look.family = libc::AF_INET as u8;
+            look.reply_destination[..4].copy_from_slice(&[127, 0, 0, 1]);
+            look.reply_destination_port[..2].copy_from_slice(&8080u16.to_be_bytes());
+            assert_eq!(
+                reply_destination(&look).expect("decodes"),
+                "127.0.0.1:8080".parse().expect("literal")
+            );
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 mod other {
     use std::io;
 
