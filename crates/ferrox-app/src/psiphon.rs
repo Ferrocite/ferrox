@@ -515,8 +515,12 @@ struct Settings {
     inproxy_disable_stun: bool,
     inproxy_offer_timeout: Duration,
     inproxy_offer_personal_timeout: Duration,
+    inproxy_offer_retry_delay: Duration,
+    inproxy_offer_retry_jitter: f64,
     inproxy_relay_timeout: Duration,
     inproxy_await_ready_timeout: Duration,
+    inproxy_no_match_failover: f64,
+    inproxy_no_match_failover_personal: f64,
     reject_countries: Vec<String>,
     reject_cidrs: Vec<String>,
     geoip_path: Option<String>,
@@ -1585,11 +1589,20 @@ impl Inner {
         let servers = load_tactics_entries(&self.settings)?;
         let session_id = hex(&random::<16>());
         let tactics = fetch_tactics_from(&self.settings, &servers, &session_id)?;
-        let broker = tactics
+        if tactics.brokers.is_empty() {
+            return Err("psiphon conduit: tactics names no broker".to_owned());
+        }
+        let routes = tactics
             .brokers
-            .first()
-            .ok_or_else(|| "psiphon conduit: tactics names no broker".to_owned())?;
-        let fronts = broker_fronts(broker);
+            .iter()
+            .map(|broker| crate::psiphon_webrtc::BrokerRoute {
+                broker: crate::psiphon_broker::Broker {
+                    public_key: broker.public_key.clone(),
+                    root_secret: broker.root_secret.clone(),
+                },
+                fronts: broker_fronts(broker),
+            })
+            .collect();
         let common = decode_compartments(&tactics.compartments)?;
         let personal = decode_compartment(&self.settings.compartment)?;
         let (common, personal) = match self.settings.conduit_mode {
@@ -1601,11 +1614,7 @@ impl Inner {
             return Err("psiphon conduit: no compartments".to_owned());
         }
         let conduit = Arc::new(crate::psiphon_webrtc::Conduit::new(
-            crate::psiphon_broker::Broker {
-                public_key: broker.public_key.clone(),
-                root_secret: broker.root_secret.clone(),
-            },
-            fronts,
+            routes,
             common,
             personal,
             inproxy_stun_servers(&self.settings, &tactics),
@@ -1614,8 +1623,12 @@ impl Inner {
             self.settings.conduit_timeout,
             self.settings.inproxy_offer_timeout,
             self.settings.inproxy_offer_personal_timeout,
+            self.settings.inproxy_offer_retry_delay,
+            self.settings.inproxy_offer_retry_jitter,
             self.settings.inproxy_relay_timeout,
             self.settings.inproxy_await_ready_timeout,
+            self.settings.inproxy_no_match_failover,
+            self.settings.inproxy_no_match_failover_personal,
             self.settings.meek_headers.clone(),
             self.settings.dns.clone(),
             &self.settings.reject_cidrs,
@@ -2919,6 +2932,14 @@ impl Settings {
             15_000,
             10_000,
         );
+        let inproxy_offer_retry_delay = Duration::from_millis(
+            number(settings, "InproxyClientOfferRetryDelayMilliseconds")
+                .unwrap_or(100)
+                .min(60_000),
+        );
+        let inproxy_offer_retry_jitter = decimal(settings, "InproxyClientOfferRetryJitter")
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
         let inproxy_relay_timeout = millis_setting(
             settings,
             "InproxyClientRelayedPacketRequestTimeoutMilliseconds",
@@ -2931,6 +2952,14 @@ impl Settings {
             20_000,
             0,
         );
+        let inproxy_no_match_failover =
+            decimal(settings, "InproxyClientNoMatchFailoverProbability")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+        let inproxy_no_match_failover_personal =
+            decimal(settings, "InproxyClientNoMatchFailoverPersonalProbability")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
         let mut conduit_protocols = string_list(settings, "ConduitTunnelProtocols");
         if conduit_protocols.is_empty() {
             conduit_protocols = string_list(settings, "conduitTunnelProtocols");
@@ -3632,8 +3661,12 @@ impl Settings {
             inproxy_disable_stun,
             inproxy_offer_timeout,
             inproxy_offer_personal_timeout,
+            inproxy_offer_retry_delay,
+            inproxy_offer_retry_jitter,
             inproxy_relay_timeout,
             inproxy_await_ready_timeout,
+            inproxy_no_match_failover,
+            inproxy_no_match_failover_personal,
             reject_countries,
             reject_cidrs,
             geoip_path,
@@ -5474,8 +5507,12 @@ const KNOWN_SETTINGS: &[&str] = &[
     "InproxyClientDisableSTUN",
     "InproxyClientOfferRequestTimeoutMilliseconds",
     "InproxyClientOfferRequestPersonalTimeoutMilliseconds",
+    "InproxyClientOfferRetryDelayMilliseconds",
+    "InproxyClientOfferRetryJitter",
     "InproxyClientRelayedPacketRequestTimeoutMilliseconds",
     "InproxyClientWebRTCAwaitReadyToProxyTimeoutMilliseconds",
+    "InproxyClientNoMatchFailoverProbability",
+    "InproxyClientNoMatchFailoverPersonalProbability",
     "inproxyCompartment",
     "protocol_selection",
     "conduitMode",
@@ -14808,6 +14845,33 @@ mod tests {
         );
         assert_eq!(settings.inproxy_relay_timeout, Duration::from_secs(10));
         assert_eq!(settings.inproxy_await_ready_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn client_inproxy_retry_and_failover_default_to_the_reference() {
+        let settings = Settings::from_json(None).expect("settings");
+        assert_eq!(
+            settings.inproxy_offer_retry_delay,
+            Duration::from_millis(100)
+        );
+        assert_eq!(settings.inproxy_offer_retry_jitter, 0.5);
+        assert_eq!(settings.inproxy_no_match_failover, 0.5);
+        assert_eq!(settings.inproxy_no_match_failover_personal, 1.0);
+
+        let explicit = Settings::from_json(Some(
+            &json::parse(
+                r#"{"InproxyClientOfferRetryDelayMilliseconds":250,"InproxyClientOfferRetryJitter":0.25,"InproxyClientNoMatchFailoverProbability":0.4,"InproxyClientNoMatchFailoverPersonalProbability":0.9}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            explicit.inproxy_offer_retry_delay,
+            Duration::from_millis(250)
+        );
+        assert_eq!(explicit.inproxy_offer_retry_jitter, 0.25);
+        assert_eq!(explicit.inproxy_no_match_failover, 0.4);
+        assert_eq!(explicit.inproxy_no_match_failover_personal, 0.9);
     }
 
     #[test]
