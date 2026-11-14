@@ -194,21 +194,14 @@ impl Manager {
         })
     }
 
-    /// The reference's `getXmuxClient(create=true)` (`mux.go:66`): reuse a live entry the bounds
-    /// allow, otherwise dial one, and never block — a saturated pool over its target dials fresh,
-    /// as `getXmuxClient` does when every client is filtered out.
-    pub(crate) fn lease(&self, create: impl FnOnce() -> Option<Arc<H2Client>>) -> Option<Lease> {
+    /// The reference's `newXmuxClient` (`mux.go:62`): a session that found no live entry dials its
+    /// own transport and adds it, so a stale entry can never discard the session it just handshook.
+    pub(crate) fn adopt(&self, conn: Arc<H2Client>) -> Lease {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.retain(|entry| !entry.expired());
-        let chosen = self.choose(&entries);
-        let entry = if let Some(entry) = chosen {
-            entry
-        } else {
-            let entry = Arc::new(Entry::new(create()?, &self.bounds));
-            entries.push(Arc::clone(&entry));
-            entry
-        };
-        Some(hold(entry))
+        let entry = Arc::new(Entry::new(conn, &self.bounds));
+        entries.push(Arc::clone(&entry));
+        hold(entry)
     }
 
     /// `GetExistingXmuxClient` (`mux.go:73`): a session that would rather dial its own transport
@@ -319,6 +312,15 @@ mod tests {
         H2Client::new(std::io::empty(), Sink, None)
     }
 
+    fn take(
+        manager: &Arc<Manager>,
+        create: &impl Fn() -> Option<Arc<H2Client>>,
+    ) -> Option<Lease> {
+        manager
+            .existing()
+            .or_else(|| create().map(|conn| manager.adopt(conn)))
+    }
+
     fn counter() -> (Arc<AtomicUsize>, impl Fn() -> Option<Arc<H2Client>>) {
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&count);
@@ -418,7 +420,7 @@ mod tests {
         let manager = Manager::new(defaults(), None);
         let (dialed, create) = counter();
         let leased: Vec<Lease> = (0..4)
-            .map(|_| manager.lease(&create).expect("a lease"))
+            .map(|_| take(&manager, &create).expect("a lease"))
             .collect();
         assert_eq!(
             dialed.load(Ordering::SeqCst),
@@ -441,9 +443,9 @@ mod tests {
         bounds.max_concurrency = (1, 1);
         let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        let first = manager.lease(&create).expect("a lease");
+        let first = take(&manager, &create).expect("a lease");
         let first_conn = Arc::clone(first.conn());
-        let second = manager.lease(&create).expect("a lease");
+        let second = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,
@@ -451,7 +453,7 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(&first_conn, second.conn()));
         drop(first);
-        let third = manager.lease(&create).expect("a lease");
+        let third = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,
@@ -467,10 +469,10 @@ mod tests {
         bounds.c_max_reuse_times = (3, 3);
         let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        let one = manager.lease(&create).expect("a lease");
+        let one = take(&manager, &create).expect("a lease");
         let one_conn = Arc::clone(one.conn());
         drop(one);
-        let two = manager.lease(&create).expect("a lease");
+        let two = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             1,
@@ -478,7 +480,7 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&one_conn, two.conn()));
         drop(two);
-        let three = manager.lease(&create).expect("a lease");
+        let three = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,
@@ -493,8 +495,8 @@ mod tests {
         bounds.h_max_request_times = (1, 1);
         let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        drop(manager.lease(&create).expect("a lease"));
-        drop(manager.lease(&create).expect("a lease"));
+        drop(take(&manager, &create).expect("a lease"));
+        drop(take(&manager, &create).expect("a lease"));
         assert_eq!(dialed.load(Ordering::SeqCst), 2, "one request per client");
     }
 
@@ -517,9 +519,9 @@ mod tests {
         bounds.h_max_reusable_secs = (1, 1);
         let manager = Manager::new(bounds, None);
         let (dialed, create) = counter();
-        drop(manager.lease(&create).expect("a lease"));
+        drop(take(&manager, &create).expect("a lease"));
         std::thread::sleep(Duration::from_millis(1100));
-        let _second = manager.lease(&create).expect("a lease");
+        let _second = take(&manager, &create).expect("a lease");
         assert_eq!(
             dialed.load(Ordering::SeqCst),
             2,

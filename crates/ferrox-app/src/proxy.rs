@@ -20706,14 +20706,13 @@ fn dial_vless_tls(
                     .alpn()
                     .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2")) =>
         {
-            let pool = tls_xmux(server, vless, Arc::clone(tls), settings);
-            let lease = pool.lease(|| {
-                let (reader, writer, raw) = session.into_halves()?;
+            let Some(conn) = session.into_halves().and_then(|(reader, writer, raw)| {
                 crate::xhttp_h2::H2Client::new(reader, writer, Some(raw))
-            });
-            let Some(lease) = lease else {
+            }) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
+            let pool = tls_xmux(server, vless, Arc::clone(tls), settings);
+            let lease = pool.adopt(conn);
             if !pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
                 note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
@@ -21026,14 +21025,13 @@ fn dial_vless_reality(
             }
         }
         Carrier::Xhttp { settings } if settings.mode == crate::xhttp::XhttpMode::StreamOne => {
-            let pool = reality_xmux(server, vless, reality, settings);
-            let lease = pool.lease(|| {
-                let (reader, writer, raw) = session.into_halves()?;
+            let Some(conn) = session.into_halves().and_then(|(reader, writer, raw)| {
                 crate::xhttp_h2::H2Client::new(reader, writer, Some(raw))
-            });
-            let Some(lease) = lease else {
+            }) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
+            let pool = reality_xmux(server, vless, reality, settings);
+            let lease = pool.adopt(conn);
             if !pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
                 note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
