@@ -1148,9 +1148,14 @@ fn clue_group(grid: &[u8; 16], pos: u8) -> u8 {
     ((grid[pos as usize] - 1) << 4) | (pos & 0x0f)
 }
 
-fn sort4(mut v: [u8; 4]) -> [u8; 4] {
-    v.sort_unstable();
-    v
+fn sort4(v: [u8; 4]) -> [u8; 4] {
+    // A five-comparator network sorts four octets without the branchy insertion the standard sort uses.
+    let (a0, a1) = (v[0].min(v[1]), v[0].max(v[1]));
+    let (a2, a3) = (v[2].min(v[3]), v[2].max(v[3]));
+    let (b0, b2) = (a0.min(a2), a0.max(a2));
+    let (b1, b3) = (a1.min(a3), a1.max(a3));
+    let (c1, c2) = (b1.min(b2), b1.max(b2));
+    [b0, c1, c2, b3]
 }
 
 const fn rank_terms() -> [[u32; 64]; 4] {
