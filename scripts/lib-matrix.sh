@@ -571,6 +571,7 @@ carrier_of() {
     *-grpc-multi-*) echo grpc-multi ;;
     *-tls-grpc-*) echo tls-grpc ;;
     *-grpc-*) echo grpc ;;
+    *-tls-xhttp-h3-*) echo tls-xhttp-h3 ;;
     *-tls-xhttp-h2-*) echo tls-xhttp-h2 ;;
     *-tls-xhttp-h1-*) echo tls-xhttp-h1 ;;
     *-xhttp-streamone-*) echo xhttp-streamone ;;
@@ -611,6 +612,7 @@ carrier_stream() {
     xhttp) stream_json xhttp ;;
     tls-xhttp-h1) if [[ "$role" == server ]]; then tls_xhttp_server_settings auto http/1.1; else tls_xhttp_client_settings auto http/1.1; fi ;;
     tls-xhttp-h2) if [[ "$role" == server ]]; then tls_xhttp_server_settings auto h2; else tls_xhttp_client_settings auto h2; fi ;;
+    tls-xhttp-h3) if [[ "$role" == server ]]; then tls_xhttp_server_settings auto h3; else tls_xhttp_client_settings auto h3; fi ;;
     xhttp-streamone) xhttp_h1_settings stream-one ;;
     xhttp-streamup) xhttp_h1_settings stream-up ;;
     xhttp-packets) xhttp_h1_settings packet-up ;;
@@ -746,7 +748,7 @@ matrix_carriers() {
     raw tls-raw ws tls-ws ws-ed tls-ws-ed \
     httpupgrade tls-httpupgrade httpupgrade-ed tls-httpupgrade-ed \
     grpc tls-grpc grpc-multi tls-grpc-multi \
-    xhttp tls-xhttp-h1 tls-xhttp-h2 xhttp-streamone xhttp-streamup xhttp-packets \
+    xhttp tls-xhttp-h1 tls-xhttp-h2 tls-xhttp-h3 xhttp-streamone xhttp-streamup xhttp-packets \
     kcp hysteria reality-raw
 }
 
