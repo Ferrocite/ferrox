@@ -1248,7 +1248,9 @@ impl Dsl {
         self.timeout = duration_field(fields, "DSLFetcherTunneledRequestTimeout", self.timeout)
             .min(Duration::from_mins(2));
         self.retry_count = number(fields, "DSLFetcherTunneledRequestRetryCount")
-            .map_or(self.retry_count, |count| count.min(5) as usize);
+            .map_or(self.retry_count, |count| {
+                usize::try_from(count).unwrap_or(usize::MAX)
+            });
         self.retry_delay = duration_field(
             fields,
             "DSLFetcherTunneledRequestRetryDelay",
@@ -2331,12 +2333,7 @@ impl Inner {
                         at += count;
                         break;
                     }
-                    Err(why)
-                        if why.starts_with("psiphon ssh")
-                            && !why.contains("timed out")
-                            && attempt < dsl.retry_count
-                            && count > 1 =>
-                    {
+                    Err(why) if attempt < dsl.retry_count && count > 1 => {
                         pause_dsl(&dsl);
                         count = (count / 2).max(1);
                         attempt += 1;
@@ -10219,16 +10216,15 @@ fn absorb_exchanged(
     seen: &mut HashSet<(IpAddr, u16)>,
     include_inproxy: bool,
 ) {
-    if !state_is_ours(&settings.state) {
+    // Without a key an exchanged entry cannot be authenticated, and this file is one a later config could point at; the reference verifies every entry it dials.
+    if !state_is_ours(&settings.state) || settings.signature_key.is_empty() {
         return;
     }
     let Ok(text) = std::fs::read_to_string(exchanged_path(settings)) else {
         return;
     };
     for entry in text.lines().filter_map(entry_line_json) {
-        if !settings.signature_key.is_empty()
-            && verify_entry_signature(&entry, &settings.signature_key).is_err()
-        {
+        if verify_entry_signature(&entry, &settings.signature_key).is_err() {
             continue;
         }
         if let Some(server) =
@@ -10273,14 +10269,18 @@ fn transfer_endpoint(
     let (dial, port) = split_fronting_address_with(&dial, 443);
     let disable_sni = spec.disable_sni || dial.parse::<IpAddr>().is_ok();
     let verify_name = (verified && !spec.skip_verify).then_some(spec.verify_name.as_str());
-    Ok(endpoint.with_fronting(
-        &spec.host,
-        &dial,
-        port,
-        disable_sni,
-        verify_name,
-        spec.verify_pins.clone(),
-    ))
+    endpoint
+        .with_fronting(
+            &spec.host,
+            &dial,
+            port,
+            disable_sni,
+            verify_name,
+            spec.verify_pins.clone(),
+        )
+        .ok_or_else(|| {
+            format!("psiphon: {url} names a VerifyPins entry that is not base64 of a SHA-256 key")
+        })
 }
 
 /// The fronting spec a transfer root draws for one request.
