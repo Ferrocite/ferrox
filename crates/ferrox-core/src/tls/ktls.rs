@@ -397,6 +397,7 @@ use std::io::{Read, Write};
 const APPLICATION: u8 = 23;
 const HANDSHAKE: u8 = 22;
 const ALERT: u8 = 21;
+const CLOSE: u8 = 0;
 const MAX_PLAINTEXT: usize = 16384;
 
 /// The handshake message a peer's `update_requested` asks this side to send.
